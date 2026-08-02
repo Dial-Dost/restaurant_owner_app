@@ -1,0 +1,19449 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ui' show ImageFilter;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:excel/excel.dart' as xl;
+import 'package:image_picker/image_picker.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+
+import '../config.dart';
+import '../models/profile.dart';
+import '../services/api_client.dart';
+import '../services/rest_client.dart';
+import '../services/printer_service.dart';
+import '../services/restaurant_time.dart';
+import '../services/tz_offsets.dart';
+import '../ui/theme/app_colors.dart';
+import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/charts.dart';
+import '../ui/widgets/empty_state.dart';
+import '../ui/widgets/food_tile.dart';
+import '../ui/widgets/fork_button.dart';
+import '../ui/widgets/fork_card.dart';
+import '../ui/widgets/fork_tabs.dart';
+import '../ui/widgets/metric_tag.dart';
+import '../ui/widgets/section_header.dart';
+import '../ui/widgets/skeleton.dart';
+import '../ui/widgets/stat_card.dart';
+import '../ui/widgets/status_chip.dart';
+import '../widgets/async_view.dart';
+import '../widgets/module_navigator.dart';
+import '../widgets/table_bill.dart';
+import 'order_entry.dart';
+
+// Feature modules for the owner app. Each is a builder `(RestClient, Profile) ->
+// Widget` that loads from the live backend via AsyncView and renders the data.
+// Read views for every module; Inventory and Employees also support adding.
+
+// ---------------------------------------------------------------- helpers ----
+
+/// Which feedback card is expanded (empty = none). Module-level so it survives
+/// the AsyncView rebuilds, matching how the analytics view selection is kept.
+String _feedbackOpenId = '';
+
+double _numOf(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+
+/// Ratings are stored to 2dp, so a genuine 4.8 must read "4.8" rather than the
+/// "5" a rounded integer used to show. Whole scores stay clean ("5", not "5.0").
+String _score(dynamic v) {
+  if (v == null) {return '-';}
+  final d = _numOf(v);
+  if (d == 0 && '$v'.trim().isEmpty) {return '-';}
+  return d == d.roundToDouble() ? d.toStringAsFixed(0) : d.toStringAsFixed(1);
+}
+
+String _s(Map row, String key, [String fallback = '—']) {
+  final v = row[key];
+  if (v == null) return fallback;
+  final s = v.toString();
+  return s.isEmpty ? fallback : s;
+}
+
+String _money(dynamic v) {
+  final n = v is num ? v : num.tryParse('${v ?? ''}');
+  return n == null ? '—' : '₹${n.toStringAsFixed(2)}';
+}
+
+// Whole-number JSON field (capacity, max_capacity, party size…); null when absent.
+int? _int(dynamic v) => num.tryParse('${v ?? ''}')?.round();
+
+// Seat read-out for a table row: "4 seats", or "4 seats · max 6" when extra
+// chairs push it further. The server always sends max_capacity (it coalesces to
+// capacity), so a max is only spelled out when it actually buys extra covers.
+String _seatsLabel(Map table) {
+  final cap = _int(table['capacity']);
+  final max = _int(table['max_capacity']) ?? cap;
+  if (cap == null) return max == null ? '' : 'max $max';
+  return max != null && max > cap ? '$cap seats · max $max' : '$cap seats';
+}
+
+// The per-table ordering OTP as it should be SHOWN — '' when it must not be.
+//
+// The code is only meaningful while the restaurant's `require_table_otp` setting
+// is ON. With the gate off the backend reports `otp_required: false` and
+// `order_otp: null` on every table (so a code left in the DB from an earlier
+// toggle never leaks), but honour the flag explicitly too: any row that says the
+// gate is off must not display a code, whatever else it carries. A row without
+// `otp_required` at all (older backend) keeps the previous behaviour — show the
+// code if one was sent.
+String _tableOtp(Map table) =>
+    table['otp_required'] == false ? '' : _s(table, 'order_otp', '');
+
+// String list off a JSON row, blanks dropped ("table_names", …).
+List<String> _strList(dynamic v) =>
+    ((v as List?) ?? const []).map((e) => '$e').where((e) => e.isNotEmpty).toList();
+
+// Timestamp rendering. All four delegate to the ONE shared formatter
+// (RestaurantTime), which renders in the RESTAURANT's timezone — the per-tenant
+// `timezone` setting — not the device's. These wrappers stay so the ~40 call
+// sites below read the same as before; the anchor underneath them changed.
+//
+// "Jun 26, 14:05"
+String _fmtTime(String iso) => iso.isEmpty ? '' : RestaurantTime.short(iso);
+
+// dd/mm/yy · HH:mm (used for reservations).
+String _fmtDmy(String iso) => iso.isEmpty ? '' : RestaurantTime.dmy(iso);
+
+// A short day ("Aug 20"), no time-of-day.
+String _fmtDay(String iso) => iso.isEmpty ? '' : RestaurantTime.day(iso);
+
+// Time of day only ("14:05"), for rows that already carry the date.
+String _fmtClock(String iso) => iso.isEmpty ? '' : RestaurantTime.clock(iso);
+
+// Pick a table from a dropdown of all tables (shows occupancy). Returns the name.
+Future<String?> _pickTable(BuildContext context, RestClient rest) async {
+  List tables;
+  try {
+    tables = await rest.getList('/get-tables');
+  } catch (e) {
+    if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    return null;
+  }
+  if (!context.mounted) return null;
+  if (tables.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No tables to assign.')));
+    return null;
+  }
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => SimpleDialog(
+      title: const Text('Assign to table'),
+      children: [
+        for (final t in tables)
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, _s(t as Map, 'table_name')),
+            child: Row(children: [
+              Icon(Icons.table_restaurant, size: 18, color: t['occupied'] == true ? AppColors.danger : AppColors.success),
+              const SizedBox(width: 10),
+              Text(_s(t, 'table_name'), style: const TextStyle(fontWeight: FontWeight.w600)),
+              const Spacer(),
+              Text(t['occupied'] == true ? 'occupied' : 'free',
+                  style: TextStyle(fontSize: 11, color: t['occupied'] == true ? AppColors.danger : AppColors.success)),
+            ]),
+          ),
+      ],
+    ),
+  );
+}
+
+Widget _empty(String text) => EmptyState(
+      icon: Icons.inbox_outlined,
+      title: 'Nothing to show',
+      caption: text,
+    );
+
+// ------------------------------------------- notification focus (deep-link) ---
+// A tapped notification lands on its module AND asks it to focus one record.
+// The shell parks the request on the ModuleNavigator; each module reads its own
+// with `_focusOf(context, 'Orders')`. Null outside the shell (tests/previews)
+// or when nothing is pending, so every call site degrades to the plain list.
+
+ModuleFocusRequest? _focusOf(BuildContext context, String moduleLabel) =>
+    ModuleNavigator.of(context)?.focusFor(moduleLabel);
+
+// The banner a module shows while it is honouring a focus request: copper when
+// the record is right there, warning when it is NOT in this list (so the user is
+// never left staring at a screen wondering where their notification went).
+// [actions] are the ways out — switch outlet, widen the filter, open History.
+Widget _focusBanner(
+  BuildContext context, {
+  required bool found,
+  required String message,
+  List<Widget> actions = const [],
+}) {
+  final color = found ? AppColors.copper : AppColors.warning;
+  final text = Theme.of(context).textTheme;
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
+      decoration: BoxDecoration(
+        color: AppColors.tint(color),
+        borderRadius: AppRadius.controlAll,
+        border: Border.all(color: AppColors.edge(color)),
+      ),
+      child: Row(children: [
+        Icon(found ? Icons.my_location : Icons.search_off,
+            size: 16, color: found ? AppColors.copperHi : AppColors.warning),
+        const SizedBox(width: AppSpacing.sm),
+        Expanded(
+          child: Text(message,
+              style: text.bodySmall!.copyWith(
+                fontSize: 12,
+                color: found ? AppColors.textPrimary : AppColors.warning,
+              )),
+        ),
+        for (final a in actions) ...[const SizedBox(width: AppSpacing.sm), a],
+        IconButton(
+          icon: const Icon(Icons.close, size: 16, color: AppColors.textTertiary),
+          tooltip: 'Dismiss',
+          visualDensity: VisualDensity.compact,
+          onPressed: () => ModuleNavigator.of(context)?.clearFocus(),
+        ),
+      ]),
+    ),
+  );
+}
+
+// ------------------------------------------------------- outlet scope (bug 3) --
+// Every order lands on the outlet of the TABLE it was placed from, and reads are
+// scoped to the outlet you signed in to / switched to. So a perfectly healthy
+// restaurant can show an EMPTY orders grid. GET /orders/scope reports the live
+// count per outlet (same predicate as GET /orders) so these surfaces can say
+// where the orders actually are instead of rendering a blank list.
+
+// Best-effort: an older backend without /orders/scope just yields {} and every
+// helper below degrades to the plain behaviour.
+Future<Map<String, dynamic>> _loadOrdersScope(RestClient rest) async {
+  try {
+    return await rest.getMap('/orders/scope');
+  } catch (_) {
+    return const <String, dynamic>{};
+  }
+}
+
+int _scopeInt(Map scope, String key) {
+  final v = scope[key];
+  return v is num ? v.toInt() : (int.tryParse('${v ?? ''}') ?? 0);
+}
+
+List<Map> _scopeOutlets(Map scope) =>
+    ((scope['outlets'] as List?) ?? const []).whereType<Map>().toList();
+
+String _scopeOutletName(Map scope) {
+  final o = scope['outlet'];
+  final name = o is Map ? '${o['outlet_name'] ?? o['name'] ?? ''}'.trim() : '';
+  return name.isEmpty ? 'this outlet' : name;
+}
+
+// The outlet with the most live orders right now — where an empty grid should
+// point the user.
+Map? _busiestOtherOutlet(Map scope) {
+  Map? best;
+  for (final o in _scopeOutlets(scope)) {
+    if (o['is_current'] == true) continue;
+    if (_scopeInt(o, 'live_orders') <= 0) continue;
+    if (best == null || _scopeInt(o, 'live_orders') > _scopeInt(best, 'live_orders')) best = o;
+  }
+  return best;
+}
+
+// Quiet "you are looking at <outlet>" strip, shown only when the restaurant has
+// more than one outlet (single-outlet tenants see nothing new).
+Widget? _outletScopeBar(BuildContext context, Map scope) {
+  if (_scopeOutlets(scope).length < 2) return null;
+  final text = Theme.of(context).textTheme;
+  final all = scope['is_all_outlets'] == true;
+  final other = _scopeInt(scope, 'other_outlet_orders');
+  final nav = ModuleNavigator.of(context);
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Row(children: [
+      Icon(all ? Icons.layers : Icons.store_mall_directory_outlined,
+          size: 14, color: AppColors.copperHi),
+      const SizedBox(width: 6),
+      Expanded(
+        child: Text(
+          all ? 'All outlets (combined)' : _scopeOutletName(scope),
+          overflow: TextOverflow.ellipsis,
+          style: text.bodySmall!.copyWith(fontSize: 11.5, fontWeight: FontWeight.w600),
+        ),
+      ),
+      if (!all && other > 0) ...[
+        Text('$other in other outlets',
+            style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.warning)),
+        if (nav?.switchOutlet != null) ...[
+          const SizedBox(width: AppSpacing.sm),
+          ForkButton.ghost(
+            label: 'View all',
+            icon: Icons.layers,
+            dense: true,
+            onPressed: () => nav!.switchOutlet!('all'),
+          ),
+        ],
+      ],
+    ]),
+  );
+}
+
+// The empty state that explains itself. [noun] is what is missing ('orders',
+// 'kitchen tickets'). Never a bare "nothing here" when the rows exist on another
+// outlet — and it names History for settled orders past the live window.
+Widget _outletScopeEmpty(
+  BuildContext context, {
+  required Map scope,
+  required String noun,
+  required IconData icon,
+  required String title,
+  required String caption,
+  // The live grid deliberately hides settled orders past the window — worth
+  // saying on the Orders list, noise on the kitchen board.
+  bool mentionHistory = true,
+}) {
+  final other = _scopeInt(scope, 'other_outlet_orders');
+  final nav = ModuleNavigator.of(context);
+  final days = _scopeInt(scope, 'live_window_days');
+  final historyNote = !mentionHistory
+      ? ''
+      : days > 0
+          ? ' Settled orders older than $days days move to History.'
+          : ' Settled orders move to History after a few days.';
+
+  if (other <= 0) {
+    return EmptyState(
+      icon: icon,
+      title: title,
+      caption: '$caption$historyNote',
+      action: mentionHistory && nav != null && nav.canOpen('History')
+          ? ForkButton.ghost(
+              label: 'Open History',
+              icon: Icons.calendar_month,
+              dense: true,
+              onPressed: () => nav.openModule('History'),
+            )
+          : null,
+    );
+  }
+
+  final busiest = _busiestOtherOutlet(scope);
+  final busiestName = busiest == null ? 'another outlet' : '${busiest['outlet_name'] ?? 'another outlet'}';
+  final noTables = scope['current_outlet_has_tables'] == false;
+  return EmptyState(
+    icon: Icons.store_mall_directory_outlined,
+    title: 'No $noun in ${_scopeOutletName(scope)}',
+    caption: '$other live ${other == 1 ? 'order is' : 'orders are'} in $busiestName.'
+        '${noTables ? ' This outlet has no tables yet, so guest QR orders can\'t land here.' : ''}'
+        '$historyNote',
+    action: nav?.switchOutlet == null
+        ? null
+        : Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, alignment: WrapAlignment.center, children: [
+            if (busiest != null && busiest['outlet_id'] != null)
+              // Short, fixed label — the caption above already names the outlet,
+              // and a long label would overflow this Wrap on a narrow window.
+              ForkButton(
+                label: 'Switch outlet',
+                icon: Icons.swap_horiz,
+                dense: true,
+                onPressed: () => nav!.switchOutlet!('${busiest['outlet_id']}'),
+              ),
+            ForkButton.ghost(
+              label: 'View all outlets',
+              icon: Icons.layers,
+              dense: true,
+              onPressed: () => nav!.switchOutlet!('all'),
+            ),
+          ]),
+  );
+}
+
+// Shared shimmer placeholder for modules that manage their own loading flag —
+// mirrors AsyncView's skeleton so hand-rolled loaders read the same as the
+// AsyncView-driven ones (no bare spinners on module surfaces).
+Widget _loadingSkeleton() => ListView(
+      padding: const EdgeInsets.all(AppSpacing.xxl),
+      children: [
+        const SkeletonBox(width: 180, height: 22, radius: 7),
+        const SizedBox(height: AppSpacing.xl),
+        for (var i = 0; i < 6; i++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.md),
+            child: Container(
+              padding: AppSpacing.cardPad,
+              decoration: BoxDecoration(
+                color: AppColors.inset,
+                borderRadius: AppRadius.cardAll,
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Row(children: [
+                const SkeletonBox(width: 40, height: 40, radius: 10),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: const [
+                      SkeletonBox(width: 160, height: 13),
+                      SizedBox(height: 8),
+                      SkeletonBox(width: 90, height: 11),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.md),
+                const SkeletonBox(width: 56, height: 24, radius: 8),
+              ]),
+            ),
+          ),
+      ],
+    );
+
+// Shared stat tile — the template StatCard: oversized light-weight value with
+// an uppercase micro caption. Positional signature preserved for every
+// call-site; the reference cards carry identity through type, not glyphs, so
+// the icon is intentionally not rendered.
+//
+// With [onTap] the tile becomes a control: the ForkCard hover lift plus a
+// copper "DETAILS ›" affordance so it reads as expandable rather than flat.
+Widget _statCard(BuildContext c, String label, String value, IconData icon, {VoidCallback? onTap}) => SizedBox(
+      width: 200,
+      child: StatCard(
+        value: value,
+        caption: label.toUpperCase(),
+        onTap: onTap,
+        footer: onTap == null
+            ? null
+            : Row(mainAxisSize: MainAxisSize.min, children: [
+                Text('DETAILS',
+                    style: Theme.of(c).textTheme.labelSmall!.copyWith(color: AppColors.copper)),
+                const Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
+              ]),
+      ),
+    );
+
+// Token-styled key/value row: letter-spaced micro key, quiet value. The value
+// inherits the ambient text colour so it also reads on paper-white artifacts.
+Widget _kv(String k, String v) => Builder(
+      builder: (context) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 148,
+              child: Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(k.toUpperCase(), style: Theme.of(context).textTheme.labelSmall),
+              ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(child: Text(v, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500))),
+          ],
+        ),
+      ),
+    );
+
+// --------------------------------------------------------------- modules ----
+
+// A "needs attention" tile. With [onTap] it becomes a control: the ForkCard's
+// hover lift plus a quiet chevron. A zero count stays tappable but reads quiet.
+Widget _actionTile(BuildContext context, String label, int count, IconData icon, Color color,
+    {VoidCallback? onTap}) {
+  final text = Theme.of(context).textTheme;
+  final active = count > 0;
+  return ForkCard(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    onTap: onTap,
+    child: Row(children: [
+      AnimatedContainer(
+        duration: AppDurations.base,
+        curve: Curves.easeOut,
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          color: active ? AppColors.tint(color) : AppColors.inset,
+          borderRadius: AppRadius.controlAll,
+          border: Border.all(color: active ? AppColors.edge(color) : AppColors.border),
+        ),
+        child: Icon(icon, size: 16, color: active ? color : AppColors.textTertiary),
+      ),
+      const SizedBox(width: AppSpacing.md),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          Text(
+            '$count',
+            maxLines: 1,
+            style: text.displaySmall!.copyWith(
+              fontSize: 22,
+              color: active ? AppColors.copperHi : AppColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        ]),
+      ),
+      if (onTap != null) ...[
+        const SizedBox(width: AppSpacing.sm),
+        Icon(Icons.chevron_right,
+            size: 18, color: active ? AppColors.textSecondary : AppColors.textTertiary),
+      ],
+    ]),
+  );
+}
+
+/// Focus keys each destination module actually READS — mirrors the `idOf(...)`
+/// / `tableName` reads in the module bodies below.
+///
+/// A module not listed here (Inventory, Menu) reads no focus at all.
+///
+/// 'Tables' deliberately omits `entity_id`: the two signals that land there send
+/// an ORDER id (payments awaiting approval) or a Bills id (open bills), and
+/// `Tables` resolves `idOf(['table_name'])` — which prefers `entity_id` — against
+/// TABLE NAMES. Only the `table` label it ships alongside is meaningful there.
+const Map<String, List<String>> _attentionFocusKeys = {
+  'Orders': ['entity_id', 'order_id', 'table'],
+  'Tables': ['table', 'table_name'],
+  'Bookings': ['entity_id', 'booking_id'],
+  'Feedback': ['entity_id', 'feedback_id'],
+  'Waitlist': ['entity_id', 'waitlist_id'],
+};
+
+/// The part of a deep link's `params` [dest] can actually resolve — null when
+/// nothing survives, so the row navigates with no focus request at all.
+///
+/// This filter is the whole point: the shell parks ANY non-empty target as a
+/// [ModuleFocusRequest], and a module paints its focus banner on the presence of
+/// that request alone (it cannot tell "focus this record" from "here, have a
+/// filter hint"). So forwarding a key nothing reads — `filter`, `status`, `q` —
+/// lands the user on the right screen and then tells them their record "isn't in
+/// this list". A silent, correct tap beats a tap that navigates AND lies.
+Map<String, dynamic>? _attentionFocus(String? dest, String signalKey, dynamic params) {
+  final keys = _attentionFocusKeys[dest];
+  if (keys == null || params is! Map) return null;
+  final out = <String, dynamic>{};
+  for (final k in keys) {
+    // `pending_discounts` routes to Orders but its entity_id is a
+    // DiscountRequests id, which Orders compares against ORDER ids — a
+    // real-looking id of the wrong entity type that can never match. The
+    // approvals panel it means to point at is pinned above the grid anyway, so
+    // the plain module is the honest destination.
+    if (k == 'entity_id' && signalKey == 'pending_discounts') continue;
+    final v = params[k];
+    final s = '${v ?? ''}'.trim();
+    if (s.isEmpty || s == 'null') continue;
+    out[k] = v;
+  }
+  return out.isEmpty ? null : out;
+}
+
+/// One server-composed "needs attention" row: how many, what it is, WHO the
+/// offenders are, and where to act on them.
+///
+/// The server sends both `detail` (a humanised one-liner) and `items` (the same
+/// offenders, structured) — rendering both prints the same names twice, so the
+/// structured rows win when they are there and `detail` carries rows the server
+/// could not itemise. `sub` already embeds the humanised number ("20 kg left"),
+/// and a bare `value` is money OR quantity with nothing to tell them apart, so
+/// it is only shown as a plain number when `sub` is missing.
+Widget _attentionCard(BuildContext context, Map m, ModuleNavigator? nav) {
+  final text = Theme.of(context).textTheme;
+  final count = _numOf(m['count']).round();
+  final sev = '${m['severity'] ?? 'low'}';
+  final colour = sev == 'high'
+      ? AppColors.danger
+      : sev == 'medium'
+          ? AppColors.warning
+          : AppColors.textSecondary;
+
+  // `deep_link` is the routing the server verified against both clients;
+  // `module` is the legacy field older builds shipped and can name a screen this
+  // app has no module for ('Bills'), so it is only ever the fallback.
+  final link = (m['deep_link'] as Map?) ?? const {};
+  final deep = '${link['module'] ?? ''}';
+  final legacy = '${m['module'] ?? ''}';
+  // canOpen('') is false, so a missing label needs no separate guard.
+  final dest = nav == null ? null : (nav.canOpen(deep) ? deep : (nav.canOpen(legacy) ? legacy : null));
+  final focus = _attentionFocus(dest, '${m['key'] ?? ''}', link['params']);
+  // A row we cannot route reads as inert (no chevron, no hover) rather than
+  // offering a tap that would no-op.
+  final tap = (nav == null || dest == null) ? null : () => nav.openModule(dest, target: focus);
+
+  final items = <Map>[for (final it in (m['items'] as List?) ?? const []) if (it is Map) it];
+  final shown = items.length > 4 ? items.sublist(0, 4) : items;
+  final more = count - shown.length;
+  final detail = '${m['detail'] ?? ''}'.trim();
+  final amount = m['amount'];
+
+  Widget itemRow(Map it) {
+    final sub = '${it['sub'] ?? ''}'.trim();
+    final trailing = sub.isNotEmpty ? sub : (it['value'] == null ? '' : _score(it['value']));
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(children: [
+        Expanded(
+          child: Text('${it['label'] ?? ''}',
+              maxLines: 1, overflow: TextOverflow.ellipsis, style: text.bodySmall),
+        ),
+        if (trailing.isNotEmpty) ...[
+          const SizedBox(width: AppSpacing.sm),
+          Text(trailing,
+              style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+        ],
+      ]),
+    );
+  }
+
+  return ForkCard(
+    inset: true,
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    onTap: tap,
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        StatusChip(label: '$count', color: colour, dense: true),
+        const SizedBox(width: AppSpacing.sm),
+        Expanded(
+          child: Text('${m['label'] ?? ''}',
+              maxLines: 2, overflow: TextOverflow.ellipsis, style: text.titleSmall),
+        ),
+        if (amount != null) ...[
+          const SizedBox(width: AppSpacing.sm),
+          Text(_money(amount), style: text.titleSmall?.copyWith(color: AppColors.copperHi)),
+        ],
+        if (tap != null) ...[
+          const SizedBox(width: AppSpacing.xs),
+          const Icon(Icons.chevron_right, size: 16, color: AppColors.textSecondary),
+        ],
+      ]),
+      if (shown.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        for (final it in shown) itemRow(it),
+        if (more > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text('and $more more',
+                style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
+          ),
+      ] else if (detail.isNotEmpty) ...[
+        const SizedBox(height: 5),
+        Text(detail,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: text.bodySmall?.copyWith(color: AppColors.textSecondary)),
+      ],
+    ]),
+  );
+}
+
+/// Makes a [StatCard] read as a drill-down control — click cursor, the same
+/// 2px hover lift the interactive [ForkCard] uses, and a quiet corner chevron
+/// that brightens on hover — without touching the design-system widget.
+class _TappableStat extends StatefulWidget {
+  const _TappableStat({required this.child, required this.onTap});
+
+  final Widget child;
+  final VoidCallback onTap;
+
+  @override
+  State<_TappableStat> createState() => _TappableStatState();
+}
+
+class _TappableStatState extends State<_TappableStat> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          curve: Curves.easeOut,
+          transform: Matrix4.translationValues(0, _hovered ? -2 : 0, 0),
+          // passthrough keeps the card stretching to the grid's row height
+          // exactly as it did before it became tappable.
+          child: Stack(fit: StackFit.passthrough, children: [
+            widget.child,
+            Positioned(
+              right: 10,
+              bottom: 10,
+              child: AnimatedOpacity(
+                duration: AppDurations.fast,
+                opacity: _hovered ? 1 : 0.5,
+                child: Icon(Icons.chevron_right,
+                    size: 16, color: _hovered ? AppColors.copperHi : AppColors.textTertiary),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// Shared shell for the Overview drill-downs: a dark card dialog with a micro
+// eyebrow, title, scrolling body and an optional "View in <Module>" jump. The
+// jump is hidden outright when that module is not reachable for this user,
+// rather than offering a control that would no-op.
+Future<void> _detailSheet(
+  BuildContext context, {
+  required String eyebrow,
+  required String title,
+  required List<Widget> children,
+  String? jumpTo,
+  Map<String, dynamic>? jumpTarget,
+}) {
+  final nav = ModuleNavigator.of(context);
+  final canJump = jumpTo != null && (nav?.canOpen(jumpTo) ?? false);
+  return showDialog<void>(
+    context: context,
+    builder: (ctx) {
+      final text = Theme.of(ctx).textTheme;
+      return Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 460,
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 560),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(eyebrow.toUpperCase(), style: text.labelSmall),
+              const SizedBox(height: 6),
+              Text(title, style: text.titleMedium),
+              const SizedBox(height: AppSpacing.lg),
+              Flexible(
+                child: SingleChildScrollView(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: children),
+                ),
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              Row(children: [
+                ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+                const Spacer(),
+                if (canJump)
+                  ForkButton(
+                    label: 'View in $jumpTo',
+                    icon: Icons.arrow_forward,
+                    dense: true,
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      nav!.openModule(jumpTo, target: jumpTarget);
+                    },
+                  ),
+              ]),
+            ]),
+          ),
+        ),
+      );
+    },
+  );
+}
+
+// Quiet label / value line used inside the Overview drill-downs.
+Widget _detailRow(BuildContext context, String label, String value, {String? trailing}) {
+  final text = Theme.of(context).textTheme;
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 5),
+    child: Row(children: [
+      Expanded(child: Text(label, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis)),
+      if (trailing != null) ...[
+        Text(trailing, style: text.bodySmall),
+        const SizedBox(width: AppSpacing.md),
+      ],
+      Text(value, style: text.titleSmall),
+    ]),
+  );
+}
+
+/// Lays cards out [columns] across with 14px gaps and equal row heights —
+/// the template dashboard's grid idiom.
+Widget _dashGrid(List<Widget> cards, int columns) {
+  if (columns <= 1) {
+    return Column(children: [
+      for (var i = 0; i < cards.length; i++) ...[
+        if (i > 0) const SizedBox(height: 14),
+        cards[i],
+      ],
+    ]);
+  }
+  final rows = <Widget>[];
+  for (var i = 0; i < cards.length; i += columns) {
+    final end = i + columns > cards.length ? cards.length : i + columns;
+    final slice = cards.sublist(i, end);
+    rows.add(IntrinsicHeight(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        for (var j = 0; j < columns; j++) ...[
+          if (j > 0) const SizedBox(width: 14),
+          Expanded(child: j < slice.length ? slice[j] : const SizedBox.shrink()),
+        ],
+      ]),
+    ));
+  }
+  return Column(children: [
+    for (var i = 0; i < rows.length; i++) ...[
+      if (i > 0) const SizedBox(height: 14),
+      rows[i],
+    ],
+  ]);
+}
+
+// App-wide order-stage colour map. Status is never colour alone — every use
+// pairs this tint with its text label via [StatusChip].
+Color _stageColor(String status) {
+  final s = status.toLowerCase();
+  if (s.contains('cancel')) return AppColors.danger;
+  if (s.contains('closed')) return AppColors.neutral;
+  if (s.contains('paid') || s.contains('served')) return AppColors.success;
+  if (s.contains('bark')) return s.startsWith('not') ? AppColors.neutral : AppColors.copper;
+  if (s.contains('prepar')) return AppColors.info;
+  if (s.contains('pending') || s.contains('verif')) return AppColors.warning;
+  return AppColors.neutral;
+}
+
+/// Quick-insight cards for the Overview tab, built from ONE server read
+/// (`GET /analytics/overview`). Empty sections are simply omitted rather than
+/// rendering hollow cards, so a brand-new restaurant reads as intentional.
+///
+/// [liveTiles] are the attention signals the page computes itself because the
+/// server does not send them. They close the "Needs attention" section from
+/// here rather than getting their own heading below — the page used to render
+/// that heading twice, with two different counts, one immediately after the
+/// other. [columns] lays those tiles out on the page's grid.
+List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? nav,
+    {List<Widget> liveTiles = const [], int columns = 1}) {
+  if (ins.isEmpty && liveTiles.isEmpty) return const [];
+  final text = Theme.of(context).textTheme;
+
+  double n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+  String ms(dynamic v) {
+    final total = (n(v) / 1000).round();
+    if (total <= 0) return '—';
+    return '${total ~/ 60}m ${total % 60}s';
+  }
+
+  final dishes = (ins['top_dishes_by_revenue'] as List?) ?? const [];
+  final staff = (ins['top_staff'] as List?) ?? const [];
+  final kitchen = (ins['kitchen'] as Map?) ?? const {};
+  final peak = (ins['peak'] as Map?) ?? const {};
+  // Filtered rather than cast: a non-Map element in the server's list would
+  // otherwise take the whole overview down with a TypeError.
+  final attention = <Map>[for (final a in (ins['needs_attention'] as List?) ?? const []) if (a is Map) a];
+  final head = (ins['headline'] as Map?) ?? const {};
+
+  final out = <Widget>[];
+
+  // --- headline deltas: a number with no comparison is not an insight --------
+  Widget metric(String label, Map? m, {bool money = true}) {
+    final mm = m ?? const {};
+    final pct = mm['pct_change'];
+    final dir = '${mm['direction'] ?? 'flat'}';
+    final arrow = dir == 'up' ? '▲' : dir == 'down' ? '▼' : '–';
+    final colour = dir == 'up' ? AppColors.success : dir == 'down' ? AppColors.danger : AppColors.textSecondary;
+    return Padding(
+      padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(label.toUpperCase(),
+            style: const TextStyle(
+                fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 0.7, color: AppColors.textSecondary)),
+        const SizedBox(height: 2),
+        Text(money ? _money(mm['value']) : '${n(mm['value']).round()}',
+            style: text.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+        // Pair the arrow with a sign and the window in words — colour alone is
+        // not information, and an unlabelled arrow invites the wrong reading.
+        Text(pct == null ? 'no prior baseline' : '$arrow ${n(pct).abs().toStringAsFixed(1)}% ${mm['compared_to'] ?? ''}',
+            style: TextStyle(fontSize: 10, color: pct == null ? AppColors.textSecondary : colour)),
+      ]),
+    );
+  }
+
+  if (head.isNotEmpty) {
+    out.addAll([
+      const SectionHeader(
+        title: 'Last 30 days',
+        trailing: Text('incl. tax',
+            style: TextStyle(fontSize: 10.5, color: AppColors.textSecondary)),
+      ),
+      Wrap(children: [
+        // Settled bill totals — WITH tax and service charge. The APC card above is
+        // deliberately pre-tax, so both are labelled rather than left ambiguous.
+        metric('revenue (incl. tax)', head['revenue'] as Map?),
+        metric('bills', head['bills'] as Map?, money: false),
+        metric('covers', head['covers'] as Map?, money: false),
+        metric('APC (incl. tax)', head['apc'] as Map?),
+      ]),
+      Row(children: [
+        MicroStat(value: _money(head['today_revenue']), label: 'today'),
+        const SizedBox(width: AppSpacing.lg),
+        MicroStat(value: _money(head['yesterday_revenue']), label: 'yesterday'),
+      ]),
+      const SizedBox(height: AppSpacing.lg),
+    ]);
+  }
+
+  // --- needs attention first: it is the only part that is actionable --------
+  if (attention.isNotEmpty || liveTiles.isNotEmpty) {
+    out.add(SectionHeader(title: 'Needs attention', count: attention.length + liveTiles.length));
+    for (final a in attention) {
+      out.add(Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: _attentionCard(context, a, nav),
+      ));
+    }
+    if (liveTiles.isNotEmpty) out.add(_dashGrid(liveTiles, columns));
+    out.add(const SizedBox(height: AppSpacing.lg));
+  }
+
+  // --- top sellers ----------------------------------------------------------
+  if (dishes.isNotEmpty) {
+    final top = n((dishes.first as Map)['revenue']);
+    out.add(const SectionHeader(title: 'Top selling dishes'));
+    for (final d in dishes) {
+      final m = d as Map;
+      out.add(HBarRow(
+        label: '${m['name'] ?? ''}',
+        fraction: top > 0 ? (n(m['revenue']) / top).clamp(0.0, 1.0) : 0,
+        value: _money(m['revenue']),
+        sub: '${n(m['quantity']).round()} sold · ${n(m['share_pct']).toStringAsFixed(1)}% of sales',
+      ));
+    }
+    out.add(const SizedBox(height: AppSpacing.lg));
+  }
+
+  // --- staff ---------------------------------------------------------------
+  if (staff.isNotEmpty) {
+    final top = n((staff.first as Map)['revenue']);
+    out.add(const SectionHeader(title: 'Best performing staff'));
+    for (final sm in staff) {
+      final m = sm as Map;
+      final rating = m['avg_rating'];
+      final hours = m['hours_worked'];
+      final bits = <String>[
+        '${n(m['orders']).round()} orders',
+        if (rating != null) '${n(rating).toStringAsFixed(1)}★',
+        if (hours != null) '${n(hours).toStringAsFixed(1)}h',
+      ];
+      out.add(HBarRow(
+        label: '${m['employee_name'] ?? ''}',
+        fraction: top > 0 ? (n(m['revenue']) / top).clamp(0.0, 1.0) : 0,
+        value: _money(m['revenue']),
+        sub: bits.join(' · '),
+      ));
+    }
+    // Name the signal — "best" should never imply we weigh things we do not measure.
+    final by = '${(staff.first as Map)['ranked_by'] ?? ''}';
+    if (by.isNotEmpty) {
+      out.add(Padding(
+        padding: const EdgeInsets.only(top: 2, left: 4),
+        child: Text('Ranked by $by.', style: TextStyle(fontSize: 10, color: AppColors.textSecondary)),
+      ));
+    }
+    out.add(const SizedBox(height: AppSpacing.lg));
+  }
+
+  // --- kitchen + peak trade ------------------------------------------------
+  if (kitchen.isNotEmpty || peak.isNotEmpty) {
+    out.add(const SectionHeader(title: 'Kitchen & peak trade'));
+    out.add(Wrap(children: [
+      if (kitchen.isNotEmpty) ...[
+        Padding(
+          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
+          child: MicroStat(value: ms(kitchen['avg_prep_ms']), label: 'avg prep'),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
+          child: MicroStat(value: ms(kitchen['p90_prep_ms']), label: 'slowest 10%'),
+        ),
+      ],
+      if (peak['hour'] != null)
+        Padding(
+          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
+          child: MicroStat(
+            value: '${n(peak['hour']).round().toString().padLeft(2, '0')}:00',
+            label: 'busiest hour (${n(peak['hour_orders']).round()})',
+          ),
+        ),
+      if ('${peak['weekday'] ?? ''}'.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
+          child: MicroStat(
+            value: '${peak['weekday']}',
+            label: 'busiest day (${n(peak['weekday_orders']).round()})',
+          ),
+        ),
+    ]));
+    if ('${kitchen['slowest_section'] ?? ''}'.isNotEmpty) {
+      out.add(Padding(
+        padding: const EdgeInsets.only(top: 4, left: 4),
+        child: Text(
+          'Slowest section ${kitchen['slowest_section']} (${ms(kitchen['slowest_section_avg_ms'])})'
+          '${'${kitchen['slowest_dish'] ?? ''}'.isEmpty ? '' : ' · slowest dish ${kitchen['slowest_dish']} (${ms(kitchen['slowest_dish_avg_ms'])})'}',
+          style: TextStyle(fontSize: 10, color: AppColors.textSecondary),
+        ),
+      ));
+    }
+    out.add(const SizedBox(height: AppSpacing.lg));
+  }
+
+  return out;
+}
+
+Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final r = await Future.wait<dynamic>([
+          rest.getMap('/orders/apc').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/feedback/summary').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/orders/daily-revenue?days=14').catchError((_) => <String, dynamic>{}),
+          rest.getList('/get-tables').catchError((_) => <dynamic>[]),
+          // One consolidated insight read — top dishes, best staff, kitchen speed,
+          // peak trade and what needs attention. Composed server-side from the
+          // same helpers the detail screens use, so these agree with them. It
+          // also names the offenders behind every attention signal, which is why
+          // the whole order and inventory lists no longer have to be pulled here
+          // just to count them.
+          rest.getMap('/analytics/overview?days=30').catchError((_) => <String, dynamic>{}),
+        ]);
+        return {'apc': r[0], 'feedback': r[1], 'daily': r[2], 'tables': r[3], 'insights': r[4]};
+      },
+      builder: (context, data, reload) {
+        final apc = (data['apc'] as Map?) ?? {};
+        final fb = (data['feedback'] as Map?) ?? {};
+        final daily = ((data['daily'] as Map?)?['series'] as List?) ?? [];
+        final tables = (data['tables'] as List?) ?? [];
+        final ins = (data['insights'] as Map?) ?? const {};
+
+        double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+        int countWhere(List l, bool Function(Map) f) => l.where((e) => f(e as Map)).length;
+
+        final tablesBelow = countWhere(tables, (t) => t['apc_status'] == 'red' || t['apc_status'] == 'yellow');
+        final occupied = countWhere(tables, (t) => t['occupied'] == true);
+        final totalTables = tables.length;
+
+        final text = Theme.of(context).textTheme;
+        final width = MediaQuery.sizeOf(context).width;
+        final cols = width >= 1100 ? 4 : (width >= 760 ? 2 : 1);
+
+        // Daily revenue series (already fetched) feeds the stat-card chart.
+        final dailyValues = [for (final d in daily) num0((d as Map)['revenue'])];
+        double? weekDeltaPct;
+        if (dailyValues.length >= 14) {
+          final prev = dailyValues
+              .sublist(dailyValues.length - 14, dailyValues.length - 7)
+              .fold<double>(0, (a, b) => a + b);
+          final last7 = dailyValues.sublist(dailyValues.length - 7).fold<double>(0, (a, b) => a + b);
+          if (prev > 0) weekDeltaPct = (last7 - prev) / prev * 100;
+        }
+
+        const micro = TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: AppColors.textTertiary);
+
+        // --- drill-downs -----------------------------------------------------
+        // Every popup below reads only what load() already fetched — no extra
+        // round-trips are made when a card is opened.
+        final nav = ModuleNavigator.of(context);
+
+        void openRevenue() {
+          const dayLetters = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+          final last7 = daily.length <= 7 ? daily : daily.sublist(daily.length - 7);
+          _detailSheet(
+            context,
+            eyebrow: 'Revenue',
+            title: 'Last ${daily.length} days',
+            jumpTo: 'Analytics',
+            children: [
+              Row(children: [
+                MicroStat(value: _money(apc['total_revenue']), label: 'MTD revenue'),
+                const SizedBox(width: AppSpacing.xxl),
+                MicroStat(value: '${(apc['orders'] as List?)?.length ?? 0}', label: 'bills this month'),
+                const Spacer(),
+                if (weekDeltaPct != null) DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              if (dailyValues.length >= 2) ...[
+                CopperBarcode(values: dailyValues, height: 54),
+                const SizedBox(height: AppSpacing.lg),
+              ],
+              if (last7.isNotEmpty) ...[
+                WeekdayBars(
+                  values: [for (final d in last7) num0((d as Map)['revenue'])],
+                  labels: [
+                    for (final d in last7)
+                      dayLetters[((DateTime.tryParse('${(d as Map)['date'] ?? ''}')?.weekday ?? 1) - 1)
+                          .clamp(0, 6)],
+                  ],
+                  highlight: last7.length - 1,
+                ),
+                const SizedBox(height: AppSpacing.lg),
+              ],
+              const SectionHeader(title: 'By day'),
+              if (daily.isEmpty)
+                Text('No revenue recorded in this window.', style: text.bodySmall)
+              else
+                for (final d in daily.reversed)
+                  _detailRow(
+                    context,
+                    _fmtDay('${(d as Map)['date'] ?? ''}'),
+                    _money(d['revenue']),
+                    trailing: '${d['orders'] ?? 0} order(s)',
+                  ),
+            ],
+          );
+        }
+
+        void openApc() {
+          final covers = num0(apc['total_covers']);
+          final basis = num0(apc['total_revenue']);
+          final band = apc['yellow_band_percent'];
+          _detailSheet(
+            context,
+            eyebrow: 'Average per cover',
+            title: 'How APC is calculated',
+            jumpTo: 'Analytics',
+            children: [
+              Row(children: [
+                MicroStat(value: _money(apc['monthly_apc']), label: 'APC (pre-tax)'),
+                const SizedBox(width: AppSpacing.xxl),
+                MicroStat(value: covers.toStringAsFixed(0), label: 'covers'),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              ForkCard(
+                inset: true,
+                child: Text(
+                  '${_money(basis)}  ÷  ${covers.toStringAsFixed(0)} covers  =  ${_money(apc['monthly_apc'])}',
+                  style: text.titleSmall,
+                ),
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              const SectionHeader(title: 'Basis'),
+              _detailRow(context, 'Bill basis (pre-tax)', _money(basis)),
+              _detailRow(context, 'Covers (counted once per table)', covers.toStringAsFixed(0)),
+              _detailRow(context, 'Bills counted', '${(apc['orders'] as List?)?.length ?? 0}'),
+              _detailRow(context, 'Period', _s(apc, 'month')),
+              if (band != null) _detailRow(context, 'Target band', '±${num0(band).toStringAsFixed(0)}%'),
+            ],
+          );
+        }
+
+        void openTables() {
+          final occupiedRows = <Map>[for (final t in tables) if ((t as Map)['occupied'] == true) t];
+          _detailSheet(
+            context,
+            eyebrow: 'Floor',
+            title: 'Occupied right now',
+            jumpTo: 'Tables',
+            children: [
+              Row(children: [
+                DonutGauge(fraction: totalTables == 0 ? 0 : occupied / totalTables, size: 54),
+                const SizedBox(width: AppSpacing.lg),
+                MicroStat(value: '$occupied of $totalTables', label: 'tables occupied'),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              const SectionHeader(title: 'Tables'),
+              if (occupiedRows.isEmpty)
+                Text('No table is occupied at the moment.', style: text.bodySmall)
+              else
+                for (final t in occupiedRows)
+                  _detailRow(
+                    context,
+                    _s(t, 'table_name'),
+                    _money(t['table_total']),
+                    trailing: [
+                      '${t['covers'] ?? 1} cover(s)',
+                      if (_tableOtp(t).isNotEmpty) 'OTP ${_tableOtp(t)}',
+                      if (t['payment_pending'] == true) 'payment pending',
+                    ].join(' · '),
+                  ),
+            ],
+          );
+        }
+
+        void openRating() {
+          final cats = (fb['categoryAverages'] as Map?) ?? const {};
+          _detailSheet(
+            context,
+            eyebrow: 'Guest feedback',
+            title: 'Rating summary',
+            jumpTo: 'Feedback',
+            children: [
+              Row(children: [
+                MicroStat(value: '${fb['averageRating'] ?? 0} / 5', label: 'average rating'),
+                const SizedBox(width: AppSpacing.xxl),
+                MicroStat(value: '${fb['totalResponses'] ?? 0}', label: 'responses'),
+                const SizedBox(width: AppSpacing.xxl),
+                MicroStat(value: '${fb['last30DaysResponses'] ?? 0}', label: 'last 30 days'),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              const SectionHeader(title: 'By category'),
+              if (cats.isEmpty)
+                Text('No category ratings collected yet.', style: text.bodySmall)
+              else
+                for (final e in cats.entries)
+                  HBarRow(
+                    label: _s((e.value as Map?) ?? const {}, 'label', '${e.key}'),
+                    fraction: num0(((e.value as Map?) ?? const {})['average']) / 5,
+                    value: '${((e.value as Map?) ?? const {})['average'] ?? '—'}',
+                  ),
+            ],
+          );
+        }
+
+        // The Account card jumps to Settings when that module is reachable
+        // (admin-only), and otherwise shows the same facts as a small popup.
+        void openAccount() {
+          if (nav != null && nav.canOpen('Settings')) {
+            nav.openModule('Settings');
+            return;
+          }
+          _detailSheet(
+            context,
+            eyebrow: 'Account',
+            title: p.restaurantName,
+            children: [
+              _kv('Roles', _roleLabels(p.roleAll)),
+              _kv('Plan limits',
+                  p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
+            ],
+          );
+        }
+
+        final accountJumps = nav?.canOpen('Settings') ?? false;
+
+        // Null when the destination is gated for this user, so the tile falls
+        // back to a plain (non-interactive) card instead of a dead control.
+        VoidCallback? jumpTo(String label, [Map<String, dynamic>? target]) =>
+            (nav != null && nav.canOpen(label)) ? () => nav.openModule(label, target: target) : null;
+
+        return ListView(padding: AppSpacing.pageNarrow, children: [
+          Text('Welcome${p.firstName.isNotEmpty ? ', ${p.firstName}' : ''}', style: text.headlineMedium),
+          const SizedBox(height: AppSpacing.xs),
+          Text('${p.restaurantName} · ${p.role}', style: text.bodyMedium),
+          const SizedBox(height: AppSpacing.xxl),
+
+          _dashGrid([
+            _TappableStat(
+              onTap: openRevenue,
+              child: StatCard(
+                value: _money(apc['total_revenue']),
+                tag: 'MTD',
+                caption: 'Revenue this month — all channels',
+                chart: dailyValues.length >= 2 ? CopperBarcode(values: dailyValues) : null,
+                footer: weekDeltaPct == null ? null : DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
+              ),
+            ),
+            _TappableStat(
+              onTap: openApc,
+              child: StatCard(
+                value: _money(apc['monthly_apc']),
+                caption: 'Average per cover (APC), pre-tax',
+                footer: Text('${apc['total_covers'] ?? 0} covers this month', style: micro),
+              ),
+            ),
+            _TappableStat(
+              onTap: openTables,
+              child: StatCard(
+                value: '$occupied/$totalTables',
+                unit: 'tables',
+                caption: 'Tables occupied right now',
+                chart: Align(
+                  alignment: Alignment.centerLeft,
+                  child: DonutGauge(fraction: totalTables == 0 ? 0 : occupied / totalTables, size: 46),
+                ),
+              ),
+            ),
+            _TappableStat(
+              onTap: openRating,
+              child: StatCard(
+                value: '${fb['averageRating'] ?? 0}',
+                unit: '/ 5',
+                caption: 'Average guest rating',
+                footer: Text('${fb['totalResponses'] ?? 0} responses', style: micro),
+              ),
+            ),
+          ], cols),
+          const SizedBox(height: 28),
+
+          // ---- QUICK INSIGHTS ------------------------------------------------
+          // One server read (/analytics/overview), composed from the same helpers
+          // the detail screens use, so a figure here cannot disagree with the
+          // screen it opens: what sold, who sold it, kitchen speed, peak trade.
+          //
+          // "Needs attention" lives inside that block. Orders/payments to approve
+          // and low stock now arrive from the server naming the actual offenders,
+          // so only the signal it does not send — tables under their APC target,
+          // which is a live floor reading — is still counted here.
+          ..._overviewInsights(context, ins, nav, columns: cols, liveTiles: [
+            if (tablesBelow > 0)
+              // Routed through the same filter the server-composed rows use, so
+              // this tile cannot forward a key Tables does not read: `apc_status`
+              // survives nothing, the tap navigates with no focus request, and
+              // the floor plan opens without claiming a table is missing.
+              _actionTile(context, 'Tables below target', tablesBelow, Icons.trending_down, AppColors.danger,
+                  onTap: jumpTo('Tables',
+                      _attentionFocus('Tables', 'tables_below_target', const {'apc_status': 'below_target'}))),
+          ]),
+
+          const SectionHeader(title: 'Account'),
+          ForkCard(
+            onTap: openAccount,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _kv('Roles', _roleLabels(p.roleAll)),
+              _kv('Plan limits',
+                  p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
+              const SizedBox(height: AppSpacing.sm),
+              Row(children: [
+                Text(accountJumps ? 'Open Settings' : 'View profile', style: micro),
+                const Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
+              ]),
+            ]),
+          ),
+        ]);
+      },
+    );
+
+// Start a takeaway/delivery order (no table): pick the channel, then the order
+// entry screen provisions a virtual table on send.
+Future<void> _newTakeawayOrder(BuildContext context, RestClient rest, VoidCallback reload) async {
+  final type = await showModalBottomSheet<String>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(leading: const Icon(Icons.takeout_dining), title: const Text('Takeaway'), onTap: () => Navigator.pop(ctx, 'takeaway')),
+        ListTile(leading: const Icon(Icons.delivery_dining), title: const Text('Delivery'), onTap: () => Navigator.pop(ctx, 'delivery')),
+      ]),
+    ),
+  );
+  if (type == null || !context.mounted) return;
+  await Navigator.of(context).push(MaterialPageRoute(builder: (_) => OrderEntryScreen(rest: rest, orderType: type)));
+  reload();
+}
+
+Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      // The grid plus its outlet context: an order lands on the outlet of the
+      // table it came from, so an empty list usually means "wrong outlet", not
+      // "no orders" (bug 3). /orders/scope answers which.
+      load: () async {
+        final orders = await rest.getList('/orders');
+        return {'orders': orders, 'scope': await _loadOrdersScope(rest)};
+      },
+      builder: (context, data, reload) {
+        final rows = (data['orders'] as List?) ?? const [];
+        final scope = (data['scope'] as Map?) ?? const {};
+        final messenger = ScaffoldMessenger.of(context);
+        // A notification asked us to focus one order.
+        final focus = _focusOf(context, 'Orders');
+        final focusId = focus?.idOf(const ['order_id']);
+        final focusTable = focus?.tableName;
+        bool isFocused(Map o) =>
+            (focusId != null && '${o['id']}' == focusId) ||
+            (focusId == null && focusTable != null && _s(o, 'table') == focusTable);
+        final focusFound = focusId != null || focusTable != null ? rows.any((o) => isFocused(o as Map)) : false;
+        // The focused order first, then orders awaiting approval (auto-push off),
+        // then NEWEST FIRST. That last tiebreaker matters: Dart's List.sort is not
+        // stable, so a comparator that returned 0 for every remaining pair let the
+        // backend's created_at-DESC order be scrambled arbitrarily — which is how a
+        // long-cancelled ticket kept surfacing at the top of the list.
+        int placedAt(Map o) =>
+            DateTime.tryParse(_s(o, 'created_at'))?.millisecondsSinceEpoch ?? 0;
+        final sorted = [...rows]..sort((a, b) {
+            final fa = isFocused(a as Map) ? 0 : 1;
+            final fb = isFocused(b as Map) ? 0 : 1;
+            if (fa != fb) return fa - fb;
+            final pa = _s(a, 'status').toLowerCase() == 'pending' ? 0 : 1;
+            final pb = _s(b, 'status').toLowerCase() == 'pending' ? 0 : 1;
+            if (pa != pb) return pa - pb;
+            return placedAt(b).compareTo(placedAt(a));
+          });
+        final nav = ModuleNavigator.of(context);
+        final scopeBar = _outletScopeBar(context, scope);
+        // The focused order's table, when we found it: the bill, covers, payment
+        // approval and settle all live on the table, one hop away.
+        final focusedTable = !focusFound
+            ? ''
+            : _s(sorted.firstWhere((o) => isFocused(o as Map)) as Map, 'table', '');
+        // Header strip above the grid: which outlet, and (when a notification
+        // sent us here) whether that order is actually in this list.
+        final header = <Widget>[
+          if (focus != null)
+            _focusBanner(
+              context,
+              found: focusFound,
+              message: focusFound
+                  ? 'Showing the order from your notification.'
+                  : "That order isn't in this list — it may be settled and past the live window, or on another outlet.",
+              actions: focusFound
+                  ? [
+                      if (focusedTable.isNotEmpty && focusedTable != '—' && nav != null && nav.canOpen('Tables'))
+                        ForkButton.ghost(
+                          label: 'Open $focusedTable',
+                          icon: Icons.table_restaurant_outlined,
+                          dense: true,
+                          onPressed: () => nav.openModule('Tables', target: {'table': focusedTable}),
+                        ),
+                    ]
+                  : [
+                      if (nav != null && nav.canOpen('History'))
+                        ForkButton.ghost(
+                          label: 'History',
+                          icon: Icons.calendar_month,
+                          dense: true,
+                          onPressed: () => nav.openModule('History'),
+                        ),
+                      if (nav?.switchOutlet != null && _scopeOutlets(scope).length > 1)
+                        ForkButton.ghost(
+                          label: 'All outlets',
+                          icon: Icons.layers,
+                          dense: true,
+                          onPressed: () => nav!.switchOutlet!('all'),
+                        ),
+                    ],
+            ),
+          ?scopeBar,
+        ];
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () => _newTakeawayOrder(context, rest, reload),
+            icon: const Icon(Icons.takeout_dining),
+            label: const Text('Takeaway / Delivery'),
+          ),
+          body: rows.isEmpty
+              ? Column(children: [
+                  if (header.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+                      child: Column(children: header),
+                    ),
+                  Expanded(
+                    child: _outletScopeEmpty(
+                      context,
+                      scope: scope,
+                      noun: 'orders',
+                      icon: Icons.receipt_long_outlined,
+                      title: 'No orders yet',
+                      caption: 'New orders appear here the moment they are placed.',
+                    ),
+                  ),
+                ])
+              : Builder(builder: (c) {
+          // One order used to own a full-width row, so on a desktop window most
+          // of that width carried nothing. Orders are tiles now, like Tables:
+          // the card answers "what, where, how much, what stage" at a glance and
+          // the tap opens everything else. Built eagerly rather than lazily
+          // because /orders returns only ACTIVE orders (history has its own
+          // module), so the list is small and bounded.
+          final width = MediaQuery.sizeOf(c).width;
+          final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+          final cards = <Widget>[];
+          for (var i = 0; i < sorted.length; i++) {
+            final o = sorted[i] as Map;
+            final items = (o['items'] as List?) ?? [];
+            final status = _s(o, 'status', 'open');
+            final pending = status.toLowerCase() == 'pending';
+            // Terminal: a cancelled order is read-only on every surface.
+            final cancelled = _isCancelled(status);
+            // Awaiting its bark: greyed stage, idle timers, prominent Bark action.
+            final unbarked = !pending && !cancelled && status.toLowerCase() == 'preparing' && !_orderBarked(o);
+            final orderType = _s(o, 'order_type', 'dine_in');
+            final stageLabel = unbarked ? 'Not barked' : status;
+            final text = Theme.of(c).textTheme;
+            const narrow = true; // a tile is always the dense layout
+            final ot = ((o['timing'] as Map?)?['order'] as Map?) ?? const {};
+            final timeLabel = ot['started_at'] == null
+                ? ''
+                : (ot['ended_at'] != null ? 'Prep ${_fmtDur(_elapsedMs(ot))}' : '${_fmtDur(_elapsedMs(ot))} elapsed');
+            final contact = [
+              if (_s(o, 'customer_phone').isNotEmpty) _s(o, 'customer_phone'),
+              if (_s(o, 'delivery_address').isNotEmpty) _s(o, 'delivery_address'),
+            ].join(' · ');
+
+            // The order a notification pointed at — marked so the eye lands on it.
+            final focused = isFocused(o);
+            // When the ticket was placed (created_at), in the restaurant's
+            // timezone. Distinct from the prep chip below: that one counts
+            // elapsed minutes since the bark, this is the wall-clock instant the
+            // order entered the books — the one the tally is reconciled against.
+            final placedLabel = _fmtTime(_s(o, 'created_at'));
+            final chips = <Widget>[
+              if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+              if (placedLabel.isNotEmpty) InfoChip(icon: Icons.access_time, label: 'Placed $placedLabel'),
+              InfoChip(icon: Icons.room_service_outlined, label: _s(o, 'taken_by_employee_name')),
+              if (timeLabel.isNotEmpty) InfoChip(icon: Icons.schedule, label: timeLabel),
+              if (orderType != 'dine_in')
+                InfoChip(
+                  icon: orderType == 'delivery' ? Icons.delivery_dining : Icons.takeout_dining,
+                  label: orderType == 'delivery' ? 'Delivery' : 'Takeaway',
+                ),
+            ];
+
+            // Subtle cross-fade when the stage advances between reloads.
+            final stageChip = AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: StatusChip(
+                key: ValueKey('stage-${o['id']}-$stageLabel'),
+                label: stageLabel,
+                color: _stageColor(stageLabel),
+                dense: narrow,
+              ),
+            );
+
+            final title = Text('Table ${_s(o, 'table')}',
+                style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis);
+            final desc = Text('${_s(o, 'customer', 'Guest')} · ${items.length} item(s)',
+                style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis);
+            final emoji = orderType == 'delivery'
+                ? '🛵'
+                : orderType == 'takeaway'
+                    ? '🥡'
+                    : '🍽️';
+
+            // Everything that no longer fits on the tile lives one tap away.
+            // The sheet is the ONLY place the stage can be advanced, so a
+            // mis-tap on a dense grid can never change an order's status.
+            void openDetail() {
+              _detailSheet(
+                c,
+                eyebrow: orderType == 'dine_in'
+                    ? 'Table ${_s(o, 'table')}'
+                    : (orderType == 'delivery' ? 'Delivery' : 'Takeaway'),
+                title: '${_s(o, 'customer', 'Guest')} \u00b7 ${_money(o['total'])}',
+                children: [
+                  _kv('Stage', stageLabel),
+                  _kv('Placed', placedLabel.isEmpty ? '\u2014' : placedLabel),
+                  _kv('Taken by', _s(o, 'taken_by_employee_name', '\u2014')),
+                  if (timeLabel.isNotEmpty) _kv('Timing', timeLabel),
+                  _kv('Items', '${items.length}'),
+                  const SizedBox(height: 10),
+                  // The chip set moves here rather than being dropped: it carries
+                  // who took the order and the prep timing, which the tile has no
+                  // room for but the owner still needs.
+                  Wrap(spacing: 8, runSpacing: 6, children: chips),
+                  const SizedBox(height: 10),
+                  // The full ticket -- the one thing a tile genuinely cannot show.
+                  for (final it in items)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3),
+                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text('${_numOf((it as Map)['qty'] ?? it['quantity'] ?? 1).toInt()}\u00d7 ',
+                            style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
+                        Expanded(child: Text(_s(it, 'name', _s(it, 'item_name')), style: text.bodySmall)),
+                        Text(_money(it['total'] ?? it['price']), style: text.bodySmall),
+                      ]),
+                    ),
+                  if (orderType != 'dine_in' && contact.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    _kv('Contact', contact),
+                  ],
+                  if (_s(o, 'note').isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    _kv('Note', _s(o, 'note')),
+                  ],
+                  if (cancelled) ...[
+                    const SizedBox(height: 12),
+                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Icon(Icons.lock_outline, size: 13, color: AppColors.danger),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(_cancelledCaption,
+                            style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.danger)),
+                      ),
+                    ]),
+                  ],
+                  const SizedBox(height: 14),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    if (!cancelled)
+                      ForkButton(
+                        label: 'Change stage',
+                        icon: Icons.swap_horiz,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(c).pop();
+                          _changeOrderStatus(c, rest, '${o['id']}', status, reload,
+                              barked: _orderBarked(o));
+                        },
+                      ),
+                    if (unbarked)
+                      ForkButton(
+                        label: 'Bark \u2192 kitchen',
+                        icon: Icons.campaign,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(c).pop();
+                          _barkOrder(messenger, rest, '${o['id']}', reload);
+                        },
+                      ),
+                    if (orderType == 'dine_in' &&
+                        _s(o, 'table', '').isNotEmpty &&
+                        _s(o, 'table') != '\u2014')
+                      ForkButton.ghost(
+                        label: 'Table bill \u00b7 APC',
+                        icon: Icons.table_restaurant_outlined,
+                        dense: true,
+                        onPressed: () => showTableBillSheet(c, rest: rest, tableName: _s(o, 'table')),
+                      ),
+                  ]),
+                ],
+              );
+            }
+
+            cards.add(ForkCard(
+              selected: pending || focused,
+              onTap: openDetail,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  FoodTile(emoji: emoji, size: 34),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      title,
+                      const SizedBox(height: 2),
+                      desc,
+                    ]),
+                  ),
+                  const SizedBox(width: 8),
+                  stageChip,
+                ]),
+                const SizedBox(height: 10),
+                // The money and the clock are what an owner scans a grid for, so
+                // they stay on the tile at full size rather than in the sheet.
+                Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Expanded(
+                    child: Text(
+                      [
+                        // Keep the "Placed" prefix: the tile shows two different
+                        // clocks (when it was placed, how long it has been
+                        // cooking) and a bare timestamp beside a duration reads
+                        // as neither.
+                        if (placedLabel.isNotEmpty) 'Placed $placedLabel',
+                        if (timeLabel.isNotEmpty) timeLabel,
+                      ].join(' \u00b7 '),
+                      style: text.bodySmall!.copyWith(fontSize: 11),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(_money(o['total']), style: text.titleSmall),
+                ]),
+                if (focused || orderType != 'dine_in') ...[
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (focused)
+                      const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+                    if (orderType != 'dine_in')
+                      InfoChip(
+                        icon: orderType == 'delivery' ? Icons.delivery_dining : Icons.takeout_dining,
+                        label: orderType == 'delivery' ? 'Delivery' : 'Takeaway',
+                      ),
+                  ]),
+                ],
+                // Approve/decline and bark stay ON the tile: they are the whole
+                // reason this screen is open, and burying a time-critical action
+                // behind a tap would make the grid slower than the old list.
+                if (unbarked) ...[
+                  const SizedBox(height: 10),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: ForkButton(
+                      label: 'Bark \u2192 kitchen',
+                      icon: Icons.campaign,
+                      dense: true,
+                      onPressed: () => _barkOrder(messenger, rest, '${o['id']}', reload),
+                    ),
+                  ),
+                ],
+                if (pending && !cancelled) ...[
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(
+                      child: ForkButton.ghost(
+                        label: 'Decline',
+                        icon: Icons.close,
+                        dense: true,
+                        onPressed: () => _advanceOrder(messenger, rest, '${o['id']}', 'Cancelled', reload),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ForkButton(
+                        label: 'Approve',
+                        icon: Icons.check,
+                        dense: true,
+                        onPressed: () => _advanceOrder(messenger, rest, '${o['id']}', 'Preparing', reload),
+                      ),
+                    ),
+                  ]),
+                ],
+                if (cancelled) ...[
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    const Icon(Icons.lock_outline, size: 12, color: AppColors.danger),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text('Cancelled',
+                          style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.danger)),
+                    ),
+                  ]),
+                ],
+              ]),
+            ));
+          }
+          return ListView(
+            padding: AppSpacing.pageNarrow,
+            children: [
+              if (header.isNotEmpty) ...[
+                Column(children: header),
+                const SizedBox(height: 14),
+              ],
+              _dashGrid(cards, cols),
+            ],
+          );
+        }),
+        );
+      },
+    );
+
+// Stringify an Excel cell value across the v4 CellValue subtypes.
+String _cellStr(dynamic v) {
+  if (v == null) return '';
+  try {
+    final inner = (v as dynamic).value;
+    if (inner != null) return inner.toString().trim();
+  } catch (_) {/* not a wrapped CellValue */}
+  return v.toString().trim();
+}
+
+// Parse a sectioned menu sheet: a single-cell row is a category header; rows with
+// (name, price) or (number, name, price) become items under the current category.
+// Mirrors the web dashboard's importer.
+List<Map<String, dynamic>> _parseMenuRows(List<List<String>> rows) {
+  final items = <Map<String, dynamic>>[];
+  String currentCategory = '';
+  double? toPrice(String v) {
+    final s = v.replaceAll(RegExp(r'[^0-9.]'), '');
+    final p = double.tryParse(s);
+    return (p != null && p > 0) ? p : null;
+  }
+
+  for (final cells in rows) {
+    final nonEmpty = cells.where((c) => c.isNotEmpty).toList();
+    if (nonEmpty.isEmpty) continue;
+    final norm = cells.map((c) => c.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '')).toList();
+    if (norm.contains('dishname') || norm.contains('itemname') || norm.contains('price')) continue; // header
+    if (nonEmpty.length == 1) {
+      final label = nonEmpty[0].replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (currentCategory.isEmpty && label.toLowerCase().contains('menu')) continue;
+      currentCategory = label;
+      continue;
+    }
+    if (currentCategory.isEmpty) continue;
+    String name = '';
+    double? price;
+    final c0 = cells.isNotEmpty ? cells[0] : '';
+    final c1 = cells.length > 1 ? cells[1] : '';
+    final c2 = cells.length > 2 ? cells[2] : '';
+    if (RegExp(r'^\d+$').hasMatch(c0) && c1.isNotEmpty) {
+      name = c1;
+      price = toPrice(c2);
+    }
+    if (name.isEmpty && c0.isNotEmpty && c1.isNotEmpty) {
+      name = c0;
+      price = toPrice(c1);
+    }
+    if (name.isEmpty || price == null) continue;
+    items.add({'name': name, 'price': price, 'category': currentCategory});
+  }
+  return items;
+}
+
+Widget menuModule(RestClient rest, Profile p) {
+  // Selected category tab (0 = All). Captured by the builder closure so the
+  // choice survives AsyncView reloads after edits.
+  var tab = 0;
+  // Live search text — also captured, so a reload (edit/toggle/delete) keeps
+  // the operator inside the same result set.
+  var query = '';
+  return AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final items = await rest.getList('/menu');
+        // Enrich each item with its theoretical cost + margin (recipe/BOM based).
+        // Costing is optional decoration — never fail the menu screen over it.
+        try {
+          final costing = await rest.getMap('/menu/costing');
+          final byId = <dynamic, Map>{};
+          for (final c in (costing['items'] as List? ?? const [])) {
+            final m = c as Map;
+            byId[m['id']] = m;
+          }
+          for (final r in items) {
+            final m = r as Map;
+            final c = byId[m['id']];
+            if (c != null) {
+              m['_cost'] = c['cost'];
+              m['_margin_pct'] = c['margin_pct'];
+            }
+          }
+        } catch (_) {/* costing unavailable — show plain prices */}
+        // Managed kitchen sections (KOT routing) drive the per-item section
+        // picker + badges. Optional — the menu still renders without them.
+        List<String> sections = const [];
+        try {
+          final s = await rest.getMap('/restaurant/settings');
+          sections = ((s['kitchen_sections'] as List?) ?? const [])
+              .map((e) => '$e'.trim())
+              .where((e) => e.isNotEmpty)
+              .toList();
+        } catch (_) {/* sections unavailable — items still render */}
+        return {'items': items, 'sections': sections};
+      },
+      builder: (context, data, reload) {
+        final messenger = ScaffoldMessenger.of(context);
+        final rows = (data['items'] as List?) ?? const [];
+        final sections = List<String>.from(data['sections'] as List? ?? const []);
+        final byCat = <String, List<Map>>{};
+        for (final r in rows) {
+          final m = r as Map;
+          (byCat[_s(m, 'category', 'Uncategorized')] ??= []).add(m);
+        }
+        final cats = byCat.keys.toList()..sort();
+
+        Future<void> saveItem({Map? existing}) async {
+          final result = await showDialog<Map<String, dynamic>>(
+            context: context,
+            builder: (_) => _MenuItemDialog(existing: existing, categories: cats, sections: sections, rest: rest),
+          );
+          if (result == null) return;
+          try {
+            await rest.post('/menu', result);
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // Manage the tenant's kitchen sections (add/rename/delete). Rename cascades
+        // onto items server-side, so reload to refresh badges when anything changed.
+        Future<void> manageSections() async {
+          final changed = await showDialog<bool>(
+            context: context,
+            builder: (_) => _KitchenSectionsDialog(rest: rest, isAdmin: p.isAdmin, initial: sections),
+          );
+          if (changed == true) reload();
+        }
+
+        // Quick per-item section assignment via the preserve-on-omit menu upsert:
+        // only id/name/price/category/station travel, so recipes/modifiers/images
+        // survive untouched (mirrors the web "organise by kitchen" flow).
+        Future<void> assignStation(Map item) async {
+          final picked = await showModalBottomSheet<String?>(
+            context: context,
+            showDragHandle: true,
+            builder: (_) => _StationPickerSheet(
+              itemName: _s(item, 'name'),
+              current: _s(item, 'station', ''),
+              sections: sections,
+            ),
+          );
+          if (picked == null) return; // dismissed — no change
+          final station = picked.trim();
+          try {
+            await rest.post('/menu', {
+              'id': item['id'],
+              'name': item['name'],
+              'price': item['price'],
+              'category': item['category'],
+              'station': station.isEmpty ? null : station,
+            });
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        Future<void> deleteItem(Map item) async {
+          final ok = await _confirm(context, 'Delete item', 'Delete "${_s(item, 'name')}"?');
+          if (!ok) return;
+          // Full-replace PUT — preserve every other item's fields (image/availability).
+          final remaining = rows
+              .where((r) => (r as Map)['id'] != item['id'])
+              .map((r) => {
+                    'id': (r as Map)['id'],
+                    'name': r['name'],
+                    'price': r['price'],
+                    'category': r['category'],
+                    'image_url': r['image_url'] ?? '',
+                    'available': r['available'] != false,
+                  })
+              .toList();
+          try {
+            await rest.put('/menu', {'items': remaining});
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        Future<void> toggleAvailable(Map item) async {
+          try {
+            await rest.post('/menu', {
+              'id': item['id'],
+              'name': item['name'],
+              'price': item['price'],
+              'category': item['category'],
+              'image_url': item['image_url'] ?? '',
+              'available': item['available'] == false, // flip
+            });
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        Future<void> addCategory() async {
+          final name = await _askText(context, 'Add category', 'Category name');
+          if (name == null || name.trim().isEmpty) return;
+          try {
+            await rest.post('/menu/categories', {'category': name.trim()});
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        Future<void> importMenu() async {
+          final picked = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['xlsx', 'xls'], withData: true);
+          if (picked == null || picked.files.isEmpty) return;
+          final bytes = picked.files.first.bytes;
+          if (bytes == null) {
+            messenger.showSnackBar(const SnackBar(content: Text('Could not read the file.')));
+            return;
+          }
+          List<Map<String, dynamic>> items;
+          try {
+            final book = xl.Excel.decodeBytes(bytes);
+            final sheetName = book.tables.keys.isNotEmpty ? book.tables.keys.first : null;
+            if (sheetName == null) throw Exception('No sheet found in the file');
+            final sheet = book.tables[sheetName]!;
+            final rowsData = sheet.rows.map((r) => r.map((cell) => _cellStr(cell?.value)).toList()).toList();
+            items = _parseMenuRows(rowsData);
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('Could not read the Excel file: $e')));
+            return;
+          }
+          if (items.isEmpty) {
+            messenger.showSnackBar(const SnackBar(content: Text('No items found. Put each category on its own row, then name + price rows under it.')));
+            return;
+          }
+          if (!context.mounted) return;
+          final ok = await _confirm(context, 'Import menu', 'Import ${items.length} item(s) from the file?');
+          if (!ok) return;
+          var added = 0;
+          for (final it in items) {
+            try {
+              await rest.post('/menu', it);
+              added++;
+            } catch (_) {/* skip failures, keep going */}
+          }
+          messenger.showSnackBar(SnackBar(content: Text('Imported $added of ${items.length} items.')));
+          reload();
+        }
+
+        Future<void> deleteCategory(String cat) async {
+          final ok = await _confirm(context, 'Delete category', 'Delete "$cat" and all its items?');
+          if (!ok) return;
+          try {
+            await rest.delete('/menu/categories?category=${Uri.encodeQueryComponent(cat)}');
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        final width = MediaQuery.sizeOf(context).width;
+        final narrow = width < 760;
+        final tabs = ['All', ...cats];
+
+        // One template-style menu row: leading tile, name + quiet cost line,
+        // section tag, right-aligned price MicroStat + availability chip, and
+        // the assign/toggle/delete actions.
+        Widget itemRow(Map item) => Builder(builder: (context) {
+              final text = Theme.of(context).textTheme;
+              final soldOut = item['available'] == false;
+              final station = _s(item, 'station', '');
+              final managed = station.isNotEmpty &&
+                  sections.any((s) => s.toLowerCase() == station.toLowerCase());
+              final img = _s(item, 'image_url', '');
+              final blurb = _s(item, 'blurb', '');
+              final detail = item['_cost'] == null
+                  ? ''
+                  : 'cost ${_money(item['_cost'])}'
+                      '${item['_margin_pct'] is num ? ' · ${(item['_margin_pct'] as num).toStringAsFixed(0)}% margin' : ''}';
+              final tile = img.isEmpty
+                  ? const FoodTile(emoji: '🍽️')
+                  : ClipRRect(
+                      borderRadius: AppRadius.tileAll,
+                      child: Image.network(img, width: 44, height: 44, fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => const FoodTile(emoji: '🍽️')),
+                    );
+              final name = Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                Text(
+                  _s(item, 'name'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: text.titleSmall!.copyWith(
+                    decoration: soldOut ? TextDecoration.lineThrough : null,
+                    color: soldOut ? AppColors.textSecondary : null,
+                  ),
+                ),
+                if (detail.isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(detail, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.bodySmall),
+                ],
+                // The guest-facing description, flattened to a single quiet line
+                // (the full text is in the edit dialog).
+                if (blurb.isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    blurb.replaceAll('\n', ' '),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.bodySmall!.copyWith(color: AppColors.textTertiary, fontSize: 11.5),
+                  ),
+                ],
+                const SizedBox(height: 6),
+                _sectionTag(station, managed: managed),
+              ]);
+              final availability = AnimatedSwitcher(
+                duration: AppDurations.base,
+                switchInCurve: Curves.easeOut,
+                switchOutCurve: Curves.easeIn,
+                child: StatusChip(
+                  key: ValueKey(soldOut),
+                  label: soldOut ? 'Sold out' : 'Available',
+                  color: soldOut ? AppColors.danger : AppColors.success,
+                  dense: true,
+                ),
+              );
+              final actions = Row(mainAxisSize: MainAxisSize.min, children: [
+                ForkIconButton(
+                  icon: Icons.soup_kitchen_outlined,
+                  tooltip: 'Assign kitchen section',
+                  onPressed: () => assignStation(item),
+                ),
+                const SizedBox(width: 6),
+                ForkIconButton(
+                  icon: soldOut ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                  tooltip: soldOut ? 'Mark available' : 'Mark sold out',
+                  onPressed: () => toggleAvailable(item),
+                ),
+                const SizedBox(width: 6),
+                ForkIconButton(
+                  icon: Icons.delete_outline,
+                  tooltip: 'Delete item',
+                  onPressed: () => deleteItem(item),
+                ),
+              ]);
+              if (narrow) {
+                return ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  onTap: () => saveItem(existing: Map<String, dynamic>.from(item)),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      tile,
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(child: name),
+                      const SizedBox(width: AppSpacing.md),
+                      MicroStat(value: _money(item['price']), label: 'Price', alignEnd: true),
+                    ]),
+                    const SizedBox(height: AppSpacing.md),
+                    Row(children: [availability, const Spacer(), actions]),
+                  ]),
+                );
+              }
+              return ForkCard(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                onTap: () => saveItem(existing: Map<String, dynamic>.from(item)),
+                child: Row(children: [
+                  tile,
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(child: name),
+                  const SizedBox(width: AppSpacing.md),
+                  MicroStat(value: _money(item['price']), label: 'Price', alignEnd: true),
+                  const SizedBox(width: AppSpacing.lg),
+                  availability,
+                  const SizedBox(width: AppSpacing.lg),
+                  actions,
+                ]),
+              );
+            });
+
+        return StatefulBuilder(builder: (context, setTab) {
+          if (tab >= tabs.length) tab = 0;
+          final showCats = tab == 0 ? cats : [cats[tab - 1]];
+          final q = query.trim().toLowerCase();
+          final searching = q.isNotEmpty;
+          // While searching the category tabs are ignored entirely and the whole
+          // menu is matched on name / category / kitchen section / description, so
+          // no result can hide behind an unselected tab.
+          final matches = <Map>[];
+          if (searching) {
+            for (final r in rows) {
+              final m = r as Map;
+              final hay =
+                  '${_s(m, 'name', '')} ${_s(m, 'category', '')} ${_s(m, 'station', '')} ${_s(m, 'blurb', '')}'
+                      .toLowerCase();
+              if (hay.contains(q)) matches.add(m);
+            }
+          }
+          return ListView(
+            padding: narrow ? AppSpacing.pageNarrow : const EdgeInsets.all(AppSpacing.xxl),
+            children: [
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                ForkButton(label: 'Add item', icon: Icons.add, dense: true, onPressed: () => saveItem()),
+                ForkButton.ghost(label: 'Add category', icon: Icons.create_new_folder_outlined, dense: true, onPressed: addCategory),
+                ForkButton.ghost(label: 'Import from Excel', icon: Icons.upload_file, dense: true, onPressed: importMenu),
+                ForkButton.ghost(label: 'Kitchen sections', icon: Icons.soup_kitchen_outlined, dense: true, onPressed: manageSections),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              _MenuSearchField(initial: query, onChanged: (v) => setTab(() => query = v)),
+              if (cats.isNotEmpty && !searching) ...[
+                const SizedBox(height: AppSpacing.xl),
+                ForkTabs(tabs: tabs, selected: tab, onSelected: (i) => setTab(() => tab = i)),
+              ],
+              const SizedBox(height: AppSpacing.xxl),
+              if (searching) ...[
+                if (matches.isEmpty)
+                  EmptyState(
+                    icon: Icons.search_off,
+                    title: 'No items match "$query"',
+                    caption: 'Try another name, category or kitchen section — or clear the search.',
+                    action: ForkButton.ghost(
+                      label: 'Clear search',
+                      icon: Icons.clear,
+                      dense: true,
+                      onPressed: () => setTab(() => query = ''),
+                    ),
+                  )
+                else ...[
+                  SectionHeader(title: 'Search results', count: matches.length),
+                  for (var i = 0; i < matches.length; i++) ...[
+                    if (i > 0) const SizedBox(height: 10),
+                    itemRow(matches[i]),
+                  ],
+                ],
+              ] else if (rows.isEmpty)
+                EmptyState(
+                  icon: Icons.menu_book_outlined,
+                  title: 'No menu items yet',
+                  caption: 'Add your first item, or import a full menu from Excel.',
+                  action: ForkButton(label: 'Add item', icon: Icons.add, dense: true, onPressed: () => saveItem()),
+                )
+              else
+                for (var ci = 0; ci < showCats.length; ci++) ...[
+                  if (ci > 0) const SizedBox(height: AppSpacing.xl),
+                  SectionHeader(
+                    title: showCats[ci],
+                    count: byCat[showCats[ci]]!.length,
+                    trailing: ForkButton.subtle(
+                      label: 'Delete category',
+                      icon: Icons.delete_outline,
+                      onPressed: () => deleteCategory(showCats[ci]),
+                    ),
+                  ),
+                  for (var i = 0; i < byCat[showCats[ci]]!.length; i++) ...[
+                    if (i > 0) const SizedBox(height: 10),
+                    itemRow(byCat[showCats[ci]]![i]),
+                  ],
+                ],
+            ],
+          );
+        });
+      },
+    );
+}
+
+// Menu search box. Owns (and disposes) its controller; [initial] seeds it and
+// re-syncs when the module clears the query from elsewhere (the empty-state
+// "Clear search" action), mirroring the order-entry search idiom.
+class _MenuSearchField extends StatefulWidget {
+  const _MenuSearchField({required this.initial, required this.onChanged});
+
+  final String initial;
+  final ValueChanged<String> onChanged;
+
+  @override
+  State<_MenuSearchField> createState() => _MenuSearchFieldState();
+}
+
+class _MenuSearchFieldState extends State<_MenuSearchField> {
+  late final TextEditingController _c = TextEditingController(text: widget.initial);
+
+  @override
+  void didUpdateWidget(_MenuSearchField old) {
+    super.didUpdateWidget(old);
+    if (widget.initial != _c.text) _c.text = widget.initial;
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _set(String v) {
+    widget.onChanged(v);
+    setState(() {/* refresh the clear button */});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: _c,
+      decoration: InputDecoration(
+        prefixIcon: const Icon(Icons.search, size: 18),
+        hintText: 'Search menu…',
+        isDense: true,
+        suffixIcon: _c.text.isEmpty
+            ? null
+            : IconButton(
+                icon: const Icon(Icons.clear, size: 18),
+                tooltip: 'Clear search',
+                onPressed: () {
+                  _c.clear();
+                  _set('');
+                },
+              ),
+      ),
+      onChanged: _set,
+    );
+  }
+}
+
+// Small badge showing a menu item's kitchen section. A managed section (present
+// in the tenant's list) renders solid; a leftover label from a deleted section
+// renders amber "unassigned"; no station renders a faint "No section".
+Widget _sectionTag(String station, {required bool managed}) {
+  if (station.isEmpty) {
+    return const TickTag('No section');
+  }
+  if (managed) {
+    return InfoChip(icon: Icons.soup_kitchen_outlined, label: station.toUpperCase());
+  }
+  // Leftover label from a deleted section — flagged, never colour alone.
+  return StatusChip(
+    label: '${station.toUpperCase()} · UNASSIGNED',
+    color: AppColors.warning,
+    dense: true,
+  );
+}
+
+// Manage the tenant's kitchen sections (KOT routing): list, add, rename (cascades
+// onto items server-side) and delete. Add/delete hit POST /restaurant/settings
+// (admin-only → 403 handled gracefully); rename hits POST /kitchen-sections/rename.
+// Pops `true` if anything changed so the menu reloads and badges refresh.
+class _KitchenSectionsDialog extends StatefulWidget {
+  final RestClient rest;
+  final bool isAdmin;
+  final List<String> initial;
+  const _KitchenSectionsDialog({required this.rest, required this.isAdmin, required this.initial});
+
+  @override
+  State<_KitchenSectionsDialog> createState() => _KitchenSectionsDialogState();
+}
+
+class _KitchenSectionsDialogState extends State<_KitchenSectionsDialog> {
+  late List<String> _sections;
+  final _add = TextEditingController();
+  bool _busy = false;
+  bool _changed = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _sections = List<String>.from(widget.initial);
+  }
+
+  @override
+  void dispose() {
+    _add.dispose();
+    super.dispose();
+  }
+
+  // Turn any backend/permission error into a short, human line (403 = not admin).
+  String _friendly(Object e) {
+    if (e is ApiException && e.status == 403) {
+      return 'Only an admin can change kitchen sections.';
+    }
+    return '$e';
+  }
+
+  Future<void> _save(List<String> next) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final res = await widget.rest.post('/restaurant/settings', {'kitchen_sections': next});
+      final saved = (res is Map && res['kitchen_sections'] is List)
+          ? (res['kitchen_sections'] as List).map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+          : next;
+      setState(() {
+        _sections = saved;
+        _changed = true;
+        _busy = false;
+      });
+    } catch (e) {
+      setState(() {
+        _error = _friendly(e);
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _addSection() async {
+    final name = _add.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (name.isEmpty) return;
+    if (_sections.any((s) => s.toLowerCase() == name.toLowerCase())) {
+      _add.clear();
+      return;
+    }
+    _add.clear();
+    await _save([..._sections, name]);
+  }
+
+  Future<void> _rename(String from) async {
+    final to = (await _askText(context, 'Rename "$from"', 'New section name'))?.trim().replaceAll(RegExp(r'\s+'), ' ') ?? '';
+    if (to.isEmpty || to == from) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final res = await widget.rest.post('/kitchen-sections/rename', {'from': from, 'to': to});
+      final saved = (res is Map && res['kitchen_sections'] is List)
+          ? (res['kitchen_sections'] as List).map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+          : _sections.map((s) => s == from ? to : s).toList();
+      setState(() {
+        _sections = saved;
+        _changed = true;
+        _busy = false;
+      });
+    } catch (e) {
+      setState(() {
+        _error = _friendly(e);
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _delete(String name) async {
+    final ok = await _confirm(context, 'Remove section',
+        'Remove "$name"? Items keep the label but show as unassigned until re-organised.');
+    if (!ok) return;
+    await _save(_sections.where((s) => s.toLowerCase() != name.toLowerCase()).toList());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 420,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 520),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('KOT ROUTING', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('Kitchen sections', style: text.titleMedium),
+            if (!widget.isAdmin)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text('Adding or removing sections is admin-only.', style: text.bodySmall),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: _add,
+                  enabled: !_busy,
+                  decoration: const InputDecoration(labelText: 'New section (e.g. tandoor)', isDense: true),
+                  onSubmitted: (_) => _addSection(),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkIconButton(
+                icon: Icons.add,
+                tooltip: 'Add section',
+                onPressed: _busy ? null : _addSection,
+              ),
+            ]),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            const SizedBox(height: AppSpacing.md),
+            if (_sections.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Text('No sections yet. Add one above, then assign items to it.', style: text.bodySmall),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _sections.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final s = _sections[i];
+                    return ForkCard(
+                      inset: true,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      child: Row(children: [
+                        const Icon(Icons.tag, size: 14, color: AppColors.copperHi),
+                        const SizedBox(width: AppSpacing.sm),
+                        Expanded(child: Text(s, style: text.titleSmall, overflow: TextOverflow.ellipsis)),
+                        ForkIconButton(
+                          icon: Icons.edit_outlined,
+                          tooltip: 'Rename',
+                          onPressed: _busy ? null : () => _rename(s),
+                        ),
+                        const SizedBox(width: 6),
+                        ForkIconButton(
+                          icon: Icons.delete_outline,
+                          tooltip: 'Remove',
+                          onPressed: _busy ? null : () => _delete(s),
+                        ),
+                      ]),
+                    );
+                  },
+                ),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton(
+                label: 'Done',
+                icon: Icons.check,
+                onPressed: () => Navigator.pop(context, _changed),
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// Manage the tenant's inventory categories (add/rename/delete). Mirrors
+// _KitchenSectionsDialog but points at the managed `inventory_categories`
+// list and the /inventory-categories/rename cascade. Returns true (via the
+// "Done" button) when anything changed so the caller can reload.
+class _InventoryCategoriesDialog extends StatefulWidget {
+  final RestClient rest;
+  final bool isAdmin;
+  final List<String> initial;
+  const _InventoryCategoriesDialog({required this.rest, required this.isAdmin, required this.initial});
+
+  @override
+  State<_InventoryCategoriesDialog> createState() => _InventoryCategoriesDialogState();
+}
+
+class _InventoryCategoriesDialogState extends State<_InventoryCategoriesDialog> {
+  late List<String> _categories;
+  final _add = TextEditingController();
+  bool _busy = false;
+  bool _changed = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _categories = List<String>.from(widget.initial);
+  }
+
+  @override
+  void dispose() {
+    _add.dispose();
+    super.dispose();
+  }
+
+  // Turn any backend/permission error into a short, human line (403 = not admin).
+  String _friendly(Object e) {
+    if (e is ApiException && e.status == 403) {
+      return 'Only an admin can change inventory categories.';
+    }
+    return '$e';
+  }
+
+  Future<void> _save(List<String> next) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final res = await widget.rest.post('/restaurant/settings', {'inventory_categories': next});
+      final saved = (res is Map && res['inventory_categories'] is List)
+          ? (res['inventory_categories'] as List).map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+          : next;
+      setState(() {
+        _categories = saved;
+        _changed = true;
+        _busy = false;
+      });
+    } catch (e) {
+      setState(() {
+        _error = _friendly(e);
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _addCategory() async {
+    final name = _add.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (name.isEmpty) return;
+    if (_categories.any((s) => s.toLowerCase() == name.toLowerCase())) {
+      _add.clear();
+      return;
+    }
+    _add.clear();
+    await _save([..._categories, name]);
+  }
+
+  Future<void> _rename(String from) async {
+    final to = (await _askText(context, 'Rename "$from"', 'New category name'))?.trim().replaceAll(RegExp(r'\s+'), ' ') ?? '';
+    if (to.isEmpty || to == from) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final res = await widget.rest.post('/inventory-categories/rename', {'from': from, 'to': to});
+      final saved = (res is Map && res['inventory_categories'] is List)
+          ? (res['inventory_categories'] as List).map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList()
+          : _categories.map((s) => s == from ? to : s).toList();
+      setState(() {
+        _categories = saved;
+        _changed = true;
+        _busy = false;
+      });
+    } catch (e) {
+      setState(() {
+        _error = _friendly(e);
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _delete(String name) async {
+    final ok = await _confirm(context, 'Remove category',
+        'Remove "$name"? Existing items keep the label but it leaves the picker.');
+    if (!ok) return;
+    await _save(_categories.where((s) => s.toLowerCase() != name.toLowerCase()).toList());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 420,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 520),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('STOCK ORGANISATION', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('Inventory categories', style: text.titleMedium),
+            if (!widget.isAdmin)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text('Adding or removing categories is admin-only.', style: text.bodySmall),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: _add,
+                  enabled: !_busy,
+                  decoration: const InputDecoration(labelText: 'New category (e.g. Produce)', isDense: true),
+                  onSubmitted: (_) => _addCategory(),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkIconButton(
+                icon: Icons.add,
+                tooltip: 'Add category',
+                onPressed: _busy ? null : _addCategory,
+              ),
+            ]),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            const SizedBox(height: AppSpacing.md),
+            if (_categories.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Text('No categories yet. Add one above, then assign items to it.', style: text.bodySmall),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _categories.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final s = _categories[i];
+                    return ForkCard(
+                      inset: true,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      child: Row(children: [
+                        const Icon(Icons.category_outlined, size: 14, color: AppColors.copperHi),
+                        const SizedBox(width: AppSpacing.sm),
+                        Expanded(child: Text(s, style: text.titleSmall, overflow: TextOverflow.ellipsis)),
+                        ForkIconButton(
+                          icon: Icons.edit_outlined,
+                          tooltip: 'Rename',
+                          onPressed: _busy ? null : () => _rename(s),
+                        ),
+                        const SizedBox(width: 6),
+                        ForkIconButton(
+                          icon: Icons.delete_outline,
+                          tooltip: 'Remove',
+                          onPressed: _busy ? null : () => _delete(s),
+                        ),
+                      ]),
+                    );
+                  },
+                ),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton(
+                label: 'Done',
+                icon: Icons.check,
+                onPressed: () => Navigator.pop(context, _changed),
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// Quick per-item section picker (bottom sheet). Returns the chosen section name,
+// '' for Unassigned, or null when dismissed (no change). Managed sections show as
+// chips; a free-text field covers custom/legacy stations.
+class _StationPickerSheet extends StatefulWidget {
+  final String itemName;
+  final String current;
+  final List<String> sections;
+  const _StationPickerSheet({required this.itemName, required this.current, required this.sections});
+
+  @override
+  State<_StationPickerSheet> createState() => _StationPickerSheetState();
+}
+
+class _StationPickerSheetState extends State<_StationPickerSheet> {
+  late final TextEditingController _custom;
+
+  @override
+  void initState() {
+    super.initState();
+    // Seed the custom field only with a legacy/unmanaged label so managed picks
+    // aren't duplicated as free text.
+    final inList = widget.sections.any((s) => s.toLowerCase() == widget.current.toLowerCase());
+    _custom = TextEditingController(text: inList ? '' : widget.current);
+  }
+
+  @override
+  void dispose() {
+    _custom.dispose();
+    super.dispose();
+  }
+
+  bool _isSelected(String s) => s.toLowerCase() == widget.current.toLowerCase();
+
+  // Selectable section pill — copper tint + outline when it is the current
+  // assignment (selection is never colour alone: the label is the section).
+  Widget _pill(BuildContext context, String label, {required bool selected, required VoidCallback onTap}) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: selected ? AppColors.tint(AppColors.copper) : AppColors.inset,
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(
+              color: selected ? AppColors.copper.withValues(alpha: 0.55) : AppColors.border,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+              letterSpacing: 0.2,
+              color: selected ? AppColors.copperHi : AppColors.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, 0, 20, 20 + MediaQuery.of(context).viewInsets.bottom),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('KOT ROUTING', style: text.labelSmall),
+        const SizedBox(height: 6),
+        Text('Kitchen section', style: text.titleMedium),
+        const SizedBox(height: 3),
+        Text(widget.itemName, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          _pill(
+            context,
+            'Unassigned',
+            selected: widget.current.isEmpty,
+            onTap: () => Navigator.pop(context, ''),
+          ),
+          for (final s in widget.sections)
+            _pill(
+              context,
+              s,
+              selected: _isSelected(s),
+              onTap: () => Navigator.pop(context, s),
+            ),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
+        Row(children: [
+          Expanded(
+            child: TextField(
+              controller: _custom,
+              decoration: const InputDecoration(
+                labelText: 'Custom section',
+                hintText: 'e.g. grill, bar',
+                isDense: true,
+              ),
+              // Empty custom text is a no-op (dismiss) — clearing a section is
+              // done explicitly via the Unassigned chip, so an accidental blank
+              // "Set" never wipes a managed assignment.
+              onSubmitted: (v) => Navigator.pop(context, v.trim().isEmpty ? null : v.trim()),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          ForkButton(
+            label: 'Set',
+            icon: Icons.check,
+            onPressed: () {
+              final t = _custom.text.trim();
+              Navigator.pop(context, t.isEmpty ? null : t);
+            },
+          ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// A reusable section selector for the add/edit item dialog: a dropdown of managed
+// sections (+ Unassigned, + a "Custom…" escape hatch, + any legacy label) that
+// flips to a free-text field. Falls back to plain free text when no sections
+// exist yet. Reports the chosen station ('' = unassigned) via [onChanged].
+class _SectionSelector extends StatefulWidget {
+  final String value;
+  final List<String> sections;
+  final ValueChanged<String> onChanged;
+  const _SectionSelector({required this.value, required this.sections, required this.onChanged});
+
+  @override
+  State<_SectionSelector> createState() => _SectionSelectorState();
+}
+
+class _SectionSelectorState extends State<_SectionSelector> {
+  static const _none = '__none__';
+  static const _customSentinel = '__custom__';
+  late final TextEditingController _custom;
+  late String _value; // current station ('' = unassigned) — owned locally
+  bool _customMode = false;
+
+  bool _inList(String v) => widget.sections.any((s) => s.toLowerCase() == v.toLowerCase());
+
+  @override
+  void initState() {
+    super.initState();
+    _value = widget.value;
+    _custom = TextEditingController(text: widget.value);
+    // A non-empty value that isn't a managed section starts in free-text mode
+    // (legacy/unmanaged label) — unless there are simply no managed sections.
+    _customMode = widget.sections.isNotEmpty && widget.value.isNotEmpty && !_inList(widget.value);
+  }
+
+  @override
+  void dispose() {
+    _custom.dispose();
+    super.dispose();
+  }
+
+  void _set(String v) {
+    setState(() => _value = v);
+    widget.onChanged(v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // No managed sections yet → plain free-text entry with the same contract.
+    if (widget.sections.isEmpty) {
+      return TextField(
+        controller: _custom,
+        decoration: const InputDecoration(labelText: 'Kitchen section', hintText: 'Optional — e.g. tandoor, grill, bar', isDense: true),
+        onChanged: widget.onChanged,
+      );
+    }
+    if (_customMode) {
+      return Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _custom,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Custom section', isDense: true),
+            onChanged: widget.onChanged,
+          ),
+        ),
+        IconButton(
+          icon: const Icon(Icons.close),
+          tooltip: 'Pick from list',
+          onPressed: () => setState(() {
+            _customMode = false;
+            _set('');
+          }),
+        ),
+      ]);
+    }
+    final current = _value;
+    final inList = _inList(current);
+    return DropdownButtonFormField<String>(
+      initialValue: current.isEmpty ? _none : current,
+      isExpanded: true,
+      decoration: const InputDecoration(labelText: 'Kitchen section', isDense: true),
+      items: [
+        const DropdownMenuItem(value: _none, child: Text('Unassigned')),
+        for (final s in widget.sections) DropdownMenuItem(value: s, child: Text(s)),
+        if (current.isNotEmpty && !inList)
+          DropdownMenuItem(value: current, child: Text('$current (unassigned)', style: TextStyle(color: AppColors.warning))),
+        const DropdownMenuItem(value: _customSentinel, child: Text('Custom…')),
+      ],
+      onChanged: (v) {
+        if (v == _customSentinel) {
+          setState(() {
+            _customMode = true;
+            _custom.text = '';
+          });
+          widget.onChanged('');
+        } else if (v == _none) {
+          _set('');
+        } else if (v != null) {
+          _set(v);
+        }
+      },
+    );
+  }
+}
+
+// "Undo Audited Action". The server independently re-checks this *and* the
+// original action's own permission — this is only a UI convenience filter, never
+// the security boundary.
+const String _undoAuditPermissionId = '6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94';
+
+// Audit log: searchable history of staff actions (proves the audit system is
+// recording). Backed by GET /audit-logs, paged 50 at a time with `?meta=1` so
+// the header reports the trail's REAL size; the search box re-queries the
+// server, so it filters the whole trail rather than the pages already pulled in.
+// Reversible entries can be undone via
+// POST /audit-logs/:id/undo, which is append-only (the original entry is never
+// edited — a new "Undid: …" entry is written on top).
+Widget auditLogModule(RestClient rest, Profile p) => _AuditLogView(rest: rest, profile: p);
+
+class _AuditLogView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _AuditLogView({required this.rest, required this.profile});
+  @override
+  State<_AuditLogView> createState() => _AuditLogViewState();
+}
+
+class _AuditLogViewState extends State<_AuditLogView> {
+  // Rows per fetch. The trail runs to thousands of entries, so it is pulled one
+  // batch at a time and appended as the list nears its end — the old single
+  // `?limit=300` shot both stalled the open and made the count chip read "300"
+  // forever, whatever the trail actually holds.
+  static const int _pageSize = 50;
+
+  // Past this the server refuses the page (limit is clamped to 500), so a
+  // refresh-in-place of everything scrolled in falls back to a plain reload.
+  static const int _maxWindow = 500;
+
+  final List<Map> _rows = [];
+  // Ids already held. An entry written mid-scroll shifts the offset window, so
+  // the same row can arrive in two consecutive pages.
+  final Set<String> _ids = {};
+  final ScrollController _scroll = ScrollController();
+  final TextEditingController _search = TextEditingController();
+
+  bool _loading = true;
+  bool _loadingMore = false;
+  bool _hasMore = false;
+  int _total = 0;
+  String? _error;
+
+  // The term the SERVER is filtering on (the field debounces into it), so a
+  // search spans the whole trail rather than the pages scrolled in so far.
+  String _query = '';
+  Timer? _debounce;
+  // Bumped per request; a response whose serial is stale lost a race with a
+  // newer filter and must not be merged into the list.
+  int _serial = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _scroll.dispose();
+    _search.dispose();
+    super.dispose();
+  }
+
+  // Admins always qualify; otherwise the employee must hold the undo action.
+  bool get _mayUndo {
+    final p = widget.profile;
+    return p.isAdmin || p.actions.contains('*') || p.actions.contains(_undoAuditPermissionId);
+  }
+
+  /// One page. [append] adds the next window; otherwise the list is replaced
+  /// from offset 0 — which is also what a filter change must do, so a filtered
+  /// view can never keep rows that no longer match.
+  Future<void> _load({bool append = false, int? limit}) async {
+    if (append && (_loadingMore || !_hasMore)) return;
+    final serial = ++_serial;
+    setState(() {
+      if (append) {
+        _loadingMore = true;
+      } else {
+        _loading = true;
+        _error = null;
+      }
+    });
+    final offset = append ? _rows.length : 0;
+    final q = _query.trim();
+    final path = '/audit-logs?meta=1&limit=${limit ?? _pageSize}&offset=$offset'
+        '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}';
+    try {
+      // ?meta=1 returns { logs, total, has_more } — the true row count, which is
+      // what the header chip reports, instead of "however many are loaded".
+      final res = await widget.rest.getMap(path);
+      if (!mounted || serial != _serial) return;
+      final page = <Map>[for (final r in (res['logs'] as List?) ?? const []) if (r is Map) r];
+      setState(() {
+        if (!append) {
+          _rows.clear();
+          _ids.clear();
+        }
+        var added = 0;
+        for (final r in page) {
+          final id = _s(r, 'id', '');
+          if (id.isNotEmpty && !_ids.add(id)) continue;
+          _rows.add(r);
+          added++;
+        }
+        _total = _int(res['total']) ?? _rows.length;
+        // A page that brought nothing new can never advance the offset — stop
+        // instead of asking for the same window forever.
+        _hasMore = res['has_more'] == true && (!append || added > 0);
+        _loading = false;
+        _loadingMore = false;
+      });
+    } catch (e) {
+      if (!mounted || serial != _serial) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+        _loadingMore = false;
+        // Don't re-fire the same failing page every time the list settles.
+        if (append) _hasMore = false;
+      });
+    }
+  }
+
+  // Near the end of the scroll extent, pull the next page. Guarded on
+  // _loadingMore/_hasMore so a burst of scroll notifications is one request.
+  void _onScroll() {
+    if (!_scroll.hasClients || _loading || _loadingMore || !_hasMore) return;
+    final pos = _scroll.position;
+    if (pos.pixels >= pos.maxScrollExtent - 400) _load(append: true);
+  }
+
+  // Typing re-queries the SERVER, so it filters the whole trail; the debounce
+  // keeps that to one request per pause rather than one per keystroke.
+  void _onSearchChanged(String v) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      final next = v.trim();
+      if (!mounted || next == _query) return;
+      setState(() => _query = next);
+      _load();
+    });
+  }
+
+  /// After an undo, re-read exactly the window already scrolled in (one request)
+  /// so the "Undone" badge and the new "Undid:" entry appear without throwing
+  /// the reader back to the top.
+  Future<void> _refreshLoaded() {
+    final held = _rows.length;
+    return _load(limit: held == 0 || held > _maxWindow ? null : held);
+  }
+
+  /// Confirm, then reverse [row]. Surfaces the server's own `error` text on
+  /// failure (it is already human-readable) and reloads on success so the new
+  /// "Undid:" entry and the updated badges appear.
+  Future<void> _undo(BuildContext context, Map row) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final action = _s(row, 'action');
+    final detail = _s(row, 'details', '');
+    final emp = _s(row, 'employee', '');
+    final when = _fmtTime(_s(row, 'timestamp', ''));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final text = Theme.of(ctx).textTheme;
+        return AlertDialog(
+          title: const Text('Undo this action?'),
+          content: SizedBox(
+            width: 400,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(action, style: text.titleSmall),
+              if (detail.isNotEmpty && detail != '—') ...[
+                const SizedBox(height: 4),
+                Text(detail, style: text.bodySmall),
+              ],
+              const SizedBox(height: 10),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                if (emp.isNotEmpty && emp != '—') InfoChip(icon: Icons.person_outline, label: emp),
+                if (when.isNotEmpty) InfoChip(icon: Icons.schedule, label: when),
+              ]),
+              const SizedBox(height: 12),
+              Text(
+                'This reverses that change and puts the data back the way it was before. '
+                'Nothing is deleted from the trail — the original entry stays, and a new '
+                '"Undid:" entry is added on top.',
+                style: text.bodySmall,
+              ),
+            ]),
+          ),
+          actions: [
+            ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+            ForkButton(label: 'Undo this action', icon: Icons.undo, onPressed: () => Navigator.pop(ctx, true)),
+          ],
+        );
+      },
+    );
+    if (ok != true) return;
+    final id = _s(row, 'id', '');
+    if (id.isEmpty) return;
+    final tenant = widget.profile.restaurantUsername;
+    try {
+      await widget.rest.post(
+        '/audit-logs/${Uri.encodeComponent(id)}/undo'
+        '${tenant.isEmpty ? '' : '?restaurantId=${Uri.encodeQueryComponent(tenant)}'}',
+      );
+      messenger.showSnackBar(SnackBar(content: Text('Undone: $action.')));
+      await _refreshLoaded();
+    } catch (e) {
+      // The backend's `error` string is already a human sentence — show it as-is.
+      messenger.showSnackBar(SnackBar(content: Text('$e'), backgroundColor: AppColors.danger));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final loaded = _rows.length;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+        child: SectionHeader(
+          title: 'Audit trail',
+          // The server's total for the current filter — NOT how many rows have
+          // been paged in, which is what used to pin this chip at "300".
+          count: _loading && loaded == 0 ? null : _total,
+          padding: const EdgeInsets.only(bottom: 12),
+          trailing: loaded == 0 || loaded >= _total ? null : TickTag('$loaded loaded'),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        child: TextField(
+          controller: _search,
+          decoration: const InputDecoration(
+            prefixIcon: Icon(Icons.search, size: 18),
+            hintText: 'Filter by action, employee, or detail…',
+            isDense: true,
+          ),
+          onChanged: _onSearchChanged,
+        ),
+      ),
+      Expanded(child: _body(context)),
+    ]);
+  }
+
+  Widget _body(BuildContext context) {
+    if (_loading && _rows.isEmpty) {
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          for (var i = 0; i < 6; i++)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: SkeletonBox(height: 54, radius: AppRadius.card),
+            ),
+        ],
+      );
+    }
+    if (_error != null && _rows.isEmpty) {
+      return EmptyState(
+        icon: Icons.error_outline,
+        title: "Couldn't load the audit trail",
+        caption: _error!,
+        action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: _load),
+      );
+    }
+    if (_rows.isEmpty) {
+      return _empty(_query.isEmpty ? 'No audit entries yet.' : 'No matching entries.');
+    }
+    // The list stays interactive while a page is in flight — the foot is the
+    // only thing that changes.
+    return ListView.separated(
+      controller: _scroll,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      itemCount: _rows.length + 1,
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
+      itemBuilder: (context, i) =>
+          i == _rows.length ? _pagingFoot(context) : _entryCard(context, _rows[i]),
+    );
+  }
+
+  /// Foot of the list: what is in flight, what is left, and a manual pull for
+  /// anyone whose pointer never reaches the scroll end.
+  Widget _pagingFoot(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final child = _loadingMore
+        ? Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            const SizedBox(
+              width: 13,
+              height: 13,
+              child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.copper),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Text('Loading the next $_pageSize…', style: text.bodySmall),
+          ])
+        : _hasMore
+            ? Center(
+                child: ForkButton.ghost(
+                  label: 'Load more (${_rows.length} of $_total)',
+                  icon: Icons.expand_more,
+                  dense: true,
+                  onPressed: () => _load(append: true),
+                ),
+              )
+            // Either the trail ran out or a page failed — say which, never both.
+            : Center(
+                child: Text(
+                  _error ?? 'All $_total shown',
+                  textAlign: TextAlign.center,
+                  style: text.bodySmall?.copyWith(color: _error == null ? null : AppColors.danger),
+                ),
+              );
+    return Padding(padding: const EdgeInsets.only(top: 4), child: child);
+  }
+
+  Widget _entryCard(BuildContext context, Map r) {
+    final text = Theme.of(context).textTheme;
+    final detail = _s(r, 'details', '');
+    final emp = _s(r, 'employee', '');
+    // Additive undo metadata (older backends simply omit it).
+    final undone = r['undone'] == true;
+    final isUndoEntry = _s(r, 'undo_of', '').isNotEmpty;
+    final undoable = r['undoable'] == true;
+    final blockReason = _s(r, 'undo_block_reason', '');
+    // An entry that was already undone, or that *is* an undo, is never offered
+    // an Undo button.
+    final offerUndo = _mayUndo && undoable && !undone && !isUndoEntry;
+    final showBlockHint =
+        _mayUndo && !undoable && !undone && !isUndoEntry && blockReason.isNotEmpty;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+        Container(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            color: AppColors.inset,
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.border),
+          ),
+          child: const Icon(Icons.history, size: 14, color: AppColors.copper),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(_s(r, 'action'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            if (detail.isNotEmpty && detail != '—') ...[
+              const SizedBox(height: 2),
+              Text(detail, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+            ],
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        // Trail badges: an entry that was reversed reads "Undone"; the entry
+        // that did the reversing reads "Undo", so the pair is legible in
+        // sequence.
+        if (undone) ...[
+          const StatusChip(label: 'Undone', color: AppColors.neutral, dense: true),
+          const SizedBox(width: AppSpacing.md),
+        ],
+        if (isUndoEntry) ...[
+          const TickTag('Undo', color: AppColors.info),
+          const SizedBox(width: AppSpacing.md),
+        ],
+        if (emp.isNotEmpty && emp != '—') ...[
+          InfoChip(icon: Icons.person_outline, label: emp),
+          const SizedBox(width: AppSpacing.md),
+        ],
+        Text(_fmtTime(_s(r, 'timestamp', '')).toUpperCase(), style: text.labelSmall),
+        if (offerUndo) ...[
+          const SizedBox(width: AppSpacing.md),
+          ForkButton.ghost(
+            label: 'Undo',
+            icon: Icons.undo,
+            dense: true,
+            onPressed: () => _undo(context, r),
+          ),
+        ] else if (showBlockHint) ...[
+          const SizedBox(width: AppSpacing.md),
+          // No dead control — a quiet muted hint carrying the server's own
+          // reason (never one we invent).
+          Tooltip(
+            message: blockReason,
+            child: InfoChip(
+              icon: Icons.block,
+              label: blockReason.length > 30 ? '${blockReason.substring(0, 29)}…' : blockReason,
+            ),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+// Tables are uniform, tappable boxes (not organised by seat count — any table
+// can seat a flexible number of people). Tap a free table to seat guests; tap
+// an occupied one to see its single consolidated bill + APC, or release it.
+Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final tables = await rest.getList('/get-tables');
+        List assignments = const [];
+        try {
+          assignments = await rest.getList('/table-assignments');
+        } catch (_) {/* assignments are optional */}
+        // A clubbed party (T1 + T2) lives on the BOOKING, not on the table, so
+        // the floor plan has to fold it in to be able to mark it.
+        final clubbed = <String, List<String>>{};
+        try {
+          for (final b in await rest.getList('/get-bookings')) {
+            final status = _s(b as Map, 'status', '').toLowerCase();
+            if (status.contains('cancel') || status.contains('no')) continue;
+            final names = _strList(b['table_names']);
+            if (names.length < 2) continue;
+            for (final n in names) {
+              clubbed[n.toLowerCase()] = names;
+            }
+          }
+        } catch (_) {/* bookings are optional here */}
+        final byName = <String, Map>{};
+        for (final a in assignments) {
+          byName[_s(a as Map, 'table_name').toLowerCase()] = a;
+        }
+        for (final t in tables) {
+          final m = t as Map;
+          final key = _s(m, 'table_name').toLowerCase();
+          final a = byName[key];
+          if (a != null) {
+            m['waiter_name'] = a['employee_name'];
+            m['waiter_id'] = a['employee_id'];
+          }
+          final set = clubbed[key];
+          if (set != null) {
+            m['clubbed_with'] = set.where((n) => n.toLowerCase() != key).toList();
+          }
+        }
+        // The zone ROSTER is the second source a floor plan needs. A zone with no
+        // tables in it exists ONLY there, so without this call a zone created on
+        // the web (or here) is invisible until something is dragged into it —
+        // which is the whole reason "Add section" used to be web-only.
+        //
+        // GET /table-sections carries the same "Manage Table Sections" gate as
+        // the writes, so an unpermitted user must not ask for it: they'd collect
+        // a 403 for a roster they can't act on, and the zones their tables DO
+        // carry still render underneath.
+        var zones = const <String>[];
+        var zoneError = '';
+        if (_canManageSections(p)) {
+          try {
+            final roster = await rest.getMap('/table-sections');
+            zones = ((roster['sections'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((s) => _s(s, 'section', '').trim())
+                .where((s) => s.isNotEmpty)
+                .toList();
+          } catch (e) {
+            // Not swallowed into an empty roster: the floor still renders from
+            // the tables, and the banner says which half is missing.
+            zoneError = '$e';
+          }
+        }
+        // Only the NAMES are kept. Table and seat counts are derived from the
+        // rows rendered below, so a group header can never disagree with the
+        // tiles inside it.
+        return {'tables': tables, 'zones': zones, 'zone_error': zoneError};
+      },
+      builder: (context, data, reload) {
+        final rows = (data['tables'] as List?) ?? const [];
+        final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
+        final zoneError = _s(data, 'zone_error', '');
+        final occ = rows.where((r) => (r as Map)['occupied'] == true).length;
+        final res = rows.where((r) {
+          final m = r as Map;
+          return m['occupied'] != true && (m['reserved'] == true || m['booked'] == true);
+        }).length;
+        final free = rows.length - occ - res;
+        // A caller (an order notification's "Open T4") asked us to focus a table.
+        final focus = _focusOf(context, 'Tables');
+        final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
+        final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () => _addTable(
+              context,
+              rest,
+              reload,
+              // Zones already on the floor: the labels the loaded tables carry,
+              // plus the roster names (which is where an EMPTY zone lives — a
+              // brand-new zone is precisely the one you want to place a table
+              // into). De-duplicated case-insensitively, the way the backend
+              // resolves a zone. Placing a table in an existing zone still needs
+              // no sections permission.
+              sections: () {
+                final byKey = <String, String>{};
+                for (final r in rows) {
+                  final v = _s(r as Map, 'section', '').trim();
+                  if (v.isNotEmpty) byKey.putIfAbsent(v.toLowerCase(), () => v);
+                }
+                for (final z in zones) {
+                  final v = z.trim();
+                  if (v.isNotEmpty) byKey.putIfAbsent(v.toLowerCase(), () => v);
+                }
+                return byKey.values.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+              }(),
+            ),
+            icon: const Icon(Icons.add),
+            label: const Text('Add table'),
+          ),
+          // A restaurant with zones but no tables yet is a real state now that a
+          // zone can exist on its own — don't hide the roster behind "no tables".
+          body: rows.isEmpty && zones.isEmpty
+              ? _empty('No tables yet — add one with the button below.')
+              : SingleChildScrollView(
+                  padding: AppSpacing.pageNarrow,
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    if (focus != null)
+                      _focusBanner(
+                        context,
+                        found: focusFound,
+                        message: focusFound
+                            ? 'Highlighted $focusTable — tap it to manage the bill.'
+                            : '${focusTable ?? 'That table'} is not on this floor plan — it may have been removed, or belong to another outlet.',
+                      ),
+                    SectionHeader(
+                      title: 'Floor plan',
+                      count: rows.length,
+                      // Legend doubles as the occupancy read-out — tint + label,
+                      // never colour alone.
+                      trailing: Wrap(spacing: 6, runSpacing: 6, children: [
+                        StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
+                        StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
+                        StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
+                      ]),
+                    ),
+                    // Floor SECTIONS — create / rename / un-label, and drag a
+                    // table from one zone to another. See [_FloorSections].
+                    _FloorSections(
+                      rows: rows,
+                      zones: zones,
+                      zoneError: zoneError,
+                      rest: rest,
+                      profile: p,
+                      reload: reload,
+                      focusTable: focusTable,
+                    ),
+                  ]),
+                ),
+        );
+      },
+    );
+
+
+// ------------------------------------------------------- floor sections ----
+// A zone lives in TWO places and this view reads both. "Tables".section says
+// which zone each table sits in (a drag is one single-row `PATCH /table/:name
+// {section}`), and the ROSTER — `GET /table-sections` — records that the NAME
+// exists, which is the only place a zone with no tables in it can be. Reading
+// the tables alone was the app's gap: a zone created on the web stayed invisible
+// here until somebody dragged a table into it.
+//
+// So the writes are:
+//   POST   /table-sections        mint the name (a zone can now start empty)
+//   PATCH  /table-sections/:name  rename it
+//   DELETE /table-sections/:name  dissolve it (its tables become unassigned)
+//   PATCH  /table/:name {section} move ONE table between zones
+// Nothing here ever bulk-writes the floor, and nothing ever sends a field the
+// user didn't change: a PATCH that also carried capacity once stamped
+// max_capacity onto every table it touched.
+//
+// Both kinds of write are optimistic. The new grouping shows the instant a table
+// is dropped (or a zone is minted) and is rolled back only if the call fails.
+// The optimistic value is kept until the reloaded data agrees with it, so a
+// successful write never flickers back while the refresh is still in flight.
+
+/// Re-seating is ordinary floor work — the backend keeps a move onto an
+/// EXISTING label on the same `Table Added` gate the floor already holds.
+bool _canMoveTables(Profile p) => p.can(['table']);
+
+/// Minting, renaming or dissolving a zone is administration ("Manage Table
+/// Sections"). Admins keep everything, as everywhere else in this app.
+bool _canManageSections(Profile p) => p.isAdmin || p.can(['table section']);
+
+/// The floor grouped by section: a header per group with its table and seat
+/// counts, drag-and-drop between groups, and (for admins) create / rename /
+/// un-label. Every zone on the roster gets a group even when it holds nothing.
+/// "Unassigned" always renders LAST so no table is hidden behind a section it
+/// hasn't been given yet.
+class _FloorSections extends StatefulWidget {
+  final List rows;
+
+  /// Zone names off `GET /table-sections`. Empty for a user without the
+  /// sections permission (the roster is gated), who then sees only the zones
+  /// the tables themselves carry.
+  final List<String> zones;
+
+  /// Why the roster couldn't be read, '' when it was. Never silently empty:
+  /// a blank roster and a failed one look identical on screen otherwise.
+  final String zoneError;
+  final RestClient rest;
+  final Profile profile;
+  final VoidCallback reload;
+  final String? focusTable;
+  const _FloorSections({
+    required this.rows,
+    required this.zones,
+    required this.zoneError,
+    required this.rest,
+    required this.profile,
+    required this.reload,
+    this.focusTable,
+  });
+
+  @override
+  State<_FloorSections> createState() => _FloorSectionsState();
+}
+
+class _FloorSectionsState extends State<_FloorSections> {
+  /// table name (lower-cased) -> section, `null` meaning unassigned. Optimistic
+  /// only: an entry lives until the reloaded rows carry the same value.
+  final Map<String, String?> _pending = {};
+
+  /// The same bet, one level up: zone name (lower-cased) -> what that zone reads
+  /// as now — a new or renamed label, or `null` for one being dissolved. Keyed
+  /// case-insensitively because that is how the backend resolves a zone name.
+  final Map<String, String?> _zonePending = {};
+
+  @override
+  void didUpdateWidget(covariant _FloorSections old) {
+    super.didUpdateWidget(old);
+    // Drop every optimistic value the server has now confirmed; a build follows
+    // this callback, so no setState is needed (or allowed) here.
+    if (_pending.isNotEmpty) {
+      final live = <String, String?>{};
+      for (final r in widget.rows) {
+        final m = r as Map;
+        final s = _s(m, 'section', '').trim();
+        live[_s(m, 'table_name').toLowerCase()] = s.isEmpty ? null : s;
+      }
+      _pending.removeWhere((k, v) => live.containsKey(k) && live[k] == v);
+    }
+    if (_zonePending.isNotEmpty) {
+      final live = _serverZones();
+      // A dissolve is confirmed once the old name is gone; a create or rename
+      // once the NEW name is on the roster under its own key.
+      _zonePending.removeWhere((key, value) =>
+          value == null ? !live.containsKey(key) : live.containsKey(value.toLowerCase()));
+    }
+  }
+
+  /// Every zone the SERVER currently knows: the labels the tables carry, unioned
+  /// with the roster (the only place a zone with no tables exists). Keyed
+  /// case-insensitively so a stored "patio" and a table's "Patio" stay ONE zone
+  /// — the union the backend itself renders. Table labels win the casing, since
+  /// that is what the tiles below actually show.
+  Map<String, String> _serverZones() {
+    final out = <String, String>{};
+    for (final r in widget.rows) {
+      final s = _serverSection(r as Map);
+      if (s != null) out.putIfAbsent(s.toLowerCase(), () => s);
+    }
+    for (final z in widget.zones) {
+      final name = z.trim();
+      if (name.isNotEmpty) out.putIfAbsent(name.toLowerCase(), () => name);
+    }
+    return out;
+  }
+
+  /// The roster as it reads RIGHT NOW: the server's zones with any optimistic
+  /// rename/dissolve applied, plus zones minted in this session that the
+  /// reloaded roster hasn't caught up with yet.
+  Map<String, String> _zonesNow() {
+    final out = <String, String>{};
+    _serverZones().forEach((key, name) {
+      if (!_zonePending.containsKey(key)) {
+        out[key] = name;
+        return;
+      }
+      final next = _zonePending[key];
+      if (next != null) out[next.toLowerCase()] = next;
+    });
+    _zonePending.forEach((key, next) {
+      if (next != null) out.putIfAbsent(next.toLowerCase(), () => next);
+    });
+    return out;
+  }
+
+  /// Stages an optimistic zone change and hands back exactly what was there
+  /// before, so a failed call can put it back (see [_restoreZone]).
+  ({bool had, String? value}) _stageZone(String key, String? next) {
+    final prev = (had: _zonePending.containsKey(key), value: _zonePending[key]);
+    setState(() => _zonePending[key] = next);
+    return prev;
+  }
+
+  void _restoreZone(String key, ({bool had, String? value}) prev) {
+    setState(() {
+      if (prev.had) {
+        _zonePending[key] = prev.value;
+      } else {
+        _zonePending.remove(key);
+      }
+    });
+  }
+
+  String? _serverSection(Map t) {
+    final s = _s(t, 'section', '').trim();
+    return s.isEmpty ? null : s;
+  }
+
+  /// What this table's section reads as RIGHT NOW — the optimistic value while
+  /// one is in flight, otherwise the server's.
+  String? _sectionOf(Map t) {
+    final key = _s(t, 'table_name').toLowerCase();
+    return _pending.containsKey(key) ? _pending[key] : _serverSection(t);
+  }
+
+  Map<String, ({bool had, String? value})> _snapshot(List<Map> members) {
+    final snap = <String, ({bool had, String? value})>{};
+    for (final m in members) {
+      final key = _s(m, 'table_name').toLowerCase();
+      snap[key] = (had: _pending.containsKey(key), value: _sectionOf(m));
+    }
+    return snap;
+  }
+
+  void _restore(Map<String, ({bool had, String? value})> snap, {Set<String>? only}) {
+    setState(() {
+      snap.forEach((key, s) {
+        if (only != null && !only.contains(key)) return;
+        if (s.had) {
+          _pending[key] = s.value;
+        } else {
+          _pending.remove(key);
+        }
+      });
+    });
+  }
+
+  /// One PATCH per table, each carrying ONLY `section`. Tables that fail are
+  /// rolled back to exactly what they showed before; the rest keep the new
+  /// value. Returns the failures and the first error to report.
+  Future<({List<String> failed, String error})> _apply(List<Map> tables, String? section) async {
+    if (tables.isEmpty) return (failed: const <String>[], error: '');
+    final snap = _snapshot(tables);
+    setState(() {
+      for (final t in tables) {
+        _pending[_s(t, 'table_name').toLowerCase()] = section;
+      }
+    });
+    final failed = <String>[];
+    var error = '';
+    for (final t in tables) {
+      final name = _s(t, 'table_name');
+      if (name.isEmpty) continue;
+      try {
+        await widget.rest.patch('/table/${Uri.encodeComponent(name)}', {'section': section});
+      } catch (e) {
+        failed.add(name);
+        if (error.isEmpty) error = '$e';
+      }
+    }
+    if (mounted && failed.isNotEmpty) {
+      _restore(snap, only: failed.map((n) => n.toLowerCase()).toSet());
+    }
+    return (failed: failed, error: error);
+  }
+
+  Future<void> _move(Map table, String? section) async {
+    final name = _s(table, 'table_name');
+    if (name.isEmpty) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final res = await _apply([table], section);
+    if (!mounted) return;
+    if (res.failed.isEmpty) {
+      widget.reload();
+    } else {
+      messenger.showSnackBar(SnackBar(content: Text('Could not move $name — ${res.error}')));
+    }
+  }
+
+  /// Two steps, roster first: POST mints the NAME — which is what makes the zone
+  /// survive a reload and reach every other device even while it's empty — and
+  /// only then are the picked tables moved into it. Picking tables is optional;
+  /// an empty zone is a legitimate thing to create, and used to be impossible
+  /// here. If the POST fails nothing is moved, so no table is left carrying a
+  /// label the roster never accepted.
+  Future<void> _createSection(List<Map> all, List<String> existing) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final picked = await showDialog<({String name, List<String> tables})>(
+      context: context,
+      builder: (_) => _NewSectionDialog(tables: all, existing: existing, sectionOf: _sectionOf),
+    );
+    if (picked == null || !mounted) return;
+    final key = picked.name.toLowerCase();
+    final prev = _stageZone(key, picked.name);
+    try {
+      await widget.rest.post('/table-sections', {'name': picked.name});
+    } catch (e) {
+      if (!mounted) return;
+      _restoreZone(key, prev);
+      messenger.showSnackBar(SnackBar(content: Text('Could not create "${picked.name}" — $e')));
+      return;
+    }
+    final chosen = all.where((t) => picked.tables.contains(_s(t, 'table_name'))).toList();
+    final res = await _apply(chosen, picked.name);
+    if (!mounted) return;
+    widget.reload();
+    if (res.failed.isNotEmpty) {
+      messenger.showSnackBar(SnackBar(
+        content: Text('${picked.name}: ${res.failed.join(', ')} could not be moved — ${res.error}'),
+      ));
+    }
+  }
+
+  Future<void> _renameSection(String from, List<Map> members) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final raw = await _askText(context, 'Rename "$from"', 'Section name', initial: from);
+    final to = (raw ?? '').trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (to.isEmpty || to == from || !mounted) return;
+    // Both halves move together: the members' labels AND the roster entry, so an
+    // EMPTY zone (no members at all) still renames on screen.
+    final snap = _snapshot(members);
+    final key = from.toLowerCase();
+    final prev = _stageZone(key, to);
+    setState(() {
+      for (final m in members) {
+        _pending[_s(m, 'table_name').toLowerCase()] = to;
+      }
+    });
+    try {
+      await widget.rest.patch('/table-sections/${Uri.encodeComponent(from)}', {'name': to});
+      if (!mounted) return;
+      widget.reload();
+    } catch (e) {
+      if (!mounted) return;
+      _restore(snap);
+      _restoreZone(key, prev);
+      messenger.showSnackBar(SnackBar(content: Text('Could not rename "$from" — $e')));
+    }
+  }
+
+  /// Dissolves the zone: the name leaves the roster and its tables stop carrying
+  /// it. No table is ever deleted — they simply fall through to "Unassigned".
+  Future<void> _deleteSection(String name, List<Map> members) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await _confirm(
+      context,
+      'Remove section "$name"?',
+      members.isEmpty
+          ? 'Nothing is in it — removing it just takes the name off the floor plan.'
+          : 'The ${members.length} table${members.length == 1 ? '' : 's'} in it stay on the floor — they just stop carrying a section.',
+    );
+    if (!ok || !mounted) return;
+    final snap = _snapshot(members);
+    final key = name.toLowerCase();
+    final prev = _stageZone(key, null);
+    setState(() {
+      for (final m in members) {
+        _pending[_s(m, 'table_name').toLowerCase()] = null;
+      }
+    });
+    try {
+      await widget.rest.delete('/table-sections/${Uri.encodeComponent(name)}');
+      if (!mounted) return;
+      widget.reload();
+    } catch (e) {
+      if (!mounted) return;
+      _restore(snap);
+      _restoreZone(key, prev);
+      messenger.showSnackBar(SnackBar(content: Text('Could not remove "$name" — $e')));
+    }
+  }
+
+  Widget _tableTile(Map m, {required bool canMove, required bool touch}) {
+    final focused = widget.focusTable != null && _s(m, 'table_name') == widget.focusTable;
+    Widget box({required bool focus}) => _TableBox(
+          table: m,
+          rest: widget.rest,
+          profile: widget.profile,
+          reload: widget.reload,
+          focused: focus,
+        );
+    if (!canMove) return box(focus: focused);
+    // The dragged copy rides in the app overlay, outside any Scaffold, so it
+    // needs its own Material for the card's ink to have a surface.
+    final feedback = Material(
+      color: Colors.transparent,
+      child: Opacity(opacity: 0.9, child: box(focus: false)),
+    );
+    final placeholder = Opacity(opacity: 0.3, child: box(focus: false));
+    return touch
+        ? LongPressDraggable<Map>(
+            data: m, feedback: feedback, childWhenDragging: placeholder, child: box(focus: focused))
+        : Draggable<Map>(
+            data: m, feedback: feedback, childWhenDragging: placeholder, child: box(focus: focused));
+  }
+
+  /// One zone. [key] is the lower-cased identity used for grouping and drop
+  /// tests; [name] is the label as it should READ and as it must be WRITTEN back
+  /// (a table dropped into the roster's "Patio" gets "Patio", not "patio").
+  Widget _group(
+    BuildContext context,
+    String key,
+    String name,
+    List<Map> members, {
+    required bool canMove,
+    required bool canManage,
+    required bool touch,
+  }) {
+    final text = Theme.of(context).textTheme;
+    final label = key.isEmpty ? 'Unassigned' : name;
+    final seats = members.fold<int>(0, (a, m) => a + (_int(m['capacity']) ?? 0));
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpacing.md),
+      // The WHOLE group is the drop target, not just its header strip — a small
+      // strip is a miss waiting to happen with a 168px card under the cursor.
+      child: DragTarget<Map>(
+        onWillAcceptWithDetails: (d) => canMove && (_sectionOf(d.data) ?? '').toLowerCase() != key,
+        onAcceptWithDetails: (d) => _move(d.data, key.isEmpty ? null : name),
+        builder: (context, candidate, rejected) {
+          final hot = candidate.isNotEmpty;
+          return AnimatedContainer(
+            duration: AppDurations.fast,
+            curve: Curves.easeOut,
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 14),
+            decoration: BoxDecoration(
+              color: hot ? AppColors.tint(AppColors.copper) : AppColors.inset,
+              borderRadius: AppRadius.cardAll,
+              border: Border.all(
+                color: hot ? AppColors.copper : AppColors.border,
+                width: hot ? 2 : 1,
+              ),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Icon(key.isEmpty ? Icons.help_outline : Icons.dashboard_outlined,
+                    size: 15, color: hot ? AppColors.copperHi : AppColors.textSecondary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(label.toUpperCase(),
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.8,
+                            color: hot ? AppColors.copperHi : AppColors.textSecondary,
+                          )),
+                      // An empty zone is a real, saved zone — say so rather than
+                      // letting it read as a rendering accident.
+                      if (members.isEmpty && key.isNotEmpty)
+                        const StatusChip(label: 'Empty', color: AppColors.neutral, dense: true)
+                      else ...[
+                        InfoChip(
+                          icon: Icons.table_restaurant,
+                          label: '${members.length} ${members.length == 1 ? 'table' : 'tables'}',
+                        ),
+                        InfoChip(icon: Icons.event_seat_outlined, label: '$seats seats'),
+                      ],
+                      if (hot)
+                        Text('DROP TO MOVE HERE',
+                            style: text.labelSmall!.copyWith(color: AppColors.copperHi)),
+                    ],
+                  ),
+                ),
+                if (!hot && canManage && key.isNotEmpty) ...[
+                  const SizedBox(width: AppSpacing.sm),
+                  ForkIconButton(
+                    icon: Icons.drive_file_rename_outline,
+                    tooltip: 'Rename section',
+                    onPressed: () => _renameSection(name, members),
+                  ),
+                  ForkIconButton(
+                    icon: Icons.layers_clear_outlined,
+                    tooltip: 'Remove section (tables stay)',
+                    onPressed: () => _deleteSection(name, members),
+                  ),
+                ],
+              ]),
+              const SizedBox(height: AppSpacing.md),
+              if (members.isEmpty)
+                Text(
+                  canMove
+                      ? (touch
+                          ? 'Nothing here yet — long-press a table and drag it in.'
+                          : 'Nothing here yet — drag a table in.')
+                      : 'Nothing here yet.',
+                  style: text.bodySmall,
+                )
+              else
+                Wrap(spacing: 12, runSpacing: 12, children: [
+                  for (final m in members) _tableTile(m, canMove: canMove, touch: touch),
+                ]),
+            ]),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final all = widget.rows.map((r) => r as Map).toList();
+    // Grouped on the lower-cased name so a table labelled "Patio" lands in the
+    // roster's "patio" instead of splitting the floor into two look-alike zones.
+    final groups = <String, List<Map>>{};
+    final labels = <String, String>{};
+    for (final m in all) {
+      final s = _sectionOf(m);
+      final key = (s ?? '').toLowerCase();
+      groups.putIfAbsent(key, () => <Map>[]).add(m);
+      if (s != null) labels.putIfAbsent(key, () => s);
+    }
+    // Every zone on the roster gets a group even when nothing is in it. This is
+    // the whole point of reading the roster: an empty zone has no table to be
+    // inferred from, so before this it simply did not exist on this screen.
+    _zonesNow().forEach((key, name) {
+      groups.putIfAbsent(key, () => <Map>[]);
+      labels.putIfAbsent(key, () => name);
+    });
+    final named = groups.keys.where((k) => k.isNotEmpty).toList()..sort();
+    final ordered = <String>[...named, if (groups.containsKey('')) ''];
+    final canMove = _canMoveTables(widget.profile);
+    final canManage = _canManageSections(widget.profile);
+    final touch = switch (Theme.of(context).platform) {
+      TargetPlatform.android || TargetPlatform.iOS => true,
+      _ => false,
+    };
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const SizedBox(height: AppSpacing.lg),
+      SectionHeader(
+        title: 'Sections',
+        count: named.length,
+        padding: const EdgeInsets.only(bottom: 6),
+        trailing: canManage
+            ? ForkButton.ghost(
+                label: 'New section',
+                icon: Icons.add,
+                dense: true,
+                onPressed: () =>
+                    _createSection(all, [for (final k in named) labels[k] ?? k]),
+              )
+            : null,
+      ),
+      Text(
+        canMove
+            ? (touch
+                ? 'Long-press a table and drag it onto another section to move it.'
+                : 'Drag a table onto another section to move it.')
+            : 'Tables are grouped by their floor section.',
+        style: text.bodySmall,
+      ),
+      // The roster is half the picture — if it didn't load, say so instead of
+      // quietly showing only the zones that happen to have a table in them.
+      if (widget.zoneError.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.md),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+          decoration: BoxDecoration(
+            color: AppColors.tint(AppColors.warning),
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.edge(AppColors.warning)),
+          ),
+          child: Row(children: [
+            const Icon(Icons.warning_amber_outlined, size: 16, color: AppColors.warning),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Text(
+                'Section list unavailable — sections with no tables in them are missing from this floor plan. ${widget.zoneError}',
+                style: text.bodySmall!.copyWith(fontSize: 12, color: AppColors.warning),
+              ),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton.ghost(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: widget.reload),
+          ]),
+        ),
+      ],
+      const SizedBox(height: AppSpacing.md),
+      for (final key in ordered)
+        _group(context, key, labels[key] ?? key, groups[key] ?? const <Map>[],
+            canMove: canMove, canManage: canManage, touch: touch),
+    ]);
+  }
+}
+
+/// Names a new section and optionally picks the tables to start it with. The
+/// roster (`POST /table-sections`) records the NAME, so an empty zone is a real
+/// saved thing now — tables can be dragged in whenever the floor is ready.
+class _NewSectionDialog extends StatefulWidget {
+  final List<Map> tables;
+  final List<String> existing;
+  final String? Function(Map table) sectionOf;
+  const _NewSectionDialog({required this.tables, required this.existing, required this.sectionOf});
+
+  @override
+  State<_NewSectionDialog> createState() => _NewSectionDialogState();
+}
+
+class _NewSectionDialogState extends State<_NewSectionDialog> {
+  final _name = TextEditingController();
+  final Set<String> _picked = {};
+  String? _error;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final name = _name.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (name.isEmpty) {
+      setState(() => _error = 'Give the section a name.');
+      return;
+    }
+    // Cheap client-side echo of the server's own 409 — the POST is still the
+    // authority, this just saves a round-trip on the obvious case.
+    if (widget.existing.any((e) => e.toLowerCase() == name.toLowerCase())) {
+      setState(() => _error = '"$name" already exists — drag tables into it instead.');
+      return;
+    }
+    Navigator.pop(context, (name: name, tables: _picked.toList()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 400, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('FLOOR', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('New section', style: text.titleMedium),
+            const SizedBox(height: AppSpacing.lg),
+            TextField(
+              controller: _name,
+              autofocus: true,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(labelText: 'Section name (e.g. Terrace)', isDense: true),
+              onChanged: (_) {
+                if (_error != null) setState(() => _error = null);
+              },
+              onSubmitted: (_) => _submit(),
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Text(
+                widget.tables.isEmpty
+                    ? 'The section is saved on its own — add tables to the floor and drag them in whenever you like.'
+                    : 'Optionally start it with a few tables. Leave them all unticked to create an empty section and drag tables in later.',
+                style: text.bodySmall),
+            const SizedBox(height: AppSpacing.sm),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(children: [
+                  for (final t in widget.tables)
+                    Builder(builder: (_) {
+                      final name = _s(t, 'table_name');
+                      final current = widget.sectionOf(t);
+                      final seats = _seatsLabel(t);
+                      return CheckboxListTile(
+                        value: _picked.contains(name),
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        activeColor: AppColors.copper,
+                        onChanged: (v) => setState(() {
+                          if (v == true) {
+                            _picked.add(name);
+                          } else {
+                            _picked.remove(name);
+                          }
+                          _error = null;
+                        }),
+                        title: Text(name, style: text.titleSmall),
+                        subtitle: Text(
+                          '${seats.isEmpty ? 'No seat count' : seats} · ${current == null ? 'unassigned' : 'in $current'}',
+                          style: text.bodySmall,
+                        ),
+                      );
+                    }),
+                ]),
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+            ],
+            const SizedBox(height: AppSpacing.lg),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context)),
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton(label: 'Create section', icon: Icons.check, onPressed: _submit),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _TableBox extends StatelessWidget {
+  final Map table;
+  final RestClient rest;
+  final Profile profile;
+  final VoidCallback reload;
+  // True when a caller (e.g. a notification's "Open T4") asked for this table —
+  // draws the copper focus ring so the eye finds it in a full floor plan.
+  final bool focused;
+  const _TableBox({
+    required this.table,
+    required this.rest,
+    required this.profile,
+    required this.reload,
+    this.focused = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final name = _s(table, 'table_name');
+    // Only a physically seated table (is_occupied) is "Occupied". A table inside
+    // an active booking window (`booked`) or with an upcoming booking (`reserved`)
+    // reads "Reserved" — distinct from Occupied — and stays orderable/occupiable.
+    final occupied = table['occupied'] == true;
+    final reserved = table['reserved'] == true || table['booked'] == true;
+    final status = occupied ? 'Occupied' : (reserved ? 'Reserved' : 'Free');
+    // Design-system table states: Occupied = copper, Reserved = info, Free = neutral.
+    final stateColor = occupied ? AppColors.copper : (reserved ? AppColors.info : AppColors.neutral);
+    final apcStatus = _s(table, 'apc_status', 'neutral');
+    final covers = table['covers'];
+    // Per-table ordering OTP: only meaningful (and only sent) while require_table_otp
+    // is ON and the table is occupied. Read aloud to the guest so they can order.
+    final otp = _tableOtp(table);
+    final paymentPending = table['payment_pending'] == true;
+    final waiter = _s(table, 'waiter_name', '');
+    final hasWaiter = waiter.isNotEmpty && waiter != '—';
+    final hasTotal = occupied && (table['table_total'] ?? 0) != 0;
+    // Seat guide + the most it can take with extra chairs.
+    final seats = _seatsLabel(table);
+    // Part of a clubbed booking — the partner tables it is joined to.
+    final clubbedWith = _strList(table['clubbed_with']);
+    // APC traffic-light (green = meeting target, yellow = close, red = well
+    // below), kept as a labelled tick so status is never colour alone.
+    final apcTick = hasTotal && apcStatus != 'neutral'
+        ? TickTag(
+            apcStatus == 'green'
+                ? 'APC ok'
+                : apcStatus == 'yellow'
+                    ? 'APC close'
+                    : 'APC low',
+            color: apcStatus == 'green'
+                ? AppColors.success
+                : apcStatus == 'yellow'
+                    ? AppColors.warning
+                    : AppColors.danger,
+          )
+        : null;
+    return InkWell(
+      onTap: () => showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        backgroundColor: AppColors.surface,
+        builder: (_) => _TableSheet(rest: rest, profile: profile, table: table, reload: reload),
+      ),
+      borderRadius: AppRadius.cardAll,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        width: 168,
+        // Min height (not fixed) so an extra row (waiter + payment-pending) grows
+        // the card instead of overflowing the bottom.
+        constraints: const BoxConstraints(minHeight: 128),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          gradient: occupied || reserved ? null : AppColors.cardGradient,
+          color: occupied
+              ? Color.alphaBlend(AppColors.copper.withValues(alpha: 0.07), AppColors.card)
+              : reserved
+                  ? Color.alphaBlend(AppColors.info.withValues(alpha: 0.06), AppColors.card)
+                  : null,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(
+            color: focused
+                ? AppColors.copperHi
+                : occupied
+                    ? AppColors.copper.withValues(alpha: 0.55)
+                    : reserved
+                        ? AppColors.edge(AppColors.info)
+                        : AppColors.border,
+            width: focused ? 2 : 1,
+          ),
+          boxShadow: focused
+              ? [BoxShadow(color: AppColors.copperHi.withValues(alpha: 0.22), blurRadius: 26, spreadRadius: 1)]
+              : occupied
+                  ? [BoxShadow(color: AppColors.copper.withValues(alpha: 0.10), blurRadius: 24)]
+                  : null,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(children: [
+              Expanded(
+                child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
+              ),
+              if (paymentPending) const StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
+            ]),
+            const SizedBox(height: 8),
+            Row(children: [
+              AnimatedSwitcher(
+                duration: AppDurations.base,
+                switchInCurve: Curves.easeOut,
+                switchOutCurve: Curves.easeIn,
+                child: StatusChip(
+                    key: ValueKey('table-$name-$status'),
+                    label: status,
+                    color: stateColor,
+                    dense: true),
+              ),
+              if (apcTick != null) ...[const Spacer(), apcTick],
+            ]),
+            if (occupied && otp.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              // Copper-accented, kept prominent — staff read this aloud to guests.
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                decoration: BoxDecoration(
+                  color: AppColors.tint(AppColors.copper),
+                  borderRadius: BorderRadius.circular(7),
+                  border: Border.all(color: AppColors.edge(AppColors.copper)),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.lock_outline, size: 13, color: AppColors.copperHi),
+                  const SizedBox(width: 6),
+                  Text('OTP $otp',
+                      style: const TextStyle(
+                          fontSize: 13.5, fontWeight: FontWeight.w700, letterSpacing: 1.5, color: AppColors.copperHi)),
+                ]),
+              ),
+            ],
+            if (clubbedWith.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              // Clubbed for a large party — name the tables it is joined to so
+              // nobody pulls one half away. Ellipsised (the box is only 168 wide)
+              // with the full set on the tooltip.
+              Tooltip(
+                message: 'Clubbed with ${clubbedWith.join(' + ')}',
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: AppColors.tint(AppColors.copper),
+                    borderRadius: BorderRadius.circular(7),
+                    border: Border.all(color: AppColors.edge(AppColors.copper)),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.link, size: 13, color: AppColors.copperHi),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text('+ ${clubbedWith.join(' + ')}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 11.5, fontWeight: FontWeight.w700, color: AppColors.copperHi)),
+                    ),
+                  ]),
+                ),
+              ),
+            ],
+            if (seats.isNotEmpty || hasWaiter || (occupied && covers != null)) ...[
+              const SizedBox(height: 8),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                if (seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: seats),
+                if (occupied && covers != null) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
+                if (hasWaiter)
+                  InfoChip(
+                    icon: Icons.badge_outlined,
+                    label: waiter.length > 14 ? '${waiter.substring(0, 13)}…' : waiter,
+                  ),
+              ]),
+            ],
+            const SizedBox(height: 10),
+            if (paymentPending)
+              Text('Tap to approve payment',
+                  style: text.bodySmall!.copyWith(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.warning))
+            else if (hasTotal)
+              MicroStat(value: _money(table['table_total']), label: 'bill · apc ${_money(table['table_apc'])}')
+            else
+              Text('Tap to manage', style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom sheet for a table: its customer QR (printable) + seat / order /
+/// settle / release / delete actions.
+class _TableSheet extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  final Map table;
+  final VoidCallback reload;
+  const _TableSheet({required this.rest, required this.profile, required this.table, required this.reload});
+
+  @override
+  State<_TableSheet> createState() => _TableSheetState();
+}
+
+class _TableSheetState extends State<_TableSheet> {
+  Map? _bill;
+
+  String get _name => _s(widget.table, 'table_name');
+  // "4 seats · max 6" — the guide seat count and the most it takes with extra
+  // chairs (what the seating suggester sizes parties against).
+  String get _seats => _seatsLabel(widget.table);
+  // Partner tables when this one is half of a clubbed booking.
+  List<String> get _clubbedWith => _strList(widget.table['clubbed_with']);
+  // The ordering code to read out, or '' when the OTP gate is off.
+  String get _otp => _tableOtp(widget.table);
+  // Occupied == physically seated (is_occupied). A `booked` (active window) or
+  // `reserved` (upcoming) table is NOT occupied — it stays orderable, so the
+  // seat/occupy action still shows and the header labels it "Reserved".
+  bool get _occupied => widget.table['occupied'] == true;
+  bool get _reserved => widget.table['reserved'] == true || widget.table['booked'] == true;
+  String get _orderUrl {
+    final root = '${AppConfig.orderBaseUrl}/order/${widget.profile.restaurantUsername}';
+    // Opaque token hides + locks the table in the URL (preferred).
+    final token = _s(widget.table, 'qr_token', '');
+    if (token.isNotEmpty) return '$root?t=${Uri.encodeQueryComponent(token)}';
+    final sig = _s(widget.table, 'qr_sig', '');
+    final base = '$root?table=${Uri.encodeQueryComponent(_name)}';
+    return sig.isEmpty ? base : '$base&sig=${Uri.encodeQueryComponent(sig)}';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (_occupied) _loadBill();
+  }
+
+  Future<void> _loadBill() async {
+    try {
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (mounted && r is Map) setState(() => _bill = r);
+    } catch (_) {/* no bill yet */}
+  }
+
+  void _popAndReload() {
+    if (mounted) Navigator.of(context).pop();
+    widget.reload();
+  }
+
+  // Assign / change / remove the waiter responsible for this table.
+  Widget _waiterRow(ScaffoldMessengerState messenger) {
+    final waiter = _s(widget.table, 'waiter_name', '');
+    final assigned = waiter.isNotEmpty && waiter != '—';
+    return ForkCard(
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(children: [
+        const Icon(Icons.badge_outlined, size: 16, color: AppColors.textSecondary),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(assigned ? 'Waiter: $waiter' : 'No waiter assigned',
+              style: Theme.of(context).textTheme.bodyLarge, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ),
+        ForkButton.subtle(label: assigned ? 'Change' : 'Assign', onPressed: () => _assignWaiter(messenger)),
+        if (assigned) ...[
+          const SizedBox(width: 6),
+          ForkIconButton(
+            icon: Icons.close,
+            tooltip: 'Remove waiter',
+            onPressed: () => _removeWaiter(messenger),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  Future<void> _assignWaiter(ScaffoldMessengerState messenger) async {
+    List users;
+    try {
+      final m = await widget.rest.getMap('/restaurant/users');
+      users = (m['users'] as List?) ?? [];
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
+    }
+    if (!mounted) return;
+    final chosen = await showDialog<Map>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Assign waiter'),
+        children: [
+          for (final u in users)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, u as Map),
+              child: ListTile(
+                dense: true,
+                leading: const Icon(Icons.badge),
+                title: Text('${_s(u, 'emp_Fname')} ${_s(u, 'emp_Lname', '')}'.trim()),
+                subtitle: Text('@${_s(u, 'employee_Username')} · ${_s(u, 'role', 'staff')}'),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null) return;
+    final id = '${chosen['employee_id'] ?? chosen['id'] ?? ''}';
+    try {
+      await widget.rest.post('/table-assignments/assign', {'table_name': _name, 'employeeId': id});
+      setState(() {
+        widget.table['waiter_name'] = '${_s(chosen, 'emp_Fname')} ${_s(chosen, 'emp_Lname', '')}'.trim();
+        widget.table['waiter_id'] = id;
+      });
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _removeWaiter(ScaffoldMessengerState messenger) async {
+    try {
+      await widget.rest.post('/table-assignments/unassign', {'table_name': _name});
+      setState(() {
+        widget.table.remove('waiter_name');
+        widget.table.remove('waiter_id');
+      });
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // APC traffic-light + push suggestions for the current table.
+  Widget _apcInsight() {
+    final status = _s(_bill!, 'apc_status', 'neutral');
+    if (status == 'neutral') return const SizedBox.shrink();
+    final text = Theme.of(context).textTheme;
+    if (status == 'green') {
+      return Container(
+        margin: const EdgeInsets.only(top: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: AppColors.tint(AppColors.success),
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.edge(AppColors.success)),
+        ),
+        child: Row(children: [
+          const Icon(Icons.check_circle_outline, color: AppColors.success, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('On target — great APC for this table.',
+                style: text.titleSmall!.copyWith(color: AppColors.success)),
+          ),
+        ]),
+      );
+    }
+    final c = status == 'red' ? AppColors.danger : AppColors.warning;
+    final suggestions = (_bill!['apc_suggestions'] as List?) ?? [];
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.tint(c),
+        borderRadius: AppRadius.cardAll,
+        border: Border.all(color: AppColors.edge(c)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(status == 'red' ? Icons.trending_down : Icons.lightbulb_outline, color: c, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(status == 'red' ? 'Below target — push to upsell' : 'Close to target — suggest more',
+                style: text.titleSmall!.copyWith(color: c)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        if (suggestions.isEmpty)
+          Text('Suggest a dessert or a drink to lift the bill.', style: text.bodySmall)
+        else
+          ...suggestions.map((s) => Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text('• $s', style: text.bodySmall),
+              )),
+      ]),
+    );
+  }
+
+  // Shown when a customer has paid from the QR page and is awaiting staff
+  // approval. Staff review the uploaded screenshot, then approve & close.
+  Widget _paymentReview(ScaffoldMessengerState messenger) {
+    final method = _s(_bill!, 'payment_method');
+    final shot = _s(_bill!, 'screenshot_url');
+    // Only treat it as a screenshot if it's a real image URL — methods that don't
+    // require proof (Cash/UPI/Card/…) have no screenshot, so don't show the box.
+    final hasShot = shot.startsWith('http');
+    final text = Theme.of(context).textTheme;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.tint(AppColors.warning),
+        borderRadius: AppRadius.cardAll,
+        border: Border.all(color: AppColors.edge(AppColors.warning)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          const Icon(Icons.notifications_active_outlined, color: AppColors.warning, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('Customer paid via ${method.isEmpty ? 'unknown method' : method} — review & approve',
+                style: text.titleSmall),
+          ),
+        ]),
+        if (hasShot) ...[
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: () => _viewImage(shot),
+            child: ClipRRect(
+              borderRadius: AppRadius.controlAll,
+              child: Image.network(shot, height: 160, fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => const Padding(
+                      padding: EdgeInsets.all(8), child: Text('Could not load screenshot'))),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text('Tap to enlarge', style: text.bodySmall!.copyWith(fontSize: 11)),
+        ],
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: 'Approve payment & close',
+            icon: Icons.check_circle_outline,
+            onPressed: () => _approveAndClose(messenger),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  bool get _isAdmin => widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin');
+
+  // Server-side thermal reprint (optionally without service charge).
+  Future<void> _thermalPrint(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
+    try {
+      await widget.rest.post('/print/bill', {'table_name': _name, if (noServiceCharge) 'no_service_charge': true});
+      messenger.showSnackBar(SnackBar(content: Text(noServiceCharge ? 'Reprinting without service charge…' : 'Printing bill…')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Fetch the current bill and show a receipt-style preview before anything is
+  // sent to the thermal printer. "Print" in the dialog fires the same
+  // server-side /print/bill call as before; "Cancel" prints nothing.
+  Future<void> _previewBill(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
+    Map? bill;
+    try {
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) bill = r;
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
+    }
+    if (bill == null || ((bill['items'] as List?) ?? const []).isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No open bill to print for this table.')));
+      return;
+    }
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => _BillPreviewDialog(
+        bill: bill!,
+        restaurantName: widget.profile.restaurantName,
+        tableName: _name,
+        noServiceCharge: noServiceCharge,
+      ),
+    );
+    if (confirmed == true) {
+      await _thermalPrint(messenger, noServiceCharge: noServiceCharge);
+    }
+  }
+
+  Future<void> _removeBillItem(ScaffoldMessengerState messenger, String name, double price) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove item?'),
+        content: Text('Remove "$name" from this table\'s bill?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await widget.rest.post('/bills/remove-item', {'table_name': _name, 'item_name': name, 'price': price});
+      messenger.showSnackBar(SnackBar(content: Text('Removed $name.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _moveBillItem(ScaffoldMessengerState messenger, String name, double price) async {
+    // Pick a destination table (any other table).
+    List tables = const [];
+    try { tables = await widget.rest.getList('/get-tables'); } catch (_) {}
+    final others = tables.map((t) => _s(t as Map, 'table_name')).where((n) => n.isNotEmpty && n != _name).toList();
+    if (others.isEmpty) { messenger.showSnackBar(const SnackBar(content: Text('No other tables available.'))); return; }
+    if (!mounted) return;
+    final dest = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('Move "$name" to…'),
+        children: [
+          for (final n in others)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, n),
+              child: Text('Table $n'),
+            ),
+        ],
+      ),
+    );
+    if (dest == null || dest.isEmpty) return;
+    try {
+      await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
+      messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Add / edit / clear the kitchen note on a bill item, at any time (any staff).
+  Future<void> _editBillItemNote(ScaffoldMessengerState messenger, String name, double price, String current) async {
+    final ctrl = TextEditingController(text: current);
+    final note = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Note for $name'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          minLines: 1,
+          maxLines: 3,
+          decoration: const InputDecoration(hintText: 'e.g. no onions, extra spicy…', border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('Save')),
+        ],
+      ),
+    );
+    if (note == null) return;
+    try {
+      await widget.rest.post('/bills/item-note', {'table_name': _name, 'item_name': name, 'price': price, 'note': note});
+      messenger.showSnackBar(SnackBar(content: Text(note.isEmpty ? 'Note cleared.' : 'Note saved.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Numeric bill field as a double (0 when missing).
+  double _bn(String k) => (num.tryParse('${_bill?[k] ?? 0}') ?? 0).toDouble();
+
+  // Apply, edit, or clear a percentage/flat discount on the table's open bill.
+  Future<void> _setDiscount(ScaffoldMessengerState messenger) async {
+    String type = _s(_bill!, 'discount_type').isEmpty ? 'percent' : _s(_bill!, 'discount_type');
+    final ctrl = TextEditingController(text: _bn('discount_value') > 0 ? _bn('discount_value').toString() : '');
+    final ok = await showDialog<bool?>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Apply discount'),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'percent', label: Text('% off')),
+                ButtonSegment(value: 'flat', label: Text('Flat')),
+              ],
+              selected: {type},
+              onSelectionChanged: (s) => setLocal(() => type = s.first),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: InputDecoration(
+                labelText: type == 'percent' ? 'Percent off (0–100)' : 'Amount off',
+                border: const OutlineInputBorder(),
+              ),
+            ),
+          ]),
+          actions: [
+            if (_bn('discount') > 0)
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Remove', style: TextStyle(color: AppColors.danger)),
+              ),
+            TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Apply')),
+          ],
+        ),
+      ),
+    );
+    if (ok == null) return; // cancelled
+    final value = ok ? (double.tryParse(ctrl.text.trim()) ?? 0) : 0;
+    try {
+      final res = await widget.rest.post('/bills/discount', {'table_name': _name, 'type': type, 'value': value});
+      // Above the restaurant's approval threshold: parked for a manager instead
+      // of applying — tell the waiter what happened.
+      final pending = res is Map && res['pending'] == true;
+      messenger.showSnackBar(SnackBar(
+          content: Text(pending
+              ? 'Discount sent for manager approval — it will apply once approved.'
+              : value > 0
+                  ? 'Discount applied.'
+                  : 'Discount removed.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Apply a coupon code to the table's bill (validated + applied server-side).
+  Future<void> _applyCoupon(ScaffoldMessengerState messenger) async {
+    final ctrl = TextEditingController(text: _s(_bill!, 'coupon_code'));
+    final code = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Apply coupon'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          textCapitalization: TextCapitalization.characters,
+          decoration: const InputDecoration(labelText: 'Coupon code', hintText: 'e.g. SAVE10', border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('Apply')),
+        ],
+      ),
+    );
+    if (code == null || code.isEmpty) return;
+    try {
+      final res = await widget.rest.post('/bills/apply-coupon', {'table_name': _name, 'code': code});
+      final disc = res is Map ? _money(res['discount']) : '';
+      messenger.showSnackBar(SnackBar(content: Text('Coupon applied — $disc off.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Even split: divide the total payable N ways and show each share.
+  Future<void> _splitBill(ScaffoldMessengerState messenger) async {
+    final ctrl = TextEditingController(text: '2');
+    final n = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Split bill evenly'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(labelText: 'Number of ways', border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, int.tryParse(ctrl.text.trim()) ?? 0), child: const Text('Split')),
+        ],
+      ),
+    );
+    if (n == null || n < 2) return;
+    try {
+      final res = await widget.rest.post('/bills/split', {'table_name': _name, 'mode': 'even', 'parts': n});
+      if (res is! Map) return;
+      final parts = (res['parts'] as List?) ?? const [];
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('Split $n ways · ${_money(res['grand_total'])}'),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            for (final p in parts)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(children: [
+                  Expanded(child: Text(_s(p as Map, 'label'))),
+                  Text(_money(p['total']), style: const TextStyle(fontWeight: FontWeight.bold)),
+                ]),
+              ),
+          ]),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Done'))],
+        ),
+      );
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Merge another occupied table's orders into this one (combine checks).
+  Future<void> _mergeBill(ScaffoldMessengerState messenger) async {
+    List tables = const [];
+    try { tables = await widget.rest.getList('/get-tables'); } catch (_) {}
+    final others = tables.where((t) {
+      final m = t as Map;
+      final n = _s(m, 'table_name');
+      final occ = m['occupied'] == true || m['is_occupied'] == true;
+      return n.isNotEmpty && n != _name && occ;
+    }).map((t) => _s(t as Map, 'table_name')).toList();
+    if (others.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No other occupied tables to merge.')));
+      return;
+    }
+    if (!mounted) return;
+    final src = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('Merge which table into $_name?'),
+        children: [
+          for (final n in others)
+            SimpleDialogOption(onPressed: () => Navigator.pop(ctx, n), child: Text('Table $n')),
+        ],
+      ),
+    );
+    if (src == null || src.isEmpty) return;
+    try {
+      await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
+      messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Refund the most recent settled bill for this table (admin only).
+  Future<void> _refundBill(ScaffoldMessengerState messenger) async {
+    final reasonCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Refund last settled bill?'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('Refunds the most recent settled bill for this table. This cannot be undone.'),
+          const SizedBox(height: 12),
+          TextField(controller: reasonCtrl, decoration: const InputDecoration(labelText: 'Reason (optional)', border: OutlineInputBorder())),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
+            child: const Text('Refund'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final res = await widget.rest.post('/bills/refund', {
+        'table_name': _name,
+        if (reasonCtrl.text.trim().isNotEmpty) 'reason': reasonCtrl.text.trim(),
+      });
+      final gw = res is Map ? '${res['gateway']}' : '';
+      final amt = res is Map ? _money(res['amount']) : '';
+      final note = gw == 'manual'
+          ? ' — process the Razorpay refund from your dashboard'
+          : gw == 'failed'
+              ? ' — gateway refund failed, process it manually'
+              : '';
+      messenger.showSnackBar(SnackBar(content: Text('Refunded $amt$note.')));
+      await _loadBill();
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _approveAndClose(ScaffoldMessengerState messenger) async {
+    final orderIds = (_bill?['order_ids'] as List?) ?? [];
+    if (orderIds.isEmpty) return;
+    final oid = '${orderIds.first}';
+    try {
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      await widget.rest.post('/bills/order/$oid/close');
+      messenger.showSnackBar(const SnackBar(content: Text('Payment approved — table freed.')));
+      _popAndReload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  void _viewImage(String url) {
+    showDialog<void>(
+      context: context,
+      builder: (_) => Dialog(
+        child: InteractiveViewer(child: Image.network(url)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final messenger = ScaffoldMessenger.of(context);
+    final text = Theme.of(context).textTheme;
+    final items = _occupied && _bill != null ? ((_bill!['items'] as List?) ?? const []) : const [];
+
+    // Bill-math line: quiet label left, right-aligned amount.
+    Widget billRow(String k, String v) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 3),
+          child: Row(children: [
+            Expanded(child: Text(k, style: text.bodyMedium)),
+            Text(v, style: text.titleSmall),
+          ]),
+        );
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: [
+              Expanded(child: Text('Table $_name', style: text.headlineMedium)),
+              StatusChip(
+                label: _occupied ? 'Occupied' : (_reserved ? 'Reserved' : 'Free'),
+                color: _occupied ? AppColors.copper : (_reserved ? AppColors.info : AppColors.neutral),
+              ),
+            ]),
+            const SizedBox(height: 10),
+            Wrap(spacing: 6, runSpacing: 6, children: [
+              if (_seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: _seats),
+              if (_clubbedWith.isNotEmpty)
+                InfoChip(icon: Icons.link, label: 'Clubbed with ${_clubbedWith.join(' + ')}'),
+            ]),
+            const SizedBox(height: 16),
+            Center(
+              child: Column(children: [
+                // Deliberately paper-white: the QR mirrors the printed sheet and
+                // must stay high-contrast for scanners.
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
+                  child: QrImageView(data: _orderUrl, size: 170),
+                ),
+                const SizedBox(height: 8),
+                Text('Customers scan to order & pay', style: text.bodySmall),
+                // The code the guest must type after scanning. Shown ONLY while
+                // the require-table-OTP setting is on (see [_tableOtp]) — with
+                // the gate off there is no code to read out and the row is gone
+                // entirely rather than showing a stale or empty one.
+                if (_otp.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: AppColors.tint(AppColors.copper),
+                      borderRadius: AppRadius.controlAll,
+                      border: Border.all(color: AppColors.edge(AppColors.copper)),
+                    ),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const Icon(Icons.lock_outline, size: 14, color: AppColors.copperHi),
+                      const SizedBox(width: 7),
+                      Text('OTP $_otp',
+                          style: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 2,
+                              color: AppColors.copperHi)),
+                    ]),
+                  ),
+                  const SizedBox(height: 4),
+                  Text('Read this out — guests enter it before they can order',
+                      style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+                ],
+                const SizedBox(height: 4),
+                SelectableText(_orderUrl,
+                    textAlign: TextAlign.center,
+                    style: text.bodySmall!.copyWith(fontSize: 10.5, color: AppColors.textTertiary)),
+                const SizedBox(height: 10),
+                ForkButton.ghost(
+                  label: 'Print QR',
+                  icon: Icons.print,
+                  dense: true,
+                  onPressed: () => _printTableQr(_name, _orderUrl),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 20),
+            _waiterRow(messenger),
+            if (_occupied && _bill != null) ...[
+              if (items.isNotEmpty) ...[
+                const SizedBox(height: 20),
+                SectionHeader(title: 'Orders', count: items.length),
+                ...items.map((it) {
+                  final m = it as Map;
+                  final qty = num.tryParse('${m['quantity'] ?? 1}') ?? 1;
+                  final price = num.tryParse('${m['price'] ?? 0}') ?? 0;
+                  final name = _s(m, 'name');
+                  final note = _s(m, 'note', '');
+                  final hasNote = note.isNotEmpty;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: ForkCard(
+                      inset: true,
+                      padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
+                      child: Row(children: [
+                        Expanded(
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text('${qty.toInt()} × $name', style: text.titleSmall),
+                            if (hasNote)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 3),
+                                child: Row(children: [
+                                  const Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
+                                  const SizedBox(width: 5),
+                                  Expanded(
+                                    child: Text(note,
+                                        style: text.bodySmall!
+                                            .copyWith(fontSize: 11, fontStyle: FontStyle.italic)),
+                                  ),
+                                ]),
+                              ),
+                          ]),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(_money(price * qty), style: text.titleSmall),
+                        // Any staff can add/edit a kitchen note on an item, anytime.
+                        IconButton(
+                          icon: Icon(Icons.sticky_note_2_outlined, size: 18,
+                              color: hasNote ? AppColors.copperHi : AppColors.textSecondary),
+                          tooltip: hasNote ? 'Edit note' : 'Add note',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => _editBillItemNote(messenger, name, price.toDouble(), note),
+                        ),
+                        // Admin can fix wrongly-added / wrong-table items.
+                        if (_isAdmin)
+                          PopupMenuButton<String>(
+                            icon: const Icon(Icons.more_vert, size: 18),
+                            tooltip: 'Edit item',
+                            onSelected: (v) {
+                              if (v == 'remove') _removeBillItem(messenger, name, price.toDouble());
+                              if (v == 'move') _moveBillItem(messenger, name, price.toDouble());
+                            },
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: 'remove', child: Text('Remove from bill')),
+                              PopupMenuItem(value: 'move', child: Text('Move to another table')),
+                            ],
+                          ),
+                      ]),
+                    ),
+                  );
+                }),
+              ],
+              const SizedBox(height: 12),
+              const SectionHeader(title: 'Bill'),
+              ForkCard(
+                inset: true,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  billRow('Subtotal', _money(_bill!['subtotal'] ?? _bill!['total_amt'])),
+                  if (_bn('discount') > 0)
+                    billRow('Discount${_s(_bill!, 'discount_type') == 'percent' ? ' (${_bn('discount_value').toStringAsFixed(_bn('discount_value') % 1 == 0 ? 0 : 1)}%)' : ''}', '− ${_money(_bill!['discount'])}'),
+                  if (_bn('service_charge') > 0) billRow('Service charge', _money(_bill!['service_charge'])),
+                  if (_bn('tax_total') > 0) billRow('Tax', _money(_bill!['tax_total'])),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Divider(),
+                  ),
+                  Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    Expanded(child: Text('TOTAL PAYABLE', style: text.labelSmall)),
+                    Text(_money(_bill!['grand_total'] ?? _bill!['total_amt']), style: text.displaySmall),
+                  ]),
+                  const SizedBox(height: 14),
+                  Row(children: [
+                    MicroStat(value: '${_bill!['covers'] ?? '—'}', label: 'covers'),
+                    const SizedBox(width: 24),
+                    MicroStat(value: _money(_bill!['apc']), label: 'apc'),
+                    if ((_bill!['target_apc'] ?? 0) != 0) ...[
+                      const SizedBox(width: 24),
+                      MicroStat(value: _money(_bill!['target_apc']), label: 'target apc'),
+                    ],
+                  ]),
+                ]),
+              ),
+              _apcInsight(),
+              const SizedBox(height: 14),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                ForkButton.ghost(
+                  // Preview the receipt first, then print via the server (unified
+                  // ESC/POS format → thermal printer agent), matching the web bill.
+                  label: 'Print bill',
+                  icon: Icons.receipt_long,
+                  dense: true,
+                  onPressed: () => _previewBill(messenger),
+                ),
+                ForkButton.ghost(
+                  label: 'Reprint (no service charge)',
+                  icon: Icons.money_off,
+                  dense: true,
+                  onPressed: () => _previewBill(messenger, noServiceCharge: true),
+                ),
+                ForkButton.ghost(
+                  label: _bn('discount') > 0 ? 'Edit discount' : 'Discount',
+                  icon: Icons.percent,
+                  dense: true,
+                  onPressed: () => _setDiscount(messenger),
+                ),
+                ForkButton.ghost(
+                  label: _s(_bill!, 'coupon_code').isNotEmpty ? 'Coupon: ${_s(_bill!, 'coupon_code')}' : 'Coupon',
+                  icon: Icons.local_offer,
+                  dense: true,
+                  onPressed: () => _applyCoupon(messenger),
+                ),
+                ForkButton.ghost(
+                  label: 'Split',
+                  icon: Icons.call_split,
+                  dense: true,
+                  onPressed: () => _splitBill(messenger),
+                ),
+                ForkButton.ghost(
+                  label: 'Merge',
+                  icon: Icons.merge_type,
+                  dense: true,
+                  onPressed: () => _mergeBill(messenger),
+                ),
+                if (_isAdmin)
+                  ForkButton.ghost(
+                    label: 'Refund',
+                    icon: Icons.undo,
+                    dense: true,
+                    onPressed: () => _refundBill(messenger),
+                  ),
+              ]),
+              const SizedBox(height: 12),
+              if (_bill!['payment_status'] == 'pending_approval') _paymentReview(messenger),
+            ],
+            const SizedBox(height: 20),
+            const SectionHeader(title: 'Actions'),
+            if (!_occupied)
+              Center(
+                child: ForkButton(
+                  label: 'Seat guests & take order',
+                  icon: Icons.event_seat,
+                  onPressed: () => _seat(messenger),
+                ),
+              )
+            else ...[
+              Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
+                ForkButton.ghost(
+                  label: 'Add order',
+                  icon: Icons.add,
+                  onPressed: _addOrder,
+                ),
+                ForkButton(
+                  label: 'Settle bill',
+                  icon: Icons.payments,
+                  onPressed: () => _settle(messenger),
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Center(
+                child: ForkButton.ghost(
+                  label: 'Release without payment',
+                  icon: Icons.logout,
+                  onPressed: () => _release(messenger),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            Center(
+              child: ForkButton.ghost(
+                label: 'Edit seating',
+                icon: Icons.event_seat_outlined,
+                dense: true,
+                onPressed: () => _editSeating(messenger),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Center(
+              child: TextButton.icon(
+                onPressed: () => _delete(messenger),
+                icon: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger),
+                label: const Text('Delete table',
+                    style: TextStyle(color: AppColors.danger, fontSize: 12.5, fontWeight: FontWeight.w600)),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // Change the seat count and the MAX this table can take with extra chairs.
+  // The max is what the seating suggester sizes parties against.
+  Future<void> _editSeating(ScaffoldMessengerState messenger) async {
+    final seats = await showDialog<_TableSeating>(
+      context: context,
+      builder: (_) => _TableSeatingDialog(existing: widget.table),
+    );
+    if (seats == null) return;
+    try {
+      final res = await widget.rest.patch('/table/${Uri.encodeComponent(_name)}', {
+        'capacity': seats.capacity,
+        'max_capacity': seats.maxCapacity,
+      });
+      // Keep the open sheet honest without waiting for the list to refetch.
+      if (mounted) {
+        setState(() {
+          widget.table['capacity'] = res is Map ? (res['capacity'] ?? seats.capacity) : seats.capacity;
+          widget.table['max_capacity'] =
+              res is Map ? (res['max_capacity'] ?? seats.maxCapacity) : seats.maxCapacity;
+        });
+      }
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _seat(ScaffoldMessengerState messenger) async {
+    final covers = await _askCovers(context);
+    if (covers == null) return;
+    try {
+      await widget.rest.post('/occupy-table', {'table_name': _name, 'num_covers': covers});
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => OrderEntryScreen(rest: widget.rest, tableName: _name)),
+      );
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _addOrder() async {
+    Navigator.of(context).pop();
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => OrderEntryScreen(rest: widget.rest, tableName: _name)),
+    );
+    widget.reload();
+  }
+
+  Future<void> _settle(ScaffoldMessengerState messenger) async {
+    final orderIds = (_bill?['order_ids'] as List?) ?? [];
+    if (orderIds.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No orders to settle on this table.')));
+      return;
+    }
+    final done = await showDialog<bool>(
+      context: context,
+      builder: (_) => _SettleDialog(rest: widget.rest, orderId: '${orderIds.first}', totalText: _money(_bill?['grand_total'] ?? _bill?['total_amt'])),
+    );
+    if (done == true) _popAndReload();
+  }
+
+  Future<void> _release(ScaffoldMessengerState messenger) async {
+    try {
+      await widget.rest.post('/release-table', {'table_name': _name});
+      _popAndReload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _delete(ScaffoldMessengerState messenger) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete table $_name?'),
+        content: const Text('This removes the table from the floor.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await widget.rest.delete('/table/${Uri.encodeComponent(_name)}');
+      _popAndReload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+}
+
+/// Receipt-style preview of a table's bill, shown before it is sent to the
+/// thermal printer. Renders the same data web/Flutter already display
+/// (/bill-for-table). Returns `true` from the dialog when the user taps Print.
+class _BillPreviewDialog extends StatelessWidget {
+  final Map bill;
+  final String restaurantName;
+  final String tableName;
+  final bool noServiceCharge;
+  const _BillPreviewDialog({
+    required this.bill,
+    required this.restaurantName,
+    required this.tableName,
+    required this.noServiceCharge,
+  });
+
+  static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+  static double _round2(double v) => (v * 100).roundToDouble() / 100;
+
+  // A single receipt line: label on the left, amount right-aligned. Layout does
+  // the aligning (no monospace font needed, so it looks right on every platform).
+  Widget _row(String left, String right, {bool bold = false, Color? color}) {
+    final style = TextStyle(fontSize: 13, height: 1.3, color: color, fontWeight: bold ? FontWeight.bold : FontWeight.normal);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1.5),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Expanded(child: Text(left, style: style)),
+        const SizedBox(width: 12),
+        Text(right, style: style, textAlign: TextAlign.right),
+      ]),
+    );
+  }
+
+  // Hairline rule for the paper receipt (theme dividers are white-on-dark and
+  // would vanish on the paper-white artifact).
+  static Widget get _paperRule => Container(
+        margin: const EdgeInsets.symmetric(vertical: 8),
+        height: 1,
+        color: const Color(0x22000000),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    // PAPER ARTIFACT: the receipt body deliberately stays white with black
+    // ink — it mirrors what the thermal printer produces. Only the dialog
+    // chrome around it is dark.
+    const inkFaint = Colors.black54;
+    final items = (bill['items'] as List?) ?? const [];
+    final subtotal = _n(bill['subtotal'] ?? bill['total_amt']);
+    final discount = _n(bill['discount']);
+    final discountedBase = _round2((subtotal - discount).clamp(0, double.infinity).toDouble());
+    // When reprinting without service charge, recompute the charges the way the
+    // backend does (taxes are levied on discounted base + service charge) so the
+    // preview matches what the printer will produce.
+    final serviceCharge = noServiceCharge ? 0.0 : _n(bill['service_charge']);
+    final rawTaxes = (bill['taxes'] as List?) ?? const [];
+    final taxBase = _round2(discountedBase + serviceCharge);
+    final taxes = noServiceCharge
+        ? rawTaxes.map((t) {
+            final m = t as Map;
+            final pct = _n(m['percentage']);
+            return {'name': _s(m, 'name', 'Tax'), 'percentage': pct, 'amount': _round2(taxBase * pct / 100)};
+          }).toList()
+        : rawTaxes;
+    final taxTotal = taxes.fold<double>(0, (s, t) => s + _n((t as Map)['amount']));
+    final grandTotal = noServiceCharge
+        ? _round2(taxBase + taxTotal)
+        : _n(bill['grand_total'] ?? bill['total_amt']);
+    final covers = bill['covers'];
+    final billNo = _s(bill, 'bill_no', '');
+    final customer = _s(bill, 'customer', '');
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 380,
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const SectionHeader(title: 'Bill preview'),
+          Flexible(
+            child: Container(
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: SingleChildScrollView(
+                child: DefaultTextStyle(
+                  style: const TextStyle(fontSize: 13, height: 1.3, color: Colors.black87),
+                  child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    // Header — restaurant + table + optional bill no / customer.
+                    Center(
+                      child: Text(restaurantName,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
+                    ),
+                    const SizedBox(height: 2),
+                    Center(
+                      child: Text(
+                        [
+                          'Table $tableName',
+                          if (covers != null) '$covers cover(s)',
+                          if (billNo.isNotEmpty) 'Bill #$billNo',
+                        ].join('  ·  '),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 12, color: inkFaint),
+                      ),
+                    ),
+                    if (customer.isNotEmpty)
+                      Center(
+                          child: Text(customer,
+                              textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: inkFaint))),
+                    _paperRule,
+                    // Item lines: "name ×qty" on the left, line amount on the right.
+                    ...items.map((it) {
+                      final m = it as Map;
+                      final qty = _n(m['quantity'] ?? 1);
+                      final price = _n(m['price']);
+                      final name = _s(m, 'name');
+                      final note = _s(m, 'note', '');
+                      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        _row('$name  ×${qty % 1 == 0 ? qty.toInt() : qty}', _money(_round2(price * qty))),
+                        if (note.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 8, bottom: 2),
+                            child: Text(note,
+                                style: const TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: inkFaint)),
+                          ),
+                      ]);
+                    }),
+                    _paperRule,
+                    _row('Subtotal', _money(subtotal)),
+                    if (discount > 0) _row('Discount', '− ${_money(discount)}'),
+                    if (serviceCharge > 0) _row('Service charge', _money(serviceCharge)),
+                    ...taxes.map((t) {
+                      final m = t as Map;
+                      final pct = _n(m['percentage']);
+                      final label = pct > 0 ? '${_s(m, 'name', 'Tax')} (${pct % 1 == 0 ? pct.toInt() : pct}%)' : _s(m, 'name', 'Tax');
+                      return _row(label, _money(_n(m['amount'])));
+                    }),
+                    _paperRule,
+                    _row('Grand total', _money(grandTotal), bold: true),
+                    if (noServiceCharge)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8),
+                        child: Text('Service charge excluded from this reprint.',
+                            style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: inkFaint)),
+                      ),
+                  ]),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
+            const SizedBox(width: 8),
+            ForkButton(
+              label: 'Print',
+              icon: Icons.print,
+              onPressed: () => Navigator.pop(context, true),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+}
+
+Future<bool> _confirm(BuildContext context, String title, String message) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(title),
+      content: Text(message),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
+      ],
+    ),
+  );
+  return ok == true;
+}
+
+// [initial] pre-fills the field (a rename should open on the current name);
+// callers that omit it get the same empty box as before.
+Future<String?> _askText(BuildContext context, String title, String label, {String initial = ''}) async {
+  final ctrl = TextEditingController(text: initial);
+  final result = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(title),
+      content: TextField(
+        controller: ctrl,
+        autofocus: true,
+        decoration: InputDecoration(labelText: label),
+        onSubmitted: (v) => Navigator.pop(ctx, v),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text), child: const Text('Save')),
+      ],
+    ),
+  );
+  ctrl.dispose();
+  return result;
+}
+
+/// Add/edit a single menu item: name, price, and a category (existing or new).
+class _MenuItemDialog extends StatefulWidget {
+  final Map? existing;
+  final List<String> categories;
+  final List<String> sections;
+  final RestClient rest;
+  const _MenuItemDialog({this.existing, required this.categories, required this.sections, required this.rest});
+
+  @override
+  State<_MenuItemDialog> createState() => _MenuItemDialogState();
+}
+
+class _MenuItemDialogState extends State<_MenuItemDialog> {
+  late final TextEditingController _name;
+  late final TextEditingController _price;
+  late final TextEditingController _blurb;
+  late final TextEditingController _newCat;
+  String? _category;
+  bool _addingNewCat = false;
+  String? _imageUrl;
+  bool _uploading = false;
+  bool _available = true;
+  String _station = ''; // '' = unassigned (KOT routing section)
+  late List<Map<String, dynamic>> _modifiers;
+  late List<Map<String, dynamic>> _recipe;
+  List _inventory = const [];
+
+  static const _newCatSentinel = '+ New category';
+  // Same hard cap the backend's sanitizeMenuBlurb() enforces, so the counter in
+  // this field is the truth and nothing is silently trimmed on save.
+  static const _blurbMax = 500;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: _s(widget.existing ?? const {}, 'name', ''));
+    final p = widget.existing?['price'];
+    _price = TextEditingController(text: p == null ? '' : '$p');
+    _blurb = TextEditingController(text: _s(widget.existing ?? const {}, 'blurb', ''));
+    _newCat = TextEditingController();
+    final img = _s(widget.existing ?? const {}, 'image_url', '');
+    if (img.isNotEmpty) _imageUrl = img;
+    _available = widget.existing?['available'] != false;
+    _station = _s(widget.existing ?? const {}, 'station', '');
+    _modifiers = ((widget.existing?['modifiers'] as List?) ?? []).map<Map<String, dynamic>>((g) {
+      final m = g as Map;
+      return {
+        'name': '${m['name'] ?? ''}',
+        'multi': m['multi'] == true,
+        'required': m['required'] == true,
+        'options': ((m['options'] as List?) ?? [])
+            .map<Map<String, dynamic>>((o) => {'name': '${(o as Map)['name'] ?? ''}', 'price': o['price'] ?? 0})
+            .toList(),
+      };
+    }).toList();
+    _recipe = ((widget.existing?['recipe'] as List?) ?? []).map<Map<String, dynamic>>((r) {
+      final m = r as Map;
+      return {'inventory_id': '${m['inventory_id'] ?? ''}', 'qty': m['qty'] ?? 1};
+    }).toList();
+    final cur = _s(widget.existing ?? const {}, 'category', '');
+    if (cur.isNotEmpty && widget.categories.contains(cur)) {
+      _category = cur;
+    } else if (widget.categories.isNotEmpty) {
+      _category = widget.categories.first;
+    } else {
+      _addingNewCat = true;
+    }
+    // Inventory list for the recipe ingredient picker.
+    widget.rest.getList('/inventory').then((inv) {
+      if (mounted) setState(() => _inventory = inv);
+    }).catchError((_) {});
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _price.dispose();
+    _blurb.dispose();
+    _newCat.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickImage() async {
+    final picked = await FilePicker.pickFiles(type: FileType.image, withData: true);
+    final bytes = picked?.files.single.bytes;
+    if (bytes == null) return;
+    setState(() => _uploading = true);
+    try {
+      final ext = (picked!.files.single.extension ?? 'jpg').toLowerCase();
+      final ct = ext == 'png' ? 'image/png' : 'image/jpeg';
+      final res = await widget.rest.post('/menu/upload-image', {
+        'image_base64': base64Encode(bytes),
+        'content_type': ct,
+      });
+      final url = (res is Map) ? res['image_url'] as String? : null;
+      if (mounted && url != null) setState(() => _imageUrl = url);
+      if (mounted && url == null) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Image upload failed.')));
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  void _submit() {
+    final name = _name.text.trim();
+    final category = _addingNewCat ? _newCat.text.trim() : (_category ?? '');
+    if (name.isEmpty || category.isEmpty) return;
+    Navigator.pop(context, <String, dynamic>{
+      if (widget.existing?['id'] != null) 'id': widget.existing!['id'],
+      'name': name,
+      'price': double.tryParse(_price.text.trim()) ?? 0,
+      'category': category,
+      // Guest-facing blurb (stored as `blurb` inside the menu description JSON).
+      // Always sent because this dialog always shows the current text: "" clears
+      // it, which is what an owner who empties the field means.
+      'blurb': _blurb.text.trim(),
+      'image_url': _imageUrl ?? '',
+      'available': _available,
+      'station': _station.trim().isEmpty ? null : _station.trim(),
+      'modifiers': _cleanModifiers(),
+      'recipe': _recipe
+          .where((r) => '${r['inventory_id']}'.isNotEmpty && (double.tryParse('${r['qty']}') ?? 0) > 0)
+          .map((r) => {'inventory_id': r['inventory_id'], 'qty': double.tryParse('${r['qty']}') ?? 0})
+          .toList(),
+    });
+  }
+
+  Widget _recipeEditor() {
+    final text = Theme.of(context).textTheme;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text('RECIPE · AUTO-DEDUCT STOCK', style: text.labelSmall, overflow: TextOverflow.ellipsis)),
+        Opacity(
+          opacity: _inventory.isEmpty ? 0.45 : 1,
+          child: ForkButton.subtle(
+            label: 'Ingredient',
+            icon: Icons.add,
+            onPressed: _inventory.isEmpty
+                ? null
+                : () => setState(() => _recipe.add({'inventory_id': '', 'qty': 1})),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 4),
+      if (_inventory.isEmpty)
+        Text('Add inventory items first to build a recipe.', style: text.bodySmall)
+      else
+        for (int i = 0; i < _recipe.length; i++)
+          Row(children: [
+            Expanded(
+              flex: 3,
+              child: DropdownButtonFormField<String>(
+                initialValue: ('${_recipe[i]['inventory_id']}').isEmpty ? null : '${_recipe[i]['inventory_id']}',
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Ingredient', isDense: true),
+                items: [
+                  for (final inv in _inventory)
+                    DropdownMenuItem(value: '${(inv as Map)['id']}', child: Text('${inv['name']} (${inv['stock'] ?? 0}${inv['unit'] ?? ''})', overflow: TextOverflow.ellipsis)),
+                ],
+                onChanged: (v) => setState(() => _recipe[i]['inventory_id'] = v ?? ''),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 2,
+              child: TextFormField(
+                initialValue: '${_recipe[i]['qty'] ?? ''}',
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: const InputDecoration(labelText: 'Qty/unit', isDense: true),
+                onChanged: (v) => _recipe[i]['qty'] = double.tryParse(v) ?? 0,
+              ),
+            ),
+            IconButton(icon: const Icon(Icons.close, size: 16), onPressed: () => setState(() => _recipe.removeAt(i))),
+          ]),
+    ]);
+  }
+
+  List<Map<String, dynamic>> _cleanModifiers() => _modifiers
+      .where((g) => '${g['name']}'.trim().isNotEmpty)
+      .map((g) => {
+            'name': '${g['name']}'.trim(),
+            'multi': g['multi'] == true,
+            'required': g['required'] == true,
+            'options': ((g['options'] as List?) ?? [])
+                .where((o) => '${(o as Map)['name']}'.trim().isNotEmpty)
+                .map((o) => {
+                      'name': '${(o as Map)['name']}'.trim(),
+                      'price': (o['price'] is num) ? o['price'] : (double.tryParse('${o['price']}') ?? 0),
+                    })
+                .toList(),
+          })
+      .where((g) => (g['options'] as List).isNotEmpty)
+      .toList();
+
+  Widget _modifierEditor() {
+    final text = Theme.of(context).textTheme;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text('MODIFIERS / VARIANTS', style: text.labelSmall, overflow: TextOverflow.ellipsis)),
+        ForkButton.subtle(
+          label: 'Group',
+          icon: Icons.add,
+          onPressed: () => setState(() => _modifiers.add({
+                'name': '',
+                'multi': false,
+                'required': false,
+                'options': [
+                  {'name': '', 'price': 0},
+                ],
+              })),
+        ),
+      ]),
+      const SizedBox(height: 4),
+      for (int gi = 0; gi < _modifiers.length; gi++) _groupCard(gi),
+    ]);
+  }
+
+  Widget _groupCard(int gi) {
+    final g = _modifiers[gi];
+    final options = g['options'] as List;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: ForkCard(
+        inset: true,
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Expanded(
+              child: TextFormField(
+                initialValue: '${g['name'] ?? ''}',
+                decoration: const InputDecoration(labelText: 'Group (e.g. Size)', isDense: true),
+                onChanged: (v) => g['name'] = v,
+              ),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            ForkIconButton(
+              icon: Icons.delete_outline,
+              tooltip: 'Remove group',
+              onPressed: () => setState(() => _modifiers.removeAt(gi)),
+            ),
+          ]),
+          Row(children: [
+            Expanded(
+              child: CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: g['multi'] == true,
+                onChanged: (v) => setState(() => g['multi'] = v ?? false),
+                title: const Text('Multi', style: TextStyle(fontSize: 12)),
+              ),
+            ),
+            Expanded(
+              child: CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: g['required'] == true,
+                onChanged: (v) => setState(() => g['required'] = v ?? false),
+                title: const Text('Required', style: TextStyle(fontSize: 12)),
+              ),
+            ),
+          ]),
+          for (int oi = 0; oi < options.length; oi++)
+            Row(children: [
+              Expanded(
+                flex: 3,
+                child: TextFormField(
+                  initialValue: '${(options[oi] as Map)['name'] ?? ''}',
+                  decoration: const InputDecoration(labelText: 'Option', isDense: true),
+                  onChanged: (v) => (options[oi] as Map)['name'] = v,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 2,
+                child: TextFormField(
+                  initialValue: '${(options[oi] as Map)['price'] ?? ''}',
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(labelText: '+₹', isDense: true),
+                  onChanged: (v) => (options[oi] as Map)['price'] = double.tryParse(v) ?? 0,
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close, size: 16),
+                onPressed: () => setState(() => options.removeAt(oi)),
+              ),
+            ]),
+          const SizedBox(height: 4),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ForkButton.subtle(
+              label: 'Add option',
+              icon: Icons.add,
+              onPressed: () => setState(() => options.add({'name': '', 'price': 0})),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final options = [...widget.categories, _newCatSentinel];
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 440,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('MENU', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text(widget.existing == null ? 'Add menu item' : 'Edit menu item', style: text.titleMedium),
+            const SizedBox(height: AppSpacing.lg),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+        // Photo picker + preview (shown to customers while ordering).
+        GestureDetector(
+          onTap: _uploading ? null : _pickImage,
+          child: Container(
+            height: 120,
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.tileAll,
+              border: Border.all(color: AppColors.border),
+              image: (_imageUrl != null && _imageUrl!.isNotEmpty)
+                  ? DecorationImage(image: NetworkImage(_imageUrl!), fit: BoxFit.cover)
+                  : null,
+            ),
+            child: _uploading
+                ? const Center(child: CircularProgressIndicator())
+                : (_imageUrl == null || _imageUrl!.isEmpty)
+                    ? const Center(
+                        child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.add_a_photo, color: AppColors.textSecondary),
+                          SizedBox(height: 4),
+                          Text('Add photo', style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+                        ]))
+                    : Align(
+                        alignment: Alignment.topRight,
+                        child: IconButton(
+                          icon: const CircleAvatar(radius: 14, backgroundColor: Colors.black54, child: Icon(Icons.close, size: 16, color: Colors.white)),
+                          onPressed: () => setState(() => _imageUrl = null),
+                        ),
+                      ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        TextField(controller: _name, autofocus: true, decoration: const InputDecoration(labelText: 'Item name')),
+        TextField(
+          controller: _price,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(labelText: 'Price', prefixText: '₹ '),
+        ),
+        const SizedBox(height: 8),
+        if (!_addingNewCat)
+          DropdownButtonFormField<String>(
+            initialValue: _category,
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Category'),
+            items: options.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+            onChanged: (v) => setState(() {
+              if (v == _newCatSentinel) {
+                _addingNewCat = true;
+              } else {
+                _category = v;
+              }
+            }),
+          )
+        else
+          TextField(
+            controller: _newCat,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: 'New category',
+              suffixIcon: widget.categories.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => setState(() => _addingNewCat = false),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          // A few lines about the dish, shown when a guest opens the item on the
+          // ordering page. Plain text only — the backend strips markup, collapses
+          // blank runs and caps the text at 500 chars, so the counter below is
+          // exactly the limit that will be stored. Blank = no description.
+          TextField(
+            controller: _blurb,
+            minLines: 2,
+            maxLines: 4,
+            maxLength: _blurbMax,
+            textCapitalization: TextCapitalization.sentences,
+            keyboardType: TextInputType.multiline,
+            decoration: const InputDecoration(
+              labelText: 'Description',
+              alignLabelWithHint: true,
+              helperText: 'Shown to guests when they open this item. Leave blank for none.',
+            ),
+          ),
+          const SizedBox(height: 4),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _available,
+            onChanged: (v) => setState(() => _available = v),
+            title: const Text('Available'),
+            subtitle: Text(_available ? 'Customers can order this' : 'Shown as Sold out'),
+          ),
+          const SizedBox(height: AppSpacing.md),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text('KITCHEN SECTION · KOT ROUTING', style: text.labelSmall),
+          ),
+          const SizedBox(height: 6),
+          _SectionSelector(
+            value: _station,
+            sections: widget.sections,
+            onChanged: (v) => _station = v,
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          _modifierEditor(),
+          const SizedBox(height: AppSpacing.md),
+          _recipeEditor(),
+                ]),
+              ),
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context)),
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton(label: 'Save', icon: Icons.check, onPressed: _submit),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+Future<int?> _askCovers(BuildContext context) async {
+  final covers = TextEditingController(text: '2');
+  final result = await showDialog<int>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('How many people?'),
+      content: TextField(
+        controller: covers,
+        keyboardType: TextInputType.number,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'Number of people'),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, int.tryParse(covers.text.trim()) ?? 1),
+          child: const Text('Seat'),
+        ),
+      ],
+    ),
+  );
+  covers.dispose();
+  return result;
+}
+
+Future<void> _printTableQr(String tableName, String url) async {
+  final doc = pw.Document();
+  doc.addPage(
+    pw.Page(
+      build: (ctx) => pw.Center(
+        child: pw.Column(mainAxisAlignment: pw.MainAxisAlignment.center, children: [
+          pw.Text('Scan to order — Table $tableName',
+              style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 24),
+          pw.BarcodeWidget(barcode: pw.Barcode.qrCode(), data: url, width: 260, height: 260),
+          pw.SizedBox(height: 16),
+          pw.Text(url, style: const pw.TextStyle(fontSize: 9)),
+        ]),
+      ),
+    ),
+  );
+  await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+}
+
+Future<void> _addTable(BuildContext context, RestClient rest, VoidCallback reload,
+    {List<String> sections = const []}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final seats = await showDialog<_TableSeating>(
+    context: context,
+    builder: (_) => _TableSeatingDialog(sections: sections),
+  );
+  if (seats == null) return;
+  try {
+    await rest.post('/add-table', {
+      'table': {
+        'name': seats.name,
+        'capacity': seats.capacity,
+        'max_capacity': seats.maxCapacity,
+        // Omitted when Unassigned so the backend stores null.
+        if (seats.section.trim().isNotEmpty) 'section': seats.section.trim(),
+      },
+    });
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+/// What [_TableSeatingDialog] hands back: the table's name (add mode only), its
+/// normal seat count, and the MAX it can take once extra chairs go in.
+class _TableSeating {
+  final String name;
+  final int capacity;
+  final int maxCapacity;
+  /// Zone the new table lands in. Empty = Unassigned (the field is then omitted
+  /// from the request so the backend stores null).
+  final String section;
+  const _TableSeating({required this.name, required this.capacity, required this.maxCapacity, this.section = ''});
+}
+
+/// Add a table, or edit an existing one's seating. `existing` null == add mode.
+/// The max defaults to the seat count (so it stays inert until an owner raises
+/// it) and can never sit below it.
+class _TableSeatingDialog extends StatefulWidget {
+  final Map? existing;
+  /// Zones already on the floor, so a new table can be placed straight into one.
+  final List<String> sections;
+  const _TableSeatingDialog({this.existing, this.sections = const []});
+
+  @override
+  State<_TableSeatingDialog> createState() => _TableSeatingDialogState();
+}
+
+class _TableSeatingDialogState extends State<_TableSeatingDialog> {
+  late final TextEditingController _name;
+  late final TextEditingController _capacity;
+  late final TextEditingController _max;
+  // True once the max has been typed into by hand — before that it tracks the
+  // seat count, so the common "no extra chairs" case needs no thought.
+  bool _maxTouched = false;
+  String _section = '';
+  String? _error;
+
+  bool get _adding => widget.existing == null;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    final cap = _int(e?['capacity']) ?? 4;
+    // Legacy rows carry no max — the server coalesces it to the seat count, so
+    // pre-fill the same value instead of showing a blank.
+    final max = _int(e?['max_capacity']) ?? cap;
+    _name = TextEditingController(text: e == null ? '' : _s(e, 'table_name', ''));
+    _capacity = TextEditingController(text: '$cap');
+    _max = TextEditingController(text: '$max');
+    _maxTouched = !_adding && max > cap;
+    _capacity.addListener(() {
+      if (_maxTouched) return;
+      final c = _capacity.text.trim();
+      if (_max.text != c) _max.text = c;
+    });
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _capacity.dispose();
+    _max.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final name = _name.text.trim();
+    if (_adding && name.isEmpty) {
+      setState(() => _error = 'Give the table a name (e.g. T7).');
+      return;
+    }
+    final cap = int.tryParse(_capacity.text.trim());
+    final max = int.tryParse(_max.text.trim());
+    if (cap == null || cap < 1 || max == null || max < 1) {
+      setState(() => _error = 'Seats and max must be whole numbers of 1 or more.');
+      return;
+    }
+    if (max < cap) {
+      setState(() => _error = 'Max capacity cannot be below the seat count ($cap).');
+      return;
+    }
+    Navigator.pop(context, _TableSeating(name: name, capacity: cap, maxCapacity: max, section: _section));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return AlertDialog(
+      title: Text(_adding ? 'Add table' : 'Seating for ${_s(widget.existing!, 'table_name')}'),
+      content: SizedBox(
+        width: 340,
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          if (_adding)
+            TextField(
+              controller: _name,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Table name (e.g. T7)'),
+            ),
+          TextField(
+            controller: _capacity,
+            autofocus: !_adding,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Seats (the usual cover count)'),
+          ),
+          TextField(
+            controller: _max,
+            keyboardType: TextInputType.number,
+            onChanged: (_) => _maxTouched = true,
+            decoration: const InputDecoration(labelText: 'Max capacity (with extra chairs)'),
+          ),
+          // Drop the table straight into a zone. Only offered when adding, and
+          // only lists zones that already exist — creating a NEW zone needs the
+          // "Manage Table Sections" permission, so it belongs on the floor screen.
+          if (_adding && widget.sections.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _section,
+              dropdownColor: AppColors.cardRaised,
+              decoration: const InputDecoration(labelText: 'Section', isDense: true),
+              items: [
+                const DropdownMenuItem(value: '', child: Text('Unassigned')),
+                for (final sec in widget.sections)
+                  DropdownMenuItem(value: sec, child: Text(sec)),
+              ],
+              onChanged: (v) => setState(() => _section = v ?? ''),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Text(
+            'A party larger than the max is offered a combination of adjacent '
+            'tables instead — staff always confirm the suggestion.',
+            style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textTertiary),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+          ],
+        ]),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: _submit, child: Text(_adding ? 'Add' : 'Save')),
+      ],
+    );
+  }
+}
+
+/// Settle a table's bill: pick a payment method (the aggregator methods need a
+/// payment proof PHOTO, captured/picked here and uploaded before settling),
+/// then record payment -> approve -> close (which frees the table). Approval is
+/// permission-gated on the backend.
+class _SettleDialog extends StatefulWidget {
+  final RestClient rest;
+  final String orderId;
+  final String totalText;
+  const _SettleDialog({required this.rest, required this.orderId, required this.totalText});
+
+  @override
+  State<_SettleDialog> createState() => _SettleDialogState();
+}
+
+class _SettleDialogState extends State<_SettleDialog> {
+  static const _methods = ['Upi', 'Cash', 'Card', 'Dineout', 'Zomato', 'Eazydiner', 'District'];
+  static const _needsProof = {'Dineout', 'Zomato', 'Eazydiner', 'District'};
+  // Same ~3MB ceiling POST /billing/upload-payment-proof enforces (its limit is
+  // on the base64 text, which is ~4/3 of the byte count), checked here so an
+  // oversized photo fails instantly instead of after a long upload.
+  static const int _maxProofBytes = 3000000;
+  String _method = 'Upi';
+  // The uploaded proof: the URL the settle call sends, plus the local bytes so
+  // staff can see what they attached before confirming. No URL is ever typed —
+  // the picture is uploaded and the returned URL is what settles the bill.
+  String? _proofUrl;
+  Uint8List? _proofPreview;
+  bool _uploading = false;
+  bool _busy = false;
+  String? _error;
+
+  /// Content type sniffed from the actual bytes rather than the file extension:
+  /// the backend checks the magic bytes, so a mislabelled ".jpg" would 400 there.
+  /// Returns null when the file is not a JPEG/PNG/WebP.
+  static String? _imageType(Uint8List b) {
+    if (b.length < 12) return null;
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return 'image/jpeg';
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return 'image/png';
+    if (b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
+        b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50) {
+      return 'image/webp';
+    }
+    return null;
+  }
+
+  // Capture (camera) or pick (gallery/file dialog) the proof and upload it right
+  // away, so by the time Confirm is pressed there is already a stored URL.
+  Future<void> _pickProof(ImageSource source) async {
+    setState(() {
+      _uploading = true;
+      _error = null;
+    });
+    try {
+      final shot = await ImagePicker().pickImage(source: source, maxWidth: 1600, imageQuality: 80);
+      if (shot == null) {
+        if (mounted) setState(() => _uploading = false);
+        return;
+      }
+      final bytes = await shot.readAsBytes();
+      final ct = _imageType(bytes);
+      if (ct == null) {
+        if (mounted) {
+          setState(() {
+            _uploading = false;
+            _error = 'That file is not a JPEG, PNG or WebP image.';
+          });
+        }
+        return;
+      }
+      if (bytes.length > _maxProofBytes) {
+        if (mounted) {
+          setState(() {
+            _uploading = false;
+            _error = 'That image is too large (max 3MB) — retake it at a lower quality.';
+          });
+        }
+        return;
+      }
+      final res = await widget.rest.post('/billing/upload-payment-proof', {
+        'image_base64': base64Encode(bytes),
+        'content_type': ct,
+      });
+      // The route returns payment_proof_screenshot_url (image_url is an alias).
+      final url = res is Map ? '${res['payment_proof_screenshot_url'] ?? res['image_url'] ?? ''}' : '';
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        if (url.isEmpty) {
+          _error = 'The upload came back without an image URL — please try again.';
+        } else {
+          _proofUrl = url;
+          _proofPreview = bytes;
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _uploading = false;
+          _error = '$e';
+        });
+      }
+    }
+  }
+
+  Future<void> _go() async {
+    // Unchanged rule: these methods cannot settle without a proof. It is now a
+    // real uploaded image rather than a pasted URL, so check the upload landed.
+    final needsProof = _needsProof.contains(_method);
+    final proof = _proofUrl ?? '';
+    if (needsProof && proof.isEmpty) {
+      setState(() => _error = 'Attach a payment proof photo before settling a $_method bill.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final oid = widget.orderId;
+    try {
+      await widget.rest.post('/bills/order/$oid/waiter-confirm-payment', {
+        'payment_method': _method,
+        if (needsProof) 'payment_proof_screenshot_url': proof,
+      });
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      await widget.rest.post('/bills/order/$oid/close');
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      setState(() {
+        _error = '$e';
+        _busy = false;
+      });
+    }
+  }
+
+  // Selectable payment-method pill — copper outline + tint when chosen
+  // (status/selection is never colour alone: the label is the method name).
+  Widget _methodPill(String m) {
+    final selected = _method == m;
+    return MouseRegion(
+      cursor: _busy ? MouseCursor.defer : SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: _busy ? null : () => setState(() => _method = m),
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: selected ? AppColors.tint(AppColors.copper) : AppColors.inset,
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(
+              color: selected ? AppColors.copper.withValues(alpha: 0.55) : AppColors.border,
+            ),
+          ),
+          child: Text(
+            m,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+              letterSpacing: 0.2,
+              color: selected ? AppColors.copperHi : AppColors.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final needsProof = _needsProof.contains(_method);
+    final hasProof = (_proofUrl ?? '').isNotEmpty;
+    // Camera capture only exists on the phone/tablet builds — on Windows the
+    // picker falls back to the file dialog, so only "Choose image" is offered.
+    final platform = Theme.of(context).platform;
+    final canCapture = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+    final locked = _busy || _uploading;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 420,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('SETTLE BILL', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text(widget.totalText, style: text.displayMedium),
+            const SizedBox(height: 18),
+            Text('PAYMENT METHOD', style: text.labelSmall),
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 8, children: [for (final m in _methods) _methodPill(m)]),
+            if (needsProof) ...[
+              const SizedBox(height: 16),
+              Text('PAYMENT PROOF', style: text.labelSmall),
+              const SizedBox(height: 8),
+              if (_proofPreview != null) ...[
+                ClipRRect(
+                  borderRadius: AppRadius.controlAll,
+                  child: Image.memory(
+                    _proofPreview!,
+                    height: 150,
+                    width: double.infinity,
+                    fit: BoxFit.cover,
+                    // A preview that cannot decode must not take the dialog down.
+                    errorBuilder: (_, _, _) => Container(
+                      height: 150,
+                      alignment: Alignment.center,
+                      color: AppColors.inset,
+                      child: Text('Uploaded', style: text.bodySmall),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+              Row(children: [
+                if (canCapture) ...[
+                  ForkButton.ghost(
+                    label: hasProof ? 'Retake' : 'Take photo',
+                    icon: Icons.photo_camera_outlined,
+                    dense: true,
+                    onPressed: locked ? null : () => _pickProof(ImageSource.camera),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                ForkButton.ghost(
+                  label: hasProof ? 'Replace image' : 'Choose image',
+                  icon: Icons.image_outlined,
+                  dense: true,
+                  onPressed: locked ? null : () => _pickProof(ImageSource.gallery),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              Text(
+                _uploading
+                    ? 'Uploading…'
+                    : hasProof
+                        ? 'Proof attached — it uploads with the settlement.'
+                        : '$_method needs a payment screenshot. Capture or pick one; it uploads straight away.',
+                style: text.bodySmall!.copyWith(
+                  fontSize: 11.5,
+                  color: hasProof && !_uploading ? AppColors.success : AppColors.textTertiary,
+                ),
+              ),
+            ],
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            const SizedBox(height: 12),
+            Text('Approval is required before the bill closes and the table frees.', style: text.bodySmall),
+            const SizedBox(height: 18),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton.ghost(label: 'Cancel', onPressed: locked ? null : () => Navigator.pop(context, false)),
+              const SizedBox(width: 8),
+              ForkButton(
+                label: _busy ? 'Processing…' : 'Confirm & close',
+                icon: Icons.check,
+                onPressed: locked || (needsProof && !hasProof) ? null : _go,
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------- order stages ----
+
+// Cancelled is a TERMINAL stage: once an order is cancelled nothing may modify
+// it again. The one sanctioned reversal is an undo from the Audit Log, so every
+// mutating affordance is hidden/disabled and the server refuses anything that
+// still slips through.
+bool _isCancelled(String status) => status.trim().toLowerCase() == 'cancelled';
+
+// Single wording for the terminal note so it never drifts between surfaces.
+const String _cancelledNote =
+    'This order was cancelled. Cancelled orders are final — reverse it from the Audit Log if this was a mistake.';
+
+// The same note, trimmed for the inline captions that sit under a row/ticket.
+const String _cancelledCaption = 'Cancelled — final. Reverse it from the Audit Log if this was a mistake.';
+
+// One-line caption for each pickable stage in the change-stage sheet.
+String _stageHint(String stage) => switch (stage) {
+      'Barked' => 'Announce the order to the kitchen',
+      'Preparing' => 'Kitchen is cooking this order',
+      'Served' => 'All items delivered to the table',
+      'Cancelled' => 'Void this order',
+      _ => '',
+    };
+
+Future<void> _changeOrderStatus(
+  BuildContext context,
+  RestClient rest,
+  String orderId,
+  String current,
+  VoidCallback reload, {
+  bool barked = true,
+}) async {
+  // Un-barked orders must pass the Barked step before they can be cooked/served —
+  // BUT a Pending order isn't approved to the kitchen yet, so it can't be barked
+  // until it's accepted (Preparing). Don't offer 'Barked' while Pending.
+  final isPending = current.toLowerCase() == 'pending';
+  final stages = <String>[
+    if (!barked && !isPending) 'Barked',
+    'Preparing',
+    if (barked) 'Served',
+    'Cancelled',
+  ];
+  final messenger = ScaffoldMessenger.of(context);
+  // A settled bill is view-once: its order status is locked and cannot change.
+  final cur = current.toLowerCase();
+  if (cur == 'paid' || cur == 'closed') {
+    messenger.showSnackBar(const SnackBar(content: Text('This bill is settled and locked — its status cannot be changed.')));
+    return;
+  }
+  // Cancelled is terminal: offer NO stage options at all — just the note and a
+  // way out. The audit-log undo is the only sanctioned reversal.
+  if (_isCancelled(cur)) {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final text = Theme.of(ctx).textTheme;
+        return Dialog(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: AppRadius.cardAll,
+            side: const BorderSide(color: AppColors.borderStrong),
+          ),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 400),
+            child: Padding(
+              padding: const EdgeInsets.all(AppSpacing.xl),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Order stage', style: text.titleMedium),
+                  const SizedBox(height: AppSpacing.sm),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text('NOW', style: text.labelSmall),
+                      StatusChip(label: current, color: _stageColor(current), dense: true),
+                    ],
+                  ),
+                  const SizedBox(height: AppSpacing.lg),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: AppColors.tint(AppColors.danger),
+                      borderRadius: AppRadius.cardAll,
+                      border: Border.all(color: AppColors.edge(AppColors.danger)),
+                    ),
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Icon(Icons.lock_outline, size: 16, color: AppColors.danger),
+                      const SizedBox(width: AppSpacing.sm),
+                      Expanded(child: Text(_cancelledNote, style: text.bodySmall)),
+                    ]),
+                  ),
+                  const SizedBox(height: AppSpacing.lg),
+                  Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                    ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+                  ]),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    return;
+  }
+  final picked = await showDialog<String>(
+    context: context,
+    builder: (ctx) {
+      String? sel;
+      final text = Theme.of(ctx).textTheme;
+      return StatefulBuilder(
+        builder: (ctx2, setSheet) => Dialog(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: AppRadius.cardAll,
+            side: const BorderSide(color: AppColors.borderStrong),
+          ),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 400),
+            child: Padding(
+              padding: const EdgeInsets.all(AppSpacing.xl),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Order stage', style: text.titleMedium),
+                  const SizedBox(height: AppSpacing.sm),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text('NOW', style: text.labelSmall),
+                      StatusChip(label: current, color: _stageColor(current), dense: true),
+                      if (!barked) const InfoChip(icon: Icons.campaign_outlined, label: 'Not barked'),
+                    ],
+                  ),
+                  const SizedBox(height: AppSpacing.lg),
+                  for (final s in stages)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: ForkCard(
+                        selected: sel == s,
+                        onTap: () => setSheet(() => sel = s),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        child: Row(children: [
+                          StatusChip(label: s, color: _stageColor(s), dense: true),
+                          const SizedBox(width: AppSpacing.md),
+                          Expanded(
+                            child: Text(_stageHint(s),
+                                style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          ),
+                          AnimatedSwitcher(
+                            duration: AppDurations.fast,
+                            child: sel == s
+                                ? const Icon(Icons.check_circle,
+                                    key: ValueKey('on'), size: 16, color: AppColors.copperHi)
+                                : const Icon(Icons.circle_outlined,
+                                    key: ValueKey('off'), size: 16, color: AppColors.textTertiary),
+                          ),
+                        ]),
+                      ),
+                    ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                    ForkButton.ghost(
+                        label: 'Cancel', dense: true, onPressed: () => Navigator.pop(ctx2)),
+                    const SizedBox(width: AppSpacing.sm),
+                    AnimatedOpacity(
+                      duration: AppDurations.fast,
+                      opacity: sel == null ? 0.45 : 1,
+                      child: ForkButton(
+                        label: 'Confirm',
+                        icon: Icons.check,
+                        dense: true,
+                        onPressed: sel == null ? null : () => Navigator.pop(ctx2, sel),
+                      ),
+                    ),
+                  ]),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+  if (picked == null || picked == current) return;
+  try {
+    if (picked == 'Barked') {
+      await rest.post('/orders/$orderId/bark');
+    } else {
+      await rest.patch('/orders/$orderId/status', {'status': picked});
+    }
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+// ---------------------------------------------------------- kitchen display ----
+
+// Kitchen display: live tickets (station-filterable, with course holds) plus an
+// expo/pass view consolidating each table's ready-vs-pending items.
+Widget kdsModule(RestClient rest, Profile p) => _KdsHome(rest: rest);
+
+// True when the order item is a HELD course (waiting to be fired).
+bool _itemHeld(Map m) => m['course_hold'] == true && (m['fired_at'] == null || '${m['fired_at']}'.isEmpty);
+
+// "Barked" step: un-barked orders sit greyed with idle timers until the expo
+// barks them to the kitchen. Missing field (older backend) counts as barked.
+bool _orderBarked(Map o) => !o.containsKey('barked_at') || o['barked_at'] != null;
+
+// Small uppercase station tag for an order item (KOT routing) — the quiet
+// recessed InfoChip pill from the template.
+Widget _stationBadge(String station) => InfoChip(label: station.toUpperCase());
+
+class _KdsHome extends StatefulWidget {
+  final RestClient rest;
+  const _KdsHome({required this.rest});
+
+  @override
+  State<_KdsHome> createState() => _KdsHomeState();
+}
+
+class _KdsHomeState extends State<_KdsHome> {
+  bool _expo = false;
+  String _station = 'All';
+  // Locked mode: dedicate this tablet to a single section. Other chips + the
+  // Tickets/Expo switch hide, and only the locked section's items show — until
+  // staff explicitly unlock.
+  bool _locked = false;
+  // Managed kitchen sections (from /restaurant/settings) — drive the filter
+  // chips even before any ticket carries the station. Best-effort: on failure
+  // the chips fall back to ticket-derived stations only.
+  List<String> _managed = const [];
+  // Which outlet these tickets come from + the live count per outlet, so an
+  // empty board can say "they're in the other branch" instead of just "none"
+  // (the KDS reads the same outlet-scoped /orders as the Orders grid).
+  Map<String, dynamic> _scope = const {};
+  // The KDS is a wall-mounted board nobody touches, so it must refresh itself —
+  // previously a new, barked or served order never appeared until staff left the
+  // module and came back. We hold the CURRENT view's AsyncView reload callback
+  // and tick it, which refetches in place (no spinner flash, unlike remounting).
+  Timer? _poll;
+  VoidCallback? _reloadCurrent;
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _poll = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (mounted) {_reloadCurrent?.call();}
+    });
+    widget.rest.getMap('/restaurant/settings').then((s) {
+      final list = ((s['kitchen_sections'] as List?) ?? const [])
+          .map((e) => '$e'.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+      if (mounted && list.isNotEmpty) setState(() => _managed = list);
+    }).catchError((_) {});
+    _loadOrdersScope(widget.rest).then((s) {
+      if (mounted && s.isNotEmpty) setState(() => _scope = s);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      // The Tickets/Expo switch hides while locked so the tablet stays pinned to
+      // its zone's tickets.
+      if (!_locked)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+          child: Row(children: [
+            ForkTabs(
+              tabs: const ['Tickets', 'Expo / Pass'],
+              selected: _expo ? 1 : 0,
+              onSelected: (i) => setState(() => _expo = i == 1),
+            ),
+            const Spacer(),
+          ]),
+        ),
+      Expanded(child: (!_locked && _expo) ? _ExpoView(rest: widget.rest) : _ticketsView()),
+    ]);
+  }
+
+  Widget _ticketsView() => AsyncView<List>(
+        load: () => widget.rest.getList('/orders'),
+        builder: (context, rows, reload) {
+          // Latest wins: whichever view (Tickets/Expo) is on screen is the one the
+          // poll refreshes.
+          _reloadCurrent = reload;
+          // Pending orders are NOT yet approved → they must not reach the kitchen.
+          final active = rows.where((o) {
+            final s = _s(o as Map, 'status', 'Preparing').toLowerCase();
+            return s != 'closed' && s != 'paid' && s != 'cancelled' && s != 'pending';
+          }).toList();
+          // Chips = union of the MANAGED section list (settings order first)
+          // and the stations present on active tickets (legacy labels).
+          final stations = <String>{};
+          for (final o in active) {
+            for (final it in ((o as Map)['items'] as List? ?? const [])) {
+              final st = _s(it as Map, 'station');
+              if (st.isNotEmpty) stations.add(st);
+            }
+          }
+          final seen = {for (final m in _managed) m.toLowerCase()};
+          final extras = stations.where((s) => !seen.contains(s.toLowerCase())).toList()..sort();
+          final chips = ['All', ..._managed, ...extras];
+          // While locked, keep the locked section selected even if its chip has
+          // temporarily no active tickets (so the lock doesn't snap back to All).
+          final selected = _locked && _station != 'All'
+              ? _station
+              : (chips.contains(_station) ? _station : 'All');
+          final text = Theme.of(context).textTheme;
+          bool itemMatches(Map it) => selected == 'All' || _s(it, 'station').toLowerCase() == selected.toLowerCase();
+          final visible = active
+              .where((o) => ((o as Map)['items'] as List? ?? const []).any((it) => itemMatches(it as Map)))
+              .toList();
+          return Column(children: [
+            if (_locked && selected != 'All')
+              // Locked banner: only this section shows; other chips are hidden.
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: AppColors.tint(AppColors.copper),
+                  borderRadius: AppRadius.controlAll,
+                  border: Border.all(color: AppColors.edge(AppColors.copper)),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.lock, size: 16, color: AppColors.copperHi),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Text('LOCKED TO ${selected.toUpperCase()}',
+                        overflow: TextOverflow.ellipsis,
+                        style: text.labelSmall!.copyWith(color: AppColors.copperHi)),
+                  ),
+                  ForkButton.ghost(
+                    label: 'Unlock',
+                    icon: Icons.lock_open,
+                    dense: true,
+                    onPressed: () => setState(() => _locked = false),
+                  ),
+                ]),
+              )
+            else if (chips.length > 1)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: Row(children: [
+                  Expanded(
+                    child: ForkTabs(
+                      tabs: chips,
+                      selected: chips.indexOf(selected),
+                      onSelected: (i) => setState(() => _station = chips[i]),
+                    ),
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  // Lock the current section for a dedicated single-zone tablet.
+                  ForkIconButton(
+                    icon: Icons.lock_outline,
+                    tooltip: selected == 'All' ? 'Pick a section to lock' : 'Lock to $selected',
+                    onPressed: selected == 'All' ? null : () => setState(() => _locked = true),
+                  ),
+                ]),
+              ),
+            Expanded(
+              child: visible.isEmpty
+                  ? (selected == 'All'
+                      ? _outletScopeEmpty(
+                          context,
+                          scope: _scope,
+                          noun: 'kitchen tickets',
+                          icon: Icons.soup_kitchen_outlined,
+                          title: 'No active kitchen tickets',
+                          caption: 'Approved orders appear here for the kitchen to work.',
+                          mentionHistory: false,
+                        )
+                      : _empty('No active tickets for $selected.'))
+                  : ListView.separated(
+                      padding: const EdgeInsets.all(16),
+                      itemCount: visible.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 14),
+                      itemBuilder: (c, i) => _KdsCard(order: visible[i] as Map, rest: widget.rest, reload: reload, station: selected),
+                    ),
+            ),
+          ]);
+        },
+      );
+}
+
+// Expo/pass screen: one card per active table with ready-vs-pending counts and
+// item chips coloured by state (green served / amber preparing / grey held).
+class _ExpoView extends StatefulWidget {
+  final RestClient rest;
+  const _ExpoView({required this.rest});
+
+  @override
+  State<_ExpoView> createState() => _ExpoViewState();
+}
+
+// Stateful only so the pass can refresh itself: it is a wall-mounted board, and
+// previously a newly served/barked item never appeared until staff navigated away
+// and back. Ticks the AsyncView's own reload so there is no spinner flash.
+class _ExpoViewState extends State<_ExpoView> {
+  RestClient get rest => widget.rest;
+  Timer? _poll;
+  VoidCallback? _reload;
+
+  @override
+  void initState() {
+    super.initState();
+    _poll = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (mounted) {_reload?.call();}
+    });
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  // Per-item pass chip — tinted pill whose state always ships with a label
+  // (· HOLD / · NOT BARKED), never colour alone.
+  Widget _expoChip(Map it) {
+    final status = _s(it, 'status', 'preparing');
+    final color = status == 'served'
+        ? AppColors.success
+        : (status == 'held' || status == 'unbarked' ? AppColors.neutral : AppColors.warning);
+    final station = _s(it, 'station');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+      decoration: BoxDecoration(
+        color: AppColors.tint(color),
+        border: Border.all(color: AppColors.edge(color)),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        '${it['qty'] ?? 1}× ${it['name'] ?? ''}'
+        '${station.isNotEmpty ? ' · ${station.toUpperCase()}' : ''}'
+        '${status == 'held' ? ' · HOLD' : (status == 'unbarked' ? ' · NOT BARKED' : '')}',
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0.2,
+          color: Color.lerp(color, Colors.white, 0.25),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AsyncView<Map<String, dynamic>>(
+        load: () => rest.getMap('/kds/expo'),
+        builder: (context, data, reload) {
+          _reload = reload;
+          final tables = (data['tables'] as List?) ?? [];
+          if (tables.isEmpty) return _empty('No active tables on the pass.');
+          final text = Theme.of(context).textTheme;
+          return RefreshIndicator(
+            onRefresh: () async => reload(),
+            child: ListView.separated(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(16),
+              itemCount: tables.length,
+              separatorBuilder: (_, _) => const SizedBox(height: 14),
+              itemBuilder: (c, i) {
+                final t = tables[i] as Map;
+                final items = (t['items'] as List?) ?? [];
+                final ready = (t['ready_count'] as num?)?.toInt() ?? 0;
+                final pending = (t['pending_count'] as num?)?.toInt() ?? 0;
+                return ForkCard(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Expanded(
+                        child: Text('Table ${_s(t, 'table')}',
+                            style: text.titleMedium, overflow: TextOverflow.ellipsis),
+                      ),
+                      StatusChip(label: '$ready ready', color: AppColors.success, dense: true),
+                      const SizedBox(width: 6),
+                      StatusChip(
+                          label: '$pending pending',
+                          color: pending > 0 ? AppColors.warning : AppColors.neutral,
+                          dense: true),
+                    ]),
+                    const SizedBox(height: AppSpacing.md),
+                    Wrap(spacing: 6, runSpacing: 6, children: [for (final it in items) _expoChip(it as Map)]),
+                  ]),
+                );
+              },
+            ),
+          );
+        },
+      );
+}
+
+// Live elapsed (ms) for a timing timer map, mirroring the backend computation.
+int _elapsedMs(Map t) {
+  final startStr = t['started_at'];
+  if (startStr == null) return 0;
+  final start = DateTime.tryParse('$startStr')?.millisecondsSinceEpoch;
+  if (start == null) return 0;
+  final nowMs = DateTime.now().millisecondsSinceEpoch;
+  final end = t['ended_at'] != null ? (DateTime.tryParse('${t['ended_at']}')?.millisecondsSinceEpoch ?? nowMs) : nowMs;
+  int paused = (t['paused_ms'] is num) ? (t['paused_ms'] as num).toInt() : 0;
+  if (t['paused'] == true && t['pause_started_at'] != null) {
+    final ps = DateTime.tryParse('${t['pause_started_at']}')?.millisecondsSinceEpoch;
+    if (ps != null) paused += nowMs - ps;
+  }
+  final e = end - start - paused;
+  return e < 0 ? 0 : e;
+}
+
+String _fmtDur(int ms) {
+  final s = (ms / 1000).floor();
+  final m = s ~/ 60;
+  final sec = s % 60;
+  return m > 0 ? '${m}m ${sec.toString().padLeft(2, '0')}s' : '${sec}s';
+}
+
+// A kitchen ticket with live order + per-item timers, pause/resume, mark-served,
+// station tags and held-course firing. [station] filters the visible items.
+class _KdsCard extends StatefulWidget {
+  final Map order;
+  final RestClient rest;
+  final VoidCallback reload;
+  final String station;
+  const _KdsCard({required this.order, required this.rest, required this.reload, this.station = 'All'});
+
+  @override
+  State<_KdsCard> createState() => _KdsCardState();
+}
+
+class _KdsCardState extends State<_KdsCard> {
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  Map get _timing => (widget.order['timing'] as Map?) ?? const {};
+  Map get _orderTimer => (_timing['order'] as Map?) ?? const {};
+  Map get _itemTimers => (_timing['items'] as Map?) ?? const {};
+
+  Future<void> _post(String path) async {
+    try {
+      await widget.rest.post(path);
+      widget.reload();
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Fire a held course item: fired_at is stamped and its prep timer starts.
+  Future<void> _fire(String orderId, String itemId) async {
+    try {
+      await widget.rest.post('/orders/$orderId/fire', {'item_ids': [itemId]});
+      widget.reload();
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final o = widget.order;
+    final id = '${o['id']}';
+    final items = ((o['items'] as List?) ?? [])
+        .where((it) => widget.station == 'All' || _s(it as Map, 'station').toLowerCase() == widget.station.toLowerCase())
+        .toList();
+    final status = _s(o, 'status', 'Preparing');
+    // Terminal stage: the ticket is a record only — no fire/serve/hold/bark.
+    // (The tickets list already filters cancelled orders out; this keeps the
+    // card safe if it is ever rendered from another feed.)
+    final cancelled = _isCancelled(status);
+    // Un-barked tickets are greyed with idle timers until the expo barks them.
+    final barked = _orderBarked(o);
+    final orderPaused = _orderTimer['paused'] == true;
+    final orderMs = _elapsedMs(_orderTimer);
+    final text = Theme.of(context).textTheme;
+    // Elapsed escalation: quiet under 10 minutes, warning past 10, danger past
+    // 15 — idle (un-barked / paused) timers stay neutral.
+    final orderMin = orderMs ~/ 60000;
+    final timerColor = (!barked || orderPaused)
+        ? AppColors.neutral
+        : orderMin > 15
+            ? AppColors.danger
+            : orderMin > 10
+                ? AppColors.warning
+                : AppColors.neutral;
+    // Ticket lines read at arm's length across the pass.
+    final lineStyle = text.bodyLarge!.copyWith(fontSize: 15, height: 1.35);
+    final qtyStyle = text.bodyLarge!.copyWith(fontSize: 15, fontWeight: FontWeight.w600, color: AppColors.copperHi);
+
+    final card = ForkCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Flexible(
+            child: Text('Table ${_s(o, 'table')}', style: text.titleMedium, overflow: TextOverflow.ellipsis),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          if (barked)
+            StatusChip(
+              label: orderPaused ? '${_fmtDur(orderMs)} · held' : _fmtDur(orderMs),
+              color: timerColor,
+              dense: true,
+            )
+          else
+            const InfoChip(icon: Icons.campaign_outlined, label: 'Idle timer'),
+          const Spacer(),
+          const SizedBox(width: AppSpacing.sm),
+          AnimatedSwitcher(
+            duration: AppDurations.base,
+            switchInCurve: Curves.easeOut,
+            switchOutCurve: Curves.easeIn,
+            child: StatusChip(
+              // Cancelled outranks the bark state — the terminal stage must read
+              // first on the ticket.
+              key: ValueKey(cancelled || barked ? status : 'Not barked'),
+              label: cancelled || barked ? status : 'Not barked',
+              color: cancelled || barked ? _stageColor(status) : AppColors.neutral,
+              dense: true,
+            ),
+          ),
+        ]),
+        const SizedBox(height: AppSpacing.md),
+        if (_s(o, 'order_type', 'dine_in') != 'dine_in')
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Row(children: [
+              InfoChip(
+                icon: _s(o, 'order_type') == 'delivery' ? Icons.pedal_bike_outlined : Icons.shopping_bag_outlined,
+                label: _s(o, 'order_type') == 'delivery' ? 'DELIVERY' : 'TAKEAWAY',
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Text(
+                  [
+                    if (_s(o, 'customer').isNotEmpty && _s(o, 'customer') != 'Guest') _s(o, 'customer'),
+                    if (_s(o, 'customer_phone').isNotEmpty) _s(o, 'customer_phone'),
+                    if (_s(o, 'delivery_address').isNotEmpty) _s(o, 'delivery_address'),
+                  ].join(' · '),
+                  style: text.bodySmall,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ]),
+          ),
+        if (_s(o, 'note').isNotEmpty)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: AppColors.tint(AppColors.warning),
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.warning.withValues(alpha: 0.18)),
+            ),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.warning),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  _s(o, 'note'),
+                  style: text.bodySmall!.copyWith(color: Color.lerp(AppColors.warning, Colors.white, 0.45)),
+                ),
+              ),
+            ]),
+          ),
+        ...items.map((it) {
+          final m = it as Map;
+          final iid = '${m['id']}';
+          final t = (_itemTimers[iid] as Map?) ?? const {};
+          final served = t['ended_at'] != null;
+          final paused = t['paused'] == true;
+          final held = !served && _itemHeld(m);
+          final ms = _elapsedMs(t);
+          final itemNote = _s(m, 'note', '');
+          final stationLabel = _s(m, 'station');
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: AnimatedOpacity(
+              duration: AppDurations.base,
+              curve: Curves.easeOut,
+              opacity: (held || !barked || cancelled) ? 0.55 : 1,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Expanded(
+                    child: Row(children: [
+                      Text('${m['quantity'] ?? 1} ×', style: qtyStyle),
+                      const SizedBox(width: 7),
+                      Flexible(
+                        child: Text('${m['name'] ?? ''}',
+                            overflow: TextOverflow.ellipsis,
+                            style: lineStyle.copyWith(
+                              decoration: served ? TextDecoration.lineThrough : null,
+                              color: (served || held) ? AppColors.textSecondary : null,
+                            )),
+                      ),
+                      if (stationLabel.isNotEmpty) ...[const SizedBox(width: 6), _stationBadge(stationLabel)],
+                      if (held) ...[
+                        const SizedBox(width: 6),
+                        const StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
+                      ],
+                    ]),
+                  ),
+                  if (cancelled)
+                    // Cancelled is final — no per-item fire / pause / serve.
+                    const SizedBox.shrink()
+                  else if (!barked)
+                    // Nothing cooks (and nothing ages) before the bark.
+                    const SizedBox.shrink()
+                  else if (held)
+                    // Held courses do not age; the timer starts when fired.
+                    ForkButton(
+                      label: 'Fire',
+                      icon: Icons.local_fire_department,
+                      dense: true,
+                      onPressed: () => _fire(id, iid),
+                    )
+                  else ...[
+                    Text(
+                      _fmtDur(ms),
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.2,
+                        color: served ? AppColors.success : AppColors.textSecondary,
+                      ),
+                    ),
+                    if (!served) ...[
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: Icon(paused ? Icons.play_arrow : Icons.pause, size: 18, color: AppColors.textSecondary),
+                        tooltip: paused ? 'Resume item' : 'Pause item',
+                        onPressed: () => _post('/orders/$id/items/$iid/${paused ? 'resume' : 'pause'}'),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.check, size: 18, color: AppColors.success),
+                        tooltip: 'Item served',
+                        onPressed: () => _post('/orders/$id/items/$iid/serve'),
+                      ),
+                    ] else ...[
+                      // A served item used to render a DEAD icon, so a mis-tapped
+                      // tick could never be walked back. It is now the undo control.
+                      // Once the whole order is Served the server refuses the undo,
+                      // so the button is disabled rather than failing on tap.
+                      Builder(builder: (_) {
+                        final orderServed = status.toLowerCase() != 'preparing' && status.toLowerCase() != 'pending';
+                        return IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(Icons.check_circle,
+                              size: 18,
+                              color: orderServed ? AppColors.textSecondary : AppColors.success),
+                          tooltip: orderServed
+                              ? 'The whole order is served — individual items can no longer be undone'
+                              : 'Undo served',
+                          onPressed: orderServed ? null : () => _post('/orders/$id/items/$iid/unserve'),
+                        );
+                      }),
+                    ],
+                  ],
+                ]),
+                if (itemNote.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8, bottom: 2),
+                    child: Row(children: [
+                      const Icon(Icons.sticky_note_2_outlined, size: 13, color: AppColors.warning),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          itemNote,
+                          style: text.bodySmall!.copyWith(
+                            fontStyle: FontStyle.italic,
+                            color: Color.lerp(AppColors.warning, Colors.white, 0.35),
+                          ),
+                        ),
+                      ),
+                    ]),
+                  ),
+              ]),
+            ),
+          );
+        }),
+        const SizedBox(height: 14),
+        Row(children: [
+          if (cancelled)
+            // Read-only footer: the caption replaces every stage action, and the
+            // reason travels with it. Printing the KOT stays available (no write).
+            Expanded(
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Icon(Icons.lock_outline, size: 14, color: AppColors.danger),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(_cancelledCaption,
+                      style: text.bodySmall!.copyWith(color: AppColors.danger)),
+                ),
+              ]),
+            )
+          else if (!barked)
+            ForkButton(
+              label: 'Bark to kitchen',
+              icon: Icons.campaign,
+              onPressed: () => _barkOrder(ScaffoldMessenger.of(context), widget.rest, id, widget.reload),
+            )
+          else if (status.toLowerCase() == 'preparing')
+            ForkButton(
+              label: 'Mark Served',
+              icon: Icons.room_service_outlined,
+              onPressed: () => _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Served', widget.reload),
+            )
+          else
+            ForkButton.ghost(
+              label: 'Back to Preparing',
+              icon: Icons.undo,
+              onPressed: () => _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Preparing', widget.reload),
+            ),
+          if (barked && !cancelled) ...[
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton.ghost(
+              label: orderPaused ? 'Resume' : 'Hold',
+              icon: orderPaused ? Icons.play_arrow : Icons.pause,
+              onPressed: () => _post('/orders/$id/${orderPaused ? 'resume' : 'pause'}'),
+            ),
+          ],
+          if (!cancelled) const Spacer(),
+          ForkIconButton(
+            icon: Icons.print_outlined,
+            tooltip: 'Print KOT',
+            onPressed: () => _printKot(_s(o, 'table'), items),
+          ),
+        ]),
+      ]),
+    );
+
+    // Subtle urgency glow once the ticket ages into warning/danger — always
+    // paired with the labelled timer chip above (never colour alone).
+    return AnimatedContainer(
+      duration: AppDurations.slow,
+      curve: Curves.easeOut,
+      decoration: BoxDecoration(
+        borderRadius: AppRadius.cardAll,
+        boxShadow: [
+          if (timerColor != AppColors.neutral)
+            BoxShadow(
+              color: timerColor.withValues(alpha: 0.09),
+              blurRadius: 22,
+              spreadRadius: 1,
+            ),
+        ],
+      ),
+      child: card,
+    );
+  }
+}
+
+Future<void> _advanceOrder(
+  ScaffoldMessengerState messenger,
+  RestClient rest,
+  String orderId,
+  String status,
+  VoidCallback reload,
+) async {
+  try {
+    await rest.patch('/orders/$orderId/status', {'status': status});
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+// Bark an order to the kitchen: stamps barked_at and starts the prep timers
+// (they stay idle until the bark).
+Future<void> _barkOrder(
+  ScaffoldMessengerState messenger,
+  RestClient rest,
+  String orderId,
+  VoidCallback reload,
+) async {
+  try {
+    await rest.post('/orders/$orderId/bark');
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+// Print a Kitchen Order Ticket (KOT) for a table's items.
+Future<void> _printKot(String table, List items) async {
+  final doc = pw.Document();
+  doc.addPage(
+    pw.Page(
+      build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Text('KOT — Table $table', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+        // Printed tickets leave the screen, so they carry the zone explicitly.
+        pw.Text(RestaurantTime.stampNow(), style: const pw.TextStyle(fontSize: 9)),
+        pw.Divider(),
+        ...items.map((it) {
+          final m = it as Map;
+          return pw.Padding(
+            padding: const pw.EdgeInsets.symmetric(vertical: 2),
+            child: pw.Text('${m['quantity'] ?? 1} x ${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14)),
+          );
+        }),
+      ]),
+    ),
+  );
+  await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+}
+
+// Customer receipt for the table's bill (items + total + APC).
+Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final items = await rest.getList('/inventory');
+        // Managed inventory categories drive the add-item picker + the manage
+        // dialog. Optional — items still render if settings can't be read.
+        List<String> categories = const [];
+        try {
+          final s = await rest.getMap('/restaurant/settings');
+          categories = ((s['inventory_categories'] as List?) ?? const [])
+              .map((e) => '$e'.trim())
+              .where((e) => e.isNotEmpty)
+              .toList();
+        } catch (_) {/* categories unavailable — items still render */}
+        return {'items': items, 'categories': categories};
+      },
+      builder: (context, data, reload) {
+        final rows = (data['items'] as List?) ?? const [];
+        final categories = List<String>.from(data['categories'] as List? ?? const []);
+        final text = Theme.of(context).textTheme;
+        final narrow = MediaQuery.sizeOf(context).width < 760;
+
+        // Stock tint follows the shared status voice: label + tint, never
+        // colour alone.
+        Color stockColor(String status) {
+          final s = status.toLowerCase();
+          if (s.contains('out')) return AppColors.danger;
+          if (s.contains('low')) return AppColors.warning;
+          return AppColors.success;
+        }
+
+        final lowCount = rows
+            .where((r) => stockColor(_s(r as Map, 'status', 'In Stock')) == AppColors.warning)
+            .length;
+        final outCount = rows
+            .where((r) => stockColor(_s(r as Map, 'status', 'In Stock')) == AppColors.danger)
+            .length;
+
+        // Manage the tenant's inventory categories (add/rename/delete). Rename
+        // cascades onto items server-side, so reload to refresh when changed.
+        Future<void> manageCategories() async {
+          final changed = await showDialog<bool>(
+            context: context,
+            builder: (_) => _InventoryCategoriesDialog(rest: rest, isAdmin: p.isAdmin, initial: categories),
+          );
+          if (changed == true) reload();
+        }
+
+        return Scaffold(
+        backgroundColor: Colors.transparent,
+        floatingActionButton: FloatingActionButton.extended(
+          onPressed: () => _addInventory(context, rest, categories, p.isAdmin, reload),
+          icon: const Icon(Icons.add),
+          label: const Text('Add item'),
+        ),
+        body: Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+            child: Row(children: [
+              const Spacer(),
+              ForkButton.ghost(
+                label: 'Categories',
+                icon: Icons.category_outlined,
+                dense: true,
+                onPressed: manageCategories,
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton.ghost(
+                label: 'Vendors',
+                icon: Icons.local_shipping_outlined,
+                dense: true,
+                onPressed: () => _manageVendors(context, rest),
+              ),
+            ]),
+          ),
+          Expanded(
+            child: rows.isEmpty
+                ? const EmptyState(
+                    icon: Icons.inventory_2_outlined,
+                    title: 'No inventory yet',
+                    caption: 'Add your first stock item to start tracking levels.',
+                  )
+                : ListView.builder(
+                    padding: AppSpacing.pageNarrow,
+                    itemCount: rows.length + 1,
+                    itemBuilder: (c, i) {
+                      if (i == 0) {
+                        // Low-stock summary from the rows already loaded.
+                        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          _dashGrid([
+                            StatCard(value: '${rows.length}', caption: 'ITEMS TRACKED'),
+                            StatCard(
+                              value: '$lowCount',
+                              caption: 'LOW STOCK',
+                              tag: lowCount > 0 ? 'Lo' : null,
+                              tagColor: AppColors.warning,
+                            ),
+                            StatCard(
+                              value: '$outCount',
+                              caption: 'OUT OF STOCK',
+                              tag: outCount > 0 ? 'Out' : null,
+                              tagColor: AppColors.danger,
+                            ),
+                          ], narrow ? 1 : 3),
+                          const SizedBox(height: AppSpacing.xxl),
+                          SectionHeader(title: 'Stock levels', count: rows.length),
+                        ]);
+                      }
+                      final it = rows[i - 1] as Map;
+                      final status = _s(it, 'status', 'In Stock');
+                      final color = stockColor(status);
+                      final attention = color != AppColors.success;
+                      final card = ForkCard(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        child: Row(children: [
+                          AnimatedContainer(
+                            duration: AppDurations.base,
+                            curve: Curves.easeOut,
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: attention ? AppColors.tint(color) : AppColors.inset,
+                              borderRadius: AppRadius.controlAll,
+                              border: Border.all(color: attention ? AppColors.edge(color) : AppColors.border),
+                            ),
+                            child: Icon(Icons.inventory_2_outlined,
+                                size: 16, color: attention ? color : AppColors.textTertiary),
+                          ),
+                          const SizedBox(width: AppSpacing.md),
+                          Expanded(
+                            child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(_s(it, 'name'),
+                                      style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  const SizedBox(height: 6),
+                                  Wrap(spacing: 6, runSpacing: 6, children: [
+                                    InfoChip(icon: Icons.category_outlined, label: _s(it, 'category')),
+                                  ]),
+                                ]),
+                          ),
+                          const SizedBox(width: AppSpacing.md),
+                          MicroStat(
+                            value: '${it['stock'] ?? 0} ${_s(it, 'unit', '')}'.trim(),
+                            label: 'on hand',
+                            alignEnd: true,
+                          ),
+                          const SizedBox(width: 14),
+                          StatusChip(label: status, color: color, dense: narrow),
+                          PopupMenuButton<String>(
+                            tooltip: 'Stock',
+                            iconColor: AppColors.textSecondary,
+                            onSelected: (v) {
+                              if (v == 'receive') _receiveStock(context, rest, it, reload);
+                              if (v == 'wastage') _recordWastage(context, rest, it, reload);
+                            },
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: 'receive', child: Text('Receive stock')),
+                              PopupMenuItem(value: 'wastage', child: Text('Record wastage')),
+                            ],
+                          ),
+                        ]),
+                      );
+                      // Tinted ring once an item needs attention — always paired
+                      // with the labelled StatusChip above (never colour alone).
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: AnimatedContainer(
+                          duration: AppDurations.slow,
+                          curve: Curves.easeOut,
+                          decoration: BoxDecoration(
+                            borderRadius: AppRadius.cardAll,
+                            boxShadow: [
+                              if (attention)
+                                BoxShadow(
+                                  color: color.withValues(alpha: 0.09),
+                                  blurRadius: 22,
+                                  spreadRadius: 1,
+                                ),
+                            ],
+                          ),
+                          child: card,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ]),
+      );
+      },
+    );
+
+// Receive stock for an item (purchase) → increments + logs a movement.
+Future<void> _receiveStock(BuildContext context, RestClient rest, Map item, VoidCallback reload) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final qty = TextEditingController();
+  final cost = TextEditingController();
+  List vendors = const [];
+  try { final v = await rest.getMap('/vendors'); vendors = (v['vendors'] as List?) ?? const []; } catch (_) {}
+  if (!context.mounted) return;
+  String? vendorId;
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) => AlertDialog(
+        title: Text('Receive · ${_s(item, 'name')}'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: qty, autofocus: true, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Quantity received', border: OutlineInputBorder())),
+          const SizedBox(height: 8),
+          if (vendors.isNotEmpty)
+            DropdownButtonFormField<String>(
+              initialValue: vendorId,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: 'Vendor (optional)', border: OutlineInputBorder()),
+              items: [for (final v in vendors) DropdownMenuItem(value: '${(v as Map)['id']}', child: Text(_s(v, 'name')))],
+              onChanged: (x) => setLocal(() => vendorId = x),
+            ),
+          const SizedBox(height: 8),
+          TextField(controller: cost, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Unit cost (optional)', border: OutlineInputBorder())),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Receive')),
+        ],
+      ),
+    ),
+  );
+  if (ok != true) return;
+  final q = double.tryParse(qty.text.trim()) ?? 0;
+  if (q <= 0) { messenger.showSnackBar(const SnackBar(content: Text('Enter a valid quantity.'))); return; }
+  final c = double.tryParse(cost.text.trim()) ?? 0;
+  final body = <String, dynamic>{'inventory_id': item['id'], 'qty': q};
+  if (vendorId != null) body['vendor_id'] = vendorId;
+  if (c > 0) body['unit_cost'] = c;
+  try {
+    await rest.post('/inventory/receive', body);
+    reload();
+  } catch (e) { messenger.showSnackBar(SnackBar(content: Text('$e'))); }
+}
+
+// Record wastage for an item → decrements + logs a movement.
+Future<void> _recordWastage(BuildContext context, RestClient rest, Map item, VoidCallback reload) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final qty = TextEditingController();
+  final reason = TextEditingController();
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('Wastage · ${_s(item, 'name')}'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: qty, autofocus: true, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Quantity wasted', border: OutlineInputBorder())),
+        const SizedBox(height: 8),
+        TextField(controller: reason, decoration: const InputDecoration(labelText: 'Reason (optional)', border: OutlineInputBorder())),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Log wastage')),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  final q = double.tryParse(qty.text.trim()) ?? 0;
+  if (q <= 0) { messenger.showSnackBar(const SnackBar(content: Text('Enter a valid quantity.'))); return; }
+  try {
+    await rest.post('/inventory/wastage', {'inventory_id': item['id'], 'qty': q, if (reason.text.trim().isNotEmpty) 'reason': reason.text.trim()});
+    reload();
+  } catch (e) { messenger.showSnackBar(SnackBar(content: Text('$e'))); }
+}
+
+Future<void> _manageVendors(BuildContext context, RestClient rest) =>
+    showModalBottomSheet<void>(context: context, isScrollControlled: true, builder: (_) => _VendorsSheet(rest: rest));
+
+class _VendorsSheet extends StatefulWidget {
+  final RestClient rest;
+  const _VendorsSheet({required this.rest});
+  @override
+  State<_VendorsSheet> createState() => _VendorsSheetState();
+}
+
+class _VendorsSheetState extends State<_VendorsSheet> {
+  List _vendors = const [];
+  bool _loading = true;
+  final _name = TextEditingController();
+  final _phone = TextEditingController();
+
+  @override
+  void initState() { super.initState(); _load(); }
+
+  @override
+  void dispose() { _name.dispose(); _phone.dispose(); super.dispose(); }
+
+  Future<void> _load() async {
+    try {
+      final v = await widget.rest.getMap('/vendors');
+      if (mounted) setState(() { _vendors = (v['vendors'] as List?) ?? const []; _loading = false; });
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _add() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_name.text.trim().isEmpty) return;
+    try {
+      await widget.rest.post('/vendors', {'name': _name.text.trim(), if (_phone.text.trim().isNotEmpty) 'phone': _phone.text.trim()});
+      _name.clear(); _phone.clear();
+      await _load();
+    } catch (e) { messenger.showSnackBar(SnackBar(content: Text('$e'))); }
+  }
+
+  Future<void> _del(String id) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try { await widget.rest.delete('/vendors/$id'); await _load(); }
+    catch (e) { messenger.showSnackBar(SnackBar(content: Text('$e'))); }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.card)),
+        border: Border(top: BorderSide(color: AppColors.borderStrong)),
+      ),
+      padding: EdgeInsets.only(
+          left: AppSpacing.xl,
+          right: AppSpacing.xl,
+          top: AppSpacing.xl,
+          bottom: AppSpacing.xl + MediaQuery.of(context).viewInsets.bottom),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const SectionHeader(title: 'Vendors', padding: EdgeInsets.only(bottom: 12)),
+        Row(children: [
+          Expanded(child: TextField(controller: _name, decoration: const InputDecoration(hintText: 'Vendor name', isDense: true, border: OutlineInputBorder()))),
+          const SizedBox(width: AppSpacing.sm),
+          SizedBox(width: 110, child: TextField(controller: _phone, decoration: const InputDecoration(hintText: 'Phone', isDense: true, border: OutlineInputBorder()))),
+          const SizedBox(width: AppSpacing.sm),
+          ForkButton(label: 'Add', icon: Icons.add, onPressed: _add),
+        ]),
+        const SizedBox(height: AppSpacing.md),
+        if (_loading)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
+            child: Column(children: [
+              for (var i = 0; i < 3; i++)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: AppSpacing.sm),
+                  child: Row(children: [
+                    SkeletonBox(width: 32, height: 32, radius: 8),
+                    SizedBox(width: AppSpacing.md),
+                    Expanded(child: SkeletonBox(height: 12)),
+                  ]),
+                ),
+            ]),
+          )
+        else if (_vendors.isEmpty)
+          Padding(
+            padding: const EdgeInsets.all(AppSpacing.md),
+            child: Text('No vendors yet — add your first supplier above.', style: text.bodySmall),
+          )
+        else
+          Flexible(
+            child: ListView(shrinkWrap: true, children: [
+              for (final v in _vendors)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                  child: ForkCard(
+                    inset: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    child: Row(children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: AppColors.inset,
+                          borderRadius: AppRadius.controlAll,
+                          border: Border.all(color: AppColors.border),
+                        ),
+                        child: const Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.copper),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(_s(v as Map, 'name'),
+                                  style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              if (_s(v, 'phone').isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                Text(_s(v, 'phone'), style: text.bodySmall),
+                              ],
+                            ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      ForkIconButton(
+                        icon: Icons.delete_outline,
+                        tooltip: 'Delete vendor',
+                        onPressed: () => _del('${v['id']}'),
+                      ),
+                    ]),
+                  ),
+                ),
+            ]),
+          ),
+      ]),
+    );
+  }
+}
+
+Widget customersModule(RestClient rest, Profile p) => AsyncView<List>(
+      load: () => rest.getList('/get-customers'),
+      builder: (context, rows, reload) {
+        if (rows.isEmpty) return _empty('No customers.');
+        final text = Theme.of(context).textTheme;
+        String initialsOf(String name) {
+          final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+          if (parts.isEmpty) return '?';
+          return parts.length == 1
+              ? parts.first.substring(0, 1)
+              : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+        }
+
+        return ListView.builder(
+          padding: AppSpacing.pageNarrow,
+          itemCount: rows.length + 1,
+          itemBuilder: (c, i) {
+            if (i == 0) {
+              return SectionHeader(title: 'Guest book', count: rows.length);
+            }
+            final m = rows[i - 1] as Map;
+            final email = m['email'];
+            final name = _s(m, 'name', 'Guest');
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: ForkCard(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(children: [
+                  InitialsAvatar(initials: initialsOf(name)),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 2),
+                      Text('${_s(m, 'phone_number')}${email != null ? ' · $email' : ''}',
+                          style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ]),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  MicroStat(value: '${m['booking_count'] ?? 0}', label: 'Bookings', alignEnd: true),
+                ]),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+// Month-by-month business summary, up to 3 years back.
+Widget historyModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () => rest.getMap('/analytics/history?months=36'),
+      builder: (context, data, reload) {
+        final series = (data['series'] as List?) ?? [];
+        double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+        String money(double v) => '₹${v.toStringAsFixed(0)}';
+        const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        String pretty(String ym) {
+          final p = ym.split('-');
+          if (p.length != 2) return ym;
+          final i = (int.tryParse(p[1]) ?? 0) - 1;
+          return i >= 0 && i < 12 ? '${names[i]} ${p[0]}' : ym;
+        }
+
+        final withData = series.where((r) {
+          final m = r as Map;
+          return num0(m['revenue']) > 0 || num0(m['orders']) > 0 || num0(m['feedback_count']) > 0 || num0(m['new_customers']) > 0;
+        }).toList();
+        final totalRev = series.fold<double>(0, (s, r) => s + num0((r as Map)['revenue']));
+        final totalBills = series.fold<double>(0, (s, r) => s + num0((r as Map)['bills']));
+        final totalCust = series.fold<double>(0, (s, r) => s + num0((r as Map)['new_customers']));
+        // Chart the most recent 12 months with any activity (chronological).
+        final chart = withData.take(12).toList().reversed
+            .map((r) => (label: pretty('${(r as Map)['month']}'), value: num0(r['revenue'])))
+            .toList();
+
+        final text = Theme.of(context).textTheme;
+        return RefreshIndicator(
+          onRefresh: () async => reload(),
+          child: ListView(padding: AppSpacing.pageNarrow, children: [
+            const SectionHeader(
+              title: 'History',
+              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: 'Last 3 years'),
+            ),
+            // Every card on this screen opens the record behind it. The three
+            // headline totals break down month by month; each month card opens
+            // the settled bills that actually made it up.
+            Wrap(spacing: 12, runSpacing: 12, children: [
+              _statCard(context, 'Total revenue', money(totalRev), Icons.payments,
+                  onTap: () => _detailSheet(
+                        context,
+                        eyebrow: 'History',
+                        title: 'Revenue by month',
+                        children: [
+                          for (final r in withData)
+                            _detailRow(context, pretty('${(r as Map)['month']}'), money(num0(r['revenue'])),
+                                trailing: '${r['bills'] ?? 0} bills'),
+                          if (withData.isEmpty) Text('No months with revenue yet.', style: text.bodySmall),
+                        ],
+                      )),
+              _statCard(context, 'Bills', totalBills.toStringAsFixed(0), Icons.receipt_long,
+                  onTap: () => _detailSheet(
+                        context,
+                        eyebrow: 'History',
+                        title: 'Bills by month',
+                        children: [
+                          for (final r in withData)
+                            _detailRow(context, pretty('${(r as Map)['month']}'), '${r['bills'] ?? 0}',
+                                trailing: 'avg ${money(num0(r['avg_bill']))}'),
+                          if (withData.isEmpty) Text('No bills closed yet.', style: text.bodySmall),
+                        ],
+                      )),
+              _statCard(context, 'New customers', totalCust.toStringAsFixed(0), Icons.people,
+                  onTap: () => _detailSheet(
+                        context,
+                        eyebrow: 'History',
+                        title: 'New customers by month',
+                        children: [
+                          for (final r in withData)
+                            _detailRow(context, pretty('${(r as Map)['month']}'), '${r['new_customers'] ?? 0}',
+                                trailing: '${r['orders'] ?? 0} orders'),
+                          if (withData.isEmpty) Text('No customers recorded yet.', style: text.bodySmall),
+                        ],
+                      )),
+            ]),
+            const SizedBox(height: AppSpacing.xxl),
+            if (chart.isNotEmpty) ...[
+              _chartCard(context, 'Revenue by month', _barChart(context, chart, money)),
+              const SizedBox(height: AppSpacing.xxl),
+            ],
+            if (withData.isEmpty)
+              const EmptyState(
+                icon: Icons.hourglass_empty,
+                title: 'No activity yet',
+                caption: 'Month-by-month history builds up as bills close.',
+              )
+            else
+              SectionHeader(title: 'Month by month', count: withData.length),
+            ...withData.map((r) {
+              final m = r as Map;
+              final fb = num0(m['feedback_count']);
+              // The card is a control, not a summary: it opens the month's own
+              // detail — the metric breakdown AND the settled bills that made
+              // it, each of which opens the bill itself.
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+                  onTap: () => showModalBottomSheet<void>(
+                    context: context,
+                    showDragHandle: true,
+                    isScrollControlled: true,
+                    backgroundColor: AppColors.surface,
+                    builder: (_) => _MonthDetailSheet(
+                      rest: rest,
+                      month: m,
+                      title: pretty('${m['month']}'),
+                    ),
+                  ),
+                  child: Row(children: [
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(pretty('${m['month']}'), style: text.titleSmall),
+                        const SizedBox(height: 8),
+                        Wrap(spacing: 6, runSpacing: 6, children: [
+                          InfoChip(icon: Icons.receipt_long_outlined, label: '${m['bills'] ?? 0} bills'),
+                          InfoChip(icon: Icons.restaurant_menu, label: '${m['orders'] ?? 0} orders'),
+                          InfoChip(icon: Icons.equalizer, label: 'avg ${money(num0(m['avg_bill']))}'),
+                          if (fb > 0)
+                            InfoChip(icon: Icons.star_outline, label: '$fb feedback · ${m['avg_rating'] ?? '—'}/5'),
+                        ]),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    Text(money(num0(m['revenue'])), style: text.displaySmall!.copyWith(fontSize: 20)),
+                    const Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
+                  ]),
+                ),
+              );
+            }),
+          ]),
+        );
+      },
+    );
+
+/// First and last calendar day of a "YYYY-MM" bucket, as the `from`/`to` the
+/// bills endpoint expects. Null when the bucket isn't a month.
+({String from, String to})? _monthRange(String ym) {
+  final parts = ym.split('-');
+  if (parts.length != 2) return null;
+  final y = int.tryParse(parts[0]);
+  final m = int.tryParse(parts[1]);
+  if (y == null || m == null || m < 1 || m > 12) return null;
+  // Day 0 of the NEXT month is the last day of this one (leap years included).
+  final last = DateTime.utc(y, m + 1, 0).day;
+  final mm = m.toString().padLeft(2, '0');
+  return (from: '$y-$mm-01', to: '$y-$mm-${last.toString().padLeft(2, '0')}');
+}
+
+/// What a History month card opens: the month's own metrics, then the settled
+/// bills that produced them — each of which opens the bill in full.
+class _MonthDetailSheet extends StatelessWidget {
+  final RestClient rest;
+  final Map month;
+  final String title;
+  const _MonthDetailSheet({required this.rest, required this.month, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final ym = '${month['month']}';
+    final range = _monthRange(ym);
+    final tat = month['avg_tat_min'];
+    final feedback = _numOf(month['feedback_count']);
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.9),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Row(children: [
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('MONTH', style: text.labelSmall),
+                    const SizedBox(height: 4),
+                    Text(title, style: text.headlineMedium),
+                  ]),
+                ),
+                Text(_money(month['revenue']), style: text.displaySmall!.copyWith(fontSize: 22)),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              ForkCard(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  SectionHeader(title: 'Month totals', padding: const EdgeInsets.only(bottom: 6)),
+                  _kv('Revenue', _money(month['revenue'])),
+                  _kv('Bills', '${month['bills'] ?? 0}'),
+                  _kv('Orders', '${month['orders'] ?? 0}'),
+                  _kv('Avg bill', _money(month['avg_bill'])),
+                  _kv('Discounts', _money(month['discounts'])),
+                  _kv('Feedback', feedback > 0 ? '${month['feedback_count']} (avg ${month['avg_rating'] ?? '—'}/5)' : '0'),
+                  _kv('New customers', '${month['new_customers'] ?? 0}'),
+                  _kv('Avg TAT', tat != null ? '${_numOf(tat).toStringAsFixed(0)} min' : '—'),
+                ]),
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              SectionHeader(title: 'Settled bills', padding: const EdgeInsets.only(bottom: 6)),
+              Text('Every bill closed in $title — tap one for its items, taxes, payment and who closed it.',
+                  style: text.bodySmall),
+              const SizedBox(height: AppSpacing.md),
+              if (range == null)
+                Text('No date range for "$ym".', style: text.bodySmall)
+              else
+                _ClosedBillsList(
+                  rest: rest,
+                  pageSize: 10,
+                  filter: _ClosedBillFilter(from: range.from, to: range.to),
+                  emptyCaption: 'No bills were closed in $title.',
+                ),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Widget bookingsModule(RestClient rest, Profile p) => _BookingsView(rest: rest, profile: p);
+
+class _BookingsView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _BookingsView({required this.rest, required this.profile});
+
+  @override
+  State<_BookingsView> createState() => _BookingsViewState();
+}
+
+class _BookingsViewState extends State<_BookingsView> {
+  // Which slice of bookings to show, sent as GET /get-bookings?window=. The
+  // backend windows on the exact same slot-end boundary it always used, so
+  // 'upcoming' (the default) is byte-identical to the legacy behaviour; 'past'
+  // and 'all' let a booking still be reached after its slot ends instead of
+  // silently disappearing (bug B / reservation-notification follow-ups).
+  String _window = 'upcoming';
+
+  bool get _isUpcoming => _window == 'upcoming';
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      // The window selector lives outside the AsyncView so it stays visible
+      // (and switching feels instant) even while the chosen slice is loading.
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'upcoming', label: Text('Upcoming'), icon: Icon(Icons.event_available, size: 15)),
+              ButtonSegment(value: 'past', label: Text('Past'), icon: Icon(Icons.history, size: 15)),
+              ButtonSegment(value: 'all', label: Text('All'), icon: Icon(Icons.event_note, size: 15)),
+            ],
+            selected: {_window},
+            showSelectedIcon: false,
+            onSelectionChanged: (s) => setState(() => _window = s.first),
+          ),
+        ),
+      ),
+      Expanded(
+        child: AsyncView<List>(
+          // Re-keyed so switching the window remounts and refetches.
+          key: ValueKey('bookings-$_window'),
+          load: () => widget.rest.getList('/get-bookings?window=$_window'),
+          builder: _list,
+        ),
+      ),
+    ]);
+  }
+
+  Widget _list(BuildContext context, List rows, VoidCallback reload) {
+        final rest = widget.rest;
+        final p = widget.profile;
+        final messenger = ScaffoldMessenger.of(context);
+        final reservationUrl = '${AppConfig.orderBaseUrl}/reserve/${p.restaurantUsername}';
+
+        void showReservationQr() {
+          showDialog<void>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Guest reservation link'),
+              content: SizedBox(
+                width: 280,
+                child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Center(
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      color: Colors.white,
+                      child: QrImageView(data: reservationUrl, size: 200),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('Share so guests can book a table online',
+                      textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+                  const SizedBox(height: 6),
+                  SelectableText(reservationUrl, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11)),
+                ]),
+              ),
+              actions: [
+                TextButton.icon(
+                  onPressed: () => _printTableQr('Reservations', reservationUrl),
+                  icon: const Icon(Icons.print),
+                  label: const Text('Print'),
+                ),
+                FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+              ],
+            ),
+          );
+        }
+
+        Future<void> setStatus(String id, String status) async {
+          try {
+            await rest.patch('/booking/$id/status', {'status': status});
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        Future<void> deleteBooking(String id) async {
+          if (!await _confirm(context, 'Delete booking', 'Remove this booking?')) return;
+          try {
+            await rest.delete('/booking/$id');
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // Assign the booking's table(s). When no single free table can hold the
+        // party the server's seating suggester proposes adjacent tables to club
+        // ("Party of 8 needs 2 tables — combine T1 + T2?") — a SUGGESTION only:
+        // staff accept it, pick their own set, or walk away. Nothing is ever
+        // assigned without a confirmation.
+        Future<void> assignTable(Map b) async {
+          final id = _s(b, 'booking_id');
+          final party = _int(b['number_of_people']) ?? 0;
+          final at = _s(b, 'booking_date_time', '');
+          final mins = _int(b['duration_mins']) ?? 0;
+          Map<String, dynamic>? suggestion;
+          if (party > 0) {
+            final q = StringBuffer('/tables/seating-suggestion?party=$party');
+            if (at.isNotEmpty) q.write('&at=${Uri.encodeQueryComponent(at)}');
+            if (mins > 0) q.write('&duration=$mins');
+            try {
+              suggestion = await rest.getMap(q.toString());
+            } catch (_) {/* fall back to the plain picker below */}
+          }
+          if (!context.mounted) return;
+          List<String>? names;
+          final s = suggestion;
+          // A single free table still fits: the ordinary picker is less friction.
+          final fitsAlone = s != null && ((s['single'] as List?) ?? const []).isNotEmpty;
+          if (s != null && !fitsAlone) {
+            names = await showDialog<List<String>>(
+              context: context,
+              builder: (_) => _SeatingSuggestionDialog(suggestion: s, party: party),
+            );
+          } else {
+            final one = await _pickTable(context, rest);
+            if (one != null && one.isNotEmpty) names = [one];
+          }
+          if (names == null || names.isEmpty) return;
+          try {
+            await rest.patch('/booking/$id/table', {
+              'table_name': names.first,
+              // Always explicit: a single pick un-clubs a previously joined set.
+              'combined_table_names': names.skip(1).toList(),
+            });
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // Booking-stage tint — always paired with the labelled StatusChip.
+        Color bookingColor(String s) {
+          final l = s.toLowerCase();
+          if (l.contains('confirm')) return AppColors.success;
+          if (l.contains('seat')) return AppColors.copper;
+          if (l.contains('cancel') || l.contains('no')) return AppColors.danger;
+          if (l.contains('request') || l.contains('pend')) return AppColors.warning;
+          return AppColors.neutral;
+        }
+
+        String initialsOf(String name) {
+          final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+          if (parts.isEmpty) return '?';
+          return parts.length == 1
+              ? parts.first.substring(0, 1)
+              : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+        }
+
+        // A reservation notification asked us to focus one booking.
+        final focus = _focusOf(context, 'Bookings');
+        final focusId = focus?.idOf(const ['booking_id']);
+        final focusFound = focusId != null && rows.any((b) => _s(b as Map, 'booking_id') == focusId);
+        // The focused booking first so it is on screen without scrolling; with
+        // nothing focused the server's earliest-first order already stands.
+        // The parentheses are load-bearing: a bare cascade binds to the WHOLE
+        // conditional, so the unfocused branch sorted `rows` itself with a
+        // comparator that returns 0 for every pair — and List.sort leaves
+        // insertion sort above 32 elements, permuting the queue it was handed.
+        final ordered = focusId == null
+            ? rows
+            : ([...rows]..sort((a, b) {
+                final fa = _s(a as Map, 'booking_id') == focusId ? 0 : 1;
+                final fb = _s(b as Map, 'booking_id') == focusId ? 0 : 1;
+                return fa - fb;
+              }));
+
+        final banner = focus == null
+            ? null
+            : _focusBanner(
+                context,
+                found: focusFound,
+                message: focusFound
+                    ? 'Showing the booking from your notification.'
+                    : !_isUpcoming
+                        ? "That booking isn't here — it may have been deleted, or belong to another outlet."
+                        : "That booking isn't in the upcoming list — its time slot has already passed.",
+                actions: focusFound || !_isUpcoming
+                    ? const []
+                    : [
+                        ForkButton.ghost(
+                          label: 'Show all bookings',
+                          icon: Icons.history,
+                          dense: true,
+                          onPressed: () => setState(() => _window = 'all'),
+                        ),
+                      ],
+              );
+
+        final list = ordered.isEmpty
+            ? Column(children: [
+                if (banner != null) Padding(padding: const EdgeInsets.fromLTRB(16, 14, 16, 0), child: banner),
+                Expanded(
+                  child: _empty(_window == 'past'
+                      ? 'No past bookings.'
+                      : _window == 'all'
+                          ? 'No bookings yet.'
+                          : 'No upcoming bookings. New reservations will appear here.'),
+                ),
+              ])
+            : Builder(builder: (c) {
+          // Tiles, not full-width rows: a booking is a short record (who, when,
+          // party size, which table) and a wide row spent most of its width on
+          // nothing. Detail moves into the tap. Eager build is fine here -- the
+          // list is upcoming bookings, not the whole history.
+          final width = MediaQuery.sizeOf(c).width;
+          final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+          final cards = <Widget>[];
+          for (var i = 0; i < ordered.length; i++) {
+            final b = ordered[i] as Map;
+            final id = _s(b, 'booking_id');
+            final status = _s(b, 'status', 'Requested');
+            final when = _fmtDmy(_s(b, 'booking_date_time', ''));
+            // Clubbed bookings hold several tables — read as "T1 + T2".
+            final tableNames = _strList(b['table_names']);
+            final table = tableNames.isNotEmpty ? tableNames.join(' + ') : _s(b, 'table_name', '');
+            final notes = _s(b, 'notes', '');
+            final online = _s(b, 'source', '').toLowerCase() == 'online';
+            final isRequested = status.toLowerCase() == 'requested';
+            final name = _s(b, 'customer_name', 'Guest');
+            final focused = focusId != null && id == focusId;
+            final text = Theme.of(c).textTheme;
+            final chips = <Widget>[
+              if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+              InfoChip(icon: Icons.calendar_today_outlined, label: when.isEmpty ? '\u2014' : when),
+              if (table.isNotEmpty)
+                InfoChip(
+                  icon: tableNames.length > 1 ? Icons.link : Icons.table_restaurant_outlined,
+                  label: tableNames.length > 1 ? '$table (clubbed)' : table,
+                ),
+              if (online) const InfoChip(icon: Icons.language, label: 'Online'),
+            ];
+
+            // Everything the tile cannot hold, plus every stage change. Actions
+            // live here rather than on the tile so a mis-tap in a dense grid
+            // cannot cancel somebody's reservation.
+            void openDetail() {
+              _detailSheet(
+                c,
+                eyebrow: status,
+                title: name,
+                children: [
+                  _kv('When', when.isEmpty ? '\u2014' : when),
+                  _kv('Party', '${b['number_of_people'] ?? '\u2014'}'),
+                  _kv('Table', table.isEmpty ? 'Not assigned' : (tableNames.length > 1 ? '$table (clubbed)' : table)),
+                  _kv('Source', online ? 'Online' : 'In-house'),
+                  if (_s(b, 'customer_phone').isNotEmpty) _kv('Phone', _s(b, 'customer_phone')),
+                  if (notes.isNotEmpty) _kv('Notes', notes),
+                  const SizedBox(height: 12),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    ForkButton.ghost(
+                      label: 'Assign / combine tables',
+                      icon: Icons.table_restaurant_outlined,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.of(c).pop();
+                        assignTable(b);
+                      },
+                    ),
+                    ForkButton.ghost(
+                      label: 'Mark confirmed',
+                      icon: Icons.check,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.of(c).pop();
+                        setStatus(id, 'Confirmed');
+                      },
+                    ),
+                    ForkButton.ghost(
+                      label: 'Mark seated',
+                      icon: Icons.event_seat,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.of(c).pop();
+                        setStatus(id, 'Seated');
+                      },
+                    ),
+                    ForkButton.ghost(
+                      label: 'Cancel booking',
+                      icon: Icons.close,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.of(c).pop();
+                        setStatus(id, 'Cancelled');
+                      },
+                    ),
+                    ForkButton.ghost(
+                      label: 'Delete',
+                      icon: Icons.delete_outline,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.of(c).pop();
+                        deleteBooking(id);
+                      },
+                    ),
+                  ]),
+                ],
+              );
+            }
+
+            cards.add(ForkCard(
+              selected: isRequested || focused,
+              onTap: openDetail,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  InitialsAvatar(initials: initialsOf(name)),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          const SizedBox(height: 2),
+                          Text('Party of ${b['number_of_people'] ?? '\u2014'}',
+                              style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ]),
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  AnimatedSwitcher(
+                    duration: AppDurations.base,
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    child: StatusChip(
+                      key: ValueKey('booking-$id-$status'),
+                      label: status,
+                      color: bookingColor(status),
+                      dense: true,
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 10),
+                // When and where: the two things you scan a booking grid for.
+                Wrap(spacing: 6, runSpacing: 6, children: chips),
+                if (notes.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(notes,
+                          style: text.bodySmall!.copyWith(
+                              fontSize: 11, fontStyle: FontStyle.italic, color: AppColors.textTertiary),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                  ]),
+                ],
+                // Confirm/decline stays on the tile: an unconfirmed booking is
+                // the reason this screen gets opened at all.
+                if (isRequested) ...[
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(
+                      child: ForkButton.ghost(
+                        label: 'Decline',
+                        icon: Icons.close,
+                        dense: true,
+                        onPressed: () => setStatus(id, 'Cancelled'),
+                      ),
+                    ),
+                    const SizedBox(width: AppSpacing.sm),
+                    Expanded(
+                      child: ForkButton(
+                        label: 'Confirm',
+                        icon: Icons.check,
+                        dense: true,
+                        onPressed: () => setStatus(id, 'Confirmed'),
+                      ),
+                    ),
+                  ]),
+                ],
+              ]),
+            ));
+          }
+          return ListView(
+            padding: AppSpacing.pageNarrow,
+            children: [
+              if (banner != null) ...[banner, const SizedBox(height: 12)],
+              _dashGrid(cards, cols),
+            ],
+          );
+        });
+
+        return Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            child: SectionHeader(
+              title: 'Bookings',
+              count: rows.length,
+              padding: EdgeInsets.zero,
+              trailing: ForkButton.ghost(
+                label: 'Share reservation link',
+                icon: Icons.qr_code_2,
+                dense: true,
+                onPressed: showReservationQr,
+              ),
+            ),
+          ),
+          Expanded(child: list),
+        ]);
+  }
+}
+
+/// Staff-facing seating suggester: "Party of 8 needs 2 tables — combine
+/// T1 + T2?". Shows the server's best clubbing of adjacent (consecutively
+/// numbered) FREE tables, the runners-up, and a manual override built from every
+/// free table. Pops the chosen table names, primary first — or null. It decides
+/// nothing on its own: closing the dialog assigns nothing.
+class _SeatingSuggestionDialog extends StatefulWidget {
+  final Map suggestion;
+  final int party;
+  const _SeatingSuggestionDialog({required this.suggestion, required this.party});
+
+  @override
+  State<_SeatingSuggestionDialog> createState() => _SeatingSuggestionDialogState();
+}
+
+class _SeatingSuggestionDialogState extends State<_SeatingSuggestionDialog> {
+  // Staff asked to pick their own tables instead of taking a suggestion.
+  bool _override = false;
+  final _picked = <String>{};
+
+  List<Map> get _combos => ((widget.suggestion['combinations'] as List?) ?? const []).cast<Map>();
+  List<Map> get _free => ((widget.suggestion['free_tables'] as List?) ?? const []).cast<Map>();
+  String get _noneReason => _s(widget.suggestion, 'none_reason', '');
+  List<String> get _unnumbered => _strList(widget.suggestion['unnumbered_free_tables']);
+
+  // Free tables in server order, filtered to the manual selection.
+  List<String> get _pickedInOrder => _free
+      .map((t) => _s(t, 'table_name', ''))
+      .where((n) => n.isNotEmpty && _picked.contains(n))
+      .toList();
+
+  int get _pickedSeats => _free
+      .where((t) => _picked.contains(_s(t, 'table_name', '')))
+      .fold(0, (sum, t) => sum + (_int(t['max_capacity']) ?? _int(t['capacity']) ?? 0));
+
+  static List<String> _namesOf(Map combo) => _strList(combo['table_names']);
+
+  // One proposed combination: the tables, their pooled seats, and the accept.
+  Widget _comboCard(Map combo, {required bool primary}) {
+    final text = Theme.of(context).textTheme;
+    final names = _namesOf(combo);
+    final seats = _int(combo['total_capacity']) ?? 0;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: primary ? AppColors.tint(AppColors.copper) : AppColors.inset,
+        borderRadius: AppRadius.cardAll,
+        border: Border.all(color: primary ? AppColors.edge(AppColors.copper) : AppColors.border),
+      ),
+      child: Row(children: [
+        Icon(names.length > 1 ? Icons.link : Icons.table_restaurant_outlined,
+            size: 16, color: primary ? AppColors.copperHi : AppColors.textSecondary),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(names.join(' + '),
+                style: primary ? text.titleSmall!.copyWith(color: AppColors.copperHi) : text.titleSmall,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis),
+            const SizedBox(height: 2),
+            Text('$seats seats · party of ${widget.party}', style: text.bodySmall!.copyWith(fontSize: 11.5)),
+          ]),
+        ),
+        const SizedBox(width: 10),
+        if (primary)
+          ForkButton(
+            label: 'Accept',
+            icon: Icons.check,
+            dense: true,
+            onPressed: () => Navigator.pop(context, names),
+          )
+        else
+          ForkButton.ghost(label: 'Use', dense: true, onPressed: () => Navigator.pop(context, names)),
+      ]),
+    );
+  }
+
+  // Manual override — every free table, tap to add it to the party's set.
+  Widget _overridePicker() {
+    final text = Theme.of(context).textTheme;
+    if (_free.isEmpty) {
+      return Text('No tables are free for this slot.', style: text.bodySmall!.copyWith(color: AppColors.danger));
+    }
+    final chosen = _pickedInOrder;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
+      for (final t in _free)
+        Builder(builder: (_) {
+          final name = _s(t, 'table_name', '');
+          final on = _picked.contains(name);
+          return InkWell(
+            onTap: name.isEmpty
+                ? null
+                : () => setState(() => on ? _picked.remove(name) : _picked.add(name)),
+            borderRadius: AppRadius.controlAll,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+              child: Row(children: [
+                Icon(on ? Icons.check_box : Icons.check_box_outline_blank,
+                    size: 18, color: on ? AppColors.copperHi : AppColors.textTertiary),
+                const SizedBox(width: 10),
+                Expanded(child: Text(name, style: text.titleSmall)),
+                Text(_seatsLabel(t), style: text.bodySmall!.copyWith(fontSize: 11.5)),
+              ]),
+            ),
+          );
+        }),
+      const SizedBox(height: 10),
+      Row(children: [
+        Expanded(
+          child: Text(
+            chosen.isEmpty
+                ? 'Pick one or more tables.'
+                : '${chosen.join(' + ')} · $_pickedSeats seats for ${widget.party}',
+            style: text.bodySmall!.copyWith(
+              fontSize: 11.5,
+              color: chosen.isNotEmpty && _pickedSeats < widget.party ? AppColors.warning : AppColors.textSecondary,
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        ForkButton(
+          label: 'Assign',
+          icon: Icons.check,
+          dense: true,
+          onPressed: chosen.isEmpty ? null : () => Navigator.pop(context, chosen),
+        ),
+      ]),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final combos = _combos;
+    final best = combos.isEmpty ? null : combos.first;
+    return AlertDialog(
+      title: Text(best == null
+          ? 'No table fits a party of ${widget.party}'
+          : 'Party of ${widget.party} needs ${_namesOf(best).length} tables'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (best != null) ...[
+              Text('Combine ${_namesOf(best).join(' + ')}?',
+                  style: text.bodyMedium!.copyWith(color: AppColors.textSecondary)),
+              const SizedBox(height: 10),
+              _comboCard(best, primary: true),
+              if (combos.length > 1) ...[
+                const SizedBox(height: 6),
+                Text('Other options', style: text.labelSmall),
+                const SizedBox(height: 6),
+                for (final c in combos.skip(1)) _comboCard(c, primary: false),
+              ],
+            ] else ...[
+              // The server's own words for why nothing fits — never one we invent.
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppColors.tint(AppColors.warning),
+                  borderRadius: AppRadius.cardAll,
+                  border: Border.all(color: AppColors.edge(AppColors.warning)),
+                ),
+                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Icon(Icons.info_outline, size: 16, color: AppColors.warning),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _noneReason.isEmpty || _noneReason == '—'
+                          ? 'No free table or adjacent group can seat ${widget.party} at that time.'
+                          : _noneReason,
+                      style: text.bodySmall,
+                    ),
+                  ),
+                ]),
+              ),
+            ],
+            if (_unnumbered.isNotEmpty && best == null) ...[
+              const SizedBox(height: 8),
+              Text('${_unnumbered.join(', ')} cannot be clubbed automatically — no number in the name.',
+                  style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textTertiary)),
+            ],
+            const SizedBox(height: 12),
+            if (!_override)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: ForkButton.ghost(
+                  label: best == null ? 'Choose tables manually' : 'Choose different tables',
+                  icon: Icons.tune,
+                  dense: true,
+                  onPressed: () => setState(() => _override = true),
+                ),
+              )
+            else ...[
+              Text('Free tables', style: text.labelSmall),
+              const SizedBox(height: 6),
+              _overridePicker(),
+            ],
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+      ],
+    );
+  }
+}
+
+// Resolve a service-recovery ticket (low-rating feedback) with an optional note.
+Future<void> _resolveRecovery(BuildContext context, RestClient rest, String id, VoidCallback reload) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final noteCtrl = TextEditingController();
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Resolve recovery ticket'),
+      content: TextField(
+        controller: noteCtrl,
+        minLines: 1,
+        maxLines: 3,
+        decoration: const InputDecoration(labelText: 'How was it resolved? (optional)', border: OutlineInputBorder()),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Mark resolved')),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  try {
+    await rest.post('/feedback/recovery/$id/resolve', {if (noteCtrl.text.trim().isNotEmpty) 'note': noteCtrl.text.trim()});
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+// Per-waiter feedback QR: each employee gets a QR/link that pre-fills the
+// feedback form with their eid (Employees.id) so responses are attributed to
+// them. The link targets the dashboard-hosted /feedback page (orderBaseUrl) and
+// carries rid=<slug> + oid=<outletId> + eid=<employeeId>, matching the contract
+// the printed bill QR and post-payment redirect already use.
+Widget _employeeFeedbackQrSection(Profile p, List employees) {
+  final rows = employees.whereType<Map>().where((e) => '${e['id'] ?? e['employee_id'] ?? ''}'.isNotEmpty).toList();
+  if (rows.isEmpty) return const SizedBox.shrink();
+  String urlFor(String eid) =>
+      '${AppConfig.orderBaseUrl}/feedback?rid=${p.restaurantUsername}&oid=${p.outletId}&eid=$eid';
+  return ForkCard(
+    padding: EdgeInsets.zero,
+    child: Builder(
+      builder: (context) => Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          shape: const Border(),
+          collapsedShape: const Border(),
+          iconColor: AppColors.copperHi,
+          collapsedIconColor: AppColors.textTertiary,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          leading: Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: const Icon(Icons.qr_code_2, size: 18, color: AppColors.copper),
+          ),
+          title: Text('Per-waiter feedback QR', style: Theme.of(context).textTheme.titleSmall),
+          subtitle: Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text('A QR/link per waiter — feedback scanned here is tagged to them',
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          children: [
+            for (final e in rows)
+              Builder(builder: (context) {
+                final eid = '${e['id'] ?? e['employee_id'] ?? ''}';
+                final name = '${_s(e, 'emp_Fname', '')} ${_s(e, 'emp_Lname', '')}'.trim();
+                final label = name.isEmpty ? _s(e, 'employee_Username') : name;
+                final url = urlFor(eid);
+                final text = Theme.of(context).textTheme;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: ForkCard(
+                    inset: true,
+                    padding: const EdgeInsets.all(12),
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      // Paper exception: the QR keeps a white quiet zone so it
+                      // stays scannable — printed-output styling, black on white.
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: QrImageView(data: url, size: 96, backgroundColor: Colors.white),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(label, style: text.titleSmall),
+                          const SizedBox(height: 2),
+                          Text('@${_s(e, 'employee_Username')}', style: text.bodySmall),
+                          const SizedBox(height: 6),
+                          SelectableText(url, style: text.bodySmall!.copyWith(fontSize: 11)),
+                          const SizedBox(height: 6),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: ForkButton.subtle(
+                              label: 'Copy link',
+                              icon: Icons.copy,
+                              onPressed: () async {
+                                await Clipboard.setData(ClipboardData(text: url));
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Feedback link copied')));
+                                }
+                              },
+                            ),
+                          ),
+                        ]),
+                      ),
+                    ]),
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final summary = await rest.getMap('/feedback/summary');
+        final raw = await rest.get('/feedback');
+        final items = raw is Map ? (raw['items'] as List? ?? []) : (raw as List? ?? []);
+        final recovery = await rest.getMap('/feedback/recovery').catchError((_) => <String, dynamic>{});
+        // Employees drive the per-waiter feedback QR section; tolerate no access.
+        final usersRes = await rest.getMap('/restaurant/users').catchError((_) => <String, dynamic>{});
+        return {
+          'summary': summary,
+          'items': items,
+          'tickets': (recovery['tickets'] as List?) ?? [],
+          'employees': (usersRes['users'] as List?) ?? [],
+        };
+      },
+      builder: (context, data, reload) {
+        final sum = (data['summary'] as Map?) ?? {};
+        final items = (data['items'] as List?) ?? [];
+        final tickets = (data['tickets'] as List?) ?? [];
+        final employees = (data['employees'] as List?) ?? [];
+        final text = Theme.of(context).textTheme;
+        final avgRating = double.tryParse('${sum['averageRating'] ?? 0}') ?? 0;
+        // A low-rating alert asked us to focus one response.
+        final focus = _focusOf(context, 'Feedback');
+        final focusId = focus?.idOf(const ['feedback_id']);
+        bool isFocused(Map m) => focusId != null && '${m['id']}' == focusId;
+        final focusFound = focusId != null &&
+            (items.any((m) => isFocused(m as Map)) || tickets.any((m) => isFocused(m as Map)));
+        String initialsOf(String name) {
+          final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+          if (parts.isEmpty) return '?';
+          return parts.length == 1
+              ? parts.first.substring(0, 1)
+              : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+        }
+
+        return ListView(padding: AppSpacing.pageNarrow, children: [
+          if (focus != null)
+            _focusBanner(
+              context,
+              found: focusFound,
+              message: focusFound
+                  ? 'Highlighted the response from your notification.'
+                  : "That response isn't in this list — it may have been removed, or belong to another outlet.",
+            ),
+          Wrap(spacing: 12, runSpacing: 12, children: [
+            _statCard(context, 'Responses', '${sum['totalResponses'] ?? 0}', Icons.reviews),
+            SizedBox(
+              width: 200,
+              child: StatCard(
+                value: '${sum['averageRating'] ?? 0}',
+                unit: '/ 5',
+                caption: 'AVG RATING',
+                chart: Align(
+                  alignment: Alignment.centerLeft,
+                  child: DonutGauge(fraction: (avgRating / 5).clamp(0.0, 1.0), size: 46),
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 200,
+              child: StatCard(
+                value: '${tickets.length}',
+                caption: 'RECOVERY',
+                tag: tickets.isNotEmpty ? 'Open' : null,
+                tagColor: AppColors.danger,
+              ),
+            ),
+          ]),
+          const SizedBox(height: AppSpacing.xxl),
+          _employeeFeedbackQrSection(p, employees),
+          const SizedBox(height: AppSpacing.xxl),
+          if (tickets.isNotEmpty) ...[
+            SectionHeader(
+              title: 'Service recovery',
+              count: tickets.length,
+              trailing: const StatusChip(label: 'Needs follow-up', color: AppColors.danger, dense: true),
+            ),
+            ...tickets.map((t) {
+              final m = t as Map;
+              final cats = (m['category_ratings'] as List?) ?? [];
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  selected: isFocused(m),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      InitialsAvatar(initials: '${m['overall_rating'] ?? '-'}', color: AppColors.danger),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(_s(m, 'customer_name', 'Guest'), style: text.titleSmall),
+                          const SizedBox(height: 2),
+                          // Not the raw ISO date: submitted_at is a UTC instant,
+                          // so slicing at the "T" dates a 1am review to the
+                          // previous day in Asia/Kolkata.
+                          Text(_fmtTime(_s(m, 'submitted_at')), style: text.bodySmall),
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      const StatusChip(label: 'Low rating', color: AppColors.danger, dense: true),
+                      const SizedBox(width: AppSpacing.sm),
+                      ForkButton(
+                        label: 'Resolve',
+                        dense: true,
+                        onPressed: () => _resolveRecovery(context, rest, '${m['id']}', reload),
+                      ),
+                    ]),
+                    if (_s(m, 'comments').isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text('"${_s(m, 'comments')}"',
+                            style: text.bodyMedium!.copyWith(fontStyle: FontStyle.italic)),
+                      ),
+                    ...cats.map((c) {
+                      final cm = c as Map;
+                      final ans = _s(cm, 'follow_up_answer');
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          InfoChip(icon: Icons.star_outline, label: '${_s(cm, 'label')} · ${cm['rating']}/5'),
+                          if (ans.isNotEmpty) ...[
+                            const SizedBox(width: AppSpacing.sm),
+                            Expanded(child: Text(ans, style: text.bodySmall)),
+                          ],
+                        ]),
+                      );
+                    }),
+                  ]),
+                ),
+              );
+            }),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          SectionHeader(title: 'All feedback', count: items.length),
+          if (items.isEmpty)
+            _empty('No feedback yet.')
+          else
+            StatefulBuilder(builder: (context, setLocal) => Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+            ...items.map((it) {
+              final m = it as Map;
+              final guest = _s(m, 'customer_name', 'Guest');
+              final id = '${m['id'] ?? ''}';
+              final open = _feedbackOpenId == id && id.isNotEmpty;
+              final cats = (m['category_ratings'] as List?) ?? const [];
+              final nps = m['nps'];
+              final comment = _s(m, 'comments', '');
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  selected: isFocused(m),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  // Tapping opens the full question-by-question breakdown; the
+                  // collapsed row alone can't show WHY a score is what it is.
+                  onTap: id.isEmpty ? null : () => setLocal(() => _feedbackOpenId = open ? '' : id),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                    Row(children: [
+                      InitialsAvatar(initials: initialsOf(guest)),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                          Text(guest, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          const SizedBox(height: 2),
+                          Text(comment.isNotEmpty ? comment : '${cats.length} question${cats.length == 1 ? '' : 's'} answered',
+                              style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+                        MicroStat(value: '${_score(m['overall_rating'])} / 5', label: 'Rating', alignEnd: true),
+                        const SizedBox(height: 4),
+                        Text(_fmtTime(_s(m, 'submitted_at')).toUpperCase(), style: text.labelSmall),
+                      ]),
+                      if (id.isNotEmpty) ...[
+                        const SizedBox(width: 4),
+                        Icon(open ? Icons.expand_less : Icons.expand_more, size: 18, color: AppColors.textSecondary),
+                      ],
+                    ]),
+                    if (open) ...[
+                      const SizedBox(height: AppSpacing.md),
+                      const Divider(height: 1),
+                      const SizedBox(height: AppSpacing.md),
+                      if (cats.isEmpty)
+                        Text('No per-question ratings were recorded.', style: text.bodySmall)
+                      else
+                        ...cats.map((c) {
+                          final cm = c as Map;
+                          final r = _numOf(cm['rating']);
+                          final followUp = _s(cm, 'follow_up');
+                          final answer = _s(cm, 'follow_up_answer');
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                              Row(children: [
+                                Expanded(
+                                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                                    Text(_s(cm, 'label', _s(cm, 'key')), style: text.bodyMedium),
+                                    if (_s(cm, 'question').isNotEmpty)
+                                      Text(_s(cm, 'question'), style: text.labelSmall),
+                                  ]),
+                                ),
+                                StatusChip(
+                                  label: '${r.toStringAsFixed(0)}/5',
+                                  color: r <= 2 ? AppColors.danger : (r >= 4 ? AppColors.success : AppColors.warning),
+                                  dense: true,
+                                ),
+                              ]),
+                              if (followUp.isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 8, top: 4),
+                                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                                    Text(followUp, style: text.labelSmall),
+                                    Text(answer.isNotEmpty ? answer : '— not answered', style: text.bodySmall),
+                                  ]),
+                                ),
+                            ]),
+                          );
+                        }),
+                      const SizedBox(height: 4),
+                      Wrap(spacing: 12, runSpacing: 4, children: [
+                        InfoChip(label: 'Overall ${_score(m['overall_rating'])}/5 (avg of ${cats.length})'),
+                        if (nps != null) InfoChip(label: 'Recommend ${_numOf(nps).toStringAsFixed(0)}/10'),
+                        if (_s(m, 'source').isNotEmpty) InfoChip(label: 'Via ${_s(m, 'source')}'),
+                      ]),
+                      if (comment.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(comment, style: text.bodySmall),
+                      ],
+                    ],
+                  ]),
+                ),
+              );
+            }),
+              ],
+            )),
+        ]);
+      },
+    );
+
+// Single-hue copper chart for (label, value) rows. Long chronological series
+// render as template CopperColumns; short/ranked data reads best as an HBarRow
+// list (label always beside value — nothing is colour-alone).
+Widget _barChart(
+  BuildContext context,
+  List<({String label, double value})> data,
+  String Function(double) fmt, {
+  String title = 'Data point',
+}) {
+  if (data.isEmpty) {
+    return Text('No data yet.', style: Theme.of(context).textTheme.bodySmall);
+  }
+  final total = data.fold<double>(0, (a, d) => a + d.value);
+  // Hovering names the mark and its value; clicking opens the same figures with
+  // the context a bare bar cannot carry (share of total, rank). Every chart
+  // built through this helper gets both, so interactivity cannot drift between
+  // one analytics panel and the next.
+  String hint(int i) => '${data[i].label} · ${fmt(data[i].value)}';
+  void open(int i) {
+    final d = data[i];
+    final share = total > 0 ? d.value / total * 100 : 0;
+    final ranked = [...data]..sort((a, b) => b.value.compareTo(a.value));
+    final rank = ranked.indexWhere((e) => e.label == d.label) + 1;
+    _detailSheet(
+      context,
+      eyebrow: title,
+      title: d.label,
+      children: [
+        _kv('Value', fmt(d.value)),
+        _kv('Share of total', total > 0 ? '${share.toStringAsFixed(1)}%' : '—'),
+        _kv('Rank', rank > 0 ? '$rank of ${data.length}' : '—'),
+        _kv('Total across all', fmt(total)),
+      ],
+    );
+  }
+
+  if (data.length >= 10) {
+    return CopperColumns(
+      values: [for (final d in data) d.value],
+      labels: [for (final d in data) d.label],
+      valueFormatter: fmt,
+      tooltipBuilder: hint,
+      onTap: open,
+    );
+  }
+  final maxV = data.map((d) => d.value).fold<double>(0, (a, b) => b > a ? b : a);
+  return Column(children: [
+    for (var i = 0; i < data.length; i++)
+      HBarRow(
+        label: data[i].label,
+        fraction: maxV > 0 ? (data[i].value / maxV).clamp(0.0, 1.0) : 0,
+        value: fmt(data[i].value),
+        tooltip: hint(i),
+        onTap: () => open(i),
+      ),
+  ]);
+}
+
+Widget _chartCard(BuildContext context, String title, Widget child, {VoidCallback? onDownload}) => ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SectionHeader(
+          title: title,
+          padding: const EdgeInsets.only(bottom: 12),
+          trailing: onDownload == null ? null : _dlButton(onDownload),
+        ),
+        child,
+      ]),
+    );
+
+Color _kpiColor(String s) {
+  switch (s) {
+    case 'blue': return AppColors.info;
+    case 'green': return AppColors.success;
+    case 'amber': return AppColors.warning;
+    case 'red': return AppColors.danger;
+    default: return AppColors.textSecondary;
+  }
+}
+
+String _kpiStatusLabel(String s) {
+  switch (s) {
+    case 'blue': return 'EXCELLENT';
+    case 'green': return 'ON TARGET';
+    case 'amber': return 'WATCH';
+    case 'red': return 'ACTION';
+    default: return 'NO DATA';
+  }
+}
+
+// --- KPI drill-down (tap a KPI tile → detail sheet with a chart) --------------
+
+// One-line plain-English meaning per KPI key (shown at the top of the sheet).
+const Map<String, String> _kpiMeaning = {
+  'profit_margin': 'Share of revenue left after expenses.',
+  'revpash': 'Revenue per available seat-hour — how hard seats work.',
+  'discount_utilization': 'Share of bills that carried a discount.',
+  'offer_redemption': 'How often live offers/coupons are redeemed.',
+  'menu_bad_share': 'Share of dishes flagged BAD (low popularity & value).',
+  'forecast_mape': 'Demand-forecast error — lower is a sharper forecast.',
+  'labour_cost': 'Staff cost as a share of revenue.',
+  'happiness_efficiency': 'Guest happiness weighed against staff effort.',
+  'avg_rating': 'Average guest rating from feedback.',
+  'nps': 'Net promoter score — promoters minus detractors.',
+  'complaint_rate': 'Share of feedback that was a complaint.',
+  'churn_rate': 'Share of regulars who have gone quiet.',
+  'wait_time': 'Average guest wait before being seated.',
+  'table_turnaround': 'Average time a table is occupied per visit.',
+  'processing_time': 'Average kitchen/order processing time.',
+  'booking_fill': 'How full reservations run against capacity.',
+  'booking_no_show': 'Share of reservations that never showed.',
+  'valet_retrieval': 'Average valet car-retrieval time.',
+  'supplier_on_time': 'Share of supplier deliveries that arrived on time.',
+  'supplier_score': 'Blended supplier quality + reliability score.',
+  'low_stock': 'Ingredients at or below their reorder point.',
+  'food_cost_pct': 'Ingredient cost as a share of revenue.',
+  'food_cost_variance': 'Gap between expected and actual food cost.',
+  'campaign_roi': 'Return on marketing-campaign spend.',
+};
+
+enum _KpiChartKind { pie, bar, columns, none }
+
+// A tap-through detail sheet for a single KPI or stat tile: header (label + big
+// value + status), the plain-English explainer, then a drill-down chart (either
+// an explicit [series] from the caller or the KPI→chart registry), a
+// legend/value list, and an optional "view full records" link.
+class _KpiDrilldownSheet extends StatelessWidget {
+  final Map kpi;
+  final Map adv;
+  final VoidCallback? onViewRecords; // switches the analytics view to the KPI's home slice
+  final String? viewRecordsLabel;
+
+  // --- generic stat-tile mode (plain numeric cards) --------------------------
+  // Explainer row from GET /analytics/metric-explainers: {title, what, how, tip}.
+  // Null (older backend / unmapped tile) simply renders no explainer.
+  final Map? explainer;
+
+  // Explicit breakdown rows. Non-null takes precedence over the KPI registry
+  // and is rendered in the order given (time-series must stay chronological),
+  // so callers sort first. Empty = no chart, explainer only — never a dead tap.
+  final List<({String label, double value})>? series;
+  final _KpiChartKind seriesKind;
+
+  // Formats every rendered value (money / duration / count). Defaults to a
+  // plain number.
+  final String Function(double)? valueFormat;
+
+  // One extra line of context under the number ("36 tickets timed · median …").
+  final String? note;
+
+  // Stat tiles have no health status, so their chip is suppressed.
+  final bool showStatus;
+
+  const _KpiDrilldownSheet({
+    required this.kpi,
+    required this.adv,
+    this.onViewRecords,
+    this.viewRecordsLabel,
+    this.explainer,
+    this.series,
+    this.seriesKind = _KpiChartKind.bar,
+    this.valueFormat,
+    this.note,
+    this.showStatus = true,
+  });
+
+  static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+  static List _list(dynamic v) => (v is List) ? v : const [];
+  static String _fmtNum(double v) => v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
+
+  // Resolve the KPI key to a chart kind + the (label, value) rows that feed it.
+  (_KpiChartKind, List<({String label, double value})>) _data() {
+    final key = _s(kpi, 'key');
+    List<({String label, double value})> pos(Iterable<({String label, double value})> it) =>
+        it.where((e) => e.value > 0).toList();
+    switch (key) {
+      case 'profit_margin':
+        {
+          final profit = (adv['profit'] as Map?) ?? {};
+          final p = _n(profit['revenue']) - _n(profit['expenses']);
+          return (_KpiChartKind.pie, pos([
+            (label: 'Profit', value: p),
+            (label: 'Expenses', value: _n(profit['expenses'])),
+          ]));
+        }
+      case 'discount_utilization':
+      case 'offer_redemption':
+        {
+          final offers = _list(adv['offers']);
+          final o = pos(offers.map((e) => (label: _s(e as Map, 'code'), value: _n(e['used']))));
+          if (o.isNotEmpty) return (_KpiChartKind.pie, o);
+          final d = (adv['discounts'] as Map?) ?? {};
+          return (_KpiChartKind.bar, pos([
+            (label: 'Discount bills', value: _n(d['discount_bills'])),
+            (label: 'All bills', value: _n(d['total_bills'])),
+            (label: 'Redemptions', value: _n(d['redemptions'])),
+          ]));
+        }
+      case 'avg_rating':
+      case 'nps':
+        return (_KpiChartKind.bar, pos(_list(adv['staff']).map((e) => (label: _s(e as Map, 'name'), value: _n(e['avg_rating'])))));
+      case 'complaint_rate':
+        return (_KpiChartKind.bar, pos(_list(adv['staff']).map((e) => (label: _s(e as Map, 'name'), value: _n(e['complaint_pct'])))));
+      case 'churn_rate':
+        {
+          final atRisk = _list((adv['churn'] as Map?)?['at_risk']);
+          return (_KpiChartKind.bar, pos(atRisk.map((e) => (label: _s(e as Map, 'customer'), value: _n(e['spend'])))));
+        }
+      case 'campaign_roi':
+        // ROI can be negative, so keep every campaign (the bar builder handles it).
+        return (_KpiChartKind.bar, _list(adv['campaigns']).map((e) => (label: _s(e as Map, 'name'), value: _n(e['roi_pct']))).toList());
+      case 'menu_bad_share':
+        {
+          final counts = <String, int>{'STAR': 0, 'GREAT': 0, 'MID': 0, 'BAD': 0};
+          for (final m in _list(adv['menu_classes'])) {
+            final c = _s(m as Map, 'class', 'MID');
+            counts[c] = (counts[c] ?? 0) + 1;
+          }
+          return (_KpiChartKind.pie, pos(counts.entries.map((e) => (label: e.key, value: e.value.toDouble()))));
+        }
+      case 'low_stock':
+        return (_KpiChartKind.bar, pos(_list(adv['stock_alerts']).map((e) => (label: _s(e as Map, 'name'), value: _n(e['qty'])))));
+      case 'table_turnaround':
+      case 'revpash':
+        {
+          final byTable = _list((adv['tat'] as Map?)?['by_table']);
+          return (_KpiChartKind.bar, pos(byTable.map((e) => (label: _s(e as Map, 'table_name'), value: _n(e['avg_min'])))));
+        }
+      case 'forecast_mape':
+        return (_KpiChartKind.bar, pos(_list(adv['demand_forecast']).map((e) => (label: _s(e as Map, 'name'), value: _n(e['forecast_next_week'])))));
+      case 'food_cost_pct':
+      case 'food_cost_variance':
+        return (_KpiChartKind.pie, pos(_list(adv['suppliers']).map((e) => (label: _s(e as Map, 'vendor'), value: _n(e['spend'])))));
+      default:
+        return (_KpiChartKind.none, const []);
+    }
+  }
+
+  // Composition breakdown (formerly a multi-hue pie): a copper donut carries
+  // the leading share, then an HBarRow list on the sequential copper ramp —
+  // every share is labelled beside its value, nothing is colour-alone.
+  Widget _pie(BuildContext context, List<({String label, double value})> data) {
+    final text = Theme.of(context).textTheme;
+    final fmt = valueFormat ?? _fmtNum;
+    final total = data.fold<double>(0, (s, e) => s + e.value);
+    final top = data.first;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      if (total > 0) ...[
+        Row(children: [
+          DonutGauge(fraction: top.value / total, size: 64),
+          const SizedBox(width: AppSpacing.lg),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(top.label, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 2),
+              Text('${(top.value / total * 100).round()}% of the total', style: text.bodySmall),
+            ]),
+          ),
+        ]),
+        const SizedBox(height: AppSpacing.md),
+      ],
+      for (var i = 0; i < data.length; i++)
+        HBarRow(
+          label: data[i].label,
+          fraction: total > 0 ? (data[i].value / total).clamp(0.0, 1.0) : 0,
+          value: fmt(data[i].value),
+          sub: total > 0 ? '${(data[i].value / total * 100).round()}%' : null,
+          color: AppColors.copperRamp[i % AppColors.copperRamp.length],
+        ),
+    ]);
+  }
+
+  // Ranked magnitudes (formerly a vertical bar chart) as an HBarRow list —
+  // single-hue copper; negative values keep their label + signed value with
+  // an empty bar, so nothing is hidden.
+  Widget _bar(BuildContext context, List<({String label, double value})> data) {
+    final fmt = valueFormat ?? _fmtNum;
+    final maxV = data.map((e) => e.value).fold<double>(0, (a, b) => b > a ? b : a);
+    return Column(children: [
+      for (final d in data)
+        HBarRow(
+          label: d.label,
+          fraction: maxV > 0 ? (d.value / maxV).clamp(0.0, 1.0) : 0,
+          value: fmt(d.value),
+        ),
+    ]);
+  }
+
+  // Chronological series (revenue by day, APC by month) — vertical columns keep
+  // the time axis readable where a ranked bar list would scramble it.
+  Widget _columns(BuildContext context, List<({String label, double value})> data) {
+    final fmt = valueFormat ?? _fmtNum;
+    return CopperColumns(
+      values: [for (final d in data) d.value],
+      labels: [for (final d in data) d.label],
+      valueFormatter: fmt,
+      tooltipBuilder: (i) => '${data[i].label} · ${fmt(data[i].value)}',
+      // Already inside the KPI's own detail view, so a tap surfaces the reading
+      // rather than opening a second sheet on top of this one.
+      onTap: (i) => ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${data[i].label}: ${fmt(data[i].value)}')),
+      ),
+    );
+  }
+
+  // The plain-English explainer block: what the number is, how it is computed,
+  // and the backend's one-line tip. Falls back to the KPI meaning registry.
+  Widget? _explainerBlock(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final what = explainer == null ? '' : _s(explainer!, 'what', '');
+    final how = explainer == null ? '' : _s(explainer!, 'how', '');
+    final tip = explainer == null ? '' : _s(explainer!, 'tip', '');
+    final fallback = _kpiMeaning[_s(kpi, 'key')];
+    if (what.isEmpty && how.isEmpty && tip.isEmpty) {
+      return fallback == null ? null : Text(fallback, style: text.bodySmall);
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      if (what.isNotEmpty)
+        Text(what, style: text.bodyMedium!.copyWith(color: AppColors.textPrimary)),
+      if (how.isNotEmpty) ...[
+        const SizedBox(height: 6),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.functions, size: 13, color: AppColors.textTertiary),
+          const SizedBox(width: 7),
+          Expanded(child: Text(how, style: text.bodySmall)),
+        ]),
+      ],
+      if (tip.isNotEmpty) ...[
+        const SizedBox(height: 6),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.lightbulb_outline, size: 13, color: AppColors.copper),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(tip, style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
+          ),
+        ]),
+      ],
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final color = _kpiColor(_s(kpi, 'status', 'grey'));
+    final v = kpi['value'];
+    final unit = _s(kpi, 'unit', '');
+    final valueText = v == null ? '—' : '$v$unit';
+    final meaning = _explainerBlock(context);
+    // An explicit series wins over the registry and keeps the caller's order
+    // (chronological for columns); registry rows are ranked biggest-first.
+    final (kind, dataRaw) = series != null ? (seriesKind, series!) : _data();
+    final data = series != null ? dataRaw : ([...dataRaw]..sort((a, b) => b.value.compareTo(a.value)));
+    final shown = data.take(kind == _KpiChartKind.columns ? 14 : 8).toList();
+    // An all-zero series has no shape to draw (and would divide by its own zero
+    // maximum), so it falls through to the explainer-only body.
+    final hasChart = kind != _KpiChartKind.none && shown.any((e) => e.value > 0);
+
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.82),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 40,
+            height: 4,
+            margin: const EdgeInsets.symmetric(vertical: 10),
+            decoration: BoxDecoration(color: AppColors.textSecondary.withValues(alpha: 0.4), borderRadius: BorderRadius.circular(2)),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 10, 12),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(_s(kpi, 'label').toUpperCase(), style: text.labelSmall),
+                  const SizedBox(height: 6),
+                  Text(valueText, style: text.displaySmall),
+                  if (note != null) ...[
+                    const SizedBox(height: 6),
+                    Text(note!, style: text.bodySmall!.copyWith(fontSize: 11.5)),
+                  ],
+                  if (showStatus) ...[
+                    const SizedBox(height: 6),
+                    StatusChip(label: _kpiStatusLabel(_s(kpi, 'status', 'grey')), color: color, dense: true),
+                  ],
+                ]),
+              ),
+              ForkIconButton(icon: Icons.close, tooltip: 'Close', onPressed: () => Navigator.pop(context)),
+            ]),
+          ),
+          Container(height: 1, color: AppColors.divider),
+          Flexible(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(18),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                if (meaning != null) ...[
+                  meaning,
+                  const SizedBox(height: AppSpacing.lg),
+                ],
+                if (hasChart) ...[
+                  const SectionHeader(title: 'Breakdown', padding: EdgeInsets.only(bottom: 10)),
+                  kind == _KpiChartKind.pie
+                      ? _pie(context, shown)
+                      : kind == _KpiChartKind.columns
+                          ? _columns(context, shown)
+                          : _bar(context, shown),
+                ] else ...[
+                  Text('No detailed breakdown yet for this metric.', style: text.bodySmall),
+                ],
+                if (onViewRecords != null) ...[
+                  const SizedBox(height: AppSpacing.md),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: ForkButton.ghost(
+                      label: viewRecordsLabel ?? 'View full records',
+                      icon: Icons.list_alt,
+                      dense: true,
+                      onPressed: onViewRecords,
+                    ),
+                  ),
+                ],
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// --- Analytics view filter ("show only this slice") --------------------------
+// Module-level so the choice survives reloads and module switches within a
+// session. Each section/KPI is tagged into exactly one detail view; 'overview'
+// is a curated headline cut and 'everything' shows all (mirrors the web page).
+String _analyticsView = 'overview';
+
+const List<(String, String)> _analyticsViews = [
+  ('overview', 'Overview'),
+  ('sales', 'Sales & Revenue'),
+  ('discounts', 'Discounts & Offers'),
+  ('menu', 'Menu'),
+  ('staff', 'Staff'),
+  ('customers', 'Customers'),
+  ('operations', 'Operations'),
+  // Kitchen is its own first-class slice (prep timing per station and per dish),
+  // and its headline also rides along on Overview so it is discoverable.
+  ('kitchen', 'Kitchen'),
+  ('supply', 'Suppliers & Inventory'),
+  ('marketing', 'Marketing'),
+  ('everything', 'Everything'),
+];
+
+const Map<String, String> _kpiHomeView = {
+  'revpash': 'sales',
+  'profit_margin': 'sales',
+  'discount_utilization': 'discounts',
+  'offer_redemption': 'discounts',
+  'menu_bad_share': 'menu',
+  'forecast_mape': 'menu',
+  'labour_cost': 'staff',
+  'happiness_efficiency': 'staff',
+  'avg_rating': 'customers',
+  'nps': 'customers',
+  'complaint_rate': 'customers',
+  'churn_rate': 'customers',
+  'wait_time': 'operations',
+  'table_turnaround': 'operations',
+  'processing_time': 'kitchen',
+  'booking_fill': 'operations',
+  'booking_no_show': 'operations',
+  'valet_retrieval': 'operations',
+  'supplier_on_time': 'supply',
+  'supplier_score': 'supply',
+  'low_stock': 'supply',
+  'food_cost_pct': 'supply',
+  'food_cost_variance': 'supply',
+  'campaign_roi': 'marketing',
+};
+
+// Headline KPIs shown on the Overview view.
+const Set<String> _overviewKpis = {
+  'profit_margin', 'revpash', 'food_cost_pct', 'labour_cost',
+  'avg_rating', 'nps', 'table_turnaround', 'churn_rate', 'low_stock',
+};
+
+// --- Per-section list sorting ------------------------------------------------
+// Every list/table in the analytics module gets a compact sort control (field
+// picker + asc/desc toggle). Selections are module-level so they survive view
+// switches and reloads within a session, mirroring _analyticsView. Charts and
+// time-series stay chronological and are never wired to this.
+typedef _SortKey = Comparable Function(Map row);
+
+class _SortOption {
+  final String label;
+  final _SortKey key;
+  const _SortOption(this.label, this.key);
+}
+
+// Selected field index per section (key = section id). Missing = index 0.
+final Map<String, int> _sortField = {};
+// Descending flag per section. Missing falls back to the section's default.
+final Map<String, bool> _sortDesc = {};
+
+// Sort an already-fetched list client-side using the section's current field +
+// direction. Returns a new list; the source is left untouched.
+List<Map> _applySort(String section, List src, List<_SortOption> opts, {required bool defaultDesc}) {
+  final rows = src.map((e) => e as Map).toList();
+  if (opts.isEmpty) return rows;
+  final fi = (_sortField[section] ?? 0).clamp(0, opts.length - 1);
+  final desc = _sortDesc[section] ?? defaultDesc;
+  final key = opts[fi].key;
+  rows.sort((a, b) {
+    final c = key(a).compareTo(key(b));
+    return desc ? -c : c;
+  });
+  return rows;
+}
+
+// Compact toolbar: optional CSV download + field picker (hidden when there's a
+// single field) + an asc/desc toggle, styled as quiet ghost pills with a copper
+// active state. Calls setLocal so the StatefulBuilder re-renders.
+Widget _sortControl(String section, List<_SortOption> opts, void Function(void Function()) setLocal,
+    {required bool defaultDesc, VoidCallback? onDownload}) {
+  final fi = (_sortField[section] ?? 0).clamp(0, opts.length - 1);
+  final desc = _sortDesc[section] ?? defaultDesc;
+  return Row(mainAxisSize: MainAxisSize.min, children: [
+    if (onDownload != null) ...[
+      _dlButton(onDownload),
+      const SizedBox(width: 6),
+    ],
+    if (opts.length > 1)
+      PopupMenuButton<int>(
+        tooltip: 'Sort by',
+        color: AppColors.cardRaised,
+        shape: RoundedRectangleBorder(
+          borderRadius: AppRadius.controlAll,
+          side: const BorderSide(color: AppColors.borderStrong),
+        ),
+        onSelected: (v) => setLocal(() => _sortField[section] = v),
+        itemBuilder: (_) => [
+          for (var i = 0; i < opts.length; i++)
+            PopupMenuItem(
+              value: i,
+              height: 36,
+              child: Row(children: [
+                Expanded(
+                  child: Text(
+                    opts[i].label,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: i == fi ? FontWeight.w600 : FontWeight.w500,
+                      color: i == fi ? AppColors.copperHi : AppColors.textPrimary,
+                    ),
+                  ),
+                ),
+                if (i == fi) const Icon(Icons.check, size: 14, color: AppColors.copperHi),
+              ]),
+            ),
+        ],
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: AppColors.inset,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppColors.border),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.sort, size: 13, color: AppColors.copper),
+            const SizedBox(width: 6),
+            Text(
+              opts[fi].label,
+              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.copperHi, letterSpacing: 0.2),
+            ),
+            const Icon(Icons.arrow_drop_down, size: 16, color: AppColors.textTertiary),
+          ]),
+        ),
+      ),
+    const SizedBox(width: 6),
+    ForkIconButton(
+      icon: desc ? Icons.arrow_downward : Icons.arrow_upward,
+      tooltip: desc ? 'Descending' : 'Ascending',
+      onPressed: () => setLocal(() => _sortDesc[section] = !desc),
+    ),
+  ]);
+}
+
+// A section title row with the sort control pinned to the right — the template
+// section-header idiom (copper tick + title) carrying the sort toolbar. Long
+// analytics titles wrap/ellipsize instead of colliding with the control.
+Widget _sortHeader(String title, String section, List<_SortOption> opts, void Function(void Function()) setLocal,
+        {required bool defaultDesc, bool bold = true, double fontSize = 14, VoidCallback? onDownload}) =>
+    Builder(
+      builder: (context) => Row(children: [
+        Container(
+          width: 3,
+          height: 14,
+          decoration: BoxDecoration(color: AppColors.copperHi, borderRadius: BorderRadius.circular(2)),
+        ),
+        const SizedBox(width: 9),
+        Expanded(
+          child: Text(title,
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium!
+                  .copyWith(fontWeight: bold ? FontWeight.w600 : FontWeight.w500),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        _sortControl(section, opts, setLocal, defaultDesc: defaultDesc, onDownload: onDownload),
+      ]),
+    );
+
+// Case-insensitive text key that keeps the sort total (never throws on nulls).
+Comparable _txt(Map m, String k) => _s(m, k, '').toLowerCase();
+double _dnum(Map m, String k) => (m[k] is num) ? (m[k] as num).toDouble() : (double.tryParse('${m[k] ?? ''}') ?? 0);
+Comparable _numk(Map m, String k) => _dnum(m, k);
+
+// Sort-option sets per analytics section (defined once, referenced at render).
+final List<_SortOption> _kpiSortOpts = [
+  _SortOption('Severity', (m) { const sev = {'red': 0, 'amber': 1, 'grey': 2, 'green': 3, 'blue': 4}; return sev[_s(m, 'status', 'grey')] ?? 2; }),
+  _SortOption('Name', (m) => _txt(m, 'label')),
+  _SortOption('Value', (m) => _numk(m, 'value')),
+];
+final List<_SortOption> _stockSortOpts = [
+  _SortOption('Qty', (m) => _numk(m, 'qty')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _menuClassSortOpts = [
+  _SortOption('Revenue', (m) => _numk(m, 'revenue')),
+  _SortOption('Qty', (m) => _numk(m, 'qty')),
+  _SortOption('Popularity', (m) => _numk(m, 'popularity_pct')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _forecastSortOpts = [
+  _SortOption('Next week', (m) => _numk(m, 'forecast_next_week')),
+  _SortOption('12-wk sold', (m) => _numk(m, 'total_qty')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _churnSortOpts = [
+  _SortOption('Spend', (m) => _numk(m, 'spend')),
+  _SortOption('Orders', (m) => _numk(m, 'orders')),
+  _SortOption('Days since visit', (m) => _numk(m, 'days_since_visit')),
+  _SortOption('Name', (m) => _txt(m, 'customer')),
+];
+final List<_SortOption> _tatSortOpts = [
+  _SortOption('Avg min', (m) => _numk(m, 'avg_min')),
+  _SortOption('Visits', (m) => _numk(m, 'visits')),
+  _SortOption('Table', (m) => _txt(m, 'table_name')),
+];
+final List<_SortOption> _campaignSortOpts = [
+  _SortOption('ROI', (m) => _numk(m, 'roi_pct')),
+  _SortOption('Uplift', (m) => _numk(m, 'uplift_pct')),
+  _SortOption('Cost', (m) => _numk(m, 'cost')),
+  _SortOption('Sales (during)', (m) => _numk(m, 'sales_during')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _staffApcSortOpts = [
+  _SortOption('APC', (m) => _numk(m, 'mean_apc')),
+  _SortOption('Orders', (m) => _numk(m, 'orders_count')),
+  _SortOption('Covers', (m) => _numk(m, 'covers_count')),
+  _SortOption('Name', (m) => _txt(m, 'employee_name')),
+];
+// One shared key for every section's dish list in "item-wise prep per section",
+// so picking a field re-orders all the stations the same way (they are one
+// logical table, just grouped).
+final List<_SortOption> _kitchenItemsSortOpts = [
+  _SortOption('Avg prep', (m) => _numk(m, 'avg_prep_ms')),
+  _SortOption('P90 prep', (m) => _numk(m, 'p90_prep_ms')),
+  _SortOption('Times timed', (m) => _numk(m, 'count')),
+  _SortOption('Dish', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _attendanceSortOpts = [
+  _SortOption('Hours worked', (m) => _numk(m, 'hours_worked')),
+  _SortOption('Shifts', (m) => _numk(m, 'shifts')),
+  _SortOption('Days present', (m) => _numk(m, 'days_present')),
+  _SortOption('Absent days', (m) => _numk(m, 'absent_days')),
+  // late_pct is null until someone has enough worked days for a baseline;
+  // _numk reads that as 0, which sorts them below anyone actually late.
+  _SortOption('Late %', (m) => _numk(m, 'late_pct')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _topDishSortOpts = [
+  _SortOption('Revenue', (m) => _numk(m, 'revenue')),
+  _SortOption('Qty sold', (m) => _numk(m, 'quantity')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _topWaiterSortOpts = [
+  _SortOption('Revenue', (m) => _numk(m, 'revenue')),
+  _SortOption('Orders', (m) => _numk(m, 'orders')),
+  _SortOption('Name', (m) => _txt(m, 'employee_name')),
+];
+final List<_SortOption> _priceSuggestSortOpts = [
+  _SortOption('Δ price', (m) => _dnum(m, 'suggested_price') - _dnum(m, 'current_price')),
+  _SortOption('Current price', (m) => _numk(m, 'current_price')),
+  _SortOption('Suggested price', (m) => _numk(m, 'suggested_price')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+final List<_SortOption> _slowMoverSortOpts = [
+  _SortOption('Qty sold', (m) => _numk(m, 'quantity')),
+  _SortOption('Price', (m) => _numk(m, 'current_price')),
+  _SortOption('Name', (m) => _txt(m, 'name')),
+];
+// --- Price-suggestion explanation --------------------------------------------
+// GET /analytics/menu-insights price_suggestions rows carry a structured
+// explanation alongside the legacy one-line `reason`:
+//   why / expected_effect  — the cause and what the change should do
+//   confidence + confidence_note — how strong the sample is
+//   delta_amount / delta_percent — authoritative (a margin-clamped cut is
+//     SMALLER than the nominal step, so never re-derive it from ±8/±10%)
+//   margin_note — only when the dish has a recipe AND a recorded unit cost
+//   caution     — only when something genuinely warrants a warning
+// All optional: an older backend sends `reason` alone, which stays the fallback.
+Color _confidenceColor(String c) {
+  switch (c) {
+    case 'high': return AppColors.success;
+    case 'medium': return AppColors.warning;
+    default: return AppColors.neutral;
+  }
+}
+
+// Rendered on the suggestion card AND inside the Apply confirm dialog, so the
+// owner reads exactly the same justification in both places.
+Widget _priceSuggestionExplainer(BuildContext context, Map m) {
+  final text = Theme.of(context).textTheme;
+  final up = _s(m, 'direction') == 'increase';
+  final why = _s(m, 'why', '');
+  final effect = _s(m, 'expected_effect', '');
+  final conf = _s(m, 'confidence', '');
+  final confNote = _s(m, 'confidence_note', '');
+  final marginNote = _s(m, 'margin_note', '');
+  final caution = _s(m, 'caution', '');
+  final cur = _dnum(m, 'current_price');
+  final sug = _dnum(m, 'suggested_price');
+  final deltaAmt = m['delta_amount'] is num ? _dnum(m, 'delta_amount') : sug - cur;
+  final deltaPct = m['delta_percent'] is num
+      ? _dnum(m, 'delta_percent')
+      : (cur > 0 ? (sug - cur) / cur * 100 : 0.0);
+  String signed(double v, String s) => '${v < 0 ? '-' : '+'}$s';
+
+  // Legacy backend: only the single-line reason is available.
+  if (why.isEmpty && effect.isEmpty) {
+    final reason = _s(m, 'reason', '');
+    return reason.isEmpty ? const SizedBox.shrink() : Text(reason, style: text.bodySmall);
+  }
+
+  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    if (why.isNotEmpty)
+      Text(why, style: text.bodyMedium!.copyWith(color: AppColors.textPrimary)),
+    if (effect.isNotEmpty) ...[
+      const SizedBox(height: 5),
+      Text(effect, style: text.bodySmall),
+    ],
+    const SizedBox(height: 9),
+    Wrap(spacing: 6, runSpacing: 6, children: [
+      if (conf.isNotEmpty)
+        StatusChip(
+          label: '${conf.toUpperCase()} CONFIDENCE',
+          color: _confidenceColor(conf),
+          dense: true,
+        ),
+      InfoChip(
+        icon: up ? Icons.arrow_upward : Icons.arrow_downward,
+        label: '${signed(deltaAmt, '₹${deltaAmt.abs().toStringAsFixed(2)}')} · '
+            '${signed(deltaPct, '${deltaPct.abs().toStringAsFixed(1)}%')}',
+      ),
+    ]),
+    if (confNote.isNotEmpty) ...[
+      const SizedBox(height: 7),
+      Text(confNote, style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+    ],
+    if (marginNote.isNotEmpty) ...[
+      const SizedBox(height: 7),
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.receipt_long_outlined, size: 13, color: AppColors.textTertiary),
+        const SizedBox(width: 7),
+        Expanded(child: Text(marginNote, style: text.bodySmall!.copyWith(fontSize: 11.5))),
+      ]),
+    ],
+    if (caution.isNotEmpty) ...[
+      const SizedBox(height: 9),
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: AppColors.tint(AppColors.warning),
+          borderRadius: AppRadius.controlAll,
+          border: Border.all(color: AppColors.edge(AppColors.warning)),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.warning_amber_outlined, size: 14, color: AppColors.warning),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(caution, style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textPrimary)),
+          ),
+        ]),
+      ),
+    ],
+  ]);
+}
+
+// One paused item: the backend's human `explanation` when present, otherwise a
+// sentence rebuilt from the `reason` code (still a discriminated code — the
+// cooldown branch is what surfaces retry_after).
+// The one-sentence "why is this dish paused" line — the backend's `explanation`
+// when present, else derived from the reason code. Shared by the paused row and
+// its CSV export so both read identically.
+String _suppressedWhy(Map row) {
+  final why = _s(row, 'explanation', '');
+  if (why.isNotEmpty) return why;
+  final reason = _s(row, 'reason', '');
+  final until = _fmtDay('${row['retry_after'] ?? ''}');
+  return reason == 'cooldown'
+      ? (until.isEmpty
+          ? 'Paused while its recent price change settles.'
+          : 'Paused until $until, while its recent price change settles.')
+      : reason == 'margin_floor'
+          ? 'A further cut would fall below the food-cost margin floor.'
+          : 'Already at its automatic drift cap.';
+}
+
+Widget _suppressedRow(BuildContext context, Map row) {
+  final text = Theme.of(context).textTheme;
+  final why = _suppressedWhy(row);
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 5),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Icon(Icons.pause_circle_outline, size: 14, color: AppColors.textTertiary),
+      const SizedBox(width: 8),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(_s(row, 'name', 'Dish'),
+              style: text.titleSmall!.copyWith(fontSize: 12.5), maxLines: 1, overflow: TextOverflow.ellipsis),
+          const SizedBox(height: 2),
+          Text(why, style: text.bodySmall!.copyWith(fontSize: 11.5)),
+        ]),
+      ),
+    ]),
+  );
+}
+
+final List<_SortOption> _demoSortOpts = [
+  _SortOption('Count', (m) => _numk(m, 'n')),
+  _SortOption('Label', (m) => _txt(m, 'label')),
+];
+
+// --- CSV export (analytics) ---------------------------------------------------
+// Every analytics section can be saved as a spreadsheet-ready CSV built entirely
+// from the rows already on screen — no extra request, no new dependency. Values
+// are written exactly as the section renders them (₹ amounts, "3m 20s"
+// durations, the same sort order and the same row cap), so a file always matches
+// what the owner was looking at.
+
+// RFC-4180 quoting: wrap in quotes and double any embedded quote whenever the
+// cell carries a quote, comma or newline.
+String _csvCell(Object? v) {
+  final s = v == null ? '' : '$v';
+  if (s.contains('"') || s.contains(',') || s.contains('\n') || s.contains('\r')) {
+    return '"${s.replaceAll('"', '""')}"';
+  }
+  return s;
+}
+
+String _csvOf(List<String> headers, List<List<Object?>> rows) {
+  final b = StringBuffer();
+  if (headers.isNotEmpty) b.write('${headers.map(_csvCell).join(',')}\r\n');
+  for (final r in rows) {
+    b.write('${r.map(_csvCell).join(',')}\r\n');
+  }
+  return b.toString();
+}
+
+// Filename-safe slug: "Kitchen · by dish" -> "kitchen-by-dish".
+String _fileSlug(String s) => s
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+    .replaceAll(RegExp(r'^-+'), '')
+    .replaceAll(RegExp(r'-+$'), '');
+
+// The restaurant's today, not the device's — an export named for the wrong day
+// is the kind of thing that only shows up at reconciliation time.
+String _fileDate() => RestaurantTime.todayIso();
+
+// Write one section's CSV through the platform save dialog — a native file dialog
+// on Windows, ACTION_CREATE_DOCUMENT (Save to…) on Android. Same route as the
+// accounting Tally export. UTF-8, no BOM.
+Future<void> _downloadCsv(BuildContext context, String slug, String section, String csv) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final name = '${_fileSlug(slug)}-${_fileSlug(section)}-${_fileDate()}.csv';
+  try {
+    final path = await FilePicker.saveFile(
+      dialogTitle: 'Save "$section" as CSV',
+      fileName: name,
+      type: FileType.custom,
+      allowedExtensions: const ['csv'],
+      bytes: Uint8List.fromList(utf8.encode(csv)),
+    );
+    messenger.showSnackBar(SnackBar(content: Text(path == null ? 'Download cancelled.' : 'Saved $name')));
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('Could not save the CSV: $e')));
+  }
+}
+
+// Downloads are whole-SECTION ("entire Kitchen", "entire Sales & Revenue"), not
+// per-card: this used to render a download icon on every card, which meant one
+// file per widget. It now runs the section's registration callback during build
+// and renders nothing — each card contributes its rows to the single
+// "Download <view>" button in the analytics toolbar. Keeping the same signature
+// means every existing call site (_dlButton(...) and onDownload:) is unchanged.
+Widget _dlButton(VoidCallback register) {
+  register();
+  return const SizedBox.shrink();
+}
+
+Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final r = await Future.wait([
+          rest.getMap('/orders/apc'),
+          rest.getMap('/feedback/summary'),
+          rest.getMap('/orders/daily-revenue?days=14'),
+          rest.getMap('/orders/timing-stats'),
+          rest.getMap('/analytics/menu-insights?days=30').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/orders/apc-trends?months=12').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/analytics/advanced?days=90').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/analytics/kitchen?days=30').catchError((_) => <String, dynamic>{}),
+          // Static "what is this number" copy for the stat tiles — no tenant
+          // data, fetched once per load. Older backends omit the route and the
+          // tiles simply render without an explainer.
+          rest.getMap('/analytics/metric-explainers').catchError((_) => <String, dynamic>{}),
+        ]);
+        return {'apc': r[0], 'feedback': r[1], 'daily': r[2], 'timing': r[3], 'menu': r[4], 'trends': r[5], 'adv': r[6], 'kitchen': r[7], 'explainers': r[8]};
+      },
+      builder: (context, data, reload) {
+        final apc = (data['apc'] as Map?) ?? {};
+        final fb = (data['feedback'] as Map?) ?? {};
+        final daily = ((data['daily'] as Map?)?['series'] as List?) ?? [];
+        final timing = (data['timing'] as Map?) ?? {};
+        final incentives = (apc['employee_incentives'] as List?) ?? [];
+        final orders = (apc['orders'] as List?) ?? [];
+        final menu = (data['menu'] as Map?) ?? {};
+        final topDishes = (menu['top_dishes'] as List?) ?? [];
+        final priceSuggestions = (menu['price_suggestions'] as List?) ?? [];
+        // Items the backend deliberately withheld this period (recently repriced,
+        // at their drift cap, or floored by food cost). Additive field — older
+        // backends simply omit it and these stay empty.
+        final suppressedMap = (menu['suppressed_suggestions'] as Map?) ?? {};
+        final suppressedItems = (suppressedMap['items'] as List?) ?? [];
+        final suppressedCount = (suppressedMap['count'] as num?)?.toInt() ?? suppressedItems.length;
+        final topWaiters = (menu['top_waiters'] as List?) ?? [];
+        final slowMovers = (menu['slow_movers'] as List?) ?? [];
+        final menuDays = (menu['period_days'] as num?)?.toInt() ?? 30;
+
+        double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+        String money(double v) => '₹${v.toStringAsFixed(0)}';
+
+        final revenueByTable = orders
+            .map((o) => (label: 'Table ${_s(o as Map, 'table_name', '—')}', value: num0(o['total'])))
+            .where((d) => d.value > 0)
+            .toList()
+          ..sort((a, b) => b.value.compareTo(a.value));
+        final staffApc = incentives
+            .map((e) => (label: _s(e as Map, 'employee_name', 'Staff'), value: num0(e['mean_apc'])))
+            .where((d) => d.value > 0)
+            .toList()
+          ..sort((a, b) => b.value.compareTo(a.value));
+        String ddmm(String iso) {
+          final pcs = iso.split('-');
+          return pcs.length == 3 ? '${pcs[2]}/${pcs[1]}' : iso;
+        }
+
+        final dailySeries = daily
+            .map((d) => (label: ddmm('${(d as Map)['date']}'), value: num0(d['revenue'])))
+            .toList();
+
+        // Historical month-by-month trend (revenue / APC / covers), last 12 months.
+        final trends = ((data['trends'] as Map?)?['series'] as List?) ?? [];
+        String ym(String mo) { final pcs = mo.split('-'); return pcs.length == 2 ? '${pcs[1]}/${pcs[0].length >= 4 ? pcs[0].substring(2) : pcs[0]}' : mo; }
+        final revByMonth = trends.map((t) => (label: ym('${(t as Map)['month']}'), value: num0(t['total_revenue']))).toList();
+        final apcByMonth = trends.map((t) => (label: ym('${(t as Map)['month']}'), value: num0(t['monthly_apc']))).toList();
+        final coversByMonth = trends.map((t) => (label: ym('${(t as Map)['month']}'), value: num0(t['total_covers']))).toList();
+        final trendsHasData = trends.any((t) => num0((t as Map)['total_revenue']) > 0 || num0(t['bills']) > 0);
+
+        // Advanced analytics (KPI health, discounts, low stock, menu classes, churn).
+        final adv = (data['adv'] as Map?) ?? {};
+        final kpis = (adv['kpis'] as List?) ?? [];
+        final advDisc = (adv['discounts'] as Map?) ?? {};
+        final advStock = (adv['stock_alerts'] as List?) ?? [];
+        final menuClasses = (adv['menu_classes'] as List?) ?? [];
+        final churn = (adv['churn'] as Map?) ?? {};
+        final atRisk = (churn['at_risk'] as List?) ?? [];
+        // Attendance over the same window as the rest of /analytics/advanced.
+        // Additive: older backends omit both and the section simply never renders.
+        final attendance = (adv['staff_attendance'] as List?) ?? [];
+        final attSummary = (adv['attendance_summary'] as Map?) ?? {};
+        final forecast = (adv['demand_forecast'] as List?) ?? [];
+        final demo = (adv['demographics'] as Map?) ?? {};
+        final campaigns = (adv['campaigns'] as List?) ?? [];
+        final tat = (adv['tat'] as Map?) ?? {};
+        final tatByTable = (tat['by_table'] as List?) ?? [];
+
+        // Kitchen analytics — order-level prep summary, per-section (station)
+        // averages, and per-dish prep times (GetKitchenAnalytics). Additive:
+        // older backends omit /analytics/kitchen and these stay empty/zero.
+        final kitchen = (data['kitchen'] as Map?) ?? {};
+        final kSummary = (kitchen['order_summary'] as Map?) ?? {};
+        final kByDish = (kitchen['by_dish'] as List?) ?? [];
+        final kBySection = (kitchen['by_section'] as List?) ?? [];
+        // Item-wise prep time nested under the station that cooks it. Built from
+        // the FULL dish set server-side (by_dish is capped at the 40 slowest
+        // overall), so a fast section still lists its own items. Each section's
+        // `dishes` is capped at 25 with `dishes_total` giving the true count.
+        final kSectionItems = ((kitchen['by_section_items'] as List?) ?? []).map((e) => e as Map).toList();
+        final kOrdersTimed = (kSummary['orders_timed'] as num?)?.toInt() ?? 0;
+        final kitchenDays = (kitchen['period_days'] as num?)?.toInt() ?? 30;
+
+        // Plain-English explainers for the stat tiles, keyed by metric id
+        // (GET /analytics/metric-explainers). A missing key renders no
+        // explainer rather than blocking the drill-down.
+        final explainers = ((data['explainers'] as Map?)?['explainers'] as Map?) ?? {};
+        Map? explainerFor(String key) => explainers[key] as Map?;
+
+        // Breakdown series for the stat-tile drill-downs, built from data this
+        // module already fetched (no extra requests).
+        String dur(double v) => _fmtDur(v.toInt());
+        List<({String label, double value})> ranked(Iterable<({String label, double value})> it) =>
+            it.where((d) => d.value > 0).toList()..sort((a, b) => b.value.compareTo(a.value));
+        final advStaff = (adv['staff'] as List?) ?? [];
+        final staffRating =
+            ranked(advStaff.map((e) => (label: _s(e as Map, 'name', 'Staff'), value: num0(e['avg_rating']))));
+        final kSectionAvg = ranked(
+            kBySection.map((e) => (label: _s(e as Map, 'section', 'Unassigned'), value: num0(e['avg_prep_ms']))));
+        final kSectionP90 = ranked(
+            kBySection.map((e) => (label: _s(e as Map, 'section', 'Unassigned'), value: num0(e['p90_prep_ms']))));
+        final kDishP90 =
+            ranked(kByDish.map((e) => (label: _s(e as Map, 'name', 'Dish'), value: num0(e['p90_prep_ms']))));
+        // Attendance breakdowns for the tile drill-downs — same already-fetched
+        // payload, one series per headline number.
+        final attHours =
+            ranked(attendance.map((e) => (label: _s(e as Map, 'name', 'Staff'), value: num0(e['hours_worked']))));
+        final attShifts =
+            ranked(attendance.map((e) => (label: _s(e as Map, 'name', 'Staff'), value: num0(e['shifts']))));
+        final attLate =
+            ranked(attendance.map((e) => (label: _s(e as Map, 'name', 'Staff'), value: num0(e['late_shifts']))));
+        final attAbsent =
+            ranked(attendance.map((e) => (label: _s(e as Map, 'name', 'Staff'), value: num0(e['absent_days']))));
+        // Hours are the one attendance number that is not a whole count.
+        String hrs(double v) => '${v.toStringAsFixed(1)}h';
+        final attDays = (attSummary['window_days'] as num?)?.toInt() ?? 90;
+
+        // Create a campaign (name + spend + date window) → ROI shows on reload.
+        Future<void> addCampaign() async {
+          final nameCtl = TextEditingController();
+          final costCtl = TextEditingController();
+          final startCtl = TextEditingController();
+          final endCtl = TextEditingController();
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('New campaign'),
+              content: SizedBox(width: 380, child: Column(mainAxisSize: MainAxisSize.min, children: [
+                TextField(controller: nameCtl, decoration: const InputDecoration(labelText: 'Name', border: OutlineInputBorder())),
+                const SizedBox(height: 8),
+                TextField(controller: costCtl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Cost (spend)', border: OutlineInputBorder())),
+                const SizedBox(height: 8),
+                TextField(controller: startCtl, decoration: const InputDecoration(labelText: 'Starts (YYYY-MM-DD)', border: OutlineInputBorder())),
+                const SizedBox(height: 8),
+                TextField(controller: endCtl, decoration: const InputDecoration(labelText: 'Ends (YYYY-MM-DD)', border: OutlineInputBorder())),
+              ])),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add')),
+              ],
+            ),
+          );
+          if (ok != true) return;
+          try {
+            await rest.post('/campaigns', {
+              'name': nameCtl.text.trim(),
+              'cost': double.tryParse(costCtl.text.trim()) ?? 0,
+              'starts_at': startCtl.text.trim(),
+              'ends_at': endCtl.text.trim(),
+            });
+            reload();
+          } catch (e) {
+            if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // Whether this user may apply a price suggestion to the live menu —
+        // same gate as the Menu module's edit affordances (the 'menu' permission
+        // keyword; admins always pass via actions == ["*"]).
+        final canApplyPrice = p.can(const ['menu']);
+
+        // Apply one suggested price via the single-item PATCH /menu/:id/price
+        // route (never PUT /menu — that's a full-menu replace which would drop
+        // every item not in the payload). Confirms first: this edits the LIVE menu.
+        Future<void> applySuggestion(Map m) async {
+          final id = '${m['id'] ?? ''}';
+          final name = _s(m, 'name', 'Dish');
+          final price = num0(m['suggested_price']);
+          if (id.isEmpty || price <= 0) return;
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Apply suggested price?'),
+              // The same explanation the card shows, so the decision is made
+              // against the reasoning rather than just the two numbers.
+              content: SizedBox(
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(name, style: Theme.of(ctx).textTheme.titleSmall),
+                    const SizedBox(height: 8),
+                    Text('${_money(m['current_price'])}  →  ${_money(price)}',
+                        style: Theme.of(ctx).textTheme.titleMedium!.copyWith(color: AppColors.copperHi)),
+                    const SizedBox(height: 12),
+                    _priceSuggestionExplainer(ctx, m),
+                    const SizedBox(height: 12),
+                    Text('This changes the live menu immediately — guests and new orders will be charged the new price.',
+                        style: Theme.of(ctx).textTheme.bodySmall),
+                  ]),
+                ),
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text('Apply ${_money(price)}')),
+              ],
+            ),
+          );
+          if (ok != true) return;
+          try {
+            await rest.patch('/menu/${Uri.encodeComponent(id)}/price', {'price': price});
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$name is now ${_money(price)}.')));
+            }
+            reload(); // refetches menu-insights so the applied row updates
+          } catch (e) {
+            if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // StatefulBuilder so picking a view chip re-renders without refetching.
+        return StatefulBuilder(builder: (context, setLocal) {
+        final view = _analyticsView;
+        bool vis(String home, {bool onOverview = false}) =>
+            view == 'everything' || view == home || (view == 'overview' && onOverview);
+
+        // Every card that can be exported calls dl(...) while the view builds, so
+        // this holds exactly the sections currently on screen. The toolbar's
+        // "Download <view>" button reads it when TAPPED — by then the build has
+        // finished and the list is complete (same list instance, captured by ref).
+        final exportable = <({String label, List<String> headers, List<List<Object?>> rows})>[];
+        void dl(String section, List<String> headers, List<List<Object?>> rows) {
+          exportable.add((label: section, headers: headers, rows: rows));
+        }
+
+        // One file for the whole section: each card as a labelled block, blank
+        // line between them — the same layout the web dashboard exports.
+        Future<void> downloadView() async {
+          if (exportable.isEmpty) {return;}
+          final b = StringBuffer();
+          for (final s in exportable) {
+            if (b.isNotEmpty) {b.write('\r\n');}
+            b.write('${_csvCell(s.label)}\r\n');
+            b.write(_csvOf(s.headers, s.rows));
+          }
+          final label = _analyticsView == 'everything' ? 'analytics-everything' : 'analytics-$_analyticsView';
+          await _downloadCsv(context, p.restaurantUsername, label, b.toString());
+        }
+
+        // Kitchen is its own slice, still reachable from Operations, and its
+        // headline (summary tiles + a short section/dish cut) also shows on
+        // Overview. Only the Kitchen/Operations/Everything views list every
+        // section and every dish.
+        final kitchenFull = view == 'kitchen' || view == 'operations' || view == 'everything';
+        final kitchenVisible = kitchenFull || view == 'overview';
+
+        // Expand one plain number into the dark drill-down sheet: the big
+        // number, the metric explainer, and a breakdown chart built from
+        // already-fetched data. Never a dead tap — with no series the sheet
+        // still explains what the number is and how it is computed.
+        void openMetric(
+          String label,
+          String value, {
+          String? explainerKey,
+          String? note,
+          List<({String label, double value})> series = const [],
+          _KpiChartKind kind = _KpiChartKind.bar,
+          String Function(double)? fmt,
+          String? jumpTo,
+        }) {
+          final homeLabel = jumpTo == null
+              ? null
+              : _analyticsViews.firstWhere((e) => e.$1 == jumpTo, orElse: () => (jumpTo, jumpTo)).$2;
+          showModalBottomSheet(
+            context: context,
+            isScrollControlled: true,
+            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+            builder: (_) => _KpiDrilldownSheet(
+              kpi: {'label': label, 'value': value, 'unit': ''},
+              adv: adv,
+              showStatus: false,
+              explainer: explainerKey == null ? null : explainerFor(explainerKey),
+              note: note,
+              series: series,
+              seriesKind: kind,
+              valueFormat: fmt,
+              viewRecordsLabel: homeLabel == null ? null : 'See more in $homeLabel',
+              onViewRecords: jumpTo == null
+                  ? null
+                  : () {
+                      Navigator.pop(context);
+                      setLocal(() => _analyticsView = jumpTo);
+                    },
+            ),
+          );
+        }
+
+        // The tappable stat tile itself (hover lift + "DETAILS ›" affordance).
+        Widget metricCard(
+          String label,
+          String value,
+          IconData icon, {
+          String? explainerKey,
+          String? note,
+          List<({String label, double value})> series = const [],
+          _KpiChartKind kind = _KpiChartKind.bar,
+          String Function(double)? fmt,
+          String? jumpTo,
+        }) =>
+            _statCard(context, label, value, icon,
+                onTap: () => openMetric(label, value,
+                    explainerKey: explainerKey,
+                    note: note,
+                    series: series,
+                    kind: kind,
+                    fmt: fmt,
+                    jumpTo: jumpTo));
+        final visibleKpis = kpis.where((kk) {
+          final key = _s(kk as Map, 'key');
+          if (view == 'everything') return true;
+          // Unmapped (new) KPI keys surface on Overview instead of vanishing.
+          if (view == 'overview') return _overviewKpis.contains(key) || !_kpiHomeView.containsKey(key);
+          return _kpiHomeView[key] == view;
+        }).toList();
+
+        return ListView(padding: AppSpacing.pageNarrow, children: [
+          ForkTabs(
+            tabs: [for (final v in _analyticsViews) v.$2],
+            selected: _analyticsViews.indexWhere((v) => v.$1 == view) < 0
+                ? 0
+                : _analyticsViews.indexWhere((v) => v.$1 == view),
+            onSelected: (i) => setLocal(() => _analyticsView = _analyticsViews[i].$1),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          // One download for the whole section the user is looking at.
+          Align(
+            alignment: Alignment.centerRight,
+            child: ForkButton.ghost(
+              label: view == 'everything'
+                  ? 'Download everything'
+                  : 'Download ${_analyticsViews.firstWhere((v) => v.$1 == view, orElse: () => (view, view)).$2}',
+              icon: Icons.file_download_outlined,
+              dense: true,
+              onPressed: () => unawaited(downloadView()),
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          if (vis('sales', onOverview: true)) ...[
+            SectionHeader(
+              title: 'Performance',
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                _dlButton(() => dl('performance', const ['Metric', 'Value', 'Note'], [
+                      ['Monthly APC', _money(apc['monthly_apc']), '${apc['total_covers'] ?? 0} covers this month'],
+                      ['Revenue', _money(apc['total_revenue']), '${_s(apc, 'month')} to date'],
+                      ['Covers', '${apc['total_covers'] ?? 0}', ''],
+                      [
+                        'Avg prep',
+                        _fmtDur(((timing['avg_prep_ms'] ?? 0) as num).toInt()),
+                        kOrdersTimed == 0 ? '' : '$kOrdersTimed tickets timed in the last $kitchenDays days',
+                      ],
+                      ['Avg rating', '${fb['averageRating'] ?? 0}', '${fb['totalResponses'] ?? 0} responses'],
+                    ])),
+                const SizedBox(width: 8),
+                InfoChip(icon: Icons.calendar_today_outlined, label: _s(apc, 'month')),
+              ]),
+            ),
+            Wrap(spacing: 12, runSpacing: 12, children: [
+              metricCard('Monthly APC', _money(apc['monthly_apc']), Icons.trending_up,
+                  explainerKey: 'apc',
+                  note: '${apc['total_covers'] ?? 0} covers this month',
+                  series: apcByMonth.isNotEmpty ? apcByMonth : staffApc,
+                  kind: apcByMonth.isNotEmpty ? _KpiChartKind.columns : _KpiChartKind.bar,
+                  fmt: money,
+                  jumpTo: 'sales'),
+              metricCard('Revenue', _money(apc['total_revenue']), Icons.payments,
+                  explainerKey: 'revenue',
+                  note: 'Last 14 days below · ${_s(apc, 'month')} to date above',
+                  series: dailySeries,
+                  kind: _KpiChartKind.columns,
+                  fmt: money,
+                  jumpTo: 'sales'),
+              metricCard('Covers', '${apc['total_covers'] ?? 0}', Icons.groups,
+                  explainerKey: 'covers',
+                  note: coversByMonth.isEmpty ? null : 'By month, last 12 months',
+                  series: coversByMonth,
+                  kind: _KpiChartKind.columns,
+                  fmt: (v) => v.toStringAsFixed(0),
+                  jumpTo: 'sales'),
+              metricCard('Avg prep', _fmtDur(((timing['avg_prep_ms'] ?? 0) as num).toInt()), Icons.timer,
+                  explainerKey: 'avg_prep_ms',
+                  note: kOrdersTimed == 0 ? null : '$kOrdersTimed tickets timed in the last $kitchenDays days',
+                  series: kSectionAvg,
+                  fmt: dur,
+                  jumpTo: 'kitchen'),
+              metricCard('Avg rating', '${fb['averageRating'] ?? 0}', Icons.star,
+                  explainerKey: 'avg_rating',
+                  note: '${fb['totalResponses'] ?? 0} responses',
+                  series: staffRating,
+                  fmt: (v) => v.toStringAsFixed(1),
+                  jumpTo: 'customers'),
+            ]),
+            const SizedBox(height: AppSpacing.xxl),
+          ],
+          if (visibleKpis.isNotEmpty) ...[
+            _sortHeader('KPI health — last 90 days', 'kpis', _kpiSortOpts, setLocal,
+                defaultDesc: false,
+                fontSize: 16,
+                onDownload: () => dl('kpi-health', const ['KPI', 'Value', 'Unit', 'Status'], [
+                      for (final k in _applySort('kpis', visibleKpis, _kpiSortOpts, defaultDesc: false))
+                        [
+                          _s(k, 'label'),
+                          k['value'] ?? '',
+                          _s(k, 'unit', ''),
+                          _kpiStatusLabel(_s(k, 'status', 'grey')),
+                        ],
+                    ])),
+            const SizedBox(height: 12),
+            Wrap(spacing: 10, runSpacing: 10, children: [
+              for (final kk in _applySort('kpis', visibleKpis, _kpiSortOpts, defaultDesc: false))
+                Builder(builder: (context) {
+                  final k = kk;
+                  final color = _kpiColor(_s(k, 'status', 'grey'));
+                  final v = k['value'];
+                  final home = _kpiHomeView[_s(k, 'key')];
+                  final homeLabel = home == null
+                      ? null
+                      : _analyticsViews.firstWhere((e) => e.$1 == home, orElse: () => (home, home)).$2;
+                  final text = Theme.of(context).textTheme;
+                  return SizedBox(
+                    width: 170,
+                    child: ForkCard(
+                      padding: const EdgeInsets.all(12),
+                      onTap: () => showModalBottomSheet(
+                        context: context,
+                        isScrollControlled: true,
+                        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+                        builder: (_) => _KpiDrilldownSheet(
+                          kpi: k,
+                          adv: adv,
+                          viewRecordsLabel: homeLabel == null ? null : 'View full records in $homeLabel',
+                          onViewRecords: home == null
+                              ? null
+                              : () {
+                                  Navigator.pop(context);
+                                  setLocal(() => _analyticsView = home);
+                                },
+                        ),
+                      ),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(_s(k, 'label').toUpperCase(),
+                            style: text.labelSmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 8),
+                        Text(v == null ? '—' : '$v${_s(k, 'unit')}',
+                            style: text.displaySmall!.copyWith(fontSize: 21),
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 8),
+                        StatusChip(label: _kpiStatusLabel(_s(k, 'status', 'grey')), color: color, dense: true),
+                      ]),
+                    ),
+                  );
+                }),
+            ]),
+            const SizedBox(height: AppSpacing.xxl),
+          ],
+          if (vis('discounts')) ...[
+            // The whole numbers block expands: which offers were actually
+            // redeemed, or the discounted-vs-plain bill split when there are no
+            // coded offers.
+            ForkCard(
+              onTap: () {
+                final offers = (adv['offers'] as List?) ?? [];
+                final byOffer =
+                    ranked(offers.map((e) => (label: _s(e as Map, 'code', 'Offer'), value: num0(e['used']))));
+                final without = num0(advDisc['total_bills']) - num0(advDisc['discount_bills']);
+                openMetric('Total discount value', money(num0(advDisc['total_discount'])),
+                    explainerKey: 'discount_total',
+                    note: '${advDisc['discount_bills'] ?? 0} of ${advDisc['total_bills'] ?? 0} bills carried a discount'
+                        ' · ${advDisc['redemptions'] ?? 0} coupon redemptions',
+                    series: byOffer.isNotEmpty
+                        ? byOffer
+                        : [
+                            (label: 'Bills with a discount', value: num0(advDisc['discount_bills'])),
+                            (label: 'Bills without', value: without > 0 ? without : 0.0),
+                          ],
+                    kind: byOffer.isNotEmpty ? _KpiChartKind.bar : _KpiChartKind.pie,
+                    fmt: (v) => v.toStringAsFixed(0));
+              },
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                SectionHeader(
+                  title: 'Discounts & offers',
+                  padding: const EdgeInsets.only(bottom: 8),
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    _dlButton(() => dl('discounts', const ['Metric', 'Value'], [
+                          ['Discount utilization', '${num0(advDisc['utilization_pct']).toStringAsFixed(0)}%'],
+                          ['Bills with a discount', '${advDisc['discount_bills'] ?? 0} / ${advDisc['total_bills'] ?? 0}'],
+                          ['Total discount value', money(num0(advDisc['total_discount']))],
+                          ['Coupon redemptions', '${advDisc['redemptions'] ?? 0}'],
+                        ])),
+                    const SizedBox(width: 6),
+                    const Icon(Icons.chevron_right, size: 18, color: AppColors.copper),
+                  ]),
+                ),
+                _kv('Discount utilization', '${num0(advDisc['utilization_pct']).toStringAsFixed(0)}%'),
+                _kv('Bills with a discount', '${advDisc['discount_bills'] ?? 0} / ${advDisc['total_bills'] ?? 0}'),
+                _kv('Total discount value', money(num0(advDisc['total_discount']))),
+                _kv('Coupon redemptions', '${advDisc['redemptions'] ?? 0}'),
+              ]),
+            ),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('supply', onOverview: true) && advStock.isNotEmpty) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('Low-stock alerts', 'stock', _stockSortOpts, setLocal,
+                  defaultDesc: false,
+                  onDownload: () => dl('low-stock-alerts', const ['Item', 'Qty left'], [
+                        for (final m in _applySort('stock', advStock, _stockSortOpts, defaultDesc: false))
+                          [_s(m, 'name'), m['qty'] ?? 0],
+                      ])),
+              const SizedBox(height: 10),
+              ..._applySort('stock', advStock, _stockSortOpts, defaultDesc: false).map((m) {
+                return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
+                  Expanded(child: Text(_s(m, 'name'), style: Theme.of(context).textTheme.bodyMedium!.copyWith(color: AppColors.textPrimary), overflow: TextOverflow.ellipsis)),
+                  StatusChip(label: '${m['qty'] ?? 0} left', color: AppColors.danger, dense: true),
+                ]));
+              }),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('menu') && menuClasses.isNotEmpty) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('Menu engineering — BAD share ${num0(adv['bad_share_pct']).toStringAsFixed(0)}%', 'menuClass',
+                  _menuClassSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl('menu-engineering', const ['Class', 'Item', 'Qty sold', 'Revenue'], [
+                        for (final m
+                            in _applySort('menuClass', menuClasses, _menuClassSortOpts, defaultDesc: true).take(12))
+                          [
+                            _s(m, 'class', 'MID'),
+                            _s(m, 'name'),
+                            num0(m['qty']).toStringAsFixed(0),
+                            money(num0(m['revenue'])),
+                          ],
+                      ])),
+              const SizedBox(height: 6),
+              Text('STAR = popular & high-value · GREAT = popular, low-value · MID = niche, high-value · BAD = review',
+                  style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: 10),
+              ..._applySort('menuClass', menuClasses, _menuClassSortOpts, defaultDesc: true).take(12).map((m) {
+                final cls = _s(m, 'class', 'MID');
+                final clsColor = cls == 'STAR' ? AppColors.success : cls == 'GREAT' ? AppColors.info : cls == 'MID' ? AppColors.warning : AppColors.danger;
+                return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
+                  StatusChip(label: cls, color: clsColor, dense: true),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(_s(m, 'name'), style: Theme.of(context).textTheme.bodyMedium!.copyWith(color: AppColors.textPrimary), overflow: TextOverflow.ellipsis)),
+                  Text('${num0(m['qty']).toStringAsFixed(0)} sold · ${money(num0(m['revenue']))}', style: Theme.of(context).textTheme.bodySmall),
+                ]));
+              }),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('menu') && forecast.isNotEmpty) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('Demand forecast — next week', 'forecast', _forecastSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl('demand-forecast', const ['Item', 'Trend', 'Forecast next week'], [
+                        for (final m in _applySort('forecast', forecast, _forecastSortOpts, defaultDesc: true))
+                          [_s(m, 'name'), _s(m, 'trend', 'flat'), '~${num0(m['forecast_next_week']).round()}'],
+                      ])),
+              const SizedBox(height: 6),
+              Text(adv['forecast_mape_pct'] != null
+                    ? 'Weighted 4-week average · accuracy MAPE ${num0(adv['forecast_mape_pct']).toStringAsFixed(0)}%'
+                    : 'Weighted 4-week average (accuracy builds up with more history)',
+                  style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: 10),
+              ..._applySort('forecast', forecast, _forecastSortOpts, defaultDesc: true).map((m) {
+                final trend = _s(m, 'trend', 'flat');
+                return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
+                  Icon(trend == 'up' ? Icons.trending_up : trend == 'down' ? Icons.trending_down : Icons.trending_flat,
+                      size: 16, color: trend == 'up' ? AppColors.success : trend == 'down' ? AppColors.danger : AppColors.textSecondary),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(_s(m, 'name'), style: Theme.of(context).textTheme.bodyMedium!.copyWith(color: AppColors.textPrimary), overflow: TextOverflow.ellipsis)),
+                  MicroStat(value: '~${num0(m['forecast_next_week']).round()}', label: 'Next wk', alignEnd: true),
+                ]));
+              }),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('customers') && atRisk.isNotEmpty) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('At-risk customers — churn ${churn['rate_pct'] ?? '—'}%', 'churn', _churnSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () =>
+                      dl('at-risk-customers', const ['Customer', 'Orders', 'Spend', 'Days since visit'], [
+                        for (final m in _applySort('churn', atRisk, _churnSortOpts, defaultDesc: true))
+                          [
+                            _s(m, 'customer'),
+                            m['orders'] ?? 0,
+                            money(num0(m['spend'])),
+                            m['days_since_visit'] ?? '?',
+                          ],
+                      ])),
+              const SizedBox(height: 6),
+              Text('Quiet for 30+ days — worth a win-back offer.', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: 10),
+              ..._applySort('churn', atRisk, _churnSortOpts, defaultDesc: true).map((m) {
+                return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
+                  Expanded(child: Text(_s(m, 'customer'), style: Theme.of(context).textTheme.bodyMedium!.copyWith(color: AppColors.textPrimary), overflow: TextOverflow.ellipsis)),
+                  Text('${m['orders'] ?? 0} orders · ${money(num0(m['spend']))} · ${m['days_since_visit'] ?? '?'}d ago',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ]));
+              }),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('operations') && (tat['sessions'] ?? 0) != 0) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('Table turnaround (TAT) — avg ${num0(tat['avg_min']).toStringAsFixed(0)} min · median ${num0(tat['median_min']).toStringAsFixed(0)} min', 'tat', _tatSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl('table-turnaround', const ['Table', 'Visits', 'Avg minutes'], [
+                        for (final m in _applySort('tat', tatByTable, _tatSortOpts, defaultDesc: true))
+                          [_s(m, 'table_name'), m['visits'] ?? 0, num0(m['avg_min']).toStringAsFixed(0)],
+                      ])),
+              const SizedBox(height: 6),
+              Text('Seated → left, recorded per visit · ${tat['sessions']} visits', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: 10),
+              ..._applySort('tat', tatByTable, _tatSortOpts, defaultDesc: true).map((m) {
+                return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
+                  Expanded(child: Text(_s(m, 'table_name'), style: Theme.of(context).textTheme.bodyMedium!.copyWith(color: AppColors.textPrimary))),
+                  Text('${m['visits'] ?? 0} visits · ${num0(m['avg_min']).toStringAsFixed(0)} min avg', style: Theme.of(context).textTheme.bodySmall),
+                ]));
+              }),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (kitchenVisible) ...[
+            SectionHeader(
+              title: 'Kitchen',
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                _dlButton(() => dl('kitchen-summary', const ['Metric', 'Value'], [
+                      ['Avg prep time', _fmtDur(num0(kSummary['avg_prep_ms']).toInt())],
+                      ['Median prep time', _fmtDur(num0(kSummary['median_prep_ms']).toInt())],
+                      ['P90 prep', _fmtDur(num0(kSummary['p90_prep_ms']).toInt())],
+                      ['Slowest ticket', _fmtDur(num0(kSummary['max_prep_ms']).toInt())],
+                      ['Avg bark → served', _fmtDur(num0(kSummary['avg_bark_to_served_ms']).toInt())],
+                      ['Orders timed', kOrdersTimed],
+                      ['Period (days)', kitchenDays],
+                    ])),
+                const SizedBox(width: 8),
+                InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $kitchenDays days'),
+              ]),
+            ),
+            if (kOrdersTimed == 0 && kByDish.isEmpty && kBySection.isEmpty)
+              _empty('No kitchen timings yet — bark and serve some orders to see prep times.')
+            else ...[
+              // Order-level prep summary — durations formatted as "Xm Ys". Each
+              // tile expands into the explainer + a per-station breakdown.
+              Wrap(spacing: 12, runSpacing: 12, children: [
+                metricCard('Avg prep time', _fmtDur(num0(kSummary['avg_prep_ms']).toInt()), Icons.timer,
+                    explainerKey: 'avg_prep_ms',
+                    note: '$kOrdersTimed tickets timed · median ${_fmtDur(num0(kSummary['median_prep_ms']).toInt())}',
+                    series: kSectionAvg,
+                    fmt: dur,
+                    jumpTo: kitchenFull ? null : 'kitchen'),
+                metricCard('P90 prep', _fmtDur(num0(kSummary['p90_prep_ms']).toInt()), Icons.speed,
+                    explainerKey: 'p90_prep_ms',
+                    note: 'Slowest ticket ${_fmtDur(num0(kSummary['max_prep_ms']).toInt())}',
+                    series: kDishP90.isNotEmpty ? kDishP90.take(8).toList() : kSectionP90,
+                    fmt: dur,
+                    jumpTo: kitchenFull ? null : 'kitchen'),
+                metricCard('Avg bark → served', _fmtDur(num0(kSummary['avg_bark_to_served_ms']).toInt()),
+                    Icons.room_service_outlined,
+                    explainerKey: 'bark_to_served',
+                    note: '$kOrdersTimed tickets timed',
+                    series: kSectionAvg,
+                    fmt: dur,
+                    jumpTo: kitchenFull ? null : 'kitchen'),
+              ]),
+              const SizedBox(height: AppSpacing.md),
+              Text('$kOrdersTimed orders timed · median ${_fmtDur(num0(kSummary['median_prep_ms']).toInt())} · max ${_fmtDur(num0(kSummary['max_prep_ms']).toInt())}',
+                  style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: AppSpacing.lg),
+              // Per kitchen section (station) — slowest average first. Overview
+              // shows the four worst stations; the Kitchen view lists them all
+              // and adds each station's p90 and its slowest dish.
+              if (kBySection.isNotEmpty) ...[
+                ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  SectionHeader(
+                    title: 'Average time per section',
+                    padding: const EdgeInsets.only(bottom: 8),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      // Exports the stations this view lists (all of them in the
+                      // Kitchen/Operations views, the four worst on Overview).
+                      _dlButton(() => dl(
+                          'kitchen-by-section',
+                          const ['Section', 'Items timed', 'Dishes', 'Avg prep', 'P90 prep', 'Slowest dish', 'Slowest dish avg'],
+                          [
+                            for (final e in (kitchenFull ? kBySection : kBySection.take(4).toList()))
+                              [
+                                _s(e as Map, 'section', 'Unassigned'),
+                                e['items_timed'] ?? 0,
+                                e['dishes'] ?? 0,
+                                _fmtDur(num0(e['avg_prep_ms']).toInt()),
+                                _fmtDur(num0(e['p90_prep_ms']).toInt()),
+                                _s((e['slowest_dish'] as Map?) ?? const {}, 'name', ''),
+                                _fmtDur(num0(((e['slowest_dish'] as Map?) ?? const {})['avg_prep_ms']).toInt()),
+                              ],
+                          ])),
+                      if (!kitchenFull) ...[
+                        const SizedBox(width: 8),
+                        InfoChip(label: '${kBySection.length} stations'),
+                      ],
+                    ]),
+                  ),
+                  ...() {
+                    final rows = kitchenFull ? kBySection : kBySection.take(4).toList();
+                    final maxAvg = kBySection
+                        .map((e) => num0((e as Map)['avg_prep_ms']))
+                        .fold<double>(0, (a, b) => b > a ? b : a);
+                    return rows.map((e) {
+                      final m = e as Map;
+                      final avg = num0(m['avg_prep_ms']);
+                      return HBarRow(
+                        label: _s(m, 'section', 'Unassigned'),
+                        fraction: maxAvg > 0 ? avg / maxAvg : 0,
+                        value: _fmtDur(avg.toInt()),
+                        sub: '${m['items_timed'] ?? 0} items',
+                      );
+                    });
+                  }(),
+                  // Station detail: the p90 (the bad nights) and the dish that
+                  // drags that station's average up. slowest_dish comes from the
+                  // full aggregate, so it may not be in the capped dish list.
+                  if (kitchenFull) ...[
+                    const SizedBox(height: AppSpacing.sm),
+                    Container(height: 1, color: AppColors.divider),
+                    const SizedBox(height: AppSpacing.sm),
+                    ...kBySection.map((e) {
+                      final m = e as Map;
+                      final slow = (m['slowest_dish'] as Map?) ?? {};
+                      final slowName = _s(slow, 'name', '');
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 3),
+                        child: Row(children: [
+                          Expanded(
+                            child: Text(
+                              slowName.isEmpty
+                                  ? '${_s(m, 'section', 'Unassigned')} · ${m['dishes'] ?? 0} dishes'
+                                  : '${_s(m, 'section', 'Unassigned')} · slowest dish $slowName (${_fmtDur(num0(slow['avg_prep_ms']).toInt())})',
+                              style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11.5),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Text('p90 ${_fmtDur(num0(m['p90_prep_ms']).toInt())}',
+                              style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+                        ]),
+                      );
+                    }),
+                  ],
+                ])),
+                const SizedBox(height: AppSpacing.lg),
+              ],
+              // Item-wise prep time GROUPED BY SECTION — every station with its
+              // own dishes underneath, so a kitchen sees which item is dragging
+              // ITS station down instead of only the globally slowest dishes.
+              // Detail cut: Kitchen / Operations / Everything, not Overview.
+              if (kitchenFull && kSectionItems.isNotEmpty) ...[
+                _sortHeader('Item-wise prep time per section', 'kitchenItems', _kitchenItemsSortOpts, setLocal,
+                    defaultDesc: true,
+                    // One flat file (Section, Dish, …) in the order shown, so the
+                    // grouping survives the export without needing merged cells.
+                    onDownload: () => dl(
+                        'kitchen-items-by-section',
+                        const ['Section', 'Dish', 'Times timed', 'Avg prep', 'P90 prep', 'Fastest', 'Slowest'],
+                        [
+                          for (final s in kSectionItems)
+                            for (final d in _applySort('kitchenItems', (s['dishes'] as List?) ?? const [],
+                                _kitchenItemsSortOpts,
+                                defaultDesc: true))
+                              [
+                                _s(s, 'section', 'Unassigned'),
+                                _s(d, 'name', 'Dish'),
+                                d['count'] ?? 0,
+                                _fmtDur(num0(d['avg_prep_ms']).toInt()),
+                                _fmtDur(num0(d['p90_prep_ms']).toInt()),
+                                _fmtDur(num0(d['min_prep_ms']).toInt()),
+                                _fmtDur(num0(d['max_prep_ms']).toInt()),
+                              ],
+                        ])),
+                const SizedBox(height: 12),
+                ...kSectionItems.map((m) {
+                  final dishes =
+                      _applySort('kitchenItems', (m['dishes'] as List?) ?? const [], _kitchenItemsSortOpts,
+                          defaultDesc: true);
+                  final total = (m['dishes_total'] as num?)?.toInt() ?? dishes.length;
+                  // Bars are scaled inside the station: the question this card
+                  // answers is "which of MY items is slow", not how this station
+                  // compares to the others (the card above already does that).
+                  final maxAvg = dishes.fold<double>(0, (a, d) {
+                    final v = num0(d['avg_prep_ms']);
+                    return v > a ? v : a;
+                  });
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(children: [
+                        Container(
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: AppColors.inset,
+                            borderRadius: AppRadius.controlAll,
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: const Icon(Icons.soup_kitchen_outlined, size: 16, color: AppColors.textSecondary),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        Expanded(
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                            Text(_s(m, 'section', 'Unassigned'),
+                                style: Theme.of(context).textTheme.titleSmall,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${m['items_timed'] ?? 0} items timed · $total ${total == 1 ? 'dish' : 'dishes'}'
+                              ' · p90 ${_fmtDur(num0(m['p90_prep_ms']).toInt())}'
+                              ' · slowest ${_fmtDur(num0(m['max_prep_ms']).toInt())}',
+                              style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ]),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        MicroStat(
+                            value: _fmtDur(num0(m['avg_prep_ms']).toInt()), label: 'Section avg', alignEnd: true),
+                      ]),
+                      const SizedBox(height: AppSpacing.sm),
+                      Container(height: 1, color: AppColors.divider),
+                      const SizedBox(height: AppSpacing.sm),
+                      if (dishes.isEmpty)
+                        Text('No individual dish timings in this section yet.',
+                            style: Theme.of(context).textTheme.bodySmall)
+                      else
+                        ...dishes.map((d) => HBarRow(
+                              label: _s(d, 'name', 'Dish'),
+                              fraction: maxAvg > 0 ? num0(d['avg_prep_ms']) / maxAvg : 0,
+                              value: _fmtDur(num0(d['avg_prep_ms']).toInt()),
+                              sub: '${d['count'] ?? 0} timed · p90 ${_fmtDur(num0(d['p90_prep_ms']).toInt())}',
+                            )),
+                      // The server caps each section's dish list, so say so
+                      // rather than letting the numbers look incomplete.
+                      if (total > dishes.length) ...[
+                        const SizedBox(height: 4),
+                        Text('Showing the ${dishes.length} slowest of $total dishes in this section.',
+                            style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+                      ],
+                    ])),
+                  );
+                }),
+                const SizedBox(height: AppSpacing.lg),
+              ],
+              // Per dish — slowest average first; slowest gets a warning tint.
+              // Overview shows the five worst, the Kitchen view every dish.
+              if (kByDish.isNotEmpty) ...[
+                SectionHeader(
+                  title: kitchenFull ? 'Prep time per dish' : 'Slowest dishes',
+                  padding: const EdgeInsets.only(bottom: 8),
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    _dlButton(() => dl(
+                        kitchenFull ? 'kitchen-by-dish' : 'kitchen-slowest-dishes',
+                        const ['Dish', 'Section', 'Timed', 'Avg prep', 'P90 prep', 'Fastest'],
+                        [
+                          for (final e in (kitchenFull ? kByDish : kByDish.take(5).toList()))
+                            [
+                              _s(e as Map, 'name', 'Dish'),
+                              _s(e, 'station', 'Unassigned'),
+                              e['count'] ?? 0,
+                              _fmtDur(num0(e['avg_prep_ms']).toInt()),
+                              _fmtDur(num0(e['p90_prep_ms']).toInt()),
+                              _fmtDur(num0(e['min_prep_ms']).toInt()),
+                            ],
+                        ])),
+                    if (!kitchenFull) ...[
+                      const SizedBox(width: 8),
+                      InfoChip(label: '${kByDish.length} timed'),
+                    ],
+                  ]),
+                ),
+                ...(kitchenFull ? kByDish : kByDish.take(5).toList()).asMap().entries.map((entry) {
+                  final i = entry.key;
+                  final m = entry.value as Map;
+                  final slowest = i == 0;
+                  final markColor = slowest ? AppColors.warning : AppColors.textSecondary;
+                  final p90 = num0(m['p90_prep_ms']);
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: ForkCard(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      child: Row(children: [
+                        Container(
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: slowest ? AppColors.tint(AppColors.warning) : AppColors.inset,
+                            borderRadius: AppRadius.controlAll,
+                            border: Border.all(color: slowest ? AppColors.edge(AppColors.warning) : AppColors.border),
+                          ),
+                          child: Icon(slowest ? Icons.local_fire_department_outlined : Icons.restaurant_outlined,
+                              size: 16, color: markColor),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        Expanded(
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                            Text(_s(m, 'name', 'Dish'), style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            const SizedBox(height: 4),
+                            Row(children: [
+                              InfoChip(icon: Icons.soup_kitchen_outlined, label: _s(m, 'station', 'Unassigned')),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  '${m['count'] ?? 0} timed${p90 > 0 ? ' · p90 ${_fmtDur(p90.toInt())}' : ''}'
+                                  '${num0(m['min_prep_ms']) > 0 ? ' · fastest ${_fmtDur(num0(m['min_prep_ms']).toInt())}' : ''}',
+                                  style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ]),
+                          ]),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        MicroStat(value: _fmtDur(num0(m['avg_prep_ms']).toInt()), label: 'Avg prep', alignEnd: true),
+                      ]),
+                    ),
+                  );
+                }),
+                // Overview is a teaser — the full per-dish table lives in Kitchen.
+                if (!kitchenFull && kByDish.length > 5)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: ForkButton.ghost(
+                      label: 'View all ${kByDish.length} dishes',
+                      icon: Icons.list_alt,
+                      dense: true,
+                      onPressed: () => setLocal(() => _analyticsView = 'kitchen'),
+                    ),
+                  ),
+              ],
+            ],
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('marketing')) ...[
+          ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Container(
+                width: 3,
+                height: 14,
+                decoration: BoxDecoration(color: AppColors.copperHi, borderRadius: BorderRadius.circular(2)),
+              ),
+              const SizedBox(width: 9),
+              Expanded(child: Text('Campaign ROI', style: Theme.of(context).textTheme.titleMedium)),
+              _sortControl('campaign', _campaignSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl(
+                      'campaign-roi',
+                      const ['Campaign', 'Starts', 'Ends', 'Cost', 'Sales during', 'Sales before', 'Uplift %', 'ROI %'],
+                      [
+                        for (final m in _applySort('campaign', campaigns, _campaignSortOpts, defaultDesc: true))
+                          [
+                            _s(m, 'name'),
+                            _s(m, 'starts_at'),
+                            _s(m, 'ends_at'),
+                            money(num0(m['cost'])),
+                            money(num0(m['sales_during'])),
+                            money(num0(m['sales_before'])),
+                            m['uplift_pct'] == null ? '' : num0(m['uplift_pct']).toStringAsFixed(0),
+                            m['roi_pct'] == null ? '' : num0(m['roi_pct']).toStringAsFixed(0),
+                          ],
+                      ])),
+              const SizedBox(width: 6),
+              ForkButton.subtle(label: 'Add', icon: Icons.add, onPressed: addCampaign),
+            ]),
+            const SizedBox(height: 6),
+            Text('Revenue in the campaign window vs the same-length window before it.', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+            const SizedBox(height: 8),
+            if (campaigns.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Text('No campaigns yet — add one to measure uplift & ROI.', style: Theme.of(context).textTheme.bodyMedium),
+              ),
+            ..._applySort('campaign', campaigns, _campaignSortOpts, defaultDesc: true).map((m) {
+              final roi = m['roi_pct'];
+              final roiColor = roi == null ? AppColors.neutral : (num0(roi) >= 20 ? AppColors.success : num0(roi) >= 0 ? AppColors.warning : AppColors.danger);
+              return Padding(padding: const EdgeInsets.symmetric(vertical: 5), child: Row(children: [
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(_s(m, 'name'), style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 2),
+                  Text('${_s(m, 'starts_at')} → ${_s(m, 'ends_at')} · cost ${money(num0(m['cost']))}', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+                ])),
+                const SizedBox(width: AppSpacing.sm),
+                Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  StatusChip(
+                    label: roi != null ? 'ROI ${num0(roi).toStringAsFixed(0)}%' : (m['uplift_pct'] != null ? 'Uplift ${num0(m['uplift_pct']).toStringAsFixed(0)}%' : 'No data'),
+                    color: roiColor,
+                    dense: true,
+                  ),
+                  const SizedBox(height: 3),
+                  Text('${money(num0(m['sales_during']))} vs ${money(num0(m['sales_before']))}', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+                ]),
+                const SizedBox(width: AppSpacing.sm),
+                ForkIconButton(
+                  icon: Icons.delete_outline,
+                  tooltip: 'Delete campaign',
+                  onPressed: () async {
+                    try { await rest.delete('/campaigns/${m['id']}'); reload(); } catch (e) { if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e'))); }
+                  },
+                ),
+              ]));
+            }),
+          ])),
+          const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('customers') && (demo['tagged'] ?? 0) != 0) ...[
+            ForkCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _sortHeader('Customer demographics — ${demo['tagged']}/${demo['total_customers']} tagged', 'demo', _demoSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl('customer-demographics', const ['Group', 'Label', 'Customers'], [
+                        for (final (group, key) in const [
+                          ('Gender', 'by_gender'),
+                          ('Age', 'by_age'),
+                          ('Pincode', 'top_pincodes'),
+                        ])
+                          for (final g in _applySort('demo', (demo[key] as List? ?? const []), _demoSortOpts, defaultDesc: true))
+                            [group, _s(g, 'label'), g['n'] ?? 0],
+                      ])),
+              const SizedBox(height: 6),
+              Text('Aggregated only. Tag guests (gender / age / pincode) when adding customers.', style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+              const SizedBox(height: 10),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (final g in _applySort('demo', (demo['by_gender'] as List? ?? []), _demoSortOpts, defaultDesc: true))
+                  InfoChip(icon: Icons.person_outline, label: '${g['label']}: ${g['n']}'),
+                for (final g in _applySort('demo', (demo['by_age'] as List? ?? []), _demoSortOpts, defaultDesc: true))
+                  InfoChip(icon: Icons.cake_outlined, label: '${g['label']}: ${g['n']}'),
+                for (final g in _applySort('demo', (demo['top_pincodes'] as List? ?? []), _demoSortOpts, defaultDesc: true))
+                  InfoChip(icon: Icons.place_outlined, label: '${g['label']}: ${g['n']}'),
+              ]),
+            ])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('sales', onOverview: true)) ...[
+            _chartCard(context, 'Revenue — last 14 days', _barChart(context, dailySeries, money),
+                onDownload: () => dl('revenue-last-14-days', const ['Date', 'Revenue'],
+                    [for (final d in dailySeries) [d.label, money(d.value)]])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('sales') && trendsHasData) ...[
+            SectionHeader(
+              title: 'Performance over time',
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                // The whole monthly table in one file: revenue, APC and covers
+                // side by side (the three charts below are also downloadable).
+                _dlButton(() => dl('monthly-trends', const ['Month', 'Revenue', 'Avg per cover', 'Covers'], [
+                      for (final t in trends)
+                        [
+                          _s(t as Map, 'month'),
+                          money(num0(t['total_revenue'])),
+                          money(num0(t['monthly_apc'])),
+                          num0(t['total_covers']).toStringAsFixed(0),
+                        ],
+                    ])),
+                const SizedBox(width: 8),
+                const InfoChip(icon: Icons.calendar_today_outlined, label: 'Last 12 months'),
+              ]),
+            ),
+            _chartCard(context, 'Revenue by month', _barChart(context, revByMonth, money),
+                onDownload: () => dl('revenue-by-month', const ['Month', 'Revenue'],
+                    [for (final d in revByMonth) [d.label, money(d.value)]])),
+            const SizedBox(height: 14),
+            _chartCard(context, 'Average per cover by month', _barChart(context, apcByMonth, money),
+                onDownload: () => dl('apc-by-month', const ['Month', 'Avg per cover'],
+                    [for (final d in apcByMonth) [d.label, money(d.value)]])),
+            const SizedBox(height: 14),
+            _chartCard(context, 'Covers by month', _barChart(context, coversByMonth, (v) => v.toStringAsFixed(0)),
+                onDownload: () => dl('covers-by-month', const ['Month', 'Covers'],
+                    [for (final d in coversByMonth) [d.label, d.value.toStringAsFixed(0)]])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('sales')) ...[
+            _chartCard(context, 'Revenue by table', _barChart(context, revenueByTable.take(8).toList(), money),
+                onDownload: () => dl('revenue-by-table', const ['Table', 'Revenue'],
+                    [for (final d in revenueByTable.take(8)) [d.label, money(d.value)]])),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('staff')) ...[
+            _chartCard(context, 'Average per cover by staff', _barChart(context, staffApc.take(8).toList(), money),
+                onDownload: () => dl('apc-by-staff', const ['Staff', 'Avg per cover'],
+                    [for (final d in staffApc.take(8)) [d.label, money(d.value)]])),
+            const SizedBox(height: AppSpacing.xxl),
+          ],
+          if (vis('staff') && incentives.isNotEmpty) ...[
+            _sortHeader('Staff performance (APC)', 'staffApc', _staffApcSortOpts, setLocal,
+                defaultDesc: true,
+                onDownload: () => dl('staff-performance', const ['Employee', 'Orders', 'Covers', 'APC'], [
+                      for (final m in _applySort('staffApc', incentives, _staffApcSortOpts, defaultDesc: true))
+                        [
+                          _s(m, 'employee_name', 'Employee'),
+                          m['orders_count'] ?? 0,
+                          m['covers_count'] ?? 0,
+                          _money(m['mean_apc']),
+                        ],
+                    ])),
+            const SizedBox(height: 12),
+            ..._applySort('staffApc', incentives, _staffApcSortOpts, defaultDesc: true).map((m) {
+              final name = _s(m, 'employee_name', 'Employee');
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(children: [
+                    InitialsAvatar(initials: name.isEmpty ? '?' : name.substring(0, 1)),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                        Text(name, style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('${m['orders_count'] ?? 0} orders · ${m['covers_count'] ?? 0} covers', style: Theme.of(context).textTheme.bodySmall),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: _money(m['mean_apc']), label: 'APC', alignEnd: true),
+                  ]),
+                ),
+              );
+            }),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          // Attendance — clock-in derived, over the same window as the rest of
+          // /analytics/advanced. "Late" and "absent" are measured against each
+          // person's OWN typical start and the days the restaurant was open,
+          // because there is no shift roster; the caption says so on screen.
+          if (vis('staff') && (attendance.isNotEmpty || attSummary.isNotEmpty)) ...[
+            SectionHeader(
+              title: 'Attendance',
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                _dlButton(() => dl('attendance-summary', const ['Metric', 'Value'], [
+                      ['Staff tracked', attSummary['staff_tracked'] ?? attendance.length],
+                      ['Operating days', attSummary['operating_days'] ?? 0],
+                      ['Total shifts', attSummary['total_shifts'] ?? 0],
+                      ['Total hours', hrs(num0(attSummary['total_hours']))],
+                      ['Avg hours per staff', hrs(num0(attSummary['avg_hours_per_staff']))],
+                      ['Late shifts', attSummary['late_shifts'] ?? 0],
+                      ['Absent days', attSummary['absent_days'] ?? 0],
+                      ['Awaiting approval', attSummary['pending_shifts'] ?? 0],
+                      ['Window (days)', attDays],
+                    ])),
+                const SizedBox(width: 8),
+                InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $attDays days'),
+              ]),
+            ),
+            if (attendance.isEmpty)
+              _empty('No attendance recorded yet — staff clock-ins will show up here.')
+            else ...[
+              Wrap(spacing: 12, runSpacing: 12, children: [
+                metricCard('Hours worked', hrs(num0(attSummary['total_hours'])), Icons.schedule,
+                    note: '${attSummary['total_shifts'] ?? 0} shifts across '
+                        '${attSummary['staff_tracked'] ?? attendance.length} staff',
+                    series: attHours,
+                    fmt: hrs),
+                metricCard('Avg hours / staff', hrs(num0(attSummary['avg_hours_per_staff'])), Icons.av_timer,
+                    note: '${attSummary['operating_days'] ?? 0} operating days in the window',
+                    series: attHours,
+                    fmt: hrs),
+                metricCard('Shifts', '${attSummary['total_shifts'] ?? 0}', Icons.badge_outlined,
+                    note: 'Approved clock-ins only', series: attShifts),
+                metricCard('Late shifts', '${attSummary['late_shifts'] ?? 0}', Icons.running_with_errors_outlined,
+                    note: 'More than 15 min after that person’s typical start', series: attLate),
+                metricCard('Absent days', '${attSummary['absent_days'] ?? 0}', Icons.event_busy_outlined,
+                    note: 'Open days with no clock-in, after their first shift', series: attAbsent),
+                metricCard('Awaiting approval', '${attSummary['pending_shifts'] ?? 0}', Icons.pending_actions_outlined,
+                    note: 'Pending shifts do not count toward hours'),
+              ]),
+              const SizedBox(height: AppSpacing.lg),
+              _sortHeader('Attendance by staff', 'attendance', _attendanceSortOpts, setLocal,
+                  defaultDesc: true,
+                  onDownload: () => dl(
+                      'attendance-by-staff',
+                      const [
+                        'Staff', 'Shifts', 'Hours worked', 'Avg shift hours', 'Days present',
+                        'Absent days', 'Late shifts', 'Late %', 'Typical start', 'Pending',
+                        'Rejected', 'On shift now', 'Last seen',
+                      ],
+                      [
+                        for (final m in _applySort('attendance', attendance, _attendanceSortOpts, defaultDesc: true))
+                          [
+                            _s(m, 'name', 'Staff'),
+                            m['shifts'] ?? 0,
+                            num0(m['hours_worked']).toStringAsFixed(2),
+                            num0(m['avg_shift_hours']).toStringAsFixed(2),
+                            m['days_present'] ?? 0,
+                            m['absent_days'] ?? 0,
+                            m['late_shifts'] ?? 0,
+                            // Null until the person has enough worked days for a
+                            // baseline — export it as blank, not a misleading 0.
+                            m['late_pct'] == null ? '' : num0(m['late_pct']).toStringAsFixed(1),
+                            _s(m, 'typical_start', ''),
+                            m['pending_shifts'] ?? 0,
+                            m['rejected_shifts'] ?? 0,
+                            m['currently_clocked_in'] == true ? 'Yes' : 'No',
+                            _s(m, 'last_seen', ''),
+                          ],
+                      ])),
+              const SizedBox(height: 6),
+              Text(
+                'Hours use the same approved-shift rule and 16h cap as payroll. There is no roster, so “late” '
+                'is measured against each person’s own typical start (median first clock-in, 15 min grace) and '
+                '“absent” counts days the restaurant was open after their first shift.',
+                style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11),
+              ),
+              const SizedBox(height: 12),
+              ..._applySort('attendance', attendance, _attendanceSortOpts, defaultDesc: true).map((m) {
+                final name = _s(m, 'name', 'Staff');
+                final onShift = m['currently_clocked_in'] == true;
+                final latePct = m['late_pct'];
+                final pending = (m['pending_shifts'] as num?)?.toInt() ?? 0;
+                final absent = (m['absent_days'] as num?)?.toInt() ?? 0;
+                final start = _s(m, 'typical_start', '');
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: ForkCard(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    child: Row(children: [
+                      InitialsAvatar(initials: name.isEmpty ? '?' : name.substring(0, 1)),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                          Row(children: [
+                            Flexible(
+                              child: Text(name,
+                                  style: Theme.of(context).textTheme.titleSmall,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis),
+                            ),
+                            if (onShift) ...[
+                              const SizedBox(width: 8),
+                              const StatusChip(label: 'On shift', color: AppColors.success, dense: true),
+                            ],
+                          ]),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${m['shifts'] ?? 0} shifts · ${m['days_present'] ?? 0} days present'
+                            '${start.isEmpty ? '' : ' · usually starts $start'}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 6),
+                          Wrap(spacing: 6, runSpacing: 6, children: [
+                            InfoChip(label: 'Avg shift ${hrs(num0(m['avg_shift_hours']))}'),
+                            if (latePct != null)
+                              StatusChip(
+                                label: '${m['late_shifts'] ?? 0} late (${num0(latePct).toStringAsFixed(0)}%)',
+                                color: num0(latePct) >= 25 ? AppColors.warning : AppColors.neutral,
+                                dense: true,
+                              ),
+                            if (absent > 0)
+                              StatusChip(label: '$absent absent', color: AppColors.warning, dense: true),
+                            if (pending > 0)
+                              StatusChip(label: '$pending pending', color: AppColors.info, dense: true),
+                          ]),
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      MicroStat(value: hrs(num0(m['hours_worked'])), label: 'Hours', alignEnd: true),
+                    ]),
+                  ),
+                );
+              }),
+            ],
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('menu', onOverview: true) || vis('staff')) ...[
+            const SizedBox(height: AppSpacing.sm),
+            SectionHeader(
+              title: 'Actionable insights',
+              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $menuDays days'),
+            ),
+          ],
+          if (vis('menu', onOverview: true) && topDishes.isNotEmpty) ...[
+            _sortHeader('Top-selling dishes', 'topDish', _topDishSortOpts, setLocal,
+                defaultDesc: true,
+                onDownload: () => dl('top-selling-dishes', const ['Rank', 'Dish', 'Category', 'Qty sold', 'Revenue'], [
+                      for (final (i, m)
+                          in _applySort('topDish', topDishes, _topDishSortOpts, defaultDesc: true).take(8).indexed)
+                        [i + 1, _s(m, 'name', 'Dish'), _s(m, 'category', ''), m['quantity'] ?? 0, money(num0(m['revenue']))],
+                    ])),
+            const SizedBox(height: 12),
+            ..._applySort('topDish', topDishes, _topDishSortOpts, defaultDesc: true).take(8).toList().asMap().entries.map((entry) {
+              final i = entry.key;
+              final m = entry.value;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(children: [
+                    InitialsAvatar(initials: '${i + 1}'),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                        Text(_s(m, 'name', 'Dish'), style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('${m['quantity'] ?? 0} sold${_s(m, 'category').isNotEmpty ? ' · ${_s(m, 'category')}' : ''}',
+                            style: Theme.of(context).textTheme.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: money(num0(m['revenue'])), label: 'Revenue', alignEnd: true),
+                  ]),
+                ),
+              );
+            }),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('staff') && topWaiters.isNotEmpty) ...[
+            _sortHeader('Top waiters by revenue', 'topWaiter', _topWaiterSortOpts, setLocal,
+                defaultDesc: true,
+                onDownload: () => dl('top-waiters', const ['Rank', 'Staff', 'Orders', 'Revenue'], [
+                      for (final (i, m)
+                          in _applySort('topWaiter', topWaiters, _topWaiterSortOpts, defaultDesc: true).take(8).indexed)
+                        [i + 1, _s(m, 'employee_name', 'Staff'), m['orders'] ?? 0, money(num0(m['revenue']))],
+                    ])),
+            const SizedBox(height: 12),
+            ..._applySort('topWaiter', topWaiters, _topWaiterSortOpts, defaultDesc: true).take(8).toList().asMap().entries.map((entry) {
+              final i = entry.key;
+              final m = entry.value;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(children: [
+                    InitialsAvatar(initials: '${i + 1}'),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                        Text(_s(m, 'employee_name', 'Staff'), style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('${m['orders'] ?? 0} orders', style: Theme.of(context).textTheme.bodySmall),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: money(num0(m['revenue'])), label: 'Revenue', alignEnd: true),
+                  ]),
+                ),
+              );
+            }),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('menu') && (priceSuggestions.isNotEmpty || suppressedCount > 0)) ...[
+            _sortHeader('Price suggestions', 'priceSuggest', _priceSuggestSortOpts, setLocal,
+                defaultDesc: true,
+                // Live suggestions and the paused ones in one file, distinguished
+                // by Status, each carrying the sentence the card shows.
+                onDownload: () => dl(
+                    'price-suggestions',
+                    const [
+                      'Item', 'Category', 'Status', 'Current price', 'Suggested price',
+                      'Direction', 'Change', 'Confidence', 'Why', 'Expected effect',
+                    ],
+                    [
+                      for (final m
+                          in _applySort('priceSuggest', priceSuggestions, _priceSuggestSortOpts, defaultDesc: true))
+                        [
+                          _s(m, 'name', 'Dish'),
+                          _s(m, 'category', ''),
+                          'Suggested',
+                          money(num0(m['current_price'])),
+                          money(num0(m['suggested_price'])),
+                          _s(m, 'direction') == 'increase' ? 'RAISE' : 'LOWER',
+                          () {
+                            final cur = num0(m['current_price']);
+                            final sug = num0(m['suggested_price']);
+                            final amt = m['delta_amount'] is num ? num0(m['delta_amount']) : sug - cur;
+                            final pct = m['delta_percent'] is num
+                                ? num0(m['delta_percent'])
+                                : (cur > 0 ? (sug - cur) / cur * 100 : 0.0);
+                            return '${amt < 0 ? '-' : '+'}₹${amt.abs().toStringAsFixed(2)} · '
+                                '${pct < 0 ? '-' : '+'}${pct.abs().toStringAsFixed(1)}%';
+                          }(),
+                          _s(m, 'confidence', ''),
+                          _s(m, 'why', '').isEmpty ? _s(m, 'reason', '') : _s(m, 'why', ''),
+                          _s(m, 'expected_effect', ''),
+                        ],
+                      for (final s in suppressedItems)
+                        [
+                          _s(s as Map, 'name', 'Dish'),
+                          _s(s, 'category', ''),
+                          'Paused',
+                          money(num0(s['current_price'])),
+                          '', '', '', '',
+                          _suppressedWhy(s),
+                          '',
+                        ],
+                    ])),
+            const SizedBox(height: 4),
+            // Why an item can vanish right after you Apply: the backend pauses a
+            // dish until the window holds a full period of sales at the new price.
+            Text('Recently adjusted items are paused until there\'s a full period of sales at the new price.',
+                style: Theme.of(context).textTheme.bodySmall!.copyWith(color: AppColors.textTertiary)),
+            if (suppressedCount > 0) ...[
+              const SizedBox(height: 10),
+              // Each paused item explains itself in a full sentence (the
+              // backend's `explanation`), so "why did this dish disappear?"
+              // never needs a decoder.
+              ForkCard(
+                inset: true,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  ...suppressedItems.take(3).map((s) => _suppressedRow(context, s as Map)),
+                  if (suppressedCount > suppressedItems.take(3).length) ...[
+                    const SizedBox(height: 4),
+                    Text('and ${suppressedCount - suppressedItems.take(3).length} more paused',
+                        style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+                  ],
+                ]),
+              ),
+            ],
+            const SizedBox(height: 12),
+            if (priceSuggestions.isEmpty)
+              _empty('All price suggestions are in their quiet period — nothing new to change yet.'),
+            ..._applySort('priceSuggest', priceSuggestions, _priceSuggestSortOpts, defaultDesc: true).map((m) {
+              final up = _s(m, 'direction') == 'increase';
+              final dirColor = up ? AppColors.success : AppColors.warning;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: AppColors.tint(dirColor),
+                          borderRadius: AppRadius.controlAll,
+                          border: Border.all(color: AppColors.edge(dirColor)),
+                        ),
+                        child: Icon(up ? Icons.arrow_upward : Icons.arrow_downward, size: 16, color: dirColor),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                          Text(_s(m, 'name', 'Dish'), style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          if (_s(m, 'category', '').isNotEmpty) ...[
+                            const SizedBox(height: 2),
+                            Text(_s(m, 'category'), style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+                          ],
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+                        Text(money(num0(m['current_price'])),
+                            style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11.5, decoration: TextDecoration.lineThrough)),
+                        const SizedBox(height: 2),
+                        Text(money(num0(m['suggested_price'])),
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: dirColor)),
+                        const SizedBox(height: 3),
+                        Text(up ? 'RAISE' : 'LOWER', style: Theme.of(context).textTheme.labelSmall),
+                      ]),
+                    ]),
+                    const SizedBox(height: 10),
+                    // Why the backend suggested this, what it should do, how
+                    // strong the evidence is, and any food-cost / drift caveat.
+                    _priceSuggestionExplainer(context, m),
+                    // Apply the suggestion to the live menu — only for users who
+                    // could edit the menu anyway, and only when the backend
+                    // resolved the dish to a real menu item id.
+                    if (canApplyPrice && '${m['id'] ?? ''}'.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: ForkButton(
+                          label: 'Apply ${money(num0(m['suggested_price']))}',
+                          icon: Icons.check,
+                          dense: true,
+                          onPressed: () => applySuggestion(m),
+                        ),
+                      ),
+                    ],
+                  ]),
+                ),
+              );
+            }),
+            const SizedBox(height: AppSpacing.lg),
+          ],
+          if (vis('menu') && slowMovers.isNotEmpty) ...[
+            _sortHeader('Slow movers', 'slowMover', _slowMoverSortOpts, setLocal,
+                defaultDesc: false,
+                onDownload: () => dl('slow-movers', const ['Dish', 'Category', 'Qty sold', 'Price'], [
+                      for (final m
+                          in _applySort('slowMover', slowMovers, _slowMoverSortOpts, defaultDesc: false).take(6))
+                        [
+                          _s(m, 'name', 'Dish'),
+                          _s(m, 'category', ''),
+                          m['quantity'] ?? 0,
+                          money(num0(m['current_price'])),
+                        ],
+                    ])),
+            const SizedBox(height: 12),
+            ..._applySort('slowMover', slowMovers, _slowMoverSortOpts, defaultDesc: false).take(6).map((m) {
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Row(children: [
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                        Text(_s(m, 'name', 'Dish'), style: Theme.of(context).textTheme.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('${m['quantity'] ?? 0} sold${_s(m, 'category').isNotEmpty ? ' · ${_s(m, 'category')}' : ''}',
+                            style: Theme.of(context).textTheme.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: money(num0(m['current_price'])), label: 'Price', alignEnd: true),
+                  ]),
+                ),
+              );
+            }),
+          ],
+        ]);
+        });
+      },
+    );
+
+// --- Accounting & reporting --------------------------------------------------
+Widget accountingModule(RestClient rest, Profile p) => _AccountingView(rest: rest, profile: p);
+
+class _AccountingView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _AccountingView({required this.rest, required this.profile});
+  @override
+  State<_AccountingView> createState() => _AccountingViewState();
+}
+
+class _AccountingViewState extends State<_AccountingView> {
+  int _days = 30;
+  bool _loading = true;
+  String? _error;
+  Map<String, dynamic> _sales = {};
+  Map<String, dynamic> _gst = {};
+  Map<String, dynamic> _pnl = {};
+  List _expenses = [];
+  String _payrollMonth = RestaurantTime.thisMonthIso();
+  Map<String, dynamic> _payroll = {};
+  Map<String, dynamic> _discounts = {};
+
+  // Settled-bill browser. The list is paged by _ClosedBillsList itself; this
+  // state only holds what the user filters it by. The term is applied on a
+  // short debounce so typing doesn't fire a request per keystroke.
+  final TextEditingController _billSearch = TextEditingController();
+  Timer? _billDebounce;
+  String _billTerm = '';
+  String? _billMethod;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _billDebounce?.cancel();
+    _billSearch.dispose();
+    super.dispose();
+  }
+
+  // "Last N days" is counted on the RESTAURANT's calendar. Off the device clock
+  // a till in another zone would pull a window shifted by a day, which is
+  // exactly the kind of silent mismatch that breaks a tally.
+  ({String from, String to}) _range() {
+    final now = RestaurantTime.nowWall();
+    final to = DateTime.utc(now.year, now.month, now.day);
+    final from = to.subtract(Duration(days: _days - 1));
+    return (from: RestaurantTime.isoDate(from), to: RestaurantTime.isoDate(to));
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final r = _range();
+    final q = 'from=${r.from}&to=${r.to}';
+    try {
+      final res = await Future.wait([
+        widget.rest.getMap('/reports/sales?$q'),
+        widget.rest.getMap('/reports/gst?$q'),
+        widget.rest.getMap('/reports/pnl?$q'),
+        widget.rest.getMap('/expenses?$q'),
+        widget.rest.getMap('/payroll?month=$_payrollMonth').catchError((_) => <String, dynamic>{}),
+        widget.rest.getMap('/reports/discounts?$q').catchError((_) => <String, dynamic>{}),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _sales = res[0];
+        _gst = res[1];
+        _pnl = res[2];
+        _expenses = (res[3]['expenses'] as List?) ?? [];
+        _payroll = res[4];
+        _discounts = res[5];
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+  String _ddmm(String iso) {
+    final pcs = iso.split('-');
+    return pcs.length == 3 ? '${pcs[2]}/${pcs[1]}' : iso;
+  }
+
+  void _shiftPayrollMonth(int delta) {
+    final p = _payrollMonth.split('-');
+    final d = DateTime(int.parse(p[0]), int.parse(p[1]) + delta, 1);
+    setState(() => _payrollMonth = '${d.year}-${d.month.toString().padLeft(2, '0')}');
+    _load();
+  }
+
+  Future<void> _editPayrollProfile(Map row) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final prof = (row['profile'] as Map?) ?? {};
+    String payType = '${prof['pay_type'] ?? 'monthly'}';
+    final base = TextEditingController(text: '${prof['base_salary'] ?? ''}');
+    final rate = TextEditingController(text: '${prof['hourly_rate'] ?? ''}');
+    final allow = TextEditingController(text: '${prof['allowances'] ?? ''}');
+    final deduct = TextEditingController(text: '${prof['deductions'] ?? ''}');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setDlg) => AlertDialog(
+        title: Text('Salary — ${_s(row, 'name')}'),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          DropdownButtonFormField<String>(
+            initialValue: payType,
+            items: const [
+              DropdownMenuItem(value: 'monthly', child: Text('Monthly salary')),
+              DropdownMenuItem(value: 'hourly', child: Text('Hourly (from attendance)')),
+            ],
+            onChanged: (v) => setDlg(() => payType = v ?? 'monthly'),
+            decoration: const InputDecoration(labelText: 'Pay type', border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 8),
+          if (payType == 'monthly')
+            TextField(controller: base, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Base salary / month', border: OutlineInputBorder()))
+          else
+            TextField(controller: rate, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Rate / hour', border: OutlineInputBorder())),
+          const SizedBox(height: 8),
+          TextField(controller: allow, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Allowances / month', border: OutlineInputBorder())),
+          const SizedBox(height: 8),
+          TextField(controller: deduct, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Deductions / month', border: OutlineInputBorder())),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+        ],
+      )),
+    );
+    if (ok != true) return;
+    try {
+      await widget.rest.put('/payroll/profile', {
+        'emp_id': row['emp_id'],
+        'pay_type': payType,
+        'base_salary': double.tryParse(base.text.trim()) ?? 0,
+        'hourly_rate': double.tryParse(rate.text.trim()) ?? 0,
+        'allowances': double.tryParse(allow.text.trim()) ?? 0,
+        'deductions': double.tryParse(deduct.text.trim()) ?? 0,
+      });
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _payEmployee(Map row) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final amount = row['computed_pay'];
+    if (amount == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Record salary payment'),
+        content: Text('Pay ${_money(amount)} to ${_s(row, 'name')} for $_payrollMonth?\n\nThis also books a "Payroll" expense.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Pay')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await widget.rest.post('/payroll/pay', {'emp_id': row['emp_id'], 'period': _payrollMonth, 'amount': amount});
+      messenger.showSnackBar(const SnackBar(content: Text('Salary recorded + Payroll expense booked.')));
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _addExpense() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final cat = TextEditingController(text: 'General');
+    final amount = TextEditingController();
+    final vendor = TextEditingController();
+    final note = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add expense'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: cat, decoration: const InputDecoration(labelText: 'Category', border: OutlineInputBorder())),
+            const SizedBox(height: 8),
+            TextField(controller: amount, autofocus: true, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Amount', border: OutlineInputBorder())),
+            const SizedBox(height: 8),
+            TextField(controller: vendor, decoration: const InputDecoration(labelText: 'Vendor (optional)', border: OutlineInputBorder())),
+            const SizedBox(height: 8),
+            TextField(controller: note, decoration: const InputDecoration(labelText: 'Note (optional)', border: OutlineInputBorder())),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final amt = double.tryParse(amount.text.trim()) ?? 0;
+    if (amt <= 0) {
+      messenger.showSnackBar(const SnackBar(content: Text('Enter a valid amount.')));
+      return;
+    }
+    try {
+      await widget.rest.post('/expenses', {
+        'amount': amt,
+        'category': cat.text.trim().isEmpty ? 'General' : cat.text.trim(),
+        if (vendor.text.trim().isNotEmpty) 'vendor': vendor.text.trim(),
+        if (note.text.trim().isNotEmpty) 'note': note.text.trim(),
+      });
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _deleteExpense(String id) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.rest.delete('/expenses/$id');
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _exportPdf() async {
+    final r = _range();
+    final doc = pw.Document();
+    String money(dynamic v) {
+      final n = v is num ? v : num.tryParse('${v ?? ''}');
+      return n == null ? '-' : 'Rs ${n.toStringAsFixed(2)}';
+    }
+
+    pw.Widget kv(String k, dynamic v, {bool bold = false}) => pw.Padding(
+          padding: const pw.EdgeInsets.symmetric(vertical: 2),
+          child: pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
+            pw.Text(k, style: pw.TextStyle(fontSize: 11, fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal)),
+            pw.Text(money(v), style: pw.TextStyle(fontSize: 11, fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal)),
+          ]),
+        );
+
+    final byRate = (_gst['by_rate'] as List?) ?? [];
+    doc.addPage(pw.MultiPage(build: (ctx) => [
+          pw.Center(child: pw.Text(widget.profile.restaurantName, style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
+          pw.Center(child: pw.Text('Financial report · ${r.from} to ${r.to}', style: const pw.TextStyle(fontSize: 10))),
+          pw.SizedBox(height: 12),
+          pw.Text('Profit & Loss', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
+          pw.Divider(),
+          kv('Gross sales', _pnl['gross_sales']),
+          kv('Refunds', _pnl['refunds']),
+          kv('Tax collected (pass-through)', _pnl['tax_collected']),
+          kv('Net revenue (ex-tax)', _pnl['net_revenue']),
+          kv('Total expenses', _pnl['total_expenses']),
+          kv('Net profit', _pnl['net_profit'], bold: true),
+          pw.SizedBox(height: 16),
+          pw.Text('GST / Tax collected', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
+          pw.Divider(),
+          ...byRate.map((t) {
+            final m = t as Map;
+            return kv('${m['name']} (${m['percentage']}%)  on ${money(m['taxable'])}', m['tax']);
+          }),
+          kv('Total tax', _gst['total_tax'], bold: true),
+          pw.SizedBox(height: 16),
+          pw.Text('Sales', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
+          pw.Divider(),
+          kv('Total sales', _sales['total_sales']),
+          kv('Bills', _sales['bill_count'] ?? 0),
+          kv('Net sales (after refunds)', _sales['net_sales'], bold: true),
+        ]));
+    await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+  }
+
+  // Download the Tally-compatible XML for the selected range and let the user
+  // save it (parity with the web accounting page).
+  Future<void> _exportTally() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final r = _range();
+    try {
+      final xml = await widget.rest.getText('/reports/tally.xml?from=${r.from}&to=${r.to}');
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save Tally XML',
+        fileName: 'tally-${r.from}-to-${r.to}.xml',
+        type: FileType.custom,
+        allowedExtensions: const ['xml'],
+        bytes: Uint8List.fromList(utf8.encode(xml)),
+      );
+      messenger.showSnackBar(SnackBar(content: Text(path == null ? 'Export cancelled.' : 'Saved Tally XML.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('Could not load reports.\n$_error', textAlign: TextAlign.center),
+          const SizedBox(height: 8),
+          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+        ]),
+      );
+    }
+
+    String money(double v) => '₹${v.toStringAsFixed(0)}';
+    final byDay = ((_sales['by_day'] as List?) ?? [])
+        .map((d) => (label: _ddmm('${(d as Map)['date']}'), value: _n(d['sales'])))
+        .toList();
+    final byMethod = (_sales['by_method'] as List?) ?? [];
+    final byRate = (_gst['by_rate'] as List?) ?? [];
+    final byCoupon = (_discounts['by_coupon'] as List?) ?? [];
+    final hasDiscounts = _n(_discounts['discounted_bills']) > 0 || byCoupon.isNotEmpty;
+
+    final text = Theme.of(context).textTheme;
+    final width = MediaQuery.sizeOf(context).width;
+    final narrow = width < 760;
+    final cols = width >= 1100 ? 4 : (narrow ? 1 : 2);
+    // Reporting periods an owner actually files against: a single day for the
+    // shift just gone, then the windows a P&L or a tally is cut on. All six are
+    // plain day counts because /reports/* takes from/to dates -- the server
+    // applies no cap, so a full year is a legitimate range.
+    const dayOptions = [1, 7, 30, 90, 180, 365];
+    const dayLabels = ['Day', 'Week', 'Month', 'Quarter', 'Half year', 'Year'];
+
+    // Dense financial table row — label in the quiet voice, amount right.
+    Widget moneyRow(String label, String amount, {String? sub, Widget? trailing}) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 7),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(label, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                if (sub != null) ...[
+                  const SizedBox(height: 2),
+                  Text(sub, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+                ],
+              ]),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Text(amount, style: text.titleSmall),
+            if (trailing != null) ...[const SizedBox(width: AppSpacing.sm), trailing],
+          ]),
+        );
+    Widget hairline() => Container(height: 1, color: AppColors.divider);
+
+    String initialsOf(String name) {
+      final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+      if (parts.isEmpty) return '?';
+      return parts.length == 1
+          ? parts.first.substring(0, 1)
+          : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+    }
+
+    final payrollRows = (_payroll['rows'] as List?) ?? [];
+    final netProfitUp = _n(_pnl['net_profit']) >= 0;
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        Row(children: [
+          Expanded(
+            child: ForkTabs(
+              tabs: dayLabels,
+              // Fall back to the Month tab by VALUE, not by a hardcoded index --
+              // an index literal silently points at a different period the next
+              // time this list changes.
+              selected: dayOptions.contains(_days)
+                  ? dayOptions.indexOf(_days)
+                  : dayOptions.indexOf(30),
+              onSelected: (i) {
+                setState(() => _days = dayOptions[i]);
+                _load();
+              },
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          ForkButton.ghost(label: 'Tally XML', icon: Icons.description_outlined, dense: true, onPressed: _exportTally),
+          const SizedBox(width: AppSpacing.sm),
+          ForkButton.ghost(label: 'Export PDF', icon: Icons.picture_as_pdf_outlined, dense: true, onPressed: _exportPdf),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
+        _dashGrid([
+          StatCard(value: money(_n(_sales['net_sales'])), caption: 'NET SALES'),
+          StatCard(value: money(_n(_gst['total_tax'])), caption: 'GST COLLECTED'),
+          StatCard(value: money(_n(_pnl['total_expenses'])), caption: 'EXPENSES'),
+          StatCard(
+            value: money(_n(_pnl['net_profit'])),
+            caption: 'NET PROFIT',
+            tag: netProfitUp ? 'Up' : 'Dn',
+            tagColor: netProfitUp ? AppColors.success : AppColors.danger,
+          ),
+        ], cols),
+        const SizedBox(height: AppSpacing.xl),
+        if (byDay.isNotEmpty) ...[
+          _chartCard(context, 'Sales — daily', _barChart(context, byDay, money)),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (byMethod.isNotEmpty) ...[
+          ForkCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              SectionHeader(title: 'By payment method', padding: const EdgeInsets.only(bottom: 12)),
+              Builder(builder: (_) {
+                final rows = byMethod.map((m) => m as Map).toList()
+                  ..sort((a, b) => _n(b['sales']).compareTo(_n(a['sales'])));
+                final maxV = rows.fold<double>(0, (a, m) => _n(m['sales']) > a ? _n(m['sales']) : a);
+                return Column(children: [
+                  for (final m in rows)
+                    HBarRow(
+                      label: _s(m, 'method', 'Other'),
+                      sub: '${m['bills'] ?? 0} bills',
+                      fraction: maxV > 0 ? (_n(m['sales']) / maxV).clamp(0.0, 1.0) : 0,
+                      value: money(_n(m['sales'])),
+                    ),
+                ]);
+              }),
+            ]),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (byRate.isNotEmpty) ...[
+          ForkCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              SectionHeader(title: 'GST breakdown', padding: const EdgeInsets.only(bottom: 6)),
+              for (var i = 0; i < byRate.length; i++) ...[
+                if (i > 0) hairline(),
+                moneyRow(
+                  '${_s(byRate[i] as Map, 'name', 'Tax')} · ${(byRate[i] as Map)['percentage'] ?? 0}%',
+                  _money((byRate[i] as Map)['tax']),
+                  sub: 'Taxable ${_money((byRate[i] as Map)['taxable'])}',
+                ),
+              ],
+            ]),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (hasDiscounts) ...[
+          ForkCard(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              SectionHeader(title: 'Discounts & offers', padding: const EdgeInsets.only(bottom: 6)),
+              Text('Bill totals are stored net of discount — sales above already reflect these.',
+                  style: text.bodySmall),
+              const SizedBox(height: AppSpacing.sm),
+              moneyRow(
+                'Total given',
+                '${_n(_discounts['estimated_bills']) > 0 ? '≈' : ''}${_money(_discounts['total_discount'])}',
+                sub:
+                    '${_discounts['discounted_bills'] ?? 0} of ${_discounts['bill_count'] ?? 0} bills · manual ${_money(_discounts['manual_discount'])} · coupons ${_money(_discounts['coupon_discount'])}',
+              ),
+              for (final c in byCoupon) ...[
+                hairline(),
+                moneyRow(
+                  '${_s(c as Map, 'code')}${'${c['kind']}' == 'gift' ? ' · Gift voucher' : ''}',
+                  _money(c['amount']),
+                  sub: '${c['uses'] ?? 0} uses',
+                ),
+              ],
+            ]),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        // --- Settled bills ---------------------------------------------------
+        // Past bills had no home in the app at all. Scoped to the same period as
+        // every other figure on this page so the list and the totals above can
+        // never disagree about which days they are describing.
+        const SizedBox(height: AppSpacing.sm),
+        SectionHeader(
+          title: 'Settled bills',
+          trailing: InfoChip(icon: Icons.event_outlined, label: 'Last $_days days'),
+          padding: const EdgeInsets.only(bottom: 6),
+        ),
+        Text('Every bill closed in this period, newest first — tap one for its items, taxes, payment and who closed it.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        Row(children: [
+          Expanded(
+            child: TextField(
+              controller: _billSearch,
+              decoration: InputDecoration(
+                isDense: true,
+                hintText: 'Search bill no, table, customer…',
+                prefixIcon: const Icon(Icons.search, size: 18, color: AppColors.textTertiary),
+                suffixIcon: _billTerm.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close, size: 16),
+                        tooltip: 'Clear search',
+                        onPressed: () {
+                          _billDebounce?.cancel();
+                          _billSearch.clear();
+                          setState(() => _billTerm = '');
+                        },
+                      ),
+              ),
+              onChanged: (v) {
+                _billDebounce?.cancel();
+                _billDebounce = Timer(const Duration(milliseconds: 350), () {
+                  if (mounted) setState(() => _billTerm = v.trim());
+                });
+              },
+              onSubmitted: (v) {
+                _billDebounce?.cancel();
+                setState(() => _billTerm = v.trim());
+              },
+            ),
+          ),
+          if (byMethod.isNotEmpty) ...[
+            const SizedBox(width: AppSpacing.sm),
+            SizedBox(
+              width: 180,
+              child: DropdownButtonFormField<String>(
+                initialValue: _billMethod,
+                isExpanded: true,
+                dropdownColor: AppColors.cardRaised,
+                decoration: const InputDecoration(labelText: 'Payment method', isDense: true),
+                items: [
+                  const DropdownMenuItem<String>(value: null, child: Text('All methods')),
+                  for (final m in byMethod)
+                    DropdownMenuItem<String>(
+                      value: _s(m as Map, 'method', ''),
+                      child: Text(_s(m, 'method', 'Other'), overflow: TextOverflow.ellipsis),
+                    ),
+                ],
+                onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),
+              ),
+            ),
+          ],
+        ]),
+        const SizedBox(height: AppSpacing.md),
+        Builder(builder: (_) {
+          final r = _range();
+          return _ClosedBillsList(
+            rest: widget.rest,
+            filter: _ClosedBillFilter(
+              from: r.from,
+              to: r.to,
+              search: _billTerm,
+              paymentMethod: _billMethod,
+            ),
+            emptyCaption: _billTerm.isEmpty && _billMethod == null
+                ? 'No bills were closed in the last $_days days.'
+                : 'No settled bill in the last $_days days matches that filter.',
+          );
+        }),
+        const SizedBox(height: AppSpacing.xxl),
+        SectionHeader(
+          title: 'Expenses',
+          count: _expenses.length,
+          trailing: ForkButton.ghost(label: 'Add', icon: Icons.add, dense: true, onPressed: _addExpense),
+        ),
+        if (_expenses.isEmpty)
+          Text('No expenses in this period.', style: text.bodySmall)
+        else
+          ForkCard(
+            child: Column(children: [
+              for (var i = 0; i < _expenses.length; i++) ...[
+                if (i > 0) hairline(),
+                moneyRow(
+                  '${_s(_expenses[i] as Map, 'category', 'General')}${_s(_expenses[i] as Map, 'vendor').isNotEmpty ? ' · ${_s(_expenses[i] as Map, 'vendor')}' : ''}',
+                  _money((_expenses[i] as Map)['amount']),
+                  sub:
+                      '${_s(_expenses[i] as Map, 'spent_on')}${_s(_expenses[i] as Map, 'note').isNotEmpty ? ' · ${_s(_expenses[i] as Map, 'note')}' : ''}',
+                  trailing: ForkIconButton(
+                    icon: Icons.delete_outline,
+                    tooltip: 'Delete expense',
+                    onPressed: () => _deleteExpense('${(_expenses[i] as Map)['id']}'),
+                  ),
+                ),
+              ],
+            ]),
+          ),
+        const SizedBox(height: AppSpacing.xxl),
+        SectionHeader(
+          title: 'Payroll',
+          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+            ForkIconButton(icon: Icons.chevron_left, tooltip: 'Previous month', onPressed: () => _shiftPayrollMonth(-1)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Text(_payrollMonth, style: text.titleSmall),
+            ),
+            ForkIconButton(icon: Icons.chevron_right, tooltip: 'Next month', onPressed: () => _shiftPayrollMonth(1)),
+          ]),
+          padding: const EdgeInsets.only(bottom: 6),
+        ),
+        Text('Due ${_money(_payroll['total_due'])} · Paid ${_money(_payroll['total_paid'])} — paying books a "Payroll" expense.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        if (payrollRows.isNotEmpty)
+          ForkCard(
+            child: Column(children: [
+              for (var i = 0; i < payrollRows.length; i++) ...[
+                if (i > 0) hairline(),
+                Builder(builder: (_) {
+                  final r = payrollRows[i] as Map;
+                  final prof = r['profile'] as Map?;
+                  final paid = r['paid'] == true;
+                  final pay = r['computed_pay'];
+                  final hourly = '${prof?['pay_type']}' == 'hourly';
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(children: [
+                      InitialsAvatar(initials: initialsOf(_s(r, 'name', ''))),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('${_s(r, 'name')} · ${_s(r, 'role')}',
+                              style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          const SizedBox(height: 2),
+                          Text(
+                            prof == null
+                                ? 'No salary set'
+                                : hourly
+                                    ? '${_money(prof['hourly_rate'])}/h · ${r['hours_worked'] ?? 0}h worked'
+                                    : 'Monthly ${_money(prof['base_salary'])}',
+                            style: text.bodySmall,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      if (paid)
+                        StatusChip(label: 'Paid ${_money(r['paid_amount'])}', color: AppColors.success, dense: narrow)
+                      else ...[
+                        Text(pay != null ? _money(pay) : '—', style: text.titleSmall),
+                        const SizedBox(width: AppSpacing.sm),
+                        ForkIconButton(icon: Icons.edit_outlined, tooltip: 'Set salary', onPressed: () => _editPayrollProfile(r)),
+                        if (pay != null && (pay as num) > 0) ...[
+                          const SizedBox(width: AppSpacing.sm),
+                          ForkButton(
+                            label: 'Pay',
+                            icon: Icons.payments_outlined,
+                            dense: true,
+                            onPressed: () => _payEmployee(r),
+                          ),
+                        ],
+                      ],
+                    ]),
+                  );
+                }),
+              ],
+            ]),
+          ),
+      ]),
+    );
+  }
+}
+
+// --- Settled (closed) bills -------------------------------------------------
+// A settled bill used to be invisible everywhere in the app. Two call sites
+// share this block: Accounting's "Settled bills" section and the per-month
+// drill-down in History.
+//
+// Money is rendered ONLY from the four fields the backend guarantees add up —
+// `taxable_base + service_charge + tax_total == grand_total` — and the service
+// charge is NEVER shown inside the tax list (the backend keeps it out of
+// `taxes[]`; so does every row here). The identity is displayed rather than
+// assumed, so a bill that ever stopped balancing is visible instead of silent.
+
+/// Filter for `GET /bills/closed`. Blank fields are dropped so the backend
+/// keeps its own defaults rather than being handed empty strings.
+class _ClosedBillFilter {
+  final String? from;
+  final String? to;
+  final String? paymentMethod;
+  final String? search;
+  const _ClosedBillFilter({this.from, this.to, this.paymentMethod, this.search});
+
+  String query({required int limit, required int offset}) {
+    final parts = <String>['limit=$limit', 'offset=$offset'];
+    void add(String key, String? value) {
+      final v = value?.trim() ?? '';
+      if (v.isNotEmpty) parts.add('$key=${Uri.encodeQueryComponent(v)}');
+    }
+
+    add('from', from);
+    add('to', to);
+    add('payment_method', paymentMethod);
+    add('search', search);
+    return parts.join('&');
+  }
+}
+
+/// When the bill actually closed. `settled_at` is authoritative; `closed_at`
+/// then `created_at` cover rows written before it existed.
+String _billWhen(Map b) {
+  for (final k in const ['settled_at', 'closed_at', 'created_at']) {
+    final v = _s(b, k, '');
+    if (v.isNotEmpty) return v;
+  }
+  return '';
+}
+
+/// Bill title: "Bill #57 · T1" (either half degrades on its own).
+String _billTitle(Map b) {
+  final no = _s(b, 'bill_no', '');
+  final table = _s(b, 'table_name', '');
+  final left = no.isEmpty ? 'Bill' : 'Bill #$no';
+  return table.isEmpty ? left : '$left · $table';
+}
+
+void _openClosedBill(BuildContext context, RestClient rest, Map bill) {
+  final id = _s(bill, 'id', '');
+  if (id.isEmpty) return;
+  showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    backgroundColor: AppColors.surface,
+    builder: (_) => _ClosedBillSheet(rest: rest, billId: id, title: _billTitle(bill)),
+  );
+}
+
+/// One row in the settled-bill list. Tapping it opens the full bill.
+Widget _closedBillRow(BuildContext context, RestClient rest, Map b) {
+  final text = Theme.of(context).textTheme;
+  final method = _s(b, 'payment_method', '');
+  final refunded = b['refunded'] == true;
+  final covers = _int(b['covers']);
+  final when = _billWhen(b);
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      onTap: () => _openClosedBill(context, rest, b),
+      child: Row(children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: AppColors.inset,
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.border),
+          ),
+          child: const Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(_billTitle(b), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            const SizedBox(height: 4),
+            Wrap(spacing: 6, runSpacing: 4, children: [
+              if (when.isNotEmpty) InfoChip(icon: Icons.schedule, label: _fmtTime(when)),
+              if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
+              if (method.isNotEmpty && method != '—') InfoChip(icon: Icons.payments_outlined, label: method),
+              if (refunded) const InfoChip(icon: Icons.undo, label: 'Refunded'),
+            ]),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        Text(_money(b['grand_total']), style: text.titleSmall),
+        const SizedBox(width: 4),
+        const Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
+      ]),
+    ),
+  );
+}
+
+/// Paged, newest-first list of closed bills. Owns its own paging (limit/offset)
+/// so both call sites get "Load more" without repeating the plumbing.
+class _ClosedBillsList extends StatefulWidget {
+  final RestClient rest;
+  final _ClosedBillFilter filter;
+  final int pageSize;
+  final String emptyCaption;
+
+  const _ClosedBillsList({
+    required this.rest,
+    required this.filter,
+    required this.emptyCaption,
+    this.pageSize = 15,
+  });
+
+  @override
+  State<_ClosedBillsList> createState() => _ClosedBillsListState();
+}
+
+class _ClosedBillsListState extends State<_ClosedBillsList> {
+  final List<Map> _rows = [];
+  bool _loading = true;
+  bool _hasMore = false;
+  String? _error;
+  int _total = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ClosedBillsList old) {
+    super.didUpdateWidget(old);
+    final was = old.filter.query(limit: old.pageSize, offset: 0);
+    final now = widget.filter.query(limit: widget.pageSize, offset: 0);
+    if (was != now) _load();
+  }
+
+  Future<void> _load({bool append = false}) async {
+    setState(() {
+      _loading = true;
+      if (!append) _error = null;
+    });
+    final offset = append ? _rows.length : 0;
+    try {
+      final path = '/bills/closed?${widget.filter.query(limit: widget.pageSize, offset: offset)}';
+      final res = await widget.rest.getMap(path);
+      if (!mounted) return;
+      final page = ((res['bills'] as List?) ?? const []).map((e) => e as Map).toList();
+      setState(() {
+        if (!append) _rows.clear();
+        _rows.addAll(page);
+        _total = _int(res['total']) ?? _rows.length;
+        _hasMore = res['has_more'] == true;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    if (_loading && _rows.isEmpty) {
+      return Column(children: [
+        for (var i = 0; i < 3; i++)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8),
+            child: SkeletonBox(height: 60, radius: AppRadius.card),
+          ),
+      ]);
+    }
+    if (_error != null && _rows.isEmpty) {
+      return EmptyState(
+        icon: Icons.error_outline,
+        title: "Couldn't load settled bills",
+        caption: _error!,
+        action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: _load),
+      );
+    }
+    if (_rows.isEmpty) {
+      return EmptyState(
+        icon: Icons.receipt_long_outlined,
+        title: 'No settled bills',
+        caption: widget.emptyCaption,
+      );
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      for (final b in _rows) _closedBillRow(context, widget.rest, b),
+      if (_hasMore)
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Center(
+            child: ForkButton.ghost(
+              label: _loading ? 'Loading…' : 'Load more (${_rows.length} of $_total)',
+              icon: Icons.expand_more,
+              dense: true,
+              onPressed: _loading ? null : () => _load(append: true),
+            ),
+          ),
+        )
+      else if (_total > 0)
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Center(child: Text('All $_total shown', style: text.bodySmall)),
+        ),
+    ]);
+  }
+}
+
+/// Full detail of one settled bill: every line item, the money breakdown, the
+/// payment (and its split parts), and who handled it when.
+class _ClosedBillSheet extends StatelessWidget {
+  final RestClient rest;
+  final String billId;
+  final String title;
+  const _ClosedBillSheet({required this.rest, required this.billId, required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.9),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+          child: AsyncView<Map<String, dynamic>>(
+            load: () => rest.getMap('/bills/closed/$billId'),
+            builder: (context, bill, reload) =>
+                SingleChildScrollView(child: _closedBillBody(context, bill, title)),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
+  final text = Theme.of(context).textTheme;
+  final items = ((bill['items'] as List?) ?? const []).map((e) => e as Map).toList();
+  // `taxes[]` carries the per-rate lines ONLY — the service charge has its own
+  // field and gets its own row below, never a line in here.
+  final taxes = ((bill['taxes'] as List?) ?? const []).map((e) => e as Map).toList();
+  final splits = ((bill['payment_splits'] as List?) ?? const []).map((e) => e as Map).toList();
+  final orders = ((bill['orders'] as List?) ?? const []).map((e) => e as Map).toList();
+
+  final taxable = _numOf(bill['taxable_base']);
+  final service = _numOf(bill['service_charge']);
+  final taxTotal = _numOf(bill['tax_total']);
+  final grand = _numOf(bill['grand_total']);
+  final discount = _numOf(bill['discount_amount']);
+  final subtotal = _numOf(bill['items_subtotal']);
+  final refunded = bill['refunded'] == true;
+  final servicePct = _numOf(bill['service_charge_percent']);
+  final coupon = _s(bill, 'coupon_code', '');
+  final method = _s(bill, 'payment_method', '');
+  final covers = _int(bill['covers']);
+  // The contract's invariant, shown rather than trusted.
+  final balances = (taxable + service + taxTotal - grand).abs() < 0.05;
+
+  Widget rule() => Container(height: 1, color: AppColors.divider);
+  Widget money(String label, String value, {String? sub, bool strong = false, Color? tint}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(label,
+                  style: strong ? text.titleSmall : text.bodyMedium,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis),
+              if (sub != null) ...[
+                const SizedBox(height: 2),
+                Text(sub, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+              ],
+            ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Text(value,
+              style: strong
+                  ? text.displaySmall!.copyWith(fontSize: 20, color: tint ?? AppColors.textPrimary)
+                  : text.titleSmall!.copyWith(color: tint)),
+        ]),
+      );
+
+  Widget card(String heading, List<Widget> children, {Widget? trailing}) => Padding(
+        padding: const EdgeInsets.only(bottom: AppSpacing.md),
+        child: ForkCard(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            SectionHeader(title: heading, padding: const EdgeInsets.only(bottom: 6), trailing: trailing),
+            ...children,
+          ]),
+        ),
+      );
+
+  String who(String key) => _s(bill, key, '');
+  Widget? handled(String label, String byKey, String atKey) {
+    final by = who(byKey);
+    final at = _s(bill, atKey, '');
+    if (by.isEmpty && at.isEmpty) return null;
+    final when = at.isEmpty ? '' : _fmtTime(at);
+    return _kv(label, by.isEmpty ? when : (when.isEmpty ? by : '$by · $when'));
+  }
+
+  final trail = <Widget>[
+    ?handled('Opened', 'created_by', 'created_at'),
+    if (_s(bill, 'seated_at', '').isNotEmpty) _kv('Seated', _fmtTime(_s(bill, 'seated_at'))),
+    ?handled('Waiter confirmed', 'waiter_confirmed_by', 'waiter_confirmed_at'),
+    ?handled('Admin approved', 'admin_approved_by', 'admin_approved_at'),
+    ?handled('Closed', 'closed_by', 'closed_at'),
+    if (_s(bill, 'settled_at', '').isNotEmpty) _kv('Settled', _fmtTime(_s(bill, 'settled_at'))),
+    if (_s(bill, 'discount_applied_at', '').isNotEmpty)
+      _kv('Discount applied', _fmtTime(_s(bill, 'discount_applied_at'))),
+    if (_s(bill, 'left_at', '').isNotEmpty) _kv('Table released', _fmtTime(_s(bill, 'left_at'))),
+    ?handled('Refunded', 'refunded_by', 'refunded_at'),
+  ];
+
+  return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+    Row(children: [
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('SETTLED BILL', style: text.labelSmall),
+          const SizedBox(height: 4),
+          Text(_s(bill, 'bill_no', '').isEmpty ? fallbackTitle : _billTitle(bill),
+              style: text.headlineMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ]),
+      ),
+      if (refunded)
+        StatusChip(label: 'Refunded ${_money(bill['refund_amount'])}', color: AppColors.danger)
+      else
+        StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
+    ]),
+    const SizedBox(height: 10),
+    Wrap(spacing: 6, runSpacing: 6, children: [
+      if (_billWhen(bill).isNotEmpty) InfoChip(icon: Icons.schedule, label: _fmtTime(_billWhen(bill))),
+      if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
+      if (_numOf(bill['apc']) > 0) InfoChip(icon: Icons.equalizer, label: 'APC ${_money(bill['apc'])}'),
+      if (_s(bill, 'customer', '').isNotEmpty) InfoChip(icon: Icons.person_outline, label: _s(bill, 'customer')),
+      if (_s(bill, 'payment_proof_screenshot_url', '').isNotEmpty)
+        const InfoChip(icon: Icons.image_outlined, label: 'Payment proof attached'),
+    ]),
+    const SizedBox(height: AppSpacing.lg),
+    if (items.isNotEmpty)
+      card('Items', [
+        for (var i = 0; i < items.length; i++) ...[
+          if (i > 0) rule(),
+          money(
+            _s(items[i], 'name', 'Item'),
+            _money(items[i]['line_total'] ?? (_numOf(items[i]['price']) * (_int(items[i]['quantity']) ?? 1))),
+            sub: '${_int(items[i]['quantity']) ?? 1} × ${_money(items[i]['price'])}'
+                '${_s(items[i], 'note', '').isEmpty ? '' : ' · ${_s(items[i], 'note')}'}',
+          ),
+        ],
+      ]),
+    card('Money', [
+      if (subtotal > 0) money('Items subtotal', _money(subtotal)),
+      if (discount > 0)
+        money('Discount', '− ${_money(discount)}',
+            sub: coupon.isEmpty
+                ? _s(bill, 'discount_type', 'Manual')
+                : 'Coupon $coupon · ${_s(bill, 'discount_type', 'coupon')}',
+            tint: AppColors.success),
+      rule(),
+      money('Taxable base', _money(taxable)),
+      if (service != 0)
+        money('Service charge', _money(service),
+            sub: servicePct > 0 ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of the taxable base' : null),
+      // Taxes are listed rate by rate. The service charge above is deliberately
+      // NOT one of them.
+      for (final t in taxes)
+        money('${_s(t, 'name', 'Tax')} ${_numOf(t['percentage'])}%', _money(t['amount'])),
+      if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
+      rule(),
+      money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      const SizedBox(height: 6),
+      Row(children: [
+        Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
+            size: 13, color: balances ? AppColors.success : AppColors.danger),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax = ${_money(grand)}',
+            style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
+          ),
+        ),
+      ]),
+    ]),
+    card('Payment', [
+      money(method.isEmpty ? 'Method not recorded' : method, _money(grand)),
+      // Split payments: each part is its own tender, so they are named
+      // individually rather than collapsed into the headline method.
+      for (final sp in splits) ...[
+        rule(),
+        money(
+          _s(sp, 'method', _s(sp, 'payment_method', 'Split part')),
+          _money(sp['amount'] ?? sp['value']),
+          sub: _s(sp, 'reference', '').isEmpty ? 'Split part' : 'Ref ${_s(sp, 'reference')}',
+        ),
+      ],
+      if (refunded) ...[
+        rule(),
+        money('Refunded', '− ${_money(bill['refund_amount'])}',
+            sub: _s(bill, 'refund_reason', '').isEmpty
+                ? _s(bill, 'refund_ref', 'No reason recorded')
+                : _s(bill, 'refund_reason'),
+            tint: AppColors.danger),
+      ],
+    ]),
+    if (orders.isNotEmpty)
+      card('Orders on this bill', [
+        for (var i = 0; i < orders.length; i++) ...[
+          if (i > 0) rule(),
+          money(
+            '${_s(orders[i], 'status', 'Order')} · ${_int(orders[i]['item_count']) ?? 0} items',
+            _money(orders[i]['subtotal']),
+            sub: _fmtTime(_s(orders[i], 'created_at', '')),
+          ),
+        ],
+      ]),
+    if (trail.isNotEmpty) card('Handled by', trail),
+  ]);
+}
+
+// --- Attendance / working hours ---------------------------------------------
+// --- Waitlist / queue (staff) ----------------------------------------------
+Widget waitlistModule(RestClient rest, Profile p) => _WaitlistView(rest: rest, profile: p);
+
+class _WaitlistView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _WaitlistView({required this.rest, required this.profile});
+  @override
+  State<_WaitlistView> createState() => _WaitlistViewState();
+}
+
+class _WaitlistViewState extends State<_WaitlistView> {
+  bool _loading = true;
+  String? _error;
+  List _entries = const [];
+  // Parties already SEATED whose held pre-order still needs a yes/no. Seating no
+  // longer places it (backend contract), so without this list an un-answered
+  // pre-order would only ever be visible in the seat response — gone on the next
+  // refresh, or invisible to the colleague on the other terminal.
+  List _pendingPreorders = const [];
+  List<String> _freeTables = const [];
+  String? _busyId;
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _poll = Timer.periodic(const Duration(seconds: 10), (_) => _load(silent: true));
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    if (!silent) setState(() { _loading = true; _error = null; });
+    try {
+      final w = await widget.rest.getMap('/waitlist');
+      List tables = const [];
+      try { tables = await widget.rest.getList('/get-tables'); } catch (_) {}
+      // Best-effort: an older backend without the route must not blank the queue.
+      Map<String, dynamic> pending = const <String, dynamic>{};
+      try { pending = await widget.rest.getMap('/waitlist/pending-preorders'); } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _entries = (w['entries'] as List?) ?? const [];
+        _pendingPreorders = (pending['entries'] as List?) ?? const [];
+        _freeTables = [
+          for (final t in tables)
+            if (!((t as Map)['occupied'] == true || t['booked'] == true || t['reserved'] == true)) _s(t, 'table_name'),
+        ].where((s) => s.isNotEmpty && s != '—').toList();
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _error = '$e'; _loading = false; });
+    }
+  }
+
+  Future<void> _act(String id, Future<dynamic> Function() fn, {String? ok}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busyId = id);
+    try {
+      await fn();
+      if (ok != null) messenger.showSnackBar(SnackBar(content: Text(ok)));
+      await _load(silent: true);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busyId = null);
+    }
+  }
+
+  Future<void> _seat(Map e) async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_freeTables.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No free tables — free one first.')));
+      return;
+    }
+    String? pick = _freeTables.first;
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) => AlertDialog(
+        title: Text('Seat ${e['name']} (party of ${e['party_size']})'),
+        content: DropdownButtonFormField<String>(
+          initialValue: pick,
+          isExpanded: true,
+          decoration: const InputDecoration(labelText: 'Table', border: OutlineInputBorder()),
+          items: [for (final t in _freeTables) DropdownMenuItem(value: t, child: Text(t))],
+          onChanged: (x) => setLocal(() => pick = x),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, pick), child: const Text('Seat')),
+        ],
+      )),
+    );
+    if (chosen == null) return;
+    // Seating never places the held pre-order any more — the server hands it back
+    // as `pending_preorder` and someone must answer for it. Ask right here, while
+    // the party is still standing in front of the host.
+    Map? held;
+    await _act('${e['id']}', () async {
+      final r = await widget.rest.post('/waitlist/${e['id']}/seat', {'table_name': chosen});
+      held = r is Map ? r['pending_preorder'] as Map? : null;
+      messenger.showSnackBar(SnackBar(
+          content: Text('Seated at $chosen${held == null ? '' : ' · confirm their pre-order'}')));
+    });
+    final pre = held;
+    if (pre == null || !mounted) return;
+    await _resolvePreorder(
+      id: '${e['id']}',
+      partyName: _s(e, 'name'),
+      tableName: chosen,
+      items: (pre['items'] as List?)?.whereType<Map>().toList() ?? const <Map>[],
+      subtotal: _numOf(pre['subtotal']),
+    );
+  }
+
+  /// Ask, then act on a party's held pre-order.
+  ///
+  /// Confirm places it as a real order on the table; decline leaves the items on
+  /// the queue entry so the guest can change them from their own page. Dismissing
+  /// the dialog decides nothing — the pre-order stays `pending` and keeps showing
+  /// in the "Pre-orders to confirm" list above the queue.
+  Future<void> _resolvePreorder({
+    required String id,
+    required String partyName,
+    required String tableName,
+    required List<Map> items,
+    required double subtotal,
+  }) async {
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _PreorderConfirmDialog(
+        partyName: partyName,
+        tableName: tableName,
+        items: items,
+        subtotal: subtotal,
+      ),
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'confirm') {
+      await _act(id, () => widget.rest.post('/waitlist/$id/preorder/confirm'),
+          ok: 'Pre-order sent to the kitchen for $tableName');
+    } else {
+      await _act(id, () => widget.rest.post('/waitlist/$id/preorder/decline'),
+          ok: '$partyName can change their pre-order before it is placed');
+    }
+  }
+
+  // "Pre-orders to confirm": seated parties whose held items are still waiting on
+  // a yes/no. Survives a refresh and a dismissed dialog, and is visible to every
+  // terminal — the queue list itself only holds parties who are still waiting.
+  List<Widget> _pendingPreorderSection() {
+    if (_pendingPreorders.isEmpty) return const [];
+    return [
+      SectionHeader(title: 'Pre-orders to confirm', count: _pendingPreorders.length),
+      for (final raw in _pendingPreorders) _pendingCard(raw as Map),
+      const SizedBox(height: AppSpacing.xl),
+    ];
+  }
+
+  Widget _pendingCard(Map e) {
+    final text = Theme.of(context).textTheme;
+    final id = '${e['id']}';
+    final items = (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    // The held lines carry the price they were picked at; the server re-prices on
+    // confirm, so this is an indication, not the final bill.
+    final subtotal = items.fold<double>(0, (s, it) {
+      final q = _int(it['quantity']) ?? 1;
+      return s + _numOf(it['price']) * (q <= 0 ? 1 : q);
+    });
+    final table = _s(e, 'table_name', '');
+    final busy = _busyId == id;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: ForkCard(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: AppColors.tint(AppColors.copper),
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.edge(AppColors.copper)),
+              ),
+              child: const Icon(Icons.restaurant_menu, size: 18, color: AppColors.copperHi),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const SizedBox(height: 6),
+                    Wrap(spacing: 6, runSpacing: 6, children: [
+                      if (table.isNotEmpty && table != '—')
+                        InfoChip(icon: Icons.table_restaurant_outlined, label: table),
+                      InfoChip(icon: Icons.restaurant_menu, label: '${items.length}-item pre-order'),
+                      if (_s(e, 'phone', '').isNotEmpty)
+                        InfoChip(icon: Icons.phone_outlined, label: _s(e, 'phone', '')),
+                      if (subtotal > 0) InfoChip(icon: Icons.payments_outlined, label: _money(subtotal)),
+                    ]),
+                  ]),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            MicroStat(value: '${e['minutes_since_seated'] ?? 0}m', label: 'seated', alignEnd: true),
+          ]),
+          const SizedBox(height: AppSpacing.md),
+          Row(children: [
+            ForkButton(
+              label: 'Review pre-order',
+              icon: Icons.fact_check_outlined,
+              dense: true,
+              onPressed: busy
+                  ? null
+                  : () => _resolvePreorder(
+                        id: id,
+                        partyName: _s(e, 'name'),
+                        tableName: table,
+                        items: items,
+                        subtotal: subtotal,
+                      ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Text('Nothing reaches the kitchen until you confirm.',
+                  style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Text('Could not load the waitlist.\n$_error', textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+      ]));
+    }
+    // A queue notification asked us to focus one party. The queue only holds
+    // parties still waiting, so a party that has been seated / removed is simply
+    // not here any more — say so instead of showing an unexplained list.
+    final focus = _focusOf(context, 'Waitlist');
+    final focusId = focus?.idOf(const ['waitlist_id']);
+    final focusFound = focusId != null && _entries.any((e) => '${(e as Map)['id']}' == focusId);
+    final banner = focus == null
+        ? null
+        : _focusBanner(
+            context,
+            found: focusFound,
+            message: focusFound
+                ? 'Showing the party from your notification.'
+                : 'That party has left the queue — it was seated, cancelled or marked a no-show.',
+          );
+    // The focused party first so it needs no scrolling; otherwise the server's
+    // position order stands. Parenthesised for the same reason as Bookings: a
+    // bare cascade binds to the whole conditional, so the unfocused branch
+    // sorted the STATE list `_entries` in place with an all-equal comparator,
+    // and List.sort permutes above 32 entries — position 14 at the head.
+    final ordered = focusId == null
+        ? _entries
+        : ([..._entries]..sort((a, b) {
+            final fa = '${(a as Map)['id']}' == focusId ? 0 : 1;
+            final fb = '${(b as Map)['id']}' == focusId ? 0 : 1;
+            return fa - fb;
+          }));
+
+    // A seated party's un-answered pre-order outlives the queue itself, so this
+    // section renders whether or not anyone is still waiting.
+    final pendingSection = _pendingPreorderSection();
+
+    if (ordered.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _load,
+        child: ListView(padding: AppSpacing.pageNarrow, children: [
+          ?banner,
+          ...pendingSection,
+          _qrCard(),
+          const EmptyState(
+            icon: Icons.hourglass_empty,
+            title: 'Queue is empty',
+            caption: 'Walk-ins who scan the entrance QR appear here in arrival order.',
+          ),
+        ]),
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        ?banner,
+        ...pendingSection,
+        _qrCard(),
+        const SizedBox(height: AppSpacing.xl),
+        SectionHeader(title: 'In the queue', count: ordered.length),
+        for (final raw in ordered) _card(raw as Map, focused: focusId != null && '${raw['id']}' == focusId),
+      ]),
+    );
+  }
+
+  String get _queueUrl => '${AppConfig.orderBaseUrl}/queue/${widget.profile.restaurantUsername}';
+
+  // The entrance "Join the queue" QR — how a walk-in gets INTO the queue when
+  // tables are full. Print/display it at the door; it points at the public
+  // /queue/<slug> page on the web app.
+  Widget _qrCard() {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: const Icon(Icons.qr_code_2, size: 18, color: AppColors.copper),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(child: Text('Entrance “Join the queue” QR', style: text.titleSmall)),
+        ]),
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+            'Display this at your door. When all tables are full, guests scan it to join this waitlist (and can browse the menu + pre-order while they wait).',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        // Paper exception: the QR keeps its white quiet zone so it stays
+        // scannable — printed-output styling, black on white.
+        Center(
+          child: Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+            child: QrImageView(data: _queueUrl, size: 180, backgroundColor: Colors.white),
+          ),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Center(
+          child: SelectableText(_queueUrl,
+              textAlign: TextAlign.center, style: text.bodySmall!.copyWith(fontSize: 11)),
+        ),
+      ]),
+    );
+  }
+
+  // Expandable breakdown of a party's pre-order items (name ×qty, price, note)
+  // and its members (name + phone). Compact; collapsed by default.
+  Widget _details(List<Map> preItems, List<Map> members) {
+    final text = Theme.of(context).textTheme;
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        dense: true,
+        tilePadding: EdgeInsets.zero,
+        visualDensity: VisualDensity.compact,
+        iconColor: AppColors.copperHi,
+        collapsedIconColor: AppColors.textTertiary,
+        childrenPadding: const EdgeInsets.only(left: 8, bottom: 4),
+        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+        title: Text(
+          [
+            if (preItems.isNotEmpty) '${preItems.length}-item pre-order',
+            if (members.isNotEmpty) '${members.length} in party',
+          ].join(' · '),
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textPrimary),
+        ),
+        children: [
+          if (preItems.isNotEmpty) ...[
+            Text('PRE-ORDER', style: text.labelSmall),
+            const SizedBox(height: 2),
+            for (final it in preItems)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text(
+                  '• ${_s(it, 'name')} ×${it['quantity'] ?? 1}'
+                  '${(num.tryParse('${it['price'] ?? ''}') ?? 0) > 0 ? ' — ${_money(it['price'])}' : ''}'
+                  '${_s(it, 'note', '').isNotEmpty ? '  (${_s(it, 'note', '')})' : ''}',
+                  style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+                ),
+              ),
+          ],
+          if (members.isNotEmpty) ...[
+            if (preItems.isNotEmpty) const SizedBox(height: 6),
+            Text('PARTY MEMBERS', style: text.labelSmall),
+            const SizedBox(height: 2),
+            for (final mm in members)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text(
+                  '• ${_s(mm, 'name')}${_s(mm, 'phone', '').isNotEmpty ? ' · ${_s(mm, 'phone', '')}' : ''}',
+                  style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // Tinted quiet action — the StatusChip voice as a button (Seat = success,
+  // Remove = danger). The tint never ships without its text label.
+  Widget _tintButton(String label, IconData icon, Color color, VoidCallback? onPressed) {
+    final enabled = onPressed != null;
+    final fg = Color.lerp(color, Colors.white, 0.25)!;
+    return MouseRegion(
+      cursor: enabled ? SystemMouseCursors.click : MouseCursor.defer,
+      child: GestureDetector(
+        onTap: onPressed,
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: enabled ? 0.12 : 0.05),
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.edge(color)),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 14, color: fg),
+            const SizedBox(width: 7),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.w600, letterSpacing: 0.2, color: fg)),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _card(Map e, {bool focused = false}) {
+    final status = _s(e, 'status', 'waiting');
+    final id = '${e['id']}';
+    final preItems = (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    final members = (e['party_members'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    final pre = preItems.length;
+    final phone = _s(e, 'phone', '');
+    final called = status == 'called';
+    final busy = _busyId == id;
+    final text = Theme.of(context).textTheme;
+
+    final card = ForkCard(
+      selected: focused,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          // Queue position — swaps to the warning bell once the party is called.
+          AnimatedSwitcher(
+            duration: AppDurations.base,
+            switchInCurve: Curves.easeOut,
+            switchOutCurve: Curves.easeIn,
+            child: called
+                ? Container(
+                    key: const ValueKey('called'),
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      color: AppColors.tint(AppColors.warning),
+                      borderRadius: AppRadius.controlAll,
+                      border: Border.all(color: AppColors.edge(AppColors.warning)),
+                    ),
+                    child: const Icon(Icons.notifications_active, size: 18, color: AppColors.warning),
+                  )
+                : SizedBox(
+                    key: ValueKey('pos-${e['position']}'),
+                    width: 40,
+                    child: Text(
+                      '${e['position'] ?? '–'}',
+                      textAlign: TextAlign.center,
+                      style: text.displaySmall!.copyWith(fontSize: 24, color: AppColors.copperHi),
+                    ),
+                  ),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+                    InfoChip(icon: Icons.groups_outlined, label: 'Party of ${e['party_size'] ?? 1}'),
+                    // Mandatory at join now, so it is always there to call back
+                    // on — right next to the party size where staff look.
+                    if (phone.isNotEmpty) InfoChip(icon: Icons.phone_outlined, label: phone),
+                    if (pre > 0) InfoChip(icon: Icons.restaurant_menu, label: '$pre-item pre-order'),
+                  ]),
+                ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          MicroStat(value: '${e['minutes_waiting'] ?? 0}m', label: 'waited', alignEnd: true),
+          const SizedBox(width: 14),
+          StatusChip(
+            label: called ? 'Called' : status,
+            color: called
+                ? AppColors.warning
+                : status == 'waiting'
+                    ? AppColors.info
+                    : AppColors.neutral,
+            dense: true,
+          ),
+        ]),
+        if (preItems.isNotEmpty || members.isNotEmpty) _details(preItems, members),
+        const SizedBox(height: AppSpacing.md),
+        Row(children: [
+          if (status == 'waiting') ...[
+            ForkButton(
+              label: 'Call',
+              icon: Icons.notifications_outlined,
+              dense: true,
+              onPressed: busy
+                  ? null
+                  : () => _act(id, () => widget.rest.post('/waitlist/$id/call'), ok: 'Notified ${_s(e, 'name')}'),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+          ],
+          _tintButton('Seat', Icons.event_seat_outlined, AppColors.success, busy ? null : () => _seat(e)),
+          const Spacer(),
+          ForkButton.ghost(
+            label: 'No-show',
+            dense: true,
+            onPressed: busy
+                ? null
+                : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'no_show'})),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          _tintButton(
+            'Remove',
+            Icons.close,
+            AppColors.danger,
+            busy
+                ? null
+                : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'cancelled'})),
+          ),
+        ]),
+      ]),
+    );
+
+    // Warning ring while the party is called — always paired with the
+    // labelled chip above (never colour alone).
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: AnimatedContainer(
+        duration: AppDurations.slow,
+        curve: Curves.easeOut,
+        decoration: BoxDecoration(
+          borderRadius: AppRadius.cardAll,
+          boxShadow: [
+            if (called)
+              BoxShadow(
+                color: AppColors.warning.withValues(alpha: 0.09),
+                blurRadius: 22,
+                spreadRadius: 1,
+              ),
+          ],
+        ),
+        child: card,
+      ),
+    );
+  }
+}
+
+/// "Send this party's pre-order to the kitchen?" — the ask that seating a queued
+/// party now requires.
+///
+/// The items were picked at the door, possibly a long time before the table came
+/// free, so firing them the instant a table is assigned takes the decision away
+/// from the guest. Pops `'confirm'` (place it), `'decline'` (leave it for the
+/// guest to change) or null — dismissing decides NOTHING and the pre-order stays
+/// pending in the "Pre-orders to confirm" list.
+class _PreorderConfirmDialog extends StatelessWidget {
+  final String partyName;
+  final String tableName;
+  final List<Map> items;
+  final double subtotal;
+  const _PreorderConfirmDialog({
+    required this.partyName,
+    required this.tableName,
+    required this.items,
+    required this.subtotal,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final count = items.fold<int>(0, (s, it) {
+      final q = _int(it['quantity']) ?? 1;
+      return s + (q <= 0 ? 1 : q);
+    });
+    return AlertDialog(
+      title: Text('Send $partyName’s pre-order?'),
+      content: SizedBox(
+        width: 380,
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Wrap(spacing: 6, runSpacing: 6, children: [
+              if (tableName.isNotEmpty && tableName != '—')
+                InfoChip(icon: Icons.table_restaurant_outlined, label: tableName),
+              InfoChip(icon: Icons.restaurant_menu, label: '$count item${count == 1 ? '' : 's'}'),
+            ]),
+            const SizedBox(height: AppSpacing.md),
+            Text('They picked these while waiting. Nothing has gone to the kitchen yet.',
+                style: text.bodySmall),
+            const SizedBox(height: AppSpacing.md),
+            if (items.isEmpty)
+              Text('The held pre-order is empty.', style: text.bodySmall)
+            else
+              ForkCard(
+                inset: true,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                child: Column(children: [
+                  for (final it in items)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 5),
+                      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Expanded(
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text('${_s(it, 'name')}  ×${_int(it['quantity']) ?? 1}', style: text.bodyLarge),
+                            if (_s(it, 'note', '').isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 2),
+                                child: Text(_s(it, 'note', ''),
+                                    style: text.bodySmall!
+                                        .copyWith(fontSize: 11, fontStyle: FontStyle.italic)),
+                              ),
+                          ]),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(_money(_numOf(it['price']) * ((_int(it['quantity']) ?? 1).clamp(1, 999))),
+                            style: text.titleSmall),
+                      ]),
+                    ),
+                  if (subtotal > 0) ...[
+                    const Padding(padding: EdgeInsets.symmetric(vertical: 6), child: Divider()),
+                    Row(children: [
+                      Expanded(child: Text('SUBTOTAL', style: text.labelSmall)),
+                      Text(_money(subtotal), style: text.titleSmall),
+                    ]),
+                  ],
+                ]),
+              ),
+            const SizedBox(height: AppSpacing.md),
+            // True of the server: ConfirmWaitlistPreorder re-prices from the menu,
+            // so a price change since they picked is always honoured.
+            Text('Prices are re-checked against the menu when you confirm.',
+                style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, 'decline'),
+          child: const Text('Let them change it'),
+        ),
+        FilledButton(
+          onPressed: items.isEmpty ? null : () => Navigator.pop(context, 'confirm'),
+          child: const Text('Confirm & send'),
+        ),
+      ],
+    );
+  }
+}
+
+// --- Subscription & billing -------------------------------------------------
+Widget billingModule(RestClient rest, Profile p) => _BillingView(rest: rest);
+
+class _BillingView extends StatefulWidget {
+  final RestClient rest;
+  const _BillingView({required this.rest});
+  @override
+  State<_BillingView> createState() => _BillingViewState();
+}
+
+class _BillingViewState extends State<_BillingView> {
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+  Map<String, dynamic> _info = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final info = await widget.rest.getMap('/billing');
+      if (!mounted) return;
+      setState(() { _info = info; _loading = false; });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _error = '$e'; _loading = false; });
+    }
+  }
+
+  String _cents(dynamic cents) {
+    final n = num.tryParse('${cents ?? 0}') ?? 0;
+    return '₹${(n / 100).toStringAsFixed(0)}';
+  }
+
+  int? _daysUntil(String? iso) {
+    if (iso == null || iso.isEmpty) return null;
+    final dt = DateTime.tryParse(iso);
+    if (dt == null) return null;
+    return dt.difference(DateTime.now()).inDays;
+  }
+
+  Future<void> _choose(Map plan) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      final r = await widget.rest.post('/billing/change-plan', {'plan_id': plan['id']});
+      final mode = (r is Map ? '${r['mode'] ?? ''}' : '');
+      String msg;
+      if (mode == 'downgrade_scheduled') {
+        msg = 'Scheduled — switches to ${plan['name']} at period end.';
+      } else if (mode == 'noop') {
+        msg = "You're already on ${plan['name']}.";
+      } else if (r is Map && r['invoice'] != null) {
+        msg = 'Invoice created for ${plan['name']}. Pay it from the web dashboard, or your provider will confirm.';
+      } else {
+        msg = 'Switched to ${plan['name']}.';
+      }
+      messenger.showSnackBar(SnackBar(content: Text(msg)));
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Text('Could not load billing.\n$_error', textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+      ]));
+    }
+    if (_info['configured'] == false) {
+      return const EmptyState(
+        icon: Icons.credit_card_off_outlined,
+        title: 'Billing not set up',
+        caption: "Billing isn't set up for this workspace yet.",
+      );
+    }
+    final sub = _info['subscription'] as Map?;
+    final plan = _info['plan'] as Map?;
+    final pending = _info['pending_plan'] as Map?;
+    final plans = (_info['plans'] as List?) ?? const [];
+    final invoices = (_info['invoices'] as List?) ?? const [];
+    final status = '${sub?['status'] ?? ''}';
+    final currentPlanId = sub?['plan_id'];
+    final trialDays = status == 'trial' ? _daysUntil(sub?['trial_ends_at'] as String?) : null;
+    final periodDays = status == 'active' ? _daysUntil(sub?['current_period_end'] as String?) : null;
+    const labels = {
+      'accounting': 'Accounting & cash', 'analytics': 'Analytics', 'inventory': 'Inventory & purchasing',
+      'valet': 'Valet', 'coupons': 'Coupons', 'attendance': 'Attendance', 'multi_outlet': 'Multi-outlet',
+    };
+
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 760;
+    final subCaption = [
+      if (trialDays != null) trialDays >= 0 ? 'Trial — $trialDays day(s) left' : 'Trial expired',
+      if (periodDays != null) 'Renews in $periodDays day(s)',
+      if (sub == null) 'Unlimited starter (no plan assigned).',
+    ].join(' · ');
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        StatCard(
+          value: '${plan?['name'] ?? 'No plan'}',
+          caption: subCaption.isEmpty ? 'CURRENT PLAN' : 'CURRENT PLAN · ${subCaption.toUpperCase()}',
+          tag: status.isNotEmpty ? status : null,
+          tagColor: AppColors.copperHi,
+          footer: pending == null
+              ? null
+              : Row(mainAxisSize: MainAxisSize.min, children: [
+                  const StatusChip(label: 'Scheduled', color: AppColors.warning, dense: true),
+                  const SizedBox(width: AppSpacing.sm),
+                  Flexible(
+                    child: Text('Switches to ${pending['name']} at period end.',
+                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+                ]),
+        ),
+        const SizedBox(height: AppSpacing.xxl),
+        SectionHeader(title: 'Plans', count: plans.length),
+        ...plans.map((pl) {
+          final m = pl as Map;
+          final isCurrent = m['id'] == currentPlanId && status == 'active';
+          final fmap = (m['features'] as Map?) ?? const {};
+          final features = <String>[];
+          labels.forEach((k, v) { if (fmap[k] != false) features.add(v); });
+          final limits = (m['limits'] as Map?) ?? const {};
+          final price = m['price_cents'];
+          return Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.md),
+            child: ForkCard(
+              selected: isCurrent,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Expanded(child: Text(_s(m, 'name'), style: text.titleMedium)),
+                  const SizedBox(width: AppSpacing.md),
+                  MicroStat(
+                    value: (num.tryParse('$price') ?? 0) == 0 ? 'Free' : '${_cents(price)}/mo',
+                    label: 'per month',
+                    alignEnd: true,
+                  ),
+                ]),
+                const SizedBox(height: AppSpacing.sm),
+                if (features.isNotEmpty) Text(features.join(' · '), style: text.bodySmall),
+                const SizedBox(height: 4),
+                Wrap(spacing: 6, runSpacing: 6, children: [
+                  InfoChip(
+                    icon: Icons.badge_outlined,
+                    label: limits['employees'] != null ? 'Up to ${limits['employees']} staff' : 'Unlimited staff',
+                  ),
+                  InfoChip(
+                    icon: Icons.storefront_outlined,
+                    label: limits['outlets'] != null ? 'Up to ${limits['outlets']} outlet(s)' : 'Unlimited outlets',
+                  ),
+                ]),
+                const SizedBox(height: AppSpacing.md),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: isCurrent
+                      ? const StatusChip(label: 'Current plan', color: AppColors.copper)
+                      : ForkButton(
+                          label: 'Choose',
+                          icon: Icons.arrow_forward,
+                          dense: true,
+                          onPressed: _busy ? null : () => _choose(m),
+                        ),
+                ),
+              ]),
+            ),
+          );
+        }),
+        if (invoices.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.lg),
+          SectionHeader(title: 'Invoices', count: invoices.length),
+          ...invoices.map((iv) {
+            final m = iv as Map;
+            final ivStatus = _s(m, 'status');
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: ForkCard(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: AppColors.inset,
+                      borderRadius: AppRadius.controlAll,
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: const Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(_cents(m['amount_cents']), style: text.titleSmall),
+                      if (_s(m, 'note', '').isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(_s(m, 'note', ''), style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ],
+                    ]),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  StatusChip(label: ivStatus, color: _stageColor(ivStatus), dense: narrow),
+                ]),
+              ),
+            );
+          }),
+        ],
+      ]),
+    );
+  }
+}
+
+// --- Cash register / day-close ---------------------------------------------
+Widget cashModule(RestClient rest, Profile p) => _CashView(rest: rest);
+
+class _CashView extends StatefulWidget {
+  final RestClient rest;
+  const _CashView({required this.rest});
+  @override
+  State<_CashView> createState() => _CashViewState();
+}
+
+class _CashViewState extends State<_CashView> {
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+  Map<String, dynamic>? _current;
+  List _history = const [];
+
+  final _floatCtl = TextEditingController();
+  final _countedCtl = TextEditingController();
+  final _payoutCtl = TextEditingController();
+  final _notesCtl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _floatCtl.dispose();
+    _countedCtl.dispose();
+    _payoutCtl.dispose();
+    _notesCtl.dispose();
+    super.dispose();
+  }
+
+  double _d(String s) => double.tryParse(s.trim()) ?? 0;
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final cur = await widget.rest.getMap('/cash/current');
+      final hist = await widget.rest.getMap('/cash/sessions').catchError((_) => <String, dynamic>{});
+      if (!mounted) return;
+      setState(() {
+        _current = cur['session'] is Map ? Map<String, dynamic>.from(cur['session'] as Map) : null;
+        _history = (hist['sessions'] as List?) ?? const [];
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _error = '$e'; _loading = false; });
+    }
+  }
+
+  Future<void> _open() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/cash/open', {'opening_float': _d(_floatCtl.text)});
+      _floatCtl.clear();
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _close() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_countedCtl.text.trim().isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Enter the counted cash first.')));
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final res = await widget.rest.post('/cash/close', {
+        'counted_cash': _d(_countedCtl.text),
+        'cash_payouts': _d(_payoutCtl.text),
+        'notes': _notesCtl.text.trim(),
+      });
+      _countedCtl.clear();
+      _payoutCtl.clear();
+      _notesCtl.clear();
+      final v = res is Map ? (num.tryParse('${res['variance'] ?? 0}') ?? 0) : 0;
+      messenger.showSnackBar(SnackBar(
+        content: Text(v == 0 ? 'Drawer balanced 🎯' : 'Variance ${_money(v)} (${v > 0 ? 'over' : 'short'})'),
+      ));
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Text('Could not load cash sessions.\n$_error', textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+      ]));
+    }
+    final cur = _current;
+    final closed = _history.where((s) => (s as Map)['status'] == 'closed').toList();
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 760;
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        AnimatedSwitcher(
+          duration: AppDurations.base,
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeIn,
+          child: cur == null
+              ? KeyedSubtree(key: const ValueKey('cash-closed'), child: _openCard())
+              : KeyedSubtree(key: const ValueKey('cash-open'), child: _openSessionCard(cur)),
+        ),
+        const SizedBox(height: AppSpacing.xxl),
+        SectionHeader(title: 'Past sessions', count: closed.length),
+        if (closed.isEmpty)
+          Text('No closed sessions yet.', style: text.bodySmall)
+        else
+          ...closed.map((s) {
+            final m = s as Map;
+            final v = num.tryParse('${m['variance'] ?? 0}') ?? 0;
+            final vColor = v == 0 ? AppColors.success : (v > 0 ? AppColors.warning : AppColors.danger);
+            final vLabel = v == 0 ? 'Balanced' : (v > 0 ? 'Over' : 'Short');
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: ForkCard(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(children: [
+                  Container(
+                    width: 38,
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: AppColors.inset,
+                      borderRadius: AppRadius.controlAll,
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: const Icon(Icons.point_of_sale, size: 16, color: AppColors.textTertiary),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(_fmtTime(_s(m, 'closed_at', '')),
+                          style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Float ${_money(m['opening_float'])} · sales ${_money(m['cash_sales'])} · expected ${_money(m['expected_cash'])} · counted ${_money(m['counted_cash'])}',
+                        style: text.bodySmall,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ]),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  MicroStat(value: '${v > 0 ? '+' : ''}${_money(v)}', label: 'variance', alignEnd: true),
+                  const SizedBox(width: 14),
+                  StatusChip(label: vLabel, color: vColor, dense: narrow),
+                ]),
+              ),
+            );
+          }),
+      ]),
+    );
+  }
+
+  Widget _openCard() {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: const Icon(Icons.lock_open, size: 16, color: AppColors.copper),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(child: Text('Open register', style: text.titleMedium)),
+          const StatusChip(label: 'Closed', color: AppColors.neutral, dense: true),
+        ]),
+        const SizedBox(height: AppSpacing.sm),
+        Text('No register is open for this outlet. Enter the starting float to begin.', style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        TextField(controller: _floatCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Opening float (₹)', border: OutlineInputBorder())),
+        const SizedBox(height: AppSpacing.md),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? '…' : 'Open register',
+            icon: Icons.lock_open,
+            onPressed: _busy ? null : _open,
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _openSessionCard(Map<String, dynamic> cur) {
+    final expected = num.tryParse('${cur['live_expected'] ?? 0}') ?? 0;
+    final text = Theme.of(context).textTheme;
+    Widget row(String k, String v, {bool strong = false}) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 5),
+          child: Row(children: [
+            Expanded(child: Text(k, style: text.bodyMedium)),
+            const SizedBox(width: AppSpacing.md),
+            Text(v, style: strong ? text.titleMedium : text.titleSmall),
+          ]),
+        );
+    return Column(children: [
+      ForkCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: AppColors.tint(AppColors.success),
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.edge(AppColors.success)),
+              ),
+              child: const Icon(Icons.lock_open, size: 16, color: AppColors.success),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Text('Open since ${_fmtTime(_s(cur, 'opened_at', ''))}',
+                  style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ),
+            const StatusChip(label: 'Open', color: AppColors.success, dense: true),
+          ]),
+          const SizedBox(height: AppSpacing.md),
+          row('Opening float', _money(cur['opening_float'])),
+          row('Cash sales (settled)', _money(cur['live_cash_sales'])),
+          row('Cash refunds', '− ${_money(cur['live_cash_refunds'])}'),
+          Container(height: 1, margin: const EdgeInsets.symmetric(vertical: 6), color: AppColors.divider),
+          row('Expected in drawer', _money(expected), strong: true),
+        ]),
+      ),
+      const SizedBox(height: AppSpacing.md),
+      ForkCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: AppColors.inset,
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.border),
+              ),
+              child: const Icon(Icons.lock_outline, size: 16, color: AppColors.copper),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(child: Text('Close & count down', style: text.titleMedium)),
+          ]),
+          const SizedBox(height: AppSpacing.md),
+          TextField(controller: _countedCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Counted cash (₹)', border: OutlineInputBorder())),
+          const SizedBox(height: 10),
+          TextField(controller: _payoutCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Cash paid out (₹)', border: OutlineInputBorder())),
+          const SizedBox(height: 10),
+          TextField(controller: _notesCtl, decoration: const InputDecoration(labelText: 'Notes (optional)', border: OutlineInputBorder())),
+          const SizedBox(height: AppSpacing.md),
+          Align(
+            alignment: Alignment.centerRight,
+            child: ForkButton(
+              label: _busy ? '…' : 'Close register',
+              icon: Icons.lock_outline,
+              onPressed: _busy ? null : _close,
+            ),
+          ),
+        ]),
+      ),
+    ]);
+  }
+}
+
+// --- Purchase orders --------------------------------------------------------
+Widget purchaseOrdersModule(RestClient rest, Profile p) => _PurchaseOrdersView(rest: rest);
+
+class _PurchaseOrdersView extends StatefulWidget {
+  final RestClient rest;
+  const _PurchaseOrdersView({required this.rest});
+  @override
+  State<_PurchaseOrdersView> createState() => _PurchaseOrdersViewState();
+}
+
+class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
+  bool _loading = true;
+  String? _error;
+  List _orders = const [];
+  List _vendors = const [];
+  List _inventory = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final o = await widget.rest.getMap('/purchase-orders');
+      List vend = const [];
+      List inv = const [];
+      try { final v = await widget.rest.getMap('/vendors'); vend = (v['vendors'] as List?) ?? const []; } catch (_) {}
+      try { inv = await widget.rest.getList('/inventory'); } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _orders = (o['orders'] as List?) ?? const [];
+        _vendors = vend;
+        _inventory = inv;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _error = '$e'; _loading = false; });
+    }
+  }
+
+  // PO status voice: draft=neutral, ordered/sent=info, received=success,
+  // cancelled=danger — always paired with the labelled StatusChip.
+  Color _statusColor(String s) {
+    switch (s) {
+      case 'received': return AppColors.success;
+      case 'ordered': return AppColors.info;
+      case 'cancelled': return AppColors.danger;
+      default: return AppColors.neutral;
+    }
+  }
+
+  Future<void> _setStatus(Map po, String status) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.rest.post('/purchase-orders/${po['id']}/status', {'status': status});
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _delete(Map po) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.rest.delete('/purchase-orders/${po['id']}');
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Text('Could not load purchase orders.\n$_error', textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+      ]));
+    }
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _inventory.isEmpty ? null : _createPo,
+        icon: const Icon(Icons.add),
+        label: const Text('New PO'),
+      ),
+      body: RefreshIndicator(
+        onRefresh: _load,
+        child: _orders.isEmpty
+            ? ListView(children: const [
+                SizedBox(height: 80),
+                EmptyState(
+                  icon: Icons.local_shipping_outlined,
+                  title: 'No purchase orders yet',
+                  caption: 'Raise a PO to restock from your vendors — received stock updates inventory automatically.',
+                ),
+              ])
+            : ListView.builder(
+                padding: AppSpacing.pageNarrow,
+                itemCount: _orders.length + 1,
+                itemBuilder: (c, i) => i == 0
+                    ? SectionHeader(title: 'Purchase orders', count: _orders.length)
+                    : _poCard(_orders[i - 1] as Map),
+              ),
+      ),
+    );
+  }
+
+  Widget _poCard(Map po) {
+    final status = _s(po, 'status', 'draft');
+    final items = (po['items'] as List?) ?? const [];
+    final ordered = items.fold<double>(0, (s, it) => s + (num.tryParse('${(it as Map)['qty_ordered'] ?? 0}') ?? 0));
+    final received = items.fold<double>(0, (s, it) => s + (num.tryParse('${(it as Map)['qty_received'] ?? 0}') ?? 0));
+    final canReceive = status == 'ordered' || status == 'draft';
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 760;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: ForkCard(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: AppColors.inset,
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.border),
+              ),
+              child: const Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.textTertiary),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(_s(po, 'vendor_name', 'Unassigned vendor'),
+                    style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 6),
+                Wrap(spacing: 6, runSpacing: 6, children: [
+                  InfoChip(icon: Icons.inventory_2_outlined, label: '${items.length} item(s)'),
+                  InfoChip(
+                    icon: Icons.call_received,
+                    label: '${received.toStringAsFixed(0)}/${ordered.toStringAsFixed(0)} received',
+                  ),
+                ]),
+              ]),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            MicroStat(value: _money(po['total_cost']), label: 'total', alignEnd: true),
+            const SizedBox(width: 14),
+            AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: StatusChip(
+                key: ValueKey('po-${po['id']}-$status'),
+                label: status,
+                color: _statusColor(status),
+                dense: narrow,
+              ),
+            ),
+          ]),
+          const SizedBox(height: AppSpacing.md),
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+            if (status == 'draft')
+              ForkButton.ghost(label: 'Place', icon: Icons.send_outlined, dense: true, onPressed: () => _setStatus(po, 'ordered')),
+            if (canReceive)
+              ForkButton(label: 'Receive', icon: Icons.inventory_2_outlined, dense: true, onPressed: () => _receivePo(po)),
+            if (status != 'received' && status != 'cancelled')
+              ForkButton.subtle(label: 'Cancel', icon: Icons.block, onPressed: () => _setStatus(po, 'cancelled')),
+            if (status != 'received')
+              ForkButton.subtle(label: 'Delete', icon: Icons.delete_outline, onPressed: () => _delete(po)),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _createPo() async {
+    final messenger = ScaffoldMessenger.of(context);
+    String? vendorId;
+    String? pickId;
+    final List<Map<String, dynamic>> lines = [];
+    final qtyCtl = TextEditingController();
+    final costCtl = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        return AlertDialog(
+          title: const Text('New purchase order'),
+          content: SizedBox(width: 440, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (_vendors.isNotEmpty)
+              DropdownButtonFormField<String>(
+                initialValue: vendorId, isExpanded: true,
+                decoration: const InputDecoration(labelText: 'Vendor (optional)', border: OutlineInputBorder()),
+                items: [for (final v in _vendors) DropdownMenuItem(value: '${(v as Map)['id']}', child: Text(_s(v, 'name')))],
+                onChanged: (x) => setLocal(() => vendorId = x),
+              ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              initialValue: pickId, isExpanded: true,
+              decoration: const InputDecoration(labelText: 'Item', border: OutlineInputBorder()),
+              items: [for (final it in _inventory) DropdownMenuItem(value: '${(it as Map)['id']}', child: Text(_s(it, 'name')))],
+              onChanged: (x) => setLocal(() => pickId = x),
+            ),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(child: TextField(controller: qtyCtl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Qty', border: OutlineInputBorder()))),
+              const SizedBox(width: 8),
+              Expanded(child: TextField(controller: costCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Unit cost', border: OutlineInputBorder()))),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: const Icon(Icons.add_circle),
+                onPressed: () {
+                  if (pickId == null) return;
+                  final item = _inventory.firstWhere((i) => '${(i as Map)['id']}' == pickId, orElse: () => null);
+                  final q = double.tryParse(qtyCtl.text.trim()) ?? 0;
+                  if (item == null || q <= 0) return;
+                  final m = item as Map;
+                  final c = double.tryParse(costCtl.text.trim()) ?? 0;
+                  setLocal(() {
+                    lines.removeWhere((l) => l['inventory_id'] == '${m['id']}');
+                    lines.add({'inventory_id': '${m['id']}', 'name': _s(m, 'name'), 'qty_ordered': q, 'unit_cost': c});
+                    pickId = null; qtyCtl.clear(); costCtl.clear();
+                  });
+                },
+              ),
+            ]),
+            const SizedBox(height: 8),
+            for (final l in lines)
+              ListTile(
+                dense: true,
+                title: Text('${l['name']}'),
+                subtitle: Text('${l['qty_ordered']} × ${_money(l['unit_cost'])}'),
+                trailing: IconButton(icon: const Icon(Icons.delete, size: 18), onPressed: () => setLocal(() => lines.removeWhere((x) => x['inventory_id'] == l['inventory_id']))),
+              ),
+          ]))),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            TextButton(onPressed: lines.isEmpty ? null : () => Navigator.pop(ctx, 'draft'), child: const Text('Save draft')),
+            FilledButton(onPressed: lines.isEmpty ? null : () => Navigator.pop(ctx, 'ordered'), child: const Text('Place order')),
+          ],
+        );
+      }),
+    );
+    if (result == null) return;
+    try {
+      await widget.rest.post('/purchase-orders', {
+        'vendor_id': ?vendorId,
+        'items': lines,
+        'status': result,
+      });
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _receivePo(Map po) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final items = (po['items'] as List?) ?? const [];
+    final ctls = <String, TextEditingController>{};
+    for (final it in items) {
+      final m = it as Map;
+      final ordered = num.tryParse('${m['qty_ordered'] ?? 0}') ?? 0;
+      final rec = num.tryParse('${m['qty_received'] ?? 0}') ?? 0;
+      final remaining = ordered - rec;
+      ctls['${m['inventory_id']}'] = TextEditingController(text: remaining > 0 ? remaining.toStringAsFixed(0) : '');
+    }
+    int qualityRating = 0; // 0 = not rated; 1–5 feeds the supplier score
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setDlg) => AlertDialog(
+        title: const Text('Receive stock'),
+        content: SizedBox(width: 440, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          for (final it in items)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                Expanded(child: Text(_s(it as Map, 'name'))),
+                SizedBox(
+                  width: 90,
+                  child: TextField(
+                    controller: ctls['${(it)['inventory_id']}'],
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(hintText: 'Qty', border: OutlineInputBorder()),
+                  ),
+                ),
+              ]),
+            ),
+          const Divider(),
+          Row(children: [
+            const Expanded(child: Text('Delivery quality', style: TextStyle(fontSize: 13))),
+            DropdownButton<int>(
+              value: qualityRating,
+              items: const [
+                DropdownMenuItem(value: 0, child: Text('Not rated')),
+                DropdownMenuItem(value: 5, child: Text('★★★★★')),
+                DropdownMenuItem(value: 4, child: Text('★★★★')),
+                DropdownMenuItem(value: 3, child: Text('★★★')),
+                DropdownMenuItem(value: 2, child: Text('★★')),
+                DropdownMenuItem(value: 1, child: Text('★')),
+              ],
+              onChanged: (v) => setDlg(() => qualityRating = v ?? 0),
+            ),
+          ]),
+          const Align(alignment: Alignment.centerLeft, child: Text('Feeds the supplier score in Analytics.', style: TextStyle(fontSize: 11, color: AppColors.textSecondary))),
+        ]))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm')),
+        ],
+      )),
+    );
+    if (ok != true) return;
+    final lines = <Map<String, dynamic>>[];
+    ctls.forEach((id, c) {
+      final q = double.tryParse(c.text.trim()) ?? 0;
+      if (q > 0) lines.add({'inventory_id': id, 'qty_received': q});
+    });
+    if (lines.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Enter quantities to receive.')));
+      return;
+    }
+    try {
+      await widget.rest.post('/purchase-orders/${po['id']}/receive', {'lines': lines, if (qualityRating >= 1) 'quality_rating': qualityRating});
+      messenger.showSnackBar(const SnackBar(content: Text('Stock received.')));
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+}
+
+Widget attendanceModule(RestClient rest, Profile p) => _AttendanceView(rest: rest, profile: p);
+
+class _AttendanceView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _AttendanceView({required this.rest, required this.profile});
+  @override
+  State<_AttendanceView> createState() => _AttendanceViewState();
+}
+
+class _AttendanceViewState extends State<_AttendanceView> {
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+  Map<String, dynamic> _me = {};
+  List _team = [];
+  List _pending = [];
+
+  bool get _isManager =>
+      widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin') ||
+      widget.profile.role == 'manager' || widget.profile.roleAll.contains('manager');
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final me = await widget.rest.getMap('/attendance/me');
+      List team = const [];
+      List pending = const [];
+      if (_isManager) {
+        final t = await widget.rest.getMap('/attendance').catchError((_) => <String, dynamic>{});
+        team = (t['rows'] as List?) ?? const [];
+        pending = (t['pending'] as List?) ?? const [];
+      }
+      if (!mounted) return;
+      setState(() { _me = me; _team = team; _pending = pending; _loading = false; });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _error = '$e'; _loading = false; });
+    }
+  }
+
+  String _hm(int mins) => '${mins ~/ 60}h ${mins % 60}m';
+
+  Future<void> _toggle(bool clockIn) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post(clockIn ? '/attendance/clock-in' : '/attendance/clock-out');
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('Could not load attendance.\n$_error', textAlign: TextAlign.center),
+          const SizedBox(height: 8),
+          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+        ]),
+      );
+    }
+    final clockedIn = _me['clocked_in'] == true;
+    final todayMins = (num.tryParse('${_me['today_minutes'] ?? 0}') ?? 0).toInt();
+    final sinceLabel = _fmtClock(_s(_me, 'since'));
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 760;
+    final onShiftNow = _team.where((t) => (t as Map)['open'] == true).length;
+
+    String initialsOf(String name) {
+      final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+      if (parts.isEmpty) return '?';
+      return parts.length == 1
+          ? parts.first.substring(0, 1)
+          : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+    }
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        _dashGrid([
+          StatCard(
+            value: _hm(todayMins),
+            caption: 'HOURS TODAY',
+            tag: clockedIn ? 'On shift' : null,
+            tagColor: AppColors.copperHi,
+          ),
+          if (_isManager)
+            StatCard(
+              value: '${_pending.length}',
+              caption: 'PENDING APPROVALS',
+              tag: _pending.isNotEmpty ? 'Review' : null,
+              tagColor: AppColors.warning,
+            ),
+          if (_isManager)
+            StatCard(value: '$onShiftNow', caption: 'ON SHIFT NOW'),
+        ], narrow ? 1 : (_isManager ? 3 : 1)),
+        const SizedBox(height: 14),
+        ForkCard(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              AnimatedContainer(
+                duration: AppDurations.base,
+                curve: Curves.easeOut,
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: clockedIn ? AppColors.tint(AppColors.copper) : AppColors.inset,
+                  borderRadius: AppRadius.controlAll,
+                  border: Border.all(color: clockedIn ? AppColors.edge(AppColors.copper) : AppColors.border),
+                ),
+                child: Icon(clockedIn ? Icons.work_outline : Icons.work_off_outlined,
+                    size: 16, color: clockedIn ? AppColors.copper : AppColors.textTertiary),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(
+                child: Text(
+                  clockedIn ? 'Clocked in${sinceLabel.isNotEmpty ? ' · since $sinceLabel' : ''}' : 'Not clocked in',
+                  style: text.titleMedium,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              AnimatedSwitcher(
+                duration: AppDurations.base,
+                switchInCurve: Curves.easeOut,
+                switchOutCurve: Curves.easeIn,
+                child: StatusChip(
+                  key: ValueKey('me-shift-$clockedIn'),
+                  label: clockedIn ? 'On shift' : 'Off shift',
+                  color: clockedIn ? AppColors.copper : AppColors.neutral,
+                  dense: narrow,
+                ),
+              ),
+            ]),
+            if (_me['pending_approval'] == true)
+              Padding(
+                padding: const EdgeInsets.only(top: AppSpacing.sm),
+                child: Row(children: [
+                  const Icon(Icons.hourglass_top, size: 13, color: AppColors.warning),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text('Awaiting admin approval — your clock-in time is already recorded.',
+                        style: text.bodySmall!.copyWith(color: AppColors.warning)),
+                  ),
+                ]),
+              ),
+            const SizedBox(height: AppSpacing.md),
+            Align(
+              alignment: Alignment.centerRight,
+              child: ForkButton(
+                label: _busy ? '…' : (clockedIn ? 'Clock out' : 'Clock in'),
+                icon: clockedIn ? Icons.logout : Icons.login,
+                onPressed: _busy ? null : () => _toggle(!clockedIn),
+              ),
+            ),
+          ]),
+        ),
+        if (_isManager && _pending.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.xxl),
+          SectionHeader(title: 'Pending approval', count: _pending.length, padding: const EdgeInsets.only(bottom: 4)),
+          Text('Approving keeps the employee\'s original clock-in time.', style: text.bodySmall),
+          const SizedBox(height: AppSpacing.md),
+          ..._pending.map((x) {
+            final m = x as Map;
+            final label = _fmtTime(_s(m, 'clock_in'));
+            Future<void> review(bool ok) async {
+              final messenger = ScaffoldMessenger.of(context);
+              try {
+                await widget.rest.post('/attendance/${m['id']}/${ok ? 'approve' : 'reject'}');
+                await _load();
+              } catch (e) {
+                messenger.showSnackBar(SnackBar(content: Text('$e')));
+              }
+            }
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: ForkCard(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(children: [
+                  InitialsAvatar(initials: initialsOf(_s(m, 'name', '')), color: AppColors.warning),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(_s(m, 'name', 'Employee'),
+                          style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 6),
+                      Wrap(spacing: 6, runSpacing: 6, children: [
+                        if (label.isNotEmpty) InfoChip(icon: Icons.login, label: 'In $label'),
+                        AnimatedSwitcher(
+                          duration: AppDurations.base,
+                          switchInCurve: Curves.easeOut,
+                          switchOutCurve: Curves.easeIn,
+                          child: m['clock_out'] == null
+                              ? StatusChip(
+                                  key: ValueKey('att-${m['id']}-on'),
+                                  label: 'On shift',
+                                  color: AppColors.copper,
+                                  dense: true)
+                              : StatusChip(
+                                  key: ValueKey('att-${m['id']}-ended'),
+                                  label: 'Shift ended',
+                                  color: AppColors.neutral,
+                                  dense: true),
+                        ),
+                      ]),
+                    ]),
+                  ),
+                  const SizedBox(width: AppSpacing.md),
+                  ForkButton(label: 'Approve', icon: Icons.check, dense: true, onPressed: () => review(true)),
+                  const SizedBox(width: AppSpacing.sm),
+                  ForkButton.ghost(label: 'Reject', icon: Icons.close, dense: true, onPressed: () => review(false)),
+                ]),
+              ),
+            );
+          }),
+        ],
+        if (_isManager) ...[
+          const SizedBox(height: AppSpacing.xxl),
+          SectionHeader(title: 'Team hours — last 30 days', count: _team.length),
+          if (_team.isEmpty)
+            Text('No attendance recorded yet.', style: text.bodySmall)
+          else
+            ..._team.map((x) {
+              final m = x as Map;
+              final mins = (num.tryParse('${m['minutes'] ?? 0}') ?? 0).toInt();
+              final open = m['open'] == true;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: ForkCard(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(children: [
+                    InitialsAvatar(initials: initialsOf(_s(m, 'name', ''))),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(_s(m, 'name', 'Employee'),
+                            style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 6),
+                        Wrap(spacing: 6, runSpacing: 6, children: [
+                          InfoChip(icon: Icons.event_repeat, label: '${m['shifts'] ?? 0} shifts'),
+                        ]),
+                      ]),
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: _hm(mins), label: 'hours', alignEnd: true),
+                    if (open) ...[
+                      const SizedBox(width: 14),
+                      const StatusChip(label: 'On shift', color: AppColors.copper, dense: true),
+                    ],
+                  ]),
+                ),
+              );
+            }),
+        ],
+      ]),
+    );
+  }
+}
+
+// --- Multi-outlet management -------------------------------------------------
+Widget outletsModule(RestClient rest, Profile p) => _OutletsView(rest: rest, profile: p);
+
+class _OutletsView extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  const _OutletsView({required this.rest, required this.profile});
+  @override
+  State<_OutletsView> createState() => _OutletsViewState();
+}
+
+class _OutletsViewState extends State<_OutletsView> {
+  bool _loading = true;
+  String? _error;
+  List _outlets = [];
+  Map<String, dynamic> _rollup = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final outlets = await widget.rest.getMap('/outlets');
+      final rollup = await widget.rest.getMap('/outlets/rollup?days=30').catchError((_) => <String, dynamic>{});
+      if (!mounted) return;
+      setState(() {
+        _outlets = (outlets['outlets'] as List?) ?? [];
+        _rollup = rollup;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _outletDialog({Map? existing}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final name = TextEditingController(text: existing == null ? '' : _s(existing, 'outlet_name'));
+    final addr = TextEditingController(text: existing == null ? '' : _s(existing, 'outlet_add'));
+    final phone = TextEditingController(text: existing == null ? '' : _s(existing, 'outlet_phone'));
+    final hours = TextEditingController(text: existing == null ? '' : _s(existing, 'outlet_hours'));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 400,
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('MULTI-OUTLET', style: Theme.of(ctx).textTheme.labelSmall),
+              const SizedBox(height: 6),
+              Text(existing == null ? 'Add outlet' : 'Edit outlet', style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: AppSpacing.lg),
+              TextField(controller: name, autofocus: true, decoration: const InputDecoration(labelText: 'Outlet name', isDense: true)),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(controller: addr, decoration: const InputDecoration(labelText: 'Address (optional)', isDense: true)),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(controller: phone, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Phone (optional)', isDense: true)),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(controller: hours, decoration: const InputDecoration(labelText: 'Hours (optional)', isDense: true)),
+              const SizedBox(height: AppSpacing.xl),
+              Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+                const SizedBox(width: AppSpacing.sm),
+                ForkButton(
+                  label: existing == null ? 'Add' : 'Save',
+                  icon: Icons.check,
+                  onPressed: () => Navigator.pop(ctx, true),
+                ),
+              ]),
+            ]),
+          ),
+        ),
+      ),
+    );
+    if (ok != true) return;
+    if (name.text.trim().isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Outlet name is required.')));
+      return;
+    }
+    final body = {
+      'name': name.text.trim(),
+      'address': addr.text.trim(),
+      'phone': phone.text.trim(),
+      'hours': hours.text.trim(),
+    };
+    try {
+      if (existing == null) {
+        await widget.rest.post('/outlets', body);
+      } else {
+        await widget.rest.put('/outlets/${existing['id']}', body);
+      }
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _toggleActive(Map o) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.rest.post('/outlets/${o['id']}/active', {'active': o['is_active'] == false});
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _delete(Map o) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete outlet?'),
+        content: Text('Delete "${_s(o, 'outlet_name')}"? Only possible if it has no orders/bills.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await widget.rest.delete('/outlets/${o['id']}');
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Only admins/managers may switch the app into another outlet (mirrors the
+  // app-bar outlet switcher gate in home_shell).
+  bool get _canSwitchOutlet {
+    final p = widget.profile;
+    return p.role == 'admin' ||
+        p.roleAll.contains('admin') ||
+        p.role == 'manager' ||
+        p.roleAll.contains('manager');
+  }
+
+  // The outlet the app is currently scoped to. A null selection means the
+  // session's home outlet (the default one); 'all' is the combined read-only
+  // view, where no single outlet is "active".
+  bool _isCurrentOutlet(Map o) {
+    final sel = widget.rest.auth.selectedOutletId;
+    if (sel == null || sel.isEmpty) return o['is_default'] == true;
+    if (sel == 'all') return false;
+    return '${o['id']}' == sel;
+  }
+
+  // Switch the whole app into [o]: persist the outlet + set X-Outlet-Id (via
+  // AuthController.selectOutlet), rejoin the realtime printer subscription for
+  // that outlet, and refetch so this view's active indicator + rollup update.
+  // Other modules re-scope to this outlet the next time they are opened.
+  Future<void> _switchToOutlet(Map o) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final id = '${o['id']}';
+    if (id.isEmpty || _isCurrentOutlet(o)) return;
+    widget.rest.auth.selectOutlet(id);
+    try {
+      await PrinterService.instance.stop();
+      await PrinterService.instance.start(widget.rest.auth);
+    } catch (_) {/* printer agent optional */}
+    if (!mounted) return;
+    messenger.showSnackBar(SnackBar(
+        content: Text('Now viewing ${_s(o, 'outlet_name', 'this outlet')}. Other modules will show this outlet\'s data.')));
+    await _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return _loadingSkeleton();
+    if (_error != null) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('Could not load outlets.\n$_error',
+              textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: AppSpacing.md),
+          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
+        ]),
+      );
+    }
+
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 760;
+    final totals = (_rollup['totals'] as Map?) ?? {};
+    final rollupOutlets = (_rollup['outlets'] as List?) ?? [];
+    String money(double v) => '₹${v.toStringAsFixed(0)}';
+    double n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+    final compare = rollupOutlets
+        .map((o) => (label: _s(o as Map, 'name', 'Outlet'), value: n(o['revenue'])))
+        .toList();
+    // Per-outlet 30d revenue keyed by name (the rollup rows carry no id).
+    final revenueByName = <String, double>{
+      for (final o in rollupOutlets) _s(o as Map, 'name', ''): n(o['revenue']),
+    };
+
+    final outletCards = _outlets.map<Widget>((x) {
+      final o = x as Map;
+      final isDefault = o['is_default'] == true;
+      final active = o['is_active'] != false;
+      final current = _isCurrentOutlet(o);
+      final rev = revenueByName[_s(o, 'outlet_name', '')];
+      return ForkCard(
+        // Copper selection ring marks the outlet the app is scoped to — always
+        // paired with the labelled "Viewing" chip (never colour alone).
+        selected: current,
+        // Admin/manager: tapping the card switches the app into this outlet.
+        onTap: _canSwitchOutlet && !current ? () => _switchToOutlet(o) : null,
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            AnimatedContainer(
+              duration: AppDurations.base,
+              curve: Curves.easeOut,
+              width: 38,
+              height: 38,
+              decoration: BoxDecoration(
+                color: current ? AppColors.tint(AppColors.copper) : AppColors.inset,
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: current ? AppColors.edge(AppColors.copper) : AppColors.border),
+              ),
+              child: Icon(Icons.store_mall_directory_outlined,
+                  size: 16,
+                  color: current
+                      ? AppColors.copper
+                      : (active ? AppColors.textSecondary : AppColors.textTertiary)),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                Row(children: [
+                  Flexible(
+                    child: Text(_s(o, 'outlet_name', 'Outlet'),
+                        style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+                  if (isDefault) ...[
+                    const SizedBox(width: 8),
+                    const TickTag('Main', color: AppColors.copper),
+                  ],
+                ]),
+                if (_s(o, 'outlet_add').isNotEmpty) ...[
+                  const SizedBox(height: 3),
+                  Text(_s(o, 'outlet_add'), style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                ],
+              ]),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: current
+                  ? StatusChip(
+                      key: ValueKey('outlet-${o['id']}-viewing'),
+                      label: 'Viewing',
+                      color: AppColors.copper,
+                      dense: true)
+                  : !active
+                      ? StatusChip(
+                          key: ValueKey('outlet-${o['id']}-inactive'),
+                          label: 'Inactive',
+                          color: AppColors.neutral,
+                          dense: true)
+                      : StatusChip(
+                          key: ValueKey('outlet-${o['id']}-active'),
+                          label: 'Active',
+                          color: AppColors.success,
+                          dense: true),
+            ),
+            PopupMenuButton<String>(
+              iconColor: AppColors.textSecondary,
+              onSelected: (v) {
+                if (v == 'edit') _outletDialog(existing: o);
+                if (v == 'toggle') _toggleActive(o);
+                if (v == 'delete') _delete(o);
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                if (!isDefault) PopupMenuItem(value: 'toggle', child: Text(active ? 'Deactivate' : 'Activate')),
+                if (!isDefault) const PopupMenuItem(value: 'delete', child: Text('Delete')),
+              ],
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            if (rev != null) ...[
+              MicroStat(value: money(rev), label: 'revenue (30d)'),
+              const SizedBox(width: AppSpacing.xl),
+            ],
+            if (_s(o, 'outlet_phone').isNotEmpty) ...[
+              MicroStat(value: _s(o, 'outlet_phone'), label: 'phone'),
+              const SizedBox(width: AppSpacing.xl),
+            ],
+            if (_s(o, 'outlet_hours').isNotEmpty)
+              MicroStat(value: _s(o, 'outlet_hours'), label: 'hours'),
+            const Spacer(),
+            if (_canSwitchOutlet && !current)
+              ForkButton.ghost(label: 'Open', icon: Icons.login, dense: true, onPressed: () => _switchToOutlet(o)),
+          ]),
+        ]),
+      );
+    }).toList();
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: AppSpacing.pageNarrow, children: [
+        SectionHeader(
+          title: 'Outlets',
+          count: _outlets.length,
+          trailing: ForkButton(label: 'Add outlet', icon: Icons.add, dense: true, onPressed: () => _outletDialog()),
+        ),
+        _dashGrid([
+          StatCard(value: '${totals['outlets'] ?? _outlets.length}', caption: 'BRANCHES'),
+          StatCard(value: money(n(totals['revenue'])), caption: 'REVENUE (30D)'),
+          StatCard(value: '${totals['orders'] ?? 0}', caption: 'ORDERS (30D)'),
+        ], narrow ? 1 : 3),
+        const SizedBox(height: AppSpacing.lg),
+        if (compare.length > 1) ...[
+          _chartCard(context, 'Revenue by outlet — last 30 days', _barChart(context, compare, money)),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        SectionHeader(
+          title: 'Manage outlets',
+          padding: const EdgeInsets.only(top: 8, bottom: 10),
+          trailing: _canSwitchOutlet ? Text('Tap an outlet to switch', style: text.bodySmall) : null,
+        ),
+        _dashGrid(outletCards, narrow ? 1 : 2),
+      ]),
+    );
+  }
+}
+
+// Next valet step for a given status string → (state code, button label).
+({int next, String label})? _valetNext(String status) {
+  switch (status) {
+    case 'Vehicle added':
+      return (next: 2, label: 'Mark parked');
+    case 'Parked':
+      return (next: 3, label: 'Customer wants car');
+    case 'Request to bring car (from customer)':
+      return (next: 4, label: 'Accept request');
+    case 'Request accepted (from valet)':
+      return (next: 5, label: 'Car at entrance');
+    case 'Car arrived at entrance':
+      return (next: 6, label: 'Customer took car');
+    default:
+      return null;
+  }
+}
+
+Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () => rest.getMap('/valet-info'),
+      builder: (context, data, reload) {
+        final messenger = ScaffoldMessenger.of(context);
+        final bays = (data['bays'] as List?) ?? [];
+        final vehicles = (data['bookings'] as List?) ?? [];
+        final active = vehicles.where((v) => (v as Map)['active'] != false).toList();
+
+        Future<void> post(String path, Map<String, dynamic> body) async {
+          try {
+            await rest.post(path, body);
+            reload();
+          } catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text('$e')));
+          }
+        }
+
+        // [bayId] pre-selects a bay — set when the check-in is started from an
+        // empty bay's own sheet, so the attendant doesn't re-pick what they
+        // just tapped.
+        Future<void> checkIn({String? bayId}) async {
+          final res = await showDialog<Map<String, dynamic>>(
+            context: context,
+            builder: (_) => _ValetCheckInDialog(bays: bays, initialBayId: bayId),
+          );
+          if (res != null) await post('/create_valet_record', res);
+        }
+
+        Future<void> assignBay(String id) async {
+          if (bays.isEmpty) {
+            messenger.showSnackBar(const SnackBar(content: Text('Add a parking bay first.')));
+            return;
+          }
+          final bayId = await showDialog<String>(
+            context: context,
+            builder: (ctx) => SimpleDialog(
+              title: const Text('Assign bay'),
+              children: [
+                for (final b in bays)
+                  SimpleDialogOption(
+                    onPressed: () => Navigator.pop(ctx, '${(b as Map)['Bay_id']}'),
+                    child: Text(_s(b, 'Bay_name')),
+                  ),
+              ],
+            ),
+          );
+          if (bayId != null) await post('/update_valet_bay', {'booking_id': id, 'bay_id': bayId});
+        }
+
+        Future<void> addBay() async {
+          final name = TextEditingController();
+          final cap = TextEditingController(text: '10');
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Add parking bay'),
+              content: Column(mainAxisSize: MainAxisSize.min, children: [
+                TextField(controller: name, autofocus: true, decoration: const InputDecoration(labelText: 'Bay name (e.g. Front Lot)')),
+                TextField(controller: cap, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Capacity')),
+              ]),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add')),
+              ],
+            ),
+          );
+          name.dispose();
+          if (ok != true) return;
+          await post('/add-valet-bay', {'Bay_name': name.text.trim(), 'total_capacity': int.tryParse(cap.text.trim()) ?? 0});
+        }
+
+        Future<void> deleteBay(Map b) async {
+          if (!await _confirm(context, 'Delete bay', 'Delete "${_s(b, 'Bay_name')}"?')) return;
+          await post('/delete-valet-bay', {'Bay_id': '${b['Bay_id']}'});
+        }
+
+        // --- Valet ops depth (Wave D) ---------------------------------------
+
+        // Parking location — so ANY attendant can retrieve the car.
+        Future<void> editLocation(Map m) async {
+          final id = _s(m, 'booking_id');
+          final c = TextEditingController(text: _s(m, 'parking_location', ''));
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Parking location'),
+              content: TextField(
+                controller: c,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'e.g. P2 / Level 1 / Slot 14', border: OutlineInputBorder(), isDense: true),
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+              ],
+            ),
+          );
+          final v = c.text.trim();
+          c.dispose();
+          if (ok == true) await post('/valet/$id/ops', {'parking_location': v});
+        }
+
+        // Digital key log: take = keys with me, hand over = keys leave my hands.
+        Future<void> keysAction(Map m) async {
+          final id = _s(m, 'booking_id');
+          final holder = _s(m, 'key_holder', '');
+          await post('/valet/$id/keys', {'action': holder.isEmpty ? 'take' : 'handover'});
+        }
+
+        // Damage/condition notes (+ optional photo) at drop-off or later.
+        Future<void> editCondition(Map m) async {
+          final id = _s(m, 'booking_id');
+          final c = TextEditingController(text: _s(m, 'condition_notes', ''));
+          XFile? photo;
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => StatefulBuilder(
+              builder: (ctx, setLocal) => AlertDialog(
+                title: const Text('Vehicle condition'),
+                content: Column(mainAxisSize: MainAxisSize.min, children: [
+                  TextField(
+                    controller: c,
+                    autofocus: true,
+                    maxLines: 3,
+                    decoration: const InputDecoration(labelText: 'Notes (scratches, dents...)', border: OutlineInputBorder(), isDense: true),
+                  ),
+                  const SizedBox(height: 10),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: ForkButton.ghost(
+                      label: photo == null ? 'Attach photo (optional)' : 'Photo attached',
+                      icon: Icons.camera_alt,
+                      onPressed: () async {
+                        final shot = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 1600, imageQuality: 80);
+                        if (shot != null) setLocal(() => photo = shot);
+                      },
+                    ),
+                  ),
+                ]),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+                ],
+              ),
+            ),
+          );
+          final notes = c.text.trim();
+          c.dispose();
+          if (ok != true) return;
+          final body = <String, dynamic>{'condition_notes': notes};
+          if (photo != null) {
+            body['condition_photo_base64'] = base64Encode(await photo!.readAsBytes());
+            body['condition_photo_content_type'] = 'image/jpeg';
+          }
+          await post('/valet/$id/ops', body);
+        }
+
+        // Retrieval ETA quoted to the guest (quick-set from the card).
+        Future<void> setEta(String id, int mins) => post('/valet/$id/ops', {'eta_minutes': mins});
+
+        // Valet fee → the table's open POS bill.
+        Future<void> chargeToTable(Map m) async {
+          final id = _s(m, 'booking_id');
+          List targets = [];
+          try {
+            final r = await rest.getMap('/valet/charge-targets');
+            targets = (r['tables'] as List?) ?? [];
+          } catch (_) {}
+          if (!context.mounted) return;
+          if (targets.isEmpty) {
+            messenger.showSnackBar(const SnackBar(content: Text('No occupied tables to charge right now.')));
+            return;
+          }
+          String? tableName = _s(targets.first as Map, 'table_name', '');
+          final amount = TextEditingController();
+          final ok = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => StatefulBuilder(
+              builder: (ctx, setLocal) => AlertDialog(
+                title: const Text('Charge valet fee to table'),
+                content: Column(mainAxisSize: MainAxisSize.min, children: [
+                  DropdownButtonFormField<String>(
+                    initialValue: tableName,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Occupied table', border: OutlineInputBorder(), isDense: true),
+                    items: [
+                      for (final t in targets)
+                        DropdownMenuItem(value: _s(t as Map, 'table_name', ''), child: Text(_s(t, 'table_name'))),
+                    ],
+                    onChanged: (v) => setLocal(() => tableName = v),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: amount,
+                    autofocus: true,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Fee amount', border: OutlineInputBorder(), isDense: true),
+                  ),
+                ]),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Charge')),
+                ],
+              ),
+            ),
+          );
+          final amt = num.tryParse(amount.text.trim());
+          amount.dispose();
+          if (ok != true) return;
+          if (tableName == null || tableName!.isEmpty || amt == null || amt <= 0) {
+            messenger.showSnackBar(const SnackBar(content: Text('Pick a table and a positive amount.')));
+            return;
+          }
+          await post('/valet/$id/charge', {'table_name': tableName, 'amount': amt});
+        }
+
+        // Valet stage voice — tint always paired with the labelled StatusChip.
+        Color valetColor(String s) {
+          final l = s.toLowerCase();
+          if (l == 'parked') return AppColors.success;
+          if (l.contains('request')) return AppColors.warning;
+          if (l.contains('entrance')) return AppColors.copper;
+          if (l.contains('took')) return AppColors.neutral;
+          return AppColors.info;
+        }
+
+        // Short display label for the long backend stage strings (display only —
+        // the raw status still drives _valetNext and every rest call).
+        String valetLabel(String s) {
+          switch (s) {
+            case 'Vehicle added':
+              return 'Checked in';
+            case 'Request to bring car (from customer)':
+              return 'Car requested';
+            case 'Request accepted (from valet)':
+              return 'Request accepted';
+            case 'Car arrived at entrance':
+              return 'At entrance';
+            case 'Customer took car':
+              return 'Handed over';
+            default:
+              return s;
+          }
+        }
+
+        final text = Theme.of(context).textTheme;
+
+        // --- Clickable bays --------------------------------------------------
+        // A bay used to be an inert number on a card. Tapping one now shows what
+        // is actually parked in it — vehicle, owner, since when, keys — with the
+        // same actions the vehicle list already offers. An empty bay says so and
+        // offers a check-in straight into itself.
+        void openBay(Map b) {
+          final bayId = '${b['Bay_id']}';
+          final parked =
+              active.map((v) => v as Map).where((v) => '${v['bay_id']}' == bayId).toList();
+          showModalBottomSheet<void>(
+            context: context,
+            showDragHandle: true,
+            isScrollControlled: true,
+            backgroundColor: AppColors.surface,
+            builder: (sheetCtx) {
+              // Every action reloads the page underneath, so the sheet steps out
+              // of the way first rather than sitting on data it can't refresh.
+              void run(VoidCallback action) {
+                Navigator.pop(sheetCtx);
+                action();
+              }
+
+              return SafeArea(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(sheetCtx).height * 0.9),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(children: [
+                            Expanded(
+                              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                Text('PARKING BAY', style: text.labelSmall),
+                                const SizedBox(height: 4),
+                                Text(_s(b, 'Bay_name'),
+                                    style: text.headlineMedium,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis),
+                              ]),
+                            ),
+                            StatusChip(
+                              label: '${b['current_capacity'] ?? 0} / ${b['total_capacity'] ?? 0} occupied',
+                              color: parked.isEmpty ? AppColors.success : AppColors.copper,
+                            ),
+                          ]),
+                          const SizedBox(height: AppSpacing.lg),
+                          if (parked.isEmpty)
+                            EmptyState(
+                              icon: Icons.local_parking,
+                              title: 'This bay is empty',
+                              caption: 'Nothing is parked in ${_s(b, 'Bay_name')} right now.',
+                              action: ForkButton(
+                                label: 'Check a vehicle in here',
+                                icon: Icons.directions_car,
+                                onPressed: () => run(() => checkIn(bayId: bayId)),
+                              ),
+                            )
+                          else
+                            ...parked.map((m) {
+                              final id = _s(m, 'booking_id');
+                              final status = _s(m, 'status', 'Vehicle added');
+                              final nx = _valetNext(status);
+                              final keyHolder = _s(m, 'key_holder', '');
+                              final location = _s(m, 'parking_location', '');
+                              final notes = _s(m, 'condition_notes', '');
+                              final customer = _s(m, 'customer_name', '');
+                              final since = _s(m, 'booking_date_time', '');
+                              final eta = _int(m['eta_minutes']);
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 12),
+                                child: ForkCard(
+                                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Row(children: [
+                                      Expanded(
+                                        child: Text(_s(m, 'number_plate', 'Vehicle'),
+                                            style: text.titleMedium!
+                                                .copyWith(fontFamily: 'monospace', letterSpacing: 2),
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis),
+                                      ),
+                                      StatusChip(label: valetLabel(status), color: valetColor(status)),
+                                    ]),
+                                    const SizedBox(height: 10),
+                                    Wrap(spacing: 6, runSpacing: 6, children: [
+                                      if (customer.isNotEmpty && customer != '—')
+                                        InfoChip(icon: Icons.person_outline, label: customer),
+                                      if (since.isNotEmpty)
+                                        InfoChip(icon: Icons.schedule, label: 'Since ${_fmtTime(since)}'),
+                                      if (location.isNotEmpty)
+                                        InfoChip(icon: Icons.pin_drop_outlined, label: location),
+                                      InfoChip(
+                                        icon: Icons.key,
+                                        label: keyHolder.isEmpty ? 'Keys not taken' : 'Keys with $keyHolder',
+                                      ),
+                                      if (eta != null && eta > 0)
+                                        InfoChip(icon: Icons.timer_outlined, label: 'ETA $eta min'),
+                                    ]),
+                                    if (notes.isNotEmpty) ...[
+                                      const SizedBox(height: 10),
+                                      Text(notes,
+                                          style: text.bodySmall!.copyWith(
+                                              fontStyle: FontStyle.italic, color: AppColors.textTertiary)),
+                                    ],
+                                    const SizedBox(height: 12),
+                                    Wrap(spacing: 2, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                                      ForkButton.subtle(
+                                          label: 'Bay',
+                                          icon: Icons.local_parking,
+                                          onPressed: () => run(() => assignBay(id))),
+                                      ForkButton.subtle(
+                                          label: 'Location',
+                                          icon: Icons.edit_location_alt,
+                                          onPressed: () => run(() => editLocation(m))),
+                                      ForkButton.subtle(
+                                          label: keyHolder.isEmpty ? 'Take keys' : 'Hand over',
+                                          icon: Icons.key,
+                                          onPressed: () => run(() => keysAction(m))),
+                                      ForkButton.subtle(
+                                          label: 'Condition',
+                                          icon: Icons.note_alt_outlined,
+                                          onPressed: () => run(() => editCondition(m))),
+                                      ForkButton.subtle(
+                                          label: 'Charge',
+                                          icon: Icons.receipt_long,
+                                          onPressed: () => run(() => chargeToTable(m))),
+                                      if (nx != null)
+                                        ForkButton(
+                                          label: nx.label,
+                                          dense: true,
+                                          onPressed: () => run(() =>
+                                              post('/update_valet_state', {'booking_id': id, 'state': nx.next})),
+                                        ),
+                                    ]),
+                                  ]),
+                                ),
+                              );
+                            }),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        }
+
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () => checkIn(),
+            icon: const Icon(Icons.directions_car),
+            label: const Text('Check in vehicle'),
+          ),
+          // The extended FAB floats over the bottom-right of this list. Without
+          // the extra bottom inset it sits on top of the LAST vehicle card's
+          // action row — which is exactly where "Call car" lives. Padding, not a
+          // stack: the content scrolls clear instead of being covered.
+          body: ListView(
+            padding: AppSpacing.pageNarrow.add(const EdgeInsets.only(bottom: 96)),
+            children: [
+            SectionHeader(
+              title: 'Parking bays',
+              count: bays.length,
+              padding: const EdgeInsets.only(bottom: 10),
+              trailing: ForkButton.ghost(label: 'Add bay', icon: Icons.add, dense: true, onPressed: addBay),
+            ),
+            if (bays.isEmpty)
+              EmptyState(
+                icon: Icons.local_parking,
+                title: 'No parking bays yet',
+                caption: 'Add a bay to start valet parking.',
+                action: ForkButton(label: 'Add parking bay', icon: Icons.add, onPressed: addBay),
+              )
+            else
+              Wrap(spacing: 14, runSpacing: 14, children: [
+                for (final r in bays)
+                  Builder(builder: (_) {
+                    final b = r as Map;
+                    final cur = b['current_capacity'];
+                    final tot = b['total_capacity'];
+                    final ratio = (tot is num && tot > 0 && cur is num) ? (cur / tot).clamp(0.0, 1.0).toDouble() : 0.0;
+                    final here = active
+                        .map((v) => v as Map)
+                        .where((v) => '${v['bay_id']}' == '${b['Bay_id']}')
+                        .length;
+                    return SizedBox(
+                      width: 210,
+                      child: ForkCard(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 10, 16),
+                        onTap: () => openBay(b),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Row(children: [
+                            Expanded(
+                              child: Text(_s(b, 'Bay_name'),
+                                  style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                            ),
+                            ForkIconButton(
+                              icon: Icons.delete_outline,
+                              tooltip: 'Delete bay',
+                              onPressed: () => deleteBay(b),
+                            ),
+                          ]),
+                          const SizedBox(height: 8),
+                          MicroStat(value: '${cur ?? 0} / ${tot ?? 0}', label: 'occupied'),
+                          const SizedBox(height: 10),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(AppRadius.chip),
+                            child: LinearProgressIndicator(
+                              value: ratio,
+                              minHeight: 4,
+                              backgroundColor: AppColors.inset,
+                              valueColor: const AlwaysStoppedAnimation<Color>(AppColors.copper),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Row(children: [
+                            Expanded(
+                              child: Text(
+                                here == 0
+                                    ? 'Empty — tap to check a car in'
+                                    : 'Tap to see the $here vehicle${here == 1 ? '' : 's'} here',
+                                style: text.bodySmall!.copyWith(fontSize: 11),
+                                maxLines: 2,
+                              ),
+                            ),
+                            const Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
+                          ]),
+                        ]),
+                      ),
+                    );
+                  }),
+              ]),
+            const SizedBox(height: AppSpacing.xxl),
+            SectionHeader(
+              title: 'Vehicles on valet',
+              count: active.length,
+              padding: const EdgeInsets.only(bottom: 10),
+            ),
+            if (active.isEmpty)
+              const EmptyState(
+                icon: Icons.directions_car_outlined,
+                title: 'No vehicles on valet',
+                caption: 'Checked-in vehicles appear here with their bay, keys and stage.',
+              )
+            else
+              ...active.map((v) {
+                final m = v as Map;
+                final id = _s(m, 'booking_id');
+                final status = _s(m, 'status', 'Vehicle added');
+                final nx = _valetNext(status);
+                final location = _s(m, 'parking_location', '');
+                final keyHolder = _s(m, 'key_holder', '');
+                final notes = _s(m, 'condition_notes', '');
+                final eta = m['eta_minutes'] is num ? (m['eta_minutes'] as num).toInt() : int.tryParse('${m['eta_minutes'] ?? ''}');
+                final requestStage = status == 'Request to bring car (from customer)' || status == 'Request accepted (from valet)';
+                final customer = _s(m, 'customer_name', '');
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 14),
+                  child: ForkCard(
+                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            color: AppColors.inset,
+                            borderRadius: AppRadius.controlAll,
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: const Icon(Icons.directions_car_outlined, size: 18, color: AppColors.copper),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        Expanded(
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text(_s(m, 'number_plate', 'Vehicle'),
+                                style: text.titleMedium!.copyWith(fontFamily: 'monospace', letterSpacing: 2),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis),
+                            const SizedBox(height: 6),
+                            // Ops depth: owner / bay / where it's parked / keys / ETA.
+                            Wrap(spacing: 6, runSpacing: 6, children: [
+                              if (customer.isNotEmpty && customer != '—')
+                                InfoChip(icon: Icons.person_outline, label: customer),
+                              if (_s(m, 'bay_name', '').isNotEmpty)
+                                InfoChip(icon: Icons.local_parking, label: 'Bay ${_s(m, 'bay_name')}'),
+                              if (location.isNotEmpty)
+                                InfoChip(icon: Icons.pin_drop_outlined, label: location),
+                              if (keyHolder.isNotEmpty)
+                                InfoChip(icon: Icons.key, label: keyHolder),
+                              if (requestStage && eta != null && eta > 0)
+                                InfoChip(icon: Icons.schedule, label: 'ETA $eta min'),
+                            ]),
+                          ]),
+                        ),
+                        const SizedBox(width: AppSpacing.md),
+                        // Cross-fade as the vehicle advances through the flow.
+                        AnimatedSwitcher(
+                          duration: AppDurations.base,
+                          switchInCurve: Curves.easeOut,
+                          switchOutCurve: Curves.easeIn,
+                          child: StatusChip(
+                            key: ValueKey('valet-$id-$status'),
+                            label: valetLabel(status),
+                            color: valetColor(status),
+                          ),
+                        ),
+                      ]),
+                      if (notes.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            const Icon(Icons.sticky_note_2_outlined, size: 13, color: AppColors.textTertiary),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(notes,
+                                  style: text.bodySmall!
+                                      .copyWith(fontStyle: FontStyle.italic, color: AppColors.textTertiary)),
+                            ),
+                          ]),
+                        ),
+                      if (requestStage)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Wrap(spacing: 6, runSpacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                            Text('QUOTE ETA', style: text.labelSmall),
+                            const SizedBox(width: 4),
+                            for (final mins in const [5, 10, 15])
+                              MouseRegion(
+                                cursor: SystemMouseCursors.click,
+                                child: GestureDetector(
+                                  onTap: () => setEta(id, mins),
+                                  child: AnimatedContainer(
+                                    duration: AppDurations.fast,
+                                    curve: Curves.easeOut,
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                    decoration: BoxDecoration(
+                                      color: eta == mins ? AppColors.tint(AppColors.copper) : AppColors.inset,
+                                      borderRadius: BorderRadius.circular(AppRadius.chip),
+                                      border: Border.all(
+                                        color: eta == mins
+                                            ? AppColors.copper.withValues(alpha: 0.55)
+                                            : AppColors.border,
+                                      ),
+                                    ),
+                                    child: Text('$mins min',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                          letterSpacing: 0.2,
+                                          color: eta == mins ? AppColors.copperHi : AppColors.textSecondary,
+                                        )),
+                                  ),
+                                ),
+                              ),
+                          ]),
+                        ),
+                      const SizedBox(height: 12),
+                      Container(height: 1, color: AppColors.divider),
+                      const SizedBox(height: 8),
+                      // The stage action ("Call car", "Car at entrance"…) is the
+                      // one control on this card that must never be squeezed out
+                      // or hidden. Wide: it sits at the end of the row. Narrow:
+                      // it takes its own full-width line ABOVE the ops buttons
+                      // instead of being crushed by five siblings — no overlay,
+                      // nothing stacked on top of an action.
+                      LayoutBuilder(builder: (context, box) {
+                        final ops = <Widget>[
+                          ForkButton.subtle(
+                            label: 'Bay',
+                            icon: Icons.local_parking,
+                            onPressed: () => assignBay(id),
+                          ),
+                          ForkButton.subtle(
+                            label: 'Location',
+                            icon: Icons.edit_location_alt,
+                            onPressed: () => editLocation(m),
+                          ),
+                          ForkButton.subtle(
+                            label: keyHolder.isEmpty ? 'Take keys' : 'Hand over',
+                            icon: Icons.key,
+                            onPressed: () => keysAction(m),
+                          ),
+                          ForkButton.subtle(
+                            label: 'Condition',
+                            icon: Icons.note_alt_outlined,
+                            onPressed: () => editCondition(m),
+                          ),
+                          ForkButton.subtle(
+                            label: 'Charge',
+                            icon: Icons.receipt_long,
+                            onPressed: () => chargeToTable(m),
+                          ),
+                        ];
+                        final primary = nx == null
+                            ? null
+                            : ForkButton(
+                                label: nx.label,
+                                dense: true,
+                                onPressed: () =>
+                                    post('/update_valet_state', {'booking_id': id, 'state': nx.next}),
+                              );
+                        if (box.maxWidth < 560) {
+                          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            if (primary != null) ...[
+                              Align(alignment: Alignment.centerLeft, child: primary),
+                              const SizedBox(height: 8),
+                            ],
+                            Wrap(spacing: 2, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: ops),
+                          ]);
+                        }
+                        return Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                          Expanded(
+                            child: Wrap(
+                                spacing: 2,
+                                runSpacing: 4,
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                children: ops),
+                          ),
+                          if (primary != null) ...[const SizedBox(width: 10), primary],
+                        ]);
+                      }),
+                    ]),
+                  ),
+                );
+              }),
+          ]),
+        );
+      },
+    );
+
+// Valet check-in: number plate (required), customer name, optional bay.
+class _ValetCheckInDialog extends StatefulWidget {
+  final List bays;
+
+  /// Bay to open on — set when the check-in was started from that bay's sheet.
+  final String? initialBayId;
+  const _ValetCheckInDialog({required this.bays, this.initialBayId});
+
+  @override
+  State<_ValetCheckInDialog> createState() => _ValetCheckInDialogState();
+}
+
+class _ValetCheckInDialogState extends State<_ValetCheckInDialog> {
+  final _plate = TextEditingController();
+  final _name = TextEditingController();
+  String? _bayId;
+  bool _scanning = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Only honour a bay that is actually in the list, so a stale id can't leave
+    // the dropdown holding a value it has no item for.
+    final id = widget.initialBayId;
+    if (id != null && widget.bays.any((b) => '${(b as Map)['Bay_id']}' == id)) _bayId = id;
+  }
+
+  @override
+  void dispose() {
+    _plate.dispose();
+    _name.dispose();
+    super.dispose();
+  }
+
+  // Flatten OCR lines into one string in TRUE top-to-bottom, left-to-right order
+  // (ML Kit blocks aren't always ordered), so a TWO-LINE Indian plate — top row
+  // "MH 12", bottom row "AB 1234" — reads as a single sequence before matching.
+  String _orderedPlateText(RecognizedText r) {
+    final lines = <TextLine>[];
+    for (final b in r.blocks) {
+      lines.addAll(b.lines);
+    }
+    lines.sort((a, b) {
+      final dy = a.boundingBox.top.compareTo(b.boundingBox.top);
+      return dy != 0 ? dy : a.boundingBox.left.compareTo(b.boundingBox.left);
+    });
+    return lines.map((l) => l.text).join(' ');
+  }
+
+  // Pull the most plate-like token out of OCR text. Handles single-line AND
+  // two-line Indian plates (segments split across rows) plus the BH series.
+  String? _extractPlate(String raw) {
+    final up = raw.toUpperCase();
+    // Collapse ALL separators so a 2-line plate ("MH12" over "AB1234") and any
+    // stray spaces/newlines between segments join into one continuous string.
+    final collapsed = up.replaceAll(RegExp(r'[\s\-.]+'), '');
+    // Standard format: SS DD LL DDDD (state, 1-2 district digits, 1-3 series
+    // letters, 3-4 number digits).
+    final std = RegExp(r'[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}').firstMatch(collapsed);
+    if (std != null) return std.group(0)!;
+    // Bharat (BH) series: DD BH DDDD LL.
+    final bh = RegExp(r'\d{2}BH\d{4}[A-Z]{1,2}').firstMatch(collapsed);
+    if (bh != null) return bh.group(0)!;
+    // Separator-tolerant match on the original text (multiple spaces / newlines
+    // / dashes between any two segments).
+    final loose = RegExp(r'[A-Z]{2}[\s\-]*\d{1,2}[\s\-]*[A-Z]{1,3}[\s\-]*\d{3,4}').firstMatch(up);
+    if (loose != null) return loose.group(0)!.replaceAll(RegExp(r'[\s\-]'), '');
+    // Fallback: the longest alphanumeric token that mixes letters and digits.
+    String? best;
+    for (final tok in up.split(RegExp(r'[^A-Z0-9]+'))) {
+      if (tok.length < 5 || tok.length > 11) continue;
+      final hasLetter = RegExp(r'[A-Z]').hasMatch(tok);
+      final hasDigit = RegExp(r'\d').hasMatch(tok);
+      if (hasLetter && hasDigit && (best == null || tok.length > best.length)) best = tok;
+    }
+    return best;
+  }
+
+  // Capture a photo and OCR the number plate on-device (no network, no keys).
+  Future<void> _scanPlate() async {
+    setState(() => _scanning = true);
+    final messenger = ScaffoldMessenger.of(context);
+    TextRecognizer? recognizer;
+    try {
+      final shot = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 1600, imageQuality: 85);
+      if (shot == null) {
+        if (mounted) setState(() => _scanning = false);
+        return;
+      }
+      recognizer = TextRecognizer();
+      final recognized = await recognizer.processImage(InputImage.fromFilePath(shot.path));
+      // Try the row-ordered text first (best for two-line plates), then fall
+      // back to ML Kit's raw text.
+      final plate = _extractPlate(_orderedPlateText(recognized)) ?? _extractPlate(recognized.text);
+      if (!mounted) return;
+      if (plate != null && plate.isNotEmpty) {
+        _plate.text = plate;
+        messenger.showSnackBar(SnackBar(content: Text('Detected "$plate" — check it, then Check in.')));
+      } else {
+        messenger.showSnackBar(const SnackBar(content: Text('Could not read a plate — please type it in.')));
+      }
+    } catch (e) {
+      if (mounted) messenger.showSnackBar(SnackBar(content: Text('Scan failed: $e')));
+    } finally {
+      await recognizer?.close();
+      if (mounted) setState(() => _scanning = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    // Bounded and scrolling rather than a fixed 360x‹content› slab: on a short
+    // window the panel used to run past the bottom of the screen and take its
+    // own actions with it.
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 360, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('VALET', style: text.labelSmall),
+          const SizedBox(height: 6),
+          Text('Check in vehicle', style: text.titleMedium),
+          const SizedBox(height: AppSpacing.lg),
+          TextField(
+            controller: _plate,
+            autofocus: true,
+            textCapitalization: TextCapitalization.characters,
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 2,
+              color: AppColors.textPrimary,
+            ),
+            decoration: const InputDecoration(labelText: 'Number plate', isDense: true),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          Row(children: [
+            Expanded(
+              child: Text(_scanning ? 'Reading the photo on-device…' : 'Or capture it with the camera',
+                  style: text.bodySmall),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton(
+              label: _scanning ? 'Reading…' : 'Scan plate',
+              icon: Icons.camera_alt_outlined,
+              dense: true,
+              onPressed: _scanning ? null : _scanPlate,
+            ),
+          ]),
+          const SizedBox(height: AppSpacing.md),
+          TextField(
+            controller: _name,
+            decoration: const InputDecoration(labelText: 'Customer name (optional)', isDense: true),
+          ),
+          if (widget.bays.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.md),
+            DropdownButtonFormField<String>(
+              initialValue: _bayId,
+              isExpanded: true,
+              dropdownColor: AppColors.cardRaised,
+              decoration: const InputDecoration(labelText: 'Bay (optional)', isDense: true),
+              items: [
+                for (final b in widget.bays)
+                  DropdownMenuItem(value: '${(b as Map)['Bay_id']}', child: Text(_s(b, 'Bay_name'))),
+              ],
+              onChanged: (v) => setState(() => _bayId = v),
+            ),
+          ],
+          const SizedBox(height: AppSpacing.xl),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context)),
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton(
+              label: 'Check in',
+              icon: Icons.check,
+              onPressed: () {
+                final plate = _plate.text.trim();
+                if (plate.isEmpty) return;
+                Navigator.pop(context, <String, dynamic>{
+                  'number_plate': plate,
+                  if (_name.text.trim().isNotEmpty) 'customer_name': _name.text.trim(),
+                  if (_bayId != null) 'bay_id': _bayId,
+                });
+              },
+            ),
+          ]),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final results = await Future.wait<dynamic>([
+          rest.getMap('/restaurant/users'),
+          rest.getList('/roles').catchError((_) => <dynamic>[]),
+          p.isAdmin
+              ? rest.getMap('/restaurant/password-requests').catchError((_) => <String, dynamic>{})
+              : Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+        ]);
+        return {
+          'users': ((results[0] as Map)['users'] as List?) ?? [],
+          'roles': (results[1] as List?) ?? [],
+          'requests': ((results[2] as Map)['requests'] as List?) ?? [],
+        };
+      },
+      builder: (context, data, reload) {
+        final rows = (data['users'] as List?) ?? [];
+        final roles = (data['roles'] as List?) ?? [];
+        final requests = (data['requests'] as List?) ?? [];
+        // A CUSTOM role is stored on the employee as its "Roles" uuid, so the chips
+        // rendered a raw guid like "d61c1438-4b6f-...". Map it back to the role's
+        // name; anything unrecognised (a built-in like "waiter") passes through.
+        final roleNameById = <String, String>{
+          for (final r in roles)
+            '${(r as Map)['id'] ?? ''}'.trim(): '${r['role_name'] ?? ''}'.trim(),
+        }..removeWhere((k, v) => k.isEmpty || v.isEmpty);
+        // Share the names with screens that only receive a bare role list.
+        _cacheCustomRoleNames(roles);
+        final text = Theme.of(context).textTheme;
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () => _addEmployee(context, rest, reload),
+            icon: const Icon(Icons.person_add),
+            label: const Text('Add employee'),
+          ),
+          body: rows.isEmpty
+              ? const EmptyState(
+                  icon: Icons.badge_outlined,
+                  title: 'No employees yet',
+                  caption: 'Add your first team member to hand out logins and roles.',
+                )
+              : ListView(
+                  padding: AppSpacing.pageNarrow,
+                  children: [
+                    if (p.isAdmin && requests.isNotEmpty)
+                      _PasswordRequestsBanner(rest: rest, requests: requests, reload: reload),
+                    ...rows.map((r) {
+                      final u = r as Map;
+                      final isSuper = u['is_superadmin'] == true;
+                      final roleAll = (u['role_all'] as List?)?.map((e) => '$e').where((s) => s.isNotEmpty).toList() ??
+                          [_s(u, 'role', 'staff')];
+                      final name = '${_s(u, 'emp_Fname')} ${_s(u, 'emp_Lname', '')}'.trim();
+                      final display = name.isEmpty ? _s(u, 'employee_Username') : name;
+                      final initials =
+                          display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join();
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: ForkCard(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                            InitialsAvatar(
+                              initials: initials.isEmpty ? '?' : initials,
+                              color: isSuper ? AppColors.warning : AppColors.copper,
+                            ),
+                            const SizedBox(width: AppSpacing.md),
+                            Expanded(
+                              child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                                Row(children: [
+                                  Flexible(
+                                    child: Text(display,
+                                        style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  ),
+                                  if (isSuper) ...[
+                                    const SizedBox(width: 6),
+                                    const Tooltip(
+                                      message: 'Superadmin (owner)',
+                                      child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
+                                    ),
+                                  ],
+                                ]),
+                                const SizedBox(height: 2),
+                                Text('@${_s(u, 'employee_Username')}', style: text.bodySmall),
+                                const SizedBox(height: 8),
+                                Wrap(spacing: 6, runSpacing: 6, children: [
+                                  // Local map first (freshest), then the shared cache.
+                                  for (final role in roleAll) _roleChip(roleNameById[role] ?? _roleLabel(role)),
+                                ]),
+                              ]),
+                            ),
+                            const SizedBox(width: AppSpacing.md),
+                            PopupMenuButton<String>(
+                              icon: const Icon(Icons.more_vert, size: 18, color: AppColors.textSecondary),
+                              onSelected: (v) async {
+                                if (v == 'roles') {
+                                  final changed = await showModalBottomSheet<bool>(
+                                    context: context,
+                                    showDragHandle: true,
+                                    isScrollControlled: true,
+                                    builder: (_) => _ManageRolesSheet(rest: rest, employee: u, customRoles: roles, isSuperadmin: isSuper),
+                                  );
+                                  if (changed == true) reload();
+                                } else if (v == 'password') {
+                                  await _resetPassword(context, rest, u);
+                                } else if (v == 'remove') {
+                                  await _removeEmployee(context, rest, u, reload);
+                                }
+                              },
+                              itemBuilder: (_) => [
+                                const PopupMenuItem(value: 'roles', child: ListTile(leading: Icon(Icons.shield_outlined), title: Text('Manage roles'), dense: true)),
+                                if (p.isAdmin)
+                                  const PopupMenuItem(value: 'password', child: ListTile(leading: Icon(Icons.password), title: Text('Reset password'), dense: true)),
+                                if (p.isAdmin && !isSuper)
+                                  const PopupMenuItem(value: 'remove', child: ListTile(leading: Icon(Icons.person_remove, color: AppColors.danger), title: Text('Remove', style: TextStyle(color: AppColors.danger)), dense: true)),
+                              ],
+                            ),
+                          ]),
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+        );
+      },
+    );
+
+// Admin: set a new password for an employee (also fulfils a forgot-password request).
+Future<void> _resetPassword(BuildContext context, RestClient rest, Map employee) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final ctrl = TextEditingController();
+  final name = '${_s(employee, 'emp_Fname')} ${_s(employee, 'emp_Lname', '')}'.trim();
+  final pass = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('Reset password — ${name.isEmpty ? _s(employee, 'employee_Username') : name}'),
+      content: TextField(
+        controller: ctrl,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'New password', hintText: 'At least 4 characters', border: OutlineInputBorder()),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('Set password')),
+      ],
+    ),
+  );
+  if (pass == null || pass.isEmpty) return;
+  final employeeId = '${employee['employee_id'] ?? employee['id'] ?? ''}';
+  try {
+    await rest.post('/restaurant/users/password', {'employeeId': employeeId, 'password': pass});
+    messenger.showSnackBar(const SnackBar(content: Text('Password updated.')));
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+Future<void> _removeEmployee(BuildContext context, RestClient rest, Map employee, VoidCallback reload) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final name = '${_s(employee, 'emp_Fname')} ${_s(employee, 'emp_Lname', '')}'.trim();
+  final ok = await _confirm(context, 'Remove employee', 'Remove ${name.isEmpty ? _s(employee, 'employee_Username') : name}? This cannot be undone.');
+  if (!ok) return;
+  final employeeId = '${employee['employee_id'] ?? employee['id'] ?? ''}';
+  try {
+    await rest.delete('/restaurant/users', {'employeeId': employeeId});
+    messenger.showSnackBar(const SnackBar(content: Text('Employee removed.')));
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+// Pending forgot-password requests, shown to admins atop the Employees list. Each
+// can be fulfilled (set a new password) or dismissed.
+class _PasswordRequestsBanner extends StatelessWidget {
+  final RestClient rest;
+  final List requests;
+  final VoidCallback reload;
+  const _PasswordRequestsBanner({required this.rest, required this.requests, required this.reload});
+
+  @override
+  Widget build(BuildContext context) {
+    final messenger = ScaffoldMessenger.of(context);
+    final text = Theme.of(context).textTheme;
+    // Warning-tinted banner card — tint always paired with its labelled chip.
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+      decoration: BoxDecoration(
+        color: AppColors.tint(AppColors.warning),
+        borderRadius: AppRadius.cardAll,
+        border: Border.all(color: AppColors.edge(AppColors.warning)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.lock_reset, size: 16, color: AppColors.warning),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('${requests.length} password reset request${requests.length > 1 ? 's' : ''}',
+                style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+          const StatusChip(label: 'Action needed', color: AppColors.warning, dense: true),
+        ]),
+        const SizedBox(height: 6),
+        ...requests.map((r) {
+          final req = r as Map;
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Row(children: [
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                  Text(_s(req, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Text('@${_s(req, 'username')}', style: text.bodySmall),
+                ]),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              ForkButton.ghost(
+                label: 'Reset',
+                icon: Icons.password,
+                dense: true,
+                onPressed: () async {
+                  await _resetPassword(context, rest, {
+                    'employee_id': req['employee_id'],
+                    'emp_Fname': _s(req, 'name'),
+                    'employee_Username': _s(req, 'username'),
+                  });
+                  reload();
+                },
+              ),
+              const SizedBox(width: 6),
+              ForkIconButton(
+                icon: Icons.close,
+                tooltip: 'Dismiss',
+                onPressed: () async {
+                  try {
+                    await rest.post('/restaurant/password-requests/${req['id']}/dismiss');
+                    reload();
+                  } catch (e) {
+                    messenger.showSnackBar(SnackBar(content: Text('$e')));
+                  }
+                },
+              ),
+            ]),
+          );
+        }),
+      ]),
+    );
+  }
+}
+
+// Built-in thermal printer agent UI: pick the printer, watch the realtime
+// connection, and monitor the print queue/log. The PrinterService runs in the
+// background (started at login) — this screen just configures and observes it.
+Widget printerModule(RestClient rest, Profile p) {
+  final svc = PrinterService.instance;
+  return AnimatedBuilder(
+    animation: svc,
+    builder: (context, _) {
+      if (!svc.supported) {
+        return const EmptyState(
+          icon: Icons.print_disabled_outlined,
+          title: 'Desktop only',
+          caption: 'Built-in printing is available on the Windows desktop app only.',
+        );
+      }
+      final text = Theme.of(context).textTheme;
+      final messenger = ScaffoldMessenger.of(context);
+      return ListView(padding: AppSpacing.pageNarrow, children: [
+        // Connection status
+        ForkCard(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          child: Row(children: [
+            AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              switchOutCurve: Curves.easeIn,
+              child: StatusChip(
+                key: ValueKey('printer-conn-${svc.connected}'),
+                label: svc.connected ? 'Connected' : 'Offline',
+                color: svc.connected ? AppColors.success : AppColors.danger,
+              ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Text(
+                  svc.connected ? 'Listening for print jobs in realtime' : 'Not connected to realtime',
+                  style: text.bodySmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis),
+            ),
+            if (svc.paused) ...[
+              const StatusChip(label: 'Paused', color: AppColors.warning, dense: true),
+              const SizedBox(width: AppSpacing.sm),
+            ],
+            ForkIconButton(
+              tooltip: svc.paused ? 'Resume printing' : 'Pause printing',
+              icon: svc.paused ? Icons.play_arrow : Icons.pause,
+              onPressed: () => svc.setPaused(!svc.paused),
+            ),
+          ]),
+        ),
+        const SizedBox(height: AppSpacing.xxl),
+        const SectionHeader(title: 'Printer', padding: EdgeInsets.only(bottom: 6)),
+        Text('Choose the thermal printer bills are sent to. Bills print automatically when approved/printed.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        ForkCard(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: AppColors.inset,
+                    borderRadius: AppRadius.inputAll,
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: DropdownButton<String>(
+                    isExpanded: true,
+                    underline: const SizedBox.shrink(),
+                    dropdownColor: AppColors.cardRaised,
+                    borderRadius: AppRadius.controlAll,
+                    value: svc.printers.contains(svc.selectedPrinter) ? svc.selectedPrinter : null,
+                    hint: Text(svc.selectedPrinter ?? 'Select a printer', style: text.bodyMedium),
+                    items: [for (final n in svc.printers) DropdownMenuItem(value: n, child: Text(n, overflow: TextOverflow.ellipsis))],
+                    onChanged: (v) { if (v != null) svc.setSelectedPrinter(v); },
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkIconButton(
+                tooltip: 'Discover printers',
+                icon: Icons.refresh,
+                onPressed: () => svc.discoverPrinters(),
+              ),
+            ]),
+            if (svc.selectedPrinter != null && svc.selectedPrinter!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Row(children: [
+                  const Icon(Icons.check_circle, size: 14, color: AppColors.success),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text('Default: ${svc.selectedPrinter}', style: text.bodySmall)),
+                ]),
+              ),
+            const SizedBox(height: AppSpacing.md),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: ForkButton.ghost(
+                label: 'Print test slip',
+                icon: Icons.print_outlined,
+                onPressed: () {
+                  final ok = svc.testPrint();
+                  messenger.showSnackBar(SnackBar(content: Text(ok ? 'Test slip sent.' : 'Select a printer first / print failed.')));
+                },
+              ),
+            ),
+          ]),
+        ),
+        const SizedBox(height: AppSpacing.xxl),
+        SectionHeader(
+          title: 'Print queue',
+          count: svc.queue.length,
+          padding: const EdgeInsets.only(bottom: 10),
+          trailing: svc.queue.isNotEmpty
+              ? ForkButton.subtle(label: 'Clear', icon: Icons.clear_all, onPressed: svc.clearQueue)
+              : null,
+        ),
+        if (svc.queue.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Text('No pending jobs.', style: text.bodySmall),
+          )
+        else
+          ...svc.queue.map((j) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ForkCard(
+                  inset: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  child: Row(children: [
+                    const Icon(Icons.receipt_long, size: 15, color: AppColors.copperHi),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                        Text(j.billId, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('${j.bytes.length} bytes${j.attempts > 0 ? ' · attempt ${j.attempts}' : ''}',
+                            style: text.bodySmall),
+                      ]),
+                    ),
+                  ]),
+                ),
+              )),
+        const SizedBox(height: AppSpacing.xxl),
+        const SectionHeader(title: 'Activity log', padding: EdgeInsets.only(bottom: 10)),
+        ForkCard(
+          inset: true,
+          padding: const EdgeInsets.all(14),
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: 260),
+            child: svc.logs.isEmpty
+                ? Text('No activity yet.', style: text.bodySmall)
+                : ListView(
+                    shrinkWrap: true,
+                    children: [
+                      for (final l in svc.logs)
+                        Text(l,
+                            style: const TextStyle(
+                                fontFamily: 'monospace', fontSize: 11, color: AppColors.textSecondary)),
+                    ],
+                  ),
+          ),
+        ),
+      ]);
+    },
+  );
+}
+
+Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final prof = await rest.getMap('/restaurant/profile');
+        Map brand = {};
+        Map settings = {};
+        try {
+          brand = await rest.getMap('/qr/${p.restaurantUsername}/branding');
+        } catch (_) {/* branding optional */}
+        try {
+          settings = await rest.getMap('/restaurant/settings');
+        } catch (_) {/* settings optional */}
+        return {
+          ...prof,
+          'theme_color': brand['theme_color'],
+          'logo_url': brand['logo_url'] ?? prof['restaurant_logo_url'],
+          'auto_push_orders': settings['auto_push_orders'] ?? true,
+          // The zone every timestamp in the app is rendered in.
+          'timezone': settings['timezone'] ?? RestaurantTime.defaultZone,
+          'currency': settings['currency'] ?? '₹',
+          'payment_methods': settings['payment_methods'] ?? [],
+          'taxes': settings['taxes'] ?? [],
+          'service_charge': settings['service_charge'] ?? 0,
+          'discount_approval_threshold': settings['discount_approval_threshold'] ?? 0,
+          'bill_reopen_window_min': settings['bill_reopen_window_min'] ?? 240,
+          'razorpay_key_id': settings['razorpay_key_id'] ?? '',
+          'razorpay_configured': settings['razorpay_configured'] == true,
+          // Guest messaging (SMS/WhatsApp): provider secret is write-only.
+          'msg_provider': settings['msg_provider'] ?? 'none',
+          'msg_sender': settings['msg_sender'] ?? '',
+          'msg_key_id': settings['msg_key_id'] ?? '',
+          'msg_secret_configured': settings['msg_secret_configured'] == true,
+          'msg_reminder_hours': settings['msg_reminder_hours'] ?? 2,
+          'msg_webhook_secret': settings['msg_webhook_secret'] ?? '',
+          'feedback_config': settings['feedback_config'] ?? {},
+          'bill_logo_svg': settings['bill_logo_svg'] ?? '',
+          'bill_paper_width': settings['bill_paper_width'] ?? '80mm',
+          // Walk-in queue: whether waiting guests see the menu / pre-order.
+          'queue_show_menu': brand['queue_show_menu'] ?? settings['queue_show_menu'] ?? true,
+          // Whether guests must enter the per-table 4-digit OTP before ordering.
+          'require_table_otp': settings['require_table_otp'] == true,
+          // Guest page theme. The resolved config is on both endpoints; the font
+          // allowlist, the live/legacy field split and the enum option lists only
+          // on /settings (older backends omit them and the editor falls back to
+          // the shipped contract).
+          'brand_config': settings['brand_config'] ?? brand['brand_config'] ?? const {},
+          'brand_fonts': settings['brand_fonts'] ?? const [],
+          'brand_fields': settings['brand_fields'] ?? const {},
+          'brand_field_options': settings['brand_field_options'] ?? const {},
+        };
+      },
+      // Landing: the template settings idiom — a single centered column of
+      // grouped cards under copper-tick section headers. Every card carries
+      // its own titleMedium title + gray caption; groups sit 24px apart.
+      builder: (context, m, reload) => Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: ListView(padding: AppSpacing.pageNarrow, children: [
+            const SectionHeader(title: 'Profile'),
+            _ProfileEditCard(rest: rest, initial: m, reload: reload),
+            const SizedBox(height: AppSpacing.xxl),
+            // Sits high on the page on purpose: it governs how every other
+            // screen's numbers are dated.
+            const SectionHeader(title: 'Time'),
+            _TimezoneCard(
+              rest: rest,
+              initial: _s(m, 'timezone', RestaurantTime.defaultZone),
+              reload: reload,
+            ),
+            const SizedBox(height: AppSpacing.xxl),
+            const SectionHeader(title: 'Ordering'),
+            _AutoPushCard(rest: rest, initial: m['auto_push_orders'] != false),
+            const SizedBox(height: 14),
+            _RequireTableOtpCard(rest: rest, initial: m['require_table_otp'] == true),
+            const SizedBox(height: 14),
+            _QueueMenuCard(rest: rest, initial: m['queue_show_menu'] != false),
+            const SizedBox(height: AppSpacing.xxl),
+            const SectionHeader(title: 'Payments'),
+            _PaymentSettingsCard(
+              rest: rest,
+              initialCurrency: _s(m, 'currency', '₹'),
+              initialMethods: (m['payment_methods'] as List?) ?? const [],
+              reload: reload,
+            ),
+            const SizedBox(height: 14),
+            _RazorpaySettingsCard(
+              rest: rest,
+              initialKeyId: _s(m, 'razorpay_key_id', ''),
+              configured: m['razorpay_configured'] == true,
+              reload: reload,
+            ),
+            const SizedBox(height: AppSpacing.xxl),
+            const SectionHeader(title: 'Messaging'),
+            _MessagingSettingsCard(
+              rest: rest,
+              initialProvider: _s(m, 'msg_provider', 'none'),
+              initialSender: _s(m, 'msg_sender', ''),
+              initialKeyId: _s(m, 'msg_key_id', ''),
+              secretConfigured: m['msg_secret_configured'] == true,
+              initialReminderHours: (m['msg_reminder_hours'] is num)
+                  ? (m['msg_reminder_hours'] as num).toInt()
+                  : int.tryParse('${m['msg_reminder_hours']}') ?? 2,
+              webhookSecret: _s(m, 'msg_webhook_secret', ''),
+              slug: p.restaurantUsername,
+              reload: reload,
+            ),
+            const SizedBox(height: AppSpacing.xxl),
+            const SectionHeader(title: 'Billing & taxes'),
+            _TaxSettingsCard(
+              rest: rest,
+              initialTaxes: (m['taxes'] as List?) ?? const [],
+              initialServiceCharge: (m['service_charge'] is num) ? (m['service_charge'] as num).toDouble() : double.tryParse('${m['service_charge']}') ?? 0.0,
+              reload: reload,
+            ),
+            const SizedBox(height: 14),
+            _BillingControlsCard(
+              rest: rest,
+              initialThreshold: (m['discount_approval_threshold'] is num)
+                  ? (m['discount_approval_threshold'] as num).toDouble()
+                  : double.tryParse('${m['discount_approval_threshold']}') ?? 0.0,
+              initialReopenWindow: (m['bill_reopen_window_min'] is num)
+                  ? (m['bill_reopen_window_min'] as num).toInt()
+                  : int.tryParse('${m['bill_reopen_window_min']}') ?? 240,
+              reload: reload,
+            ),
+            const SizedBox(height: 14),
+            _BillLogoCard(
+              rest: rest,
+              initialSvg: _s(m, 'bill_logo_svg', ''),
+              initialPaperWidth: _s(m, 'bill_paper_width', '80mm'),
+              reload: reload,
+            ),
+            const SizedBox(height: AppSpacing.xxl),
+            const SectionHeader(title: 'Branding'),
+            _BrandingCard(
+              rest: rest,
+              initialLogo: _s(m, 'logo_url', ''),
+              initialColor: _s(m, 'theme_color', ''),
+              reload: reload,
+            ),
+            const SizedBox(height: 14),
+            _CustomerBrandingCard(
+              rest: rest,
+              isAdmin: p.isAdmin,
+              initialConfig: (m['brand_config'] as Map?) ?? const {},
+              fonts: [for (final f in (m['brand_fonts'] as List?) ?? const []) f.toString()],
+              liveFields: [
+                for (final f in (((m['brand_fields'] as Map?) ?? const {})['live'] as List?) ?? const []) f.toString(),
+              ],
+              legacyFields: [
+                for (final f in (((m['brand_fields'] as Map?) ?? const {})['legacy'] as List?) ?? const []) f.toString(),
+              ],
+              fieldOptions: (m['brand_field_options'] as Map?) ?? const {},
+              reload: reload,
+            ),
+            const SizedBox(height: 14),
+            _FeedbackSettingsCard(
+              rest: rest,
+              initial: (m['feedback_config'] as Map?) ?? const {},
+              reload: reload,
+            ),
+          ]),
+        ),
+      ),
+    );
+
+// Set the SVG bill logo: paste markup or load a .svg file. Stored via settings
+// and rasterized server-side for the thermal print; shown crisp on digital bills.
+class _BillLogoCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialSvg;
+  final String initialPaperWidth;
+  final VoidCallback reload;
+  const _BillLogoCard({required this.rest, required this.initialSvg, required this.initialPaperWidth, required this.reload});
+  @override
+  State<_BillLogoCard> createState() => _BillLogoCardState();
+}
+
+class _BillLogoCardState extends State<_BillLogoCard> {
+  late final TextEditingController _svg;
+  late String _paperWidth;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _svg = TextEditingController(text: widget.initialSvg);
+    _paperWidth = widget.initialPaperWidth == '58mm' ? '58mm' : '80mm';
+  }
+
+  @override
+  void dispose() {
+    _svg.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickFile() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final picked = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['svg'], withData: true);
+    if (picked == null || picked.files.isEmpty) return;
+    final bytes = picked.files.first.bytes;
+    if (bytes == null) {
+      messenger.showSnackBar(const SnackBar(content: Text('Could not read the file.')));
+      return;
+    }
+    final text = utf8.decode(bytes, allowMalformed: true).trim();
+    if (!text.toLowerCase().contains('<svg')) {
+      messenger.showSnackBar(const SnackBar(content: Text("That file doesn't look like an SVG.")));
+      return;
+    }
+    setState(() => _svg.text = text);
+  }
+
+  Future<void> _save({bool clear = false}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final value = clear ? '' : _svg.text.trim();
+    if (!clear && value.isNotEmpty && !value.toLowerCase().contains('<svg')) {
+      messenger.showSnackBar(const SnackBar(content: Text('Enter valid SVG markup (must contain an <svg> tag).')));
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/settings', {'bill_logo_svg': value});
+      if (clear) _svg.clear();
+      messenger.showSnackBar(SnackBar(content: Text(clear ? 'Bill logo cleared.' : 'Bill logo saved.')));
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _savePaperWidth(String v) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _paperWidth = v);
+    try {
+      await widget.rest.post('/restaurant/settings', {'bill_paper_width': v});
+      messenger.showSnackBar(SnackBar(content: Text('Paper size set to $v.')));
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  // Segmented pill choice in the template voice — recessed track, active pill
+  // lifted with a hairline border (selection also carries its text label).
+  Widget _choice(List<(String, String)> options, String value, ValueChanged<String> onPick) {
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: AppColors.inset,
+        borderRadius: AppRadius.controlAll,
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        for (final (v, label) in options)
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: _busy || v == value ? null : () => onPick(v),
+              child: AnimatedContainer(
+                duration: AppDurations.fast,
+                curve: Curves.easeOut,
+                padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 5),
+                decoration: BoxDecoration(
+                  color: v == value ? Colors.white.withValues(alpha: 0.08) : Colors.transparent,
+                  borderRadius: BorderRadius.circular(7),
+                  border: Border.all(color: v == value ? AppColors.borderStrong : Colors.transparent),
+                ),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: v == value ? FontWeight.w600 : FontWeight.w500,
+                    letterSpacing: 0.2,
+                    color: v == value ? AppColors.textPrimary : AppColors.textSecondary,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final hasLogo = _svg.text.trim().isNotEmpty;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Bill printing', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+            'Thermal paper size + a vector (SVG) logo printed at the top of the bill (crisp at any size, separate from the customer-page logo). Paste the SVG markup or load a .svg file.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Row(children: [
+          Expanded(child: Text('THERMAL PAPER SIZE', style: text.labelSmall)),
+          _choice(const [('80mm', '80mm'), ('58mm', '58mm')], _paperWidth, _savePaperWidth),
+        ]),
+        const Divider(height: 24),
+        Row(children: [
+          // Paper-white preview tile — the logo prints on paper, so its stand-in
+          // stays paper-white by design (dark chrome around it).
+          AnimatedContainer(
+            duration: AppDurations.base,
+            curve: Curves.easeOut,
+            width: 56,
+            height: 56,
+            decoration: BoxDecoration(
+              color: const Color(0xFFFAFAF7),
+              borderRadius: AppRadius.tileAll,
+              border: Border.all(color: hasLogo ? AppColors.edge(AppColors.success) : AppColors.borderStrong),
+            ),
+            child: Icon(hasLogo ? Icons.receipt_long : Icons.image_outlined,
+                size: 22, color: hasLogo ? const Color(0xFF221510) : const Color(0xFF9A978F)),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(hasLogo ? 'Bill logo is set' : 'No bill logo yet', style: text.titleSmall),
+              const SizedBox(height: 3),
+              Text('BILL HEADER · SVG', style: text.labelSmall),
+            ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          AnimatedSwitcher(
+            duration: AppDurations.base,
+            switchInCurve: Curves.easeOut,
+            child: StatusChip(
+              key: ValueKey('bill-logo-$hasLogo'),
+              label: hasLogo ? 'Set' : 'Empty',
+              color: hasLogo ? AppColors.success : AppColors.neutral,
+              dense: true,
+            ),
+          ),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
+        Text('SVG MARKUP', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _svg,
+          minLines: 4,
+          maxLines: 10,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          decoration: const InputDecoration(
+            hintText: '<svg xmlns="http://www.w3.org/2000/svg" ...> … </svg>',
+            isDense: true,
+          ),
+          onChanged: (_) => setState(() {}),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          ForkButton.ghost(label: 'Load .svg file', icon: Icons.upload_file, dense: true, onPressed: _busy ? null : _pickFile),
+          ForkButton(
+            label: _busy ? 'Saving…' : 'Save bill logo',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : () => _save(),
+          ),
+          if (hasLogo)
+            ForkButton.ghost(
+              label: 'Clear',
+              icon: Icons.delete_outline,
+              dense: true,
+              onPressed: _busy ? null : () => _save(clear: true),
+            ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// Configure the customer feedback form (title, valet gate, categories, review link).
+class _FeedbackSettingsCard extends StatefulWidget {
+  final RestClient rest;
+  final Map initial;
+  final VoidCallback reload;
+  const _FeedbackSettingsCard({required this.rest, required this.initial, required this.reload});
+  @override
+  State<_FeedbackSettingsCard> createState() => _FeedbackSettingsCardState();
+}
+
+class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
+  late final TextEditingController _title;
+  late final TextEditingController _subtitle;
+  late final TextEditingController _reviewUrl;
+  late bool _valet;
+  late bool _requireImage;
+  late List<TextEditingController> _cats;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.initial;
+    _title = TextEditingController(text: _s(c, 'title', 'Restaurant Feedback'));
+    _subtitle = TextEditingController(text: _s(c, 'subtitle', ''));
+    _reviewUrl = TextEditingController(text: _s(c, 'review_url', ''));
+    _valet = c['valet_enabled'] == true;
+    _requireImage = c['require_image'] == true;
+    final cats = (c['categories'] as List?) ?? const [];
+    final labels = cats.isEmpty
+        ? const ['Initial Greeting', 'Waiter Service', 'Food Quality', 'Ambience', 'Restroom', 'Valet Parking']
+        : cats.map((e) => _s(e as Map, 'label')).where((s) => s.isNotEmpty).toList();
+    _cats = labels.map((s) => TextEditingController(text: s)).toList();
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _subtitle.dispose();
+    _reviewUrl.dispose();
+    for (final c in _cats) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _saving = true);
+    final categories = _cats
+        .map((c) => c.text.trim())
+        .where((s) => s.isNotEmpty)
+        .map((label) => {
+              'label': label,
+              'key': label.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+$'), ''),
+            })
+        .toList();
+    try {
+      await widget.rest.post('/restaurant/settings', {
+        'feedback_config': {
+          'title': _title.text.trim(),
+          'subtitle': _subtitle.text.trim(),
+          'valet_enabled': _valet,
+          'require_image': _requireImage,
+          'review_url': _reviewUrl.text.trim(),
+          'categories': categories,
+        },
+      });
+      messenger.showSnackBar(const SnackBar(content: Text('Feedback form saved.')));
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  // Template switch row — bodyMedium label that brightens when on, quiet
+  // caption, compact copper switch.
+  Widget _switchRow(String label, String caption, bool value, ValueChanged<bool> onChanged) {
+    final text = Theme.of(context).textTheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(label,
+                style: text.bodyMedium!.copyWith(color: value ? AppColors.textPrimary : AppColors.textSecondary)),
+            const SizedBox(height: 2),
+            Text(caption, style: text.bodySmall!.copyWith(fontSize: 11)),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        SizedBox(
+          height: 24,
+          child: FittedBox(fit: BoxFit.contain, child: Switch(value: value, onChanged: onChanged)),
+        ),
+      ]),
+    );
+  }
+
+  Widget _field(String label, TextEditingController ctl, {String? hint, TextInputType? kb}) {
+    final text = Theme.of(context).textTheme;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(label.toUpperCase(), style: text.labelSmall),
+      const SizedBox(height: 6),
+      TextField(controller: ctl, keyboardType: kb, decoration: InputDecoration(hintText: hint, isDense: true)),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Customer feedback form', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+            'Configure the QR feedback form: title, the valet vehicle gate, rating categories, a review link for happy guests, and whether a photo is required. It is themed with your branding.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        _field('Form title', _title),
+        const SizedBox(height: AppSpacing.md),
+        _field('Welcome text', _subtitle),
+        const SizedBox(height: AppSpacing.md),
+        _field('Review link for happy guests (Google/TripAdvisor)', _reviewUrl, hint: 'https://…', kb: TextInputType.url),
+        const SizedBox(height: AppSpacing.sm),
+        _switchRow('Show valet vehicle gate', 'Ask for the vehicle number before feedback', _valet,
+            (v) => setState(() => _valet = v)),
+        _switchRow('Require a photo', 'Force guests to upload an image (off = optional)', _requireImage,
+            (v) => setState(() => _requireImage = v)),
+        const Divider(height: 20),
+        Row(children: [
+          Expanded(child: Text('RATING CATEGORIES', style: text.labelSmall)),
+          ForkButton.subtle(
+            label: 'Add',
+            icon: Icons.add,
+            onPressed: () => setState(() => _cats.add(TextEditingController())),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        ..._cats.asMap().entries.map((e) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(children: [
+                Expanded(child: TextField(controller: e.value, decoration: const InputDecoration(isDense: true))),
+                const SizedBox(width: AppSpacing.sm),
+                ForkIconButton(
+                  icon: Icons.remove_circle_outline,
+                  tooltip: 'Remove category',
+                  onPressed: () {
+                    final removed = _cats.removeAt(e.key);
+                    setState(() {});
+                    removed.dispose();
+                  },
+                ),
+              ]),
+            )),
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _saving ? 'Saving…' : 'Save feedback form',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _saving ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Editable restaurant profile (name/address/phone/email/hours) → PUT /restaurant/profile.
+class _ProfileEditCard extends StatefulWidget {
+  final RestClient rest;
+  final Map initial;
+  final VoidCallback reload;
+  const _ProfileEditCard({required this.rest, required this.initial, required this.reload});
+
+  @override
+  State<_ProfileEditCard> createState() => _ProfileEditCardState();
+}
+
+class _ProfileEditCardState extends State<_ProfileEditCard> {
+  late final Map<String, TextEditingController> _c;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = {
+      'name': TextEditingController(text: _s(widget.initial, 'restaurant_name', '')),
+      'address': TextEditingController(text: _s(widget.initial, 'outlet_add', '')),
+      'phone': TextEditingController(text: _s(widget.initial, 'outlet_phone', '')),
+      'email': TextEditingController(text: _s(widget.initial, 'email', '')),
+      'hours': TextEditingController(text: _s(widget.initial, 'outlet_hours', '')),
+    };
+  }
+
+  @override
+  void dispose() {
+    for (final c in _c.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() => _saving = true);
+    try {
+      await widget.rest.put('/restaurant/profile', {
+        'name': _c['name']!.text.trim(),
+        'address': _c['address']!.text.trim(),
+        'phone': _c['phone']!.text.trim(),
+        'email': _c['email']!.text.trim(),
+        'hours': _c['hours']!.text.trim(),
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Profile saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Widget _field(String key, String label, {TextInputType? kb}) => Padding(
+        padding: const EdgeInsets.only(bottom: AppSpacing.md),
+        child: Builder(
+          builder: (context) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label.toUpperCase(), style: Theme.of(context).textTheme.labelSmall),
+            const SizedBox(height: 6),
+            TextField(controller: _c[key], keyboardType: kb, decoration: const InputDecoration(isDense: true)),
+          ]),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Restaurant profile', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Name, address, contact and working hours shown on bills and guest pages.', style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        _field('name', 'Restaurant name'),
+        _field('address', 'Address'),
+        _field('phone', 'Phone', kb: TextInputType.phone),
+        _field('email', 'Email', kb: TextInputType.emailAddress),
+        _field('hours', 'Working hours'),
+        const SizedBox(height: AppSpacing.xs),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _saving ? 'Saving…' : 'Save profile',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _saving ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Toggle: push customer orders straight to the kitchen, or hold for staff approval.
+class _AutoPushCard extends StatefulWidget {
+  final RestClient rest;
+  final bool initial;
+  const _AutoPushCard({required this.rest, required this.initial});
+
+  @override
+  State<_AutoPushCard> createState() => _AutoPushCardState();
+}
+
+class _AutoPushCardState extends State<_AutoPushCard> {
+  late bool _on = widget.initial;
+  bool _busy = false;
+
+  Future<void> _set(bool v) async {
+    setState(() {
+      _on = v;
+      _busy = true;
+    });
+    try {
+      await widget.rest.post('/restaurant/settings', {'auto_push_orders': v});
+    } catch (e) {
+      if (mounted) {
+        setState(() => _on = !v); // revert on failure
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text('Push orders directly to the kitchen', style: text.titleSmall),
+            const SizedBox(height: 3),
+            AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              child: Text(
+                _on
+                    ? 'Customer QR orders go straight to the kitchen.'
+                    : 'Customer QR orders wait for staff approval (Orders tab) before the kitchen sees them.',
+                key: ValueKey('auto-push-$_on'),
+                style: text.bodySmall,
+              ),
+            ),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        SizedBox(
+          height: 24,
+          child: FittedBox(fit: BoxFit.contain, child: Switch(value: _on, onChanged: _busy ? null : _set)),
+        ),
+      ]),
+    );
+  }
+}
+
+// Toggle: require guests to enter the per-table 4-digit OTP (shown by staff on
+// the Tables screen) before they can order from the QR page. Admin-only — POST
+// /restaurant/settings enforces admin, so a 403 reverts with a clear note.
+class _RequireTableOtpCard extends StatefulWidget {
+  final RestClient rest;
+  final bool initial;
+  const _RequireTableOtpCard({required this.rest, required this.initial});
+
+  @override
+  State<_RequireTableOtpCard> createState() => _RequireTableOtpCardState();
+}
+
+class _RequireTableOtpCardState extends State<_RequireTableOtpCard> {
+  late bool _on = widget.initial;
+  bool _busy = false;
+
+  Future<void> _set(bool v) async {
+    setState(() {
+      _on = v;
+      _busy = true;
+    });
+    try {
+      await widget.rest.post('/restaurant/settings', {'require_table_otp': v});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(v
+              ? 'Guests must now enter the 4-digit table code (shown on the Tables screen) before ordering.'
+              : 'Guests can order from the QR page without a code.'),
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _on = !v); // revert on failure
+        final msg = (e is ApiException && e.status == 403)
+            ? 'Only an admin can change this setting.'
+            : '$e';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text('Require table OTP to order', style: text.titleSmall),
+            const SizedBox(height: 3),
+            Text('Guests enter a 4-digit code shown by staff before ordering. Admin-only.', style: text.bodySmall),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        SizedBox(
+          height: 24,
+          child: FittedBox(fit: BoxFit.contain, child: Switch(value: _on, onChanged: _busy ? null : _set)),
+        ),
+      ]),
+    );
+  }
+}
+
+// The restaurant's reporting timezone — the single anchor every timestamp in
+// this app is rendered in (orders, bills, bookings, waitlist, attendance, cash
+// sessions, audit rows, reports, printed tickets and exported filenames), via
+// RestaurantTime. Stored as `timezone` on POST /restaurant/settings, which is
+// admin-only and 400s an id Intl does not know.
+class _TimezoneCard extends StatefulWidget {
+  final RestClient rest;
+  final String initial;
+  final VoidCallback reload;
+  const _TimezoneCard({required this.rest, required this.initial, required this.reload});
+
+  @override
+  State<_TimezoneCard> createState() => _TimezoneCardState();
+}
+
+class _TimezoneCardState extends State<_TimezoneCard> {
+  late String _zone = widget.initial;
+  Timer? _tick;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // The settings read is authoritative for this session too — the shell's
+    // /restaurant/timezones call and this one must not disagree.
+    RestaurantTime.adopt(widget.initial);
+    // The card shows a live clock, so it needs a second hand.
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _pick() async {
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (_) => _TimezoneDialog(rest: widget.rest, current: _zone),
+    );
+    if (!mounted || chosen == null || chosen.isEmpty || chosen == _zone) return;
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/settings', {'timezone': chosen});
+      RestaurantTime.adopt(chosen);
+      if (mounted) setState(() => _zone = chosen);
+      messenger.showSnackBar(SnackBar(
+        content: Text('Timezone set to $chosen. Every timestamp now reads '
+            '${RestaurantTime.offsetLabelOf(chosen)}.'),
+      ));
+      widget.reload();
+    } catch (e) {
+      // 403 = not an admin; 400 = the backend rejected the id (its message
+      // names the offending zone, so show it verbatim).
+      final msg = (e is ApiException && e.status == 403)
+          ? 'Only an admin can change the restaurant timezone.'
+          : '$e';
+      messenger.showSnackBar(SnackBar(content: Text(msg)));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final supported = tzZoneKnown(_zone);
+    final now = RestaurantTime.nowIn(_zone);
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Restaurant timezone', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Every time this app shows — order placed, bill settled, booking, shift, '
+          'audit entry, report range, printed ticket — is written in this zone, on '
+          'every device, whatever each machine\'s own clock is set to. Change it only '
+          'if the restaurant actually moves.',
+          style: text.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Wrap(spacing: 24, runSpacing: 12, children: [
+          MicroStat(value: _zone, label: 'zone'),
+          MicroStat(
+            value: now == null ? '—' : RestaurantTime.clockIn(_zone),
+            label: 'local time now',
+          ),
+          MicroStat(value: RestaurantTime.offsetLabelOf(_zone), label: 'offset from UTC'),
+        ]),
+        if (!supported)
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.md),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.warning_amber, size: 14, color: AppColors.warning),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'This app build does not carry the offset rules for "$_zone", so it is '
+                  'falling back to each device\'s own clock. Update the app, or pick a '
+                  'zone from the list below.',
+                  style: text.bodySmall!.copyWith(color: AppColors.warning),
+                ),
+              ),
+            ]),
+          ),
+        const Divider(height: 28),
+        Row(children: [
+          Expanded(
+            child: Text(
+              'Daylight saving is handled per timestamp — a winter and a summer order in '
+              'the same zone render at their own offsets, not one fixed number.',
+              style: text.bodySmall!.copyWith(fontSize: 11.5),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          ForkButton(
+            label: _busy ? 'Saving…' : 'Change',
+            icon: Icons.public,
+            dense: true,
+            onPressed: _busy ? null : _pick,
+          ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// Timezone picker: the backend's list (GET /restaurant/timezones) with a search
+// box, each row previewing that zone's current local time. Zones this build has
+// no offset rules for are listed but not selectable — choosing one would look
+// like it worked and then quietly render every timestamp in device time.
+class _TimezoneDialog extends StatefulWidget {
+  final RestClient rest;
+  final String current;
+  const _TimezoneDialog({required this.rest, required this.current});
+
+  @override
+  State<_TimezoneDialog> createState() => _TimezoneDialogState();
+}
+
+class _TimezoneDialogState extends State<_TimezoneDialog> {
+  // Seeded from the bundled table so the picker works offline, then replaced by
+  // the server's list (the authority on what POST /restaurant/settings accepts).
+  List<String> _zones = tzZoneNames;
+  final _search = TextEditingController();
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    widget.rest.getMap('/restaurant/timezones').then((m) {
+      final list = [for (final z in (m['timezones'] as List?) ?? const []) '$z'];
+      if (mounted && list.isNotEmpty) setState(() => _zones = list);
+    }).catchError((_) {/* offline — the bundled list still works */});
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final q = _query.trim().toLowerCase().replaceAll(' ', '_');
+    final shown = q.isEmpty ? _zones : _zones.where((z) => z.toLowerCase().contains(q)).toList();
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 460,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 560),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('TIMESTAMPS', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('Restaurant timezone', style: text.titleMedium),
+            const SizedBox(height: AppSpacing.lg),
+            TextField(
+              controller: _search,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Search (city or region)',
+                prefixIcon: Icon(Icons.search, size: 18),
+                isDense: true,
+              ),
+              onChanged: (v) => setState(() => _query = v),
+            ),
+            const SizedBox(height: AppSpacing.md),
+            if (shown.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Text('No zone matches "$_query".', style: text.bodySmall),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: shown.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 6),
+                  itemBuilder: (_, i) {
+                    final z = shown[i];
+                    final selected = z == widget.current;
+                    final supported = tzZoneKnown(z);
+                    return ForkCard(
+                      inset: true,
+                      selected: selected,
+                      onTap: supported ? () => Navigator.pop(context, z) : null,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                      child: Row(children: [
+                        Icon(selected ? Icons.check_circle : Icons.public,
+                            size: 14,
+                            color: selected
+                                ? AppColors.copperHi
+                                : supported
+                                    ? AppColors.textTertiary
+                                    : AppColors.warning),
+                        const SizedBox(width: AppSpacing.sm),
+                        Expanded(
+                          child: Text(z,
+                              style: text.titleSmall!.copyWith(
+                                color: supported ? null : AppColors.textTertiary,
+                              ),
+                              overflow: TextOverflow.ellipsis),
+                        ),
+                        const SizedBox(width: AppSpacing.sm),
+                        Text(
+                          supported
+                              ? '${RestaurantTime.clockIn(z)} · ${RestaurantTime.offsetLabelOf(z)}'
+                              : 'not in this app build',
+                          style: text.bodySmall!.copyWith(fontSize: 11),
+                        ),
+                      ]),
+                    );
+                  },
+                ),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              Expanded(
+                child: Text('${_zones.length} zones · offsets from this build\'s table '
+                    '($tzDataFromYear–$tzDataToYear)', style: text.bodySmall!.copyWith(fontSize: 11)),
+              ),
+              ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// Billing controls: manager-approval threshold for staff discounts + how long
+// a closed bill stays re-openable. Saved via POST /restaurant/settings.
+class _BillingControlsCard extends StatefulWidget {
+  final RestClient rest;
+  final double initialThreshold;
+  final int initialReopenWindow;
+  final VoidCallback reload;
+  const _BillingControlsCard({
+    required this.rest,
+    required this.initialThreshold,
+    required this.initialReopenWindow,
+    required this.reload,
+  });
+
+  @override
+  State<_BillingControlsCard> createState() => _BillingControlsCardState();
+}
+
+class _BillingControlsCardState extends State<_BillingControlsCard> {
+  late final TextEditingController _threshold =
+      TextEditingController(text: widget.initialThreshold <= 0 ? '' : _trimNum(widget.initialThreshold));
+  late final TextEditingController _reopen =
+      TextEditingController(text: '${widget.initialReopenWindow}');
+  bool _busy = false;
+
+  static String _trimNum(double v) => v == v.roundToDouble() ? '${v.round()}' : '$v';
+
+  @override
+  void dispose() {
+    _threshold.dispose();
+    _reopen.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final threshold = double.tryParse(_threshold.text.trim());
+    final reopen = int.tryParse(_reopen.text.trim());
+    if (_threshold.text.trim().isNotEmpty && (threshold == null || threshold < 0)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Discount threshold must be a non-negative amount.')));
+      return;
+    }
+    if (reopen == null || reopen < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Re-open window must be a non-negative number of minutes.')));
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/settings', {
+        'discount_approval_threshold': threshold ?? 0,
+        'bill_reopen_window_min': reopen,
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Billing controls saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Billing controls', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Manager approval for large staff discounts + how long a closed bill stays re-openable.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text('DISCOUNT APPROVAL THRESHOLD', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _threshold,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(hintText: '0', isDense: true),
+        ),
+        const SizedBox(height: 6),
+        Text('Staff discounts above this amount need manager approval. 0 = every discount applies directly.',
+            style: text.bodySmall!.copyWith(fontSize: 11)),
+        const SizedBox(height: AppSpacing.lg),
+        Text('BILL RE-OPEN WINDOW (MINUTES)', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _reopen,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: '240', isDense: true),
+        ),
+        const SizedBox(height: 6),
+        Text('How long after settling a bill an admin can still re-open it.',
+            style: text.bodySmall!.copyWith(fontSize: 11)),
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Currency picker + per-method enable / require-screenshot config.
+class _PaymentSettingsCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialCurrency;
+  final List initialMethods;
+  final VoidCallback reload;
+  const _PaymentSettingsCard({required this.rest, required this.initialCurrency, required this.initialMethods, required this.reload});
+
+  @override
+  State<_PaymentSettingsCard> createState() => _PaymentSettingsCardState();
+}
+
+class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
+  // Mutable (NOT const) — we add the saved currency if it isn't a preset.
+  final List<String> _currencies = ['₹', '\$', '€', '£', 'AED', '¥'];
+  late String _currency;
+  late List<Map<String, dynamic>> _methods;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _currency = widget.initialCurrency.isNotEmpty ? widget.initialCurrency : '₹';
+    if (!_currencies.contains(_currency)) _currencies.add(_currency);
+    _methods = widget.initialMethods
+        .map<Map<String, dynamic>>((m) => {
+              'id': '${(m as Map)['id'] ?? ''}',
+              'label': '${m['label'] ?? m['id'] ?? ''}',
+              'enabled': m['enabled'] != false,
+              'requires_screenshot': m['requires_screenshot'] == true,
+              'online': m['online'] == true,
+            })
+        .toList();
+  }
+
+  Future<void> _save() async {
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/settings', {'currency': _currency, 'payment_methods': _methods});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Payment settings saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Payments & currency', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Choose currency + which payment methods guests can use (and whether a screenshot is required).',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Row(children: [
+          Expanded(child: Text('CURRENCY', style: text.labelSmall)),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.inputAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: DropdownButton<String>(
+              value: _currency,
+              underline: const SizedBox.shrink(),
+              dropdownColor: AppColors.cardRaised,
+              borderRadius: AppRadius.controlAll,
+              items: _currencies.map((c) => DropdownMenuItem(value: c, child: Text(c, style: text.bodyLarge))).toList(),
+              onChanged: (v) => setState(() => _currency = v ?? _currency),
+            ),
+          ),
+        ]),
+        const Divider(height: 24),
+        Text('PAYMENT METHODS', style: text.labelSmall),
+        const SizedBox(height: 6),
+        for (final m in _methods)
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(children: [
+                Expanded(
+                  child: Row(children: [
+                    Flexible(
+                      child: Text('${m['label']}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: text.bodyMedium!.copyWith(
+                              color: m['enabled'] == true ? AppColors.textPrimary : AppColors.textSecondary)),
+                    ),
+                    if (m['online'] == true) ...[
+                      const SizedBox(width: 8),
+                      const InfoChip(icon: Icons.bolt, label: 'online'),
+                    ],
+                  ]),
+                ),
+                const SizedBox(width: AppSpacing.md),
+                SizedBox(
+                  height: 24,
+                  child: FittedBox(
+                    fit: BoxFit.contain,
+                    child: Switch(value: m['enabled'] == true, onChanged: (v) => setState(() => m['enabled'] = v)),
+                  ),
+                ),
+              ]),
+            ),
+            if (m['enabled'] == true && m['online'] != true)
+              Padding(
+                padding: const EdgeInsets.only(left: 16, bottom: 4),
+                child: Row(children: [
+                  Checkbox(
+                    value: m['requires_screenshot'] == true,
+                    visualDensity: VisualDensity.compact,
+                    activeColor: AppColors.copper,
+                    checkColor: AppColors.onCopper,
+                    side: const BorderSide(color: AppColors.borderStrong),
+                    onChanged: (v) => setState(() => m['requires_screenshot'] = v ?? false),
+                  ),
+                  Text('Require payment screenshot', style: text.bodySmall),
+                ]),
+              ),
+          ]),
+        const SizedBox(height: AppSpacing.md),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save payments & currency',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Enter the restaurant's own Razorpay API keys so online payments settle to
+// their account. The secret is write-only (never returned); leaving it blank
+// keeps the saved one.
+class _RazorpaySettingsCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialKeyId;
+  final bool configured;
+  final VoidCallback reload;
+  const _RazorpaySettingsCard({required this.rest, required this.initialKeyId, required this.configured, required this.reload});
+
+  @override
+  State<_RazorpaySettingsCard> createState() => _RazorpaySettingsCardState();
+}
+
+class _RazorpaySettingsCardState extends State<_RazorpaySettingsCard> {
+  late final TextEditingController _keyId;
+  final TextEditingController _keySecret = TextEditingController();
+  bool _busy = false;
+  bool _showSecret = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _keyId = TextEditingController(text: widget.initialKeyId);
+  }
+
+  @override
+  void dispose() {
+    _keyId.dispose();
+    _keySecret.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() => _busy = true);
+    try {
+      final payload = <String, dynamic>{'razorpay_key_id': _keyId.text.trim()};
+      // Only send the secret when the owner typed a new one (blank = keep current).
+      if (_keySecret.text.trim().isNotEmpty) payload['razorpay_key_secret'] = _keySecret.text.trim();
+      await widget.rest.post('/restaurant/settings', payload);
+      _keySecret.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Razorpay settings saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(child: Text('Razorpay (online payments)', style: text.titleMedium)),
+          const SizedBox(width: AppSpacing.md),
+          StatusChip(
+            label: widget.configured ? 'Connected' : 'Not connected',
+            color: widget.configured ? AppColors.success : AppColors.neutral,
+            dense: true,
+          ),
+        ]),
+        const SizedBox(height: 4),
+        Text(
+            'Enter your own Razorpay API keys so online payments go straight to your account. Get them from the Razorpay Dashboard → Settings → API Keys.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text('KEY ID', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _keyId,
+          decoration: const InputDecoration(hintText: 'rzp_live_… / rzp_test_…', isDense: true),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        Text('KEY SECRET', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _keySecret,
+          obscureText: !_showSecret,
+          decoration: InputDecoration(
+            hintText: widget.configured ? 'Leave blank to keep current secret' : 'Enter your key secret',
+            isDense: true,
+            suffixIcon: IconButton(
+              icon: Icon(_showSecret ? Icons.visibility_off : Icons.visibility, size: 18),
+              onPressed: () => setState(() => _showSecret = !_showSecret),
+            ),
+          ),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save Razorpay keys',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Guest messaging (SMS/WhatsApp): provider-agnostic — Off logs messages
+// without sending (visible on the web Bookings page), Twilio/Meta send for
+// real. The provider secret is write-only (blank = keep current), mirroring
+// the Razorpay card above.
+class _MessagingSettingsCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialProvider;
+  final String initialSender;
+  final String initialKeyId;
+  final bool secretConfigured;
+  final int initialReminderHours;
+  final String webhookSecret;
+  final String slug;
+  final VoidCallback reload;
+  const _MessagingSettingsCard({
+    required this.rest,
+    required this.initialProvider,
+    required this.initialSender,
+    required this.initialKeyId,
+    required this.secretConfigured,
+    required this.initialReminderHours,
+    required this.webhookSecret,
+    required this.slug,
+    required this.reload,
+  });
+
+  @override
+  State<_MessagingSettingsCard> createState() => _MessagingSettingsCardState();
+}
+
+class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
+  late String _provider;
+  late final TextEditingController _sender;
+  late final TextEditingController _keyId;
+  final TextEditingController _keySecret = TextEditingController();
+  late final TextEditingController _reminderHours;
+  bool _busy = false;
+  bool _showSecret = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _provider = (widget.initialProvider == 'twilio' || widget.initialProvider == 'meta') ? widget.initialProvider : 'none';
+    _sender = TextEditingController(text: widget.initialSender);
+    _keyId = TextEditingController(text: widget.initialKeyId);
+    _reminderHours = TextEditingController(text: '${widget.initialReminderHours}');
+  }
+
+  @override
+  void dispose() {
+    _sender.dispose();
+    _keyId.dispose();
+    _keySecret.dispose();
+    _reminderHours.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() => _busy = true);
+    try {
+      final payload = <String, dynamic>{
+        'msg_provider': _provider,
+        'msg_sender': _sender.text.trim(),
+        'msg_key_id': _keyId.text.trim(),
+        'msg_reminder_hours': int.tryParse(_reminderHours.text.trim()) ?? widget.initialReminderHours,
+      };
+      // Only send the secret when the owner typed a new one (blank = keep current).
+      if (_keySecret.text.trim().isNotEmpty) payload['msg_key_secret'] = _keySecret.text.trim();
+      await widget.rest.post('/restaurant/settings', payload);
+      _keySecret.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Messaging settings saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final on = _provider != 'none';
+    final senderLabel = _provider == 'meta' ? 'Phone number ID (Meta)' : 'Sender phone number (Twilio)';
+    final secretLabel = _provider == 'meta' ? 'Permanent access token (Meta)' : 'Auth token (Twilio)';
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Expanded(child: Text('Guest messaging (SMS / WhatsApp)', style: text.titleMedium)),
+          const SizedBox(width: AppSpacing.md),
+          AnimatedSwitcher(
+            duration: AppDurations.base,
+            switchInCurve: Curves.easeOut,
+            child: StatusChip(
+              key: ValueKey('msg-$on-$_provider'),
+              label: on ? 'On · $_provider' : 'Off · log only',
+              color: on ? AppColors.success : AppColors.neutral,
+              dense: true,
+            ),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        Text(
+            'Automatic booking confirmations & reminders, plus WhatsApp chat bookings. Works with Twilio or the Meta WhatsApp Cloud API — while set to Off, messages are logged (not sent) so you can preview them on the web Bookings page.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text('PROVIDER', style: text.labelSmall),
+        const SizedBox(height: 6),
+        DropdownButtonFormField<String>(
+          initialValue: _provider,
+          dropdownColor: AppColors.cardRaised,
+          borderRadius: AppRadius.controlAll,
+          decoration: const InputDecoration(isDense: true),
+          items: const [
+            DropdownMenuItem(value: 'none', child: Text('Off (log only)')),
+            DropdownMenuItem(value: 'twilio', child: Text('Twilio (SMS / WhatsApp)')),
+            DropdownMenuItem(value: 'meta', child: Text('Meta WhatsApp Cloud API')),
+          ],
+          onChanged: _busy ? null : (v) => setState(() => _provider = v ?? 'none'),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        Text(senderLabel.toUpperCase(), style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _sender,
+          decoration: InputDecoration(
+              hintText: _provider == 'meta' ? 'e.g. 106540118xxxxxx' : 'e.g. +14155238886', isDense: true),
+        ),
+        if (_provider != 'meta') ...[
+          const SizedBox(height: AppSpacing.md),
+          Text('ACCOUNT SID (TWILIO)', style: text.labelSmall),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _keyId,
+            decoration: const InputDecoration(hintText: 'AC…', isDense: true),
+          ),
+        ],
+        const SizedBox(height: AppSpacing.md),
+        Text(secretLabel.toUpperCase(), style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _keySecret,
+          obscureText: !_showSecret,
+          decoration: InputDecoration(
+            hintText: widget.secretConfigured ? 'Leave blank to keep current secret' : 'Enter the provider secret',
+            isDense: true,
+            suffixIcon: IconButton(
+              icon: Icon(_showSecret ? Icons.visibility_off : Icons.visibility, size: 18),
+              onPressed: () => setState(() => _showSecret = !_showSecret),
+            ),
+          ),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        Text('REMINDER LEAD TIME (HOURS BEFORE THE BOOKING, 0 = OFF)', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _reminderHours,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: '2', isDense: true),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save messaging settings',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
+        ),
+        const Divider(height: 24),
+        Text('WhatsApp chat bookings (webhook)', style: text.titleSmall),
+        const SizedBox(height: 6),
+        Text(
+          'Point your provider\'s inbound-message webhook at the backend so guests can book by sending e.g. "book 4 tomorrow 19:30":',
+          style: text.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: AppColors.inset,
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.border),
+          ),
+          child: SelectableText('/webhooks/whatsapp/${widget.slug}',
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
+        ),
+        if (widget.webhookSecret.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text('Meta verify token (also signs webhook payloads):', style: text.bodySmall),
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: SelectableText(widget.webhookSecret,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
+          ),
+        ] else ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text('Save once to generate the webhook verify token.', style: text.bodySmall),
+        ],
+      ]),
+    );
+  }
+}
+
+// Manage the outlet's taxes (name + percentage). Added on top of the subtotal
+// in every bill (customer page, thermal print, payment amount).
+class _TaxSettingsCard extends StatefulWidget {
+  final RestClient rest;
+  final List initialTaxes;
+  final double initialServiceCharge;
+  final VoidCallback reload;
+  const _TaxSettingsCard({required this.rest, required this.initialTaxes, required this.initialServiceCharge, required this.reload});
+
+  @override
+  State<_TaxSettingsCard> createState() => _TaxSettingsCardState();
+}
+
+class _TaxSettingsCardState extends State<_TaxSettingsCard> {
+  late List<Map<String, dynamic>> _taxes;
+  late final TextEditingController _serviceCharge;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _serviceCharge = TextEditingController(text: widget.initialServiceCharge > 0 ? '${widget.initialServiceCharge}' : '');
+    _taxes = widget.initialTaxes
+        .map<Map<String, dynamic>>((t) => {
+              'name': '${(t as Map)['name'] ?? ''}',
+              'percentage': (t['percentage'] is num) ? (t['percentage'] as num).toDouble() : double.tryParse('${t['percentage']}') ?? 0.0,
+            })
+        .toList();
+  }
+
+  @override
+  void dispose() {
+    _serviceCharge.dispose();
+    super.dispose();
+  }
+
+  void _add() => setState(() => _taxes.add({'name': '', 'percentage': 0.0}));
+  void _remove(int i) => setState(() => _taxes.removeAt(i));
+
+  Future<void> _save() async {
+    // Drop blank rows; keep valid name + non-negative percentage.
+    final clean = _taxes
+        .where((t) => '${t['name']}'.trim().isNotEmpty && (t['percentage'] as num) >= 0)
+        .map((t) => {'name': '${t['name']}'.trim(), 'percentage': t['percentage']})
+        .toList();
+    final sc = double.tryParse(_serviceCharge.text.trim()) ?? 0.0;
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/settings', {'taxes': clean, 'service_charge': sc});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Taxes & service charge saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    // Live summary of the configured rates in the template's micro-stat voice.
+    final configured = [
+      for (final t in _taxes)
+        if ('${t['name']}'.trim().isNotEmpty) t,
+    ];
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Taxes & service charge', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Add a service charge and taxes (e.g. CGST 2.5%, SGST 2.5%). These are added on top of the subtotal in the final bill.',
+            style: text.bodySmall),
+        if (configured.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.lg),
+          Wrap(spacing: 24, runSpacing: 12, children: [
+            for (final t in configured)
+              MicroStat(
+                value: '${(t['percentage'] as num?) ?? 0}%',
+                label: '${t['name']}'.trim(),
+              ),
+          ]),
+        ],
+        const Divider(height: 28),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text('SERVICE CHARGE', style: text.labelSmall),
+              const SizedBox(height: 3),
+              Text('Applied to the subtotal (before tax). Leave 0 to disable.',
+                  style: text.bodySmall!.copyWith(fontSize: 11)),
+            ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          SizedBox(
+            width: 110,
+            child: TextField(
+              controller: _serviceCharge,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(hintText: '0', isDense: true, suffixText: '%'),
+            ),
+          ),
+        ]),
+        const Divider(height: 28),
+        if (_taxes.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text('No taxes configured. Bills will show the subtotal only.', style: text.bodySmall),
+          ),
+        for (int i = 0; i < _taxes.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(children: [
+              Expanded(
+                flex: 3,
+                child: TextFormField(
+                  initialValue: '${_taxes[i]['name']}',
+                  decoration: const InputDecoration(hintText: 'Tax name', isDense: true),
+                  onChanged: (v) => setState(() => _taxes[i]['name'] = v),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 2,
+                child: TextFormField(
+                  initialValue: '${_taxes[i]['percentage']}',
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(hintText: '0', isDense: true, suffixText: '%'),
+                  onChanged: (v) => setState(() => _taxes[i]['percentage'] = double.tryParse(v) ?? 0.0),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkIconButton(icon: Icons.delete_outline, tooltip: 'Remove tax', onPressed: () => _remove(i)),
+            ]),
+          ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(label: 'Add tax', icon: Icons.add, dense: true, onPressed: _add),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save taxes',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// Walk-in queue: show/hide the menu + pre-order for waiting guests.
+class _QueueMenuCard extends StatefulWidget {
+  final RestClient rest;
+  final bool initial;
+  const _QueueMenuCard({required this.rest, required this.initial});
+
+  @override
+  State<_QueueMenuCard> createState() => _QueueMenuCardState();
+}
+
+class _QueueMenuCardState extends State<_QueueMenuCard> {
+  late bool _showMenu;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _showMenu = widget.initial;
+  }
+
+  Future<void> _save(bool v) async {
+    setState(() { _showMenu = v; _busy = true; });
+    try {
+      await widget.rest.post('/restaurant/branding', {'queue_show_menu': v});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(v ? 'Guests in the queue can now browse the menu & pre-order.' : 'Queue page now shows only the place in line.'),
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _showMenu = !v); // revert on failure
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text('Show menu & pre-order in the queue', style: text.titleSmall),
+            const SizedBox(height: 3),
+            Text('When off, waiting guests on the public queue page only see their place in line (no menu, no pre-order).',
+                style: text.bodySmall),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        SizedBox(
+          height: 24,
+          child: FittedBox(fit: BoxFit.contain, child: Switch(value: _showMenu, onChanged: _busy ? null : _save)),
+        ),
+      ]),
+    );
+  }
+}
+
+// Logo upload + theme-colour picker for the customer-facing pages.
+class _BrandingCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialLogo;
+  final String initialColor;
+  final VoidCallback reload;
+  const _BrandingCard({required this.rest, required this.initialLogo, required this.initialColor, required this.reload});
+
+  @override
+  State<_BrandingCard> createState() => _BrandingCardState();
+}
+
+class _BrandingCardState extends State<_BrandingCard> {
+  static const _swatches = [
+    0xFFEA580C, 0xFFDC2626, 0xFFD97706, 0xFF16A34A,
+    0xFF0D9488, 0xFF2563EB, 0xFF7C3AED, 0xFFDB2777, 0xFF111827,
+  ];
+  late String _logo;
+  late int _color;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _logo = widget.initialLogo;
+    final hex = widget.initialColor.replaceAll('#', '');
+    _color = hex.length == 6 ? (0xFF000000 | int.parse(hex, radix: 16)) : _swatches.first;
+  }
+
+  String get _hex => '#${(_color & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+  Future<void> _post(Map<String, dynamic> body) async {
+    setState(() => _busy = true);
+    try {
+      final res = await widget.rest.post('/restaurant/branding', body);
+      if (res is Map && res['logo_url'] is String) _logo = res['logo_url'] as String;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Branding saved.')));
+        widget.reload();
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _uploadLogo() async {
+    final picked = await FilePicker.pickFiles(type: FileType.image, withData: true);
+    final bytes = picked?.files.single.bytes;
+    if (bytes == null) return;
+    final ext = (picked!.files.single.extension ?? 'png').toLowerCase();
+    await _post({'logo_base64': base64Encode(bytes), 'content_type': ext == 'png' ? 'image/png' : 'image/jpeg'});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Customer ordering page branding', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Logo + colour shown to guests on the QR ordering & reservation pages.', style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Row(children: [
+          Container(
+            width: 64, height: 64,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.tileAll,
+              border: Border.all(color: AppColors.border),
+              image: _logo.isNotEmpty ? DecorationImage(image: NetworkImage(_logo), fit: BoxFit.contain) : null,
+            ),
+            child: _logo.isEmpty ? const Icon(Icons.storefront, color: AppColors.textSecondary) : null,
+          ),
+          const SizedBox(width: AppSpacing.md),
+          ForkButton.ghost(
+            label: _logo.isEmpty ? 'Upload logo' : 'Change logo',
+            icon: Icons.upload,
+            dense: true,
+            onPressed: _busy ? null : _uploadLogo,
+          ),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
+        Text('THEME COLOUR', style: text.labelSmall),
+        const SizedBox(height: AppSpacing.sm),
+        // Guest-page palette by design: these swatches ARE the owner's choices
+        // for the customer page, so they keep their real colours here.
+        Wrap(spacing: 10, runSpacing: 10, children: [
+          for (final c in _swatches)
+            MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: _busy ? null : () => setState(() => _color = c),
+                child: AnimatedContainer(
+                  duration: AppDurations.fast,
+                  curve: Curves.easeOut,
+                  width: 36, height: 36,
+                  decoration: BoxDecoration(
+                    color: Color(c),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: _color == c ? AppColors.textPrimary : Colors.transparent, width: 3),
+                  ),
+                  child: _color == c ? const Icon(Icons.check, color: Colors.white, size: 18) : null,
+                ),
+              ),
+            ),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save theme colour',
+            icon: Icons.palette_outlined,
+            dense: true,
+            onPressed: _busy ? null : () => _post({'theme_color': _hex}),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// --- guest accent ramp (mirrors the guest pages) ------------------------------
+// The dark guest design (ordering / feedback / valet) derives its whole palette
+// from ONE accent hex: six lightness stops off the same hue —
+// hi .75 · accent .63 · mid .51 · deep .39 · shadow .27 · ink .09 — each with a
+// small saturation taper. Ported 1:1 from rampHS()/hexToHS() in
+// Restaurant_Dashboard_UI/src/app/order/[restaurant]/page.tsx so this editor's
+// preview and the real page cannot drift apart.
+typedef _BrandRamp = ({Color hi, Color acc, Color mid, Color deep, Color shadow, Color ink});
+
+double _c01(double x) => x < 0 ? 0 : (x > 1 ? 1 : x);
+
+// hsl → Color, the same integer-rounded conversion the guest page uses.
+Color _hslColor(double h, double s, double l) {
+  final a = s * (l < 1 - l ? l : 1 - l);
+  double f(double n) {
+    final k = (n + h / 30) % 12;
+    var m = k - 3;
+    if (9 - k < m) m = 9 - k;
+    if (m > 1) m = 1;
+    if (m < -1) m = -1;
+    return l - a * m;
+  }
+
+  int ch(double v) => (v * 255).round().clamp(0, 255);
+  return Color.fromARGB(255, ch(f(0)), ch(f(8)), ch(f(4)));
+}
+
+// Resolve a brand accent hex into the six-stop ramp. An unparseable hex falls
+// back to the guest page's own default copper (h 24 / s 38).
+_BrandRamp _brandRamp(String hex) {
+  var h = 24.0, s = 38.0;
+  final m = RegExp(r'^#?([0-9a-fA-F]{6})$').firstMatch(hex.trim());
+  if (m != null) {
+    final n = int.parse(m.group(1)!, radix: 16);
+    final r = ((n >> 16) & 0xff) / 255, g = ((n >> 8) & 0xff) / 255, b = (n & 0xff) / 255;
+    final mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    final mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    final l = (mx + mn) / 2;
+    h = 0;
+    s = 0;
+    if (mx != mn) {
+      final d = mx - mn;
+      s = (l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn)) * 100;
+      if (mx == r) {
+        h = (g - b) / d + (g < b ? 6 : 0);
+      } else if (mx == g) {
+        h = (b - r) / d + 2;
+      } else {
+        h = (r - g) / d + 4;
+      }
+      h *= 60;
+    }
+  }
+  return (
+    hi: _hslColor(h, _c01((s + 7) / 100), 0.75),
+    acc: _hslColor(h, _c01(s / 100), 0.63),
+    mid: _hslColor(h, _c01((s - 3) / 100), 0.51),
+    deep: _hslColor(h, _c01((s - 6) / 100), 0.39),
+    shadow: _hslColor(h, _c01((s - 8) / 100), 0.27),
+    ink: _hslColor(h, _c01((s - 5) / 100), 0.09),
+  );
+}
+
+String _hexOfColor(Color c) => '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+// The panel material behind `surface_style` — exactly the --panelBg/--blur/--pbA
+// triples the guest pages use.
+({Color bg, double blur, double edge}) _brandPanel(String style, _BrandRamp r) {
+  switch (style) {
+    case 'solid':
+      return (bg: const Color(0xF0121215), blur: 0, edge: 0.10);
+    case 'tinted':
+      return (bg: r.shadow.withValues(alpha: 0.42), blur: 22, edge: 0.18);
+    default:
+      return (bg: const Color(0x8C1A1A1F), blur: 22, edge: 0.12);
+  }
+}
+
+// Control radius behind `button_shape` — the guest pages' --rCtrl.
+double _brandCtrlRadius(String shape) => switch (shape) {
+      'pill' => 999,
+      'square' => 4,
+      _ => 13,
+    };
+
+// Guest page theme editor. The guest surfaces (ordering, feedback, valet) are one
+// committed dark design that themes itself from a single accent ramp, so this card
+// only exposes the keys that genuinely re-render them — the backend's
+// brand_fields.live list — and shows the retired colour keys as read-only history
+// instead of pretending they still work. Preview mirrors the real page: near-black
+// shell, accent orb, hero wash, frosted panel, accent CTA.
+// Persists via POST /restaurant/branding {brand_config:{…}} (merge-on-omit; only
+// provided, valid keys overwrite). Admin-only, matching the backend gate.
+class _CustomerBrandingCard extends StatefulWidget {
+  final RestClient rest;
+  final bool isAdmin;
+  final Map initialConfig;
+  final List<String> fonts;
+  // brand_fields.live / .legacy and brand_field_options from GET
+  // /restaurant/settings. Empty lists fall back to the shipped contract, so an
+  // older backend still renders a working editor.
+  final List<String> liveFields;
+  final List<String> legacyFields;
+  final Map fieldOptions;
+  final VoidCallback reload;
+  const _CustomerBrandingCard({
+    required this.rest,
+    required this.isAdmin,
+    required this.initialConfig,
+    required this.fonts,
+    required this.liveFields,
+    required this.legacyFields,
+    required this.fieldOptions,
+    required this.reload,
+  });
+
+  @override
+  State<_CustomerBrandingCard> createState() => _CustomerBrandingCardState();
+}
+
+class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
+  // Accent presets. Only real hues here: the accent seeds a six-stop ramp, so a
+  // white/black/grey "accent" would flatten the whole guest palette.
+  static const _presets = <int>[
+    0xFFEA580C, 0xFFF97316, 0xFFDC2626, 0xFFD97706, 0xFFCA8A04,
+    0xFF16A34A, 0xFF0D9488, 0xFF0EA5E9, 0xFF2563EB, 0xFF6366F1,
+    0xFF7C3AED, 0xFFDB2777,
+  ];
+  // Fallback allowlists mirroring the backend, used only when the settings fetch
+  // didn't return brand_fonts / brand_field_options (e.g. a transient error).
+  static const _fallbackFonts = <String>[
+    'Inter', 'Poppins', 'Playfair Display', 'Montserrat', 'Lato',
+    'Nunito', 'Oswald', 'Roboto Slab', 'DM Sans', 'Merriweather',
+  ];
+  static const _fallbackLive = <String>['color_primary', 'font', 'header_style', 'button_shape', 'surface_style'];
+  static const _fallbackLegacy = <String>['color_secondary', 'color_bg', 'color_text', 'color_card'];
+  static const _fallbackOptions = <String, List<String>>{
+    'header_style': ['gradient', 'solid'],
+    'button_shape': ['rounded', 'pill', 'square'],
+    'surface_style': ['frosted', 'solid', 'tinted'],
+  };
+  // Human labels for the enum values + the retired keys.
+  static const _optionLabels = <String, String>{
+    'gradient': 'Gradient',
+    'solid': 'Solid',
+    'rounded': 'Rounded',
+    'pill': 'Pill',
+    'square': 'Square',
+    'frosted': 'Frosted',
+    'tinted': 'Accent glass',
+  };
+  static const _legacyLabels = <String, String>{
+    'color_secondary': 'Secondary colour',
+    'color_bg': 'Page background',
+    'color_text': 'Body text',
+    'color_card': 'Card surface',
+  };
+  static final _hexRe = RegExp(r'^#[0-9a-fA-F]{6}$');
+
+  late final List<String> _fonts;
+  late final List<String> _live;
+  late final List<String> _legacyStored; // retired keys this tenant actually has
+  late final List<String> _unsupported; // live keys this app build can't edit yet
+  late String _font;
+  late String _headerStyle;
+  late String _buttonShape;
+  late String _surfaceStyle;
+  final TextEditingController _accent = TextEditingController();
+  bool _busy = false;
+  bool _showRetired = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.initialConfig;
+    _fonts = widget.fonts.isNotEmpty ? List<String>.from(widget.fonts) : List<String>.from(_fallbackFonts);
+    _live = widget.liveFields.isNotEmpty ? List<String>.from(widget.liveFields) : List<String>.from(_fallbackLive);
+    final legacy = widget.legacyFields.isNotEmpty ? widget.legacyFields : _fallbackLegacy;
+    // Only surface retired keys the tenant really stored — a clean tenant sees none.
+    _legacyStored = legacy.where((k) => '${c[k] ?? ''}'.trim().isNotEmpty).toList();
+    _unsupported = _live.where((k) => !_fallbackLive.contains(k)).toList();
+    final f = _s(c, 'font', 'Inter');
+    _font = _fonts.contains(f) ? f : _fonts.first;
+    _headerStyle = _pick('header_style', '${c['header_style'] ?? ''}', 'gradient');
+    _buttonShape = _pick('button_shape', '${c['button_shape'] ?? ''}', 'rounded');
+    _surfaceStyle = _pick('surface_style', '${c['surface_style'] ?? ''}', 'frosted');
+    final accent = '${c['color_primary'] ?? ''}'.trim();
+    if (_hexRe.hasMatch(accent)) _accent.text = accent;
+  }
+
+  @override
+  void dispose() {
+    _accent.dispose();
+    super.dispose();
+  }
+
+  // Allowed values for an enum key, backend-first so a newer option shows up
+  // without an app release.
+  List<String> _options(String key) {
+    final v = widget.fieldOptions[key];
+    final list = (v is List) ? v.map((e) => '$e'.trim()).where((e) => e.isNotEmpty).toList() : const <String>[];
+    return list.isNotEmpty ? list : (_fallbackOptions[key] ?? const <String>[]);
+  }
+
+  String _pick(String key, String stored, String fallback) {
+    final opts = _options(key);
+    return opts.contains(stored) ? stored : fallback;
+  }
+
+  String _label(String v) => _optionLabels[v] ?? (v.isEmpty ? v : '${v[0].toUpperCase()}${v.substring(1)}');
+
+  Color? _parse(String s) {
+    final t = s.trim();
+    if (!_hexRe.hasMatch(t)) return null;
+    return Color(0xFF000000 | int.parse(t.substring(1), radix: 16));
+  }
+
+  String _fmt(int argb) => '#${(argb & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+  // The ramp the guest pages will actually derive — unset accent shows their own
+  // copper default rather than a lie.
+  _BrandRamp get _ramp => _brandRamp(_accent.text);
+
+  Future<void> _save() async {
+    final messenger = ScaffoldMessenger.of(context);
+    // Only the LIVE keys travel. Retired colour keys are never re-sent, so they
+    // stay exactly as stored server-side (the backend keeps them on merge).
+    final cfg = <String, dynamic>{};
+    if (_live.contains('font')) cfg['font'] = _font;
+    if (_live.contains('header_style')) cfg['header_style'] = _headerStyle;
+    if (_live.contains('button_shape')) cfg['button_shape'] = _buttonShape;
+    if (_live.contains('surface_style')) cfg['surface_style'] = _surfaceStyle;
+    if (_live.contains('color_primary')) {
+      final t = _accent.text.trim();
+      // Blank accent = keep whatever the page resolves today (merge-on-omit).
+      if (_hexRe.hasMatch(t)) cfg['color_primary'] = t;
+    }
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/restaurant/branding', {'brand_config': cfg});
+      messenger.showSnackBar(const SnackBar(content: Text('Guest page theme saved.')));
+      widget.reload();
+    } on ApiException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.status == 403 ? 'Only an admin can change branding.' : '$e')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // Segmented pill choice in the template voice — recessed track, active pill
+  // lifted with a hairline border (selection also carries its text label).
+  Widget _toggle(String label, String caption, List<(String, String)> options, String value, ValueChanged<String> onPick) {
+    return Builder(
+      builder: (context) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(label.toUpperCase(), style: Theme.of(context).textTheme.labelSmall),
+        const SizedBox(height: 6),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Container(
+            padding: const EdgeInsets.all(3),
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              for (final (v, lbl) in options)
+                MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: _busy || v == value ? null : () => onPick(v),
+                    child: AnimatedContainer(
+                      duration: AppDurations.fast,
+                      curve: Curves.easeOut,
+                      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: v == value ? Colors.white.withValues(alpha: 0.08) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(7),
+                        border: Border.all(color: v == value ? AppColors.borderStrong : Colors.transparent),
+                      ),
+                      child: Text(
+                        lbl,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: v == value ? FontWeight.w600 : FontWeight.w500,
+                          letterSpacing: 0.2,
+                          color: v == value ? AppColors.textPrimary : AppColors.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 5),
+        Text(caption, style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+      ]),
+    );
+  }
+
+  // Accent picker: hue presets + a hex field. One control, because one accent is
+  // all the guest design needs.
+  Widget _accentRow() {
+    final cur = _parse(_accent.text);
+    final curHex = _accent.text.trim().toLowerCase();
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text('BRAND ACCENT', style: Theme.of(context).textTheme.labelSmall)),
+        Container(
+          width: 22,
+          height: 22,
+          decoration: BoxDecoration(
+            color: cur ?? _ramp.acc,
+            borderRadius: BorderRadius.circular(5),
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Expanded(
+          // Guest palette by design: the swatches keep their real hues because
+          // they preview the colour the CUSTOMER will see.
+          child: Wrap(spacing: 6, runSpacing: 6, children: [
+            for (final c in _presets)
+              GestureDetector(
+                onTap: _busy ? null : () => setState(() => _accent.text = _fmt(c)),
+                child: Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: Color(c),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: curHex == _fmt(c) ? AppColors.textPrimary : AppColors.border,
+                      width: curHex == _fmt(c) ? 2 : 1,
+                    ),
+                  ),
+                ),
+              ),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 100,
+          child: TextField(
+            controller: _accent,
+            enabled: !_busy,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            decoration: const InputDecoration(hintText: '#RRGGBB', isDense: true),
+            onChanged: (_) => setState(() {}),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 10),
+      // The derived ramp, so the owner can see what one hex actually produces.
+      Text('DERIVED RAMP', style: Theme.of(context).textTheme.labelSmall),
+      const SizedBox(height: 6),
+      Row(children: [
+        for (final (c, lbl) in <(Color, String)>[
+          (_ramp.hi, 'Hi'),
+          (_ramp.acc, 'Accent'),
+          (_ramp.mid, 'Mid'),
+          (_ramp.deep, 'Deep'),
+          (_ramp.shadow, 'Shadow'),
+          (_ramp.ink, 'Ink'),
+        ])
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Container(
+                  height: 26,
+                  decoration: BoxDecoration(
+                    color: c,
+                    borderRadius: BorderRadius.circular(5),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(lbl.toUpperCase(),
+                    style: Theme.of(context).textTheme.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text(_hexOfColor(c),
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 8.5, color: AppColors.textTertiary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
+              ]),
+            ),
+          ),
+      ]),
+      const SizedBox(height: 5),
+      Text('Six lightness stops off your hue — headings, buttons, glows and ink all come from these. '
+          'Leave the hex blank to keep using the logo / theme colour above.',
+          style: Theme.of(context).textTheme.bodySmall!.copyWith(fontSize: 11)),
+    ]);
+  }
+
+  // A miniature of the real guest page: near-black shell, floating accent orb,
+  // hero wash, frosted panel, accent CTA. Every live control moves something here.
+  Widget _preview() {
+    final r = _ramp;
+    final panel = _brandPanel(_surfaceStyle, r);
+    final radius = _brandCtrlRadius(_buttonShape);
+    final body = TextStyle(fontFamily: _font, fontFamilyFallback: const ['Inter', 'Roboto']);
+    final serif = const TextStyle(fontFamily: 'Georgia', fontFamilyFallback: ['Times New Roman', 'serif']);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(22), // --rCard, a design constant
+      child: Container(
+        color: const Color(0xFF08080A),
+        height: 268,
+        child: Stack(children: [
+          // The animated accent orb, held still.
+          Positioned(
+            right: -40,
+            top: 40,
+            child: Container(
+              width: 190,
+              height: 190,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(colors: [r.acc.withValues(alpha: 0.34), r.acc.withValues(alpha: 0)]),
+              ),
+            ),
+          ),
+          Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            // Hero wash — `header_style`.
+            Container(
+              height: 74,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              alignment: Alignment.centerLeft,
+              decoration: _headerStyle == 'solid'
+                  ? BoxDecoration(color: r.deep)
+                  : BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [r.deep, const Color(0xFF0B0B0D)],
+                        stops: const [0, 0.78],
+                      ),
+                    ),
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('TABLE 4 · DINE-IN',
+                    style: body.copyWith(fontSize: 8.5, letterSpacing: 1.4, color: Colors.white.withValues(alpha: 0.62))),
+                const SizedBox(height: 3),
+                Text('Your restaurant',
+                    style: serif.copyWith(fontSize: 22, color: Colors.white, height: 1.05)),
+              ]),
+            ),
+            // Frosted panel — `surface_style`.
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(22),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: panel.blur, sigmaY: panel.blur),
+                    child: Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: panel.bg,
+                        borderRadius: BorderRadius.circular(22),
+                        border: Border.all(color: Colors.white.withValues(alpha: panel.edge)),
+                      ),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Expanded(
+                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              Text('Sample dish', style: serif.copyWith(fontSize: 17, color: Colors.white)),
+                              const SizedBox(height: 4),
+                              Text('A few lines of description, exactly as a guest reads them.',
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: body.copyWith(fontSize: 11, height: 1.35, color: Colors.white.withValues(alpha: 0.58))),
+                            ]),
+                          ),
+                          const SizedBox(width: 10),
+                          // Roboto thin numerals — a design constant, tinted by the ramp.
+                          Text('₹429',
+                              style: TextStyle(
+                                fontFamily: 'Roboto',
+                                fontWeight: FontWeight.w300,
+                                fontSize: 22,
+                                letterSpacing: -0.5,
+                                color: r.hi,
+                              )),
+                        ]),
+                        const Spacer(),
+                        // CTA — `button_shape` drives --rCtrl.
+                        Row(children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(colors: [r.acc, r.mid]),
+                              borderRadius: BorderRadius.circular(radius),
+                            ),
+                            child: Text('Add to cart',
+                                style: body.copyWith(fontSize: 11.5, fontWeight: FontWeight.w600, color: r.ink)),
+                          ),
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.06),
+                              borderRadius: BorderRadius.circular(radius),
+                              border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+                            ),
+                            child: Text('Rate us',
+                                style: body.copyWith(fontSize: 11.5, fontWeight: FontWeight.w500, color: Colors.white)),
+                          ),
+                          const Spacer(),
+                          Text(_font,
+                              style: body.copyWith(fontSize: 10, color: Colors.white.withValues(alpha: 0.45))),
+                        ]),
+                      ]),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  // Retired keys this tenant still has stored. Shown read-only and clearly dead —
+  // the guest design can't express them, and the backend keeps them untouched.
+  Widget _retired() {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.history, size: 14, color: AppColors.textTertiary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text('${_legacyStored.length} retired colour${_legacyStored.length == 1 ? '' : 's'} still stored',
+                style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textSecondary)),
+          ),
+          ForkButton.subtle(
+            label: _showRetired ? 'Hide' : 'Show',
+            icon: _showRetired ? Icons.expand_less : Icons.expand_more,
+            onPressed: () => setState(() => _showRetired = !_showRetired),
+          ),
+        ]),
+        if (_showRetired) ...[
+          const SizedBox(height: 8),
+          Text('The guest pages no longer read these — the dark design fixes its own surfaces and derives the rest '
+              'from the accent above. They are kept as-is server-side and are not sent when you save.',
+              style: text.bodySmall!.copyWith(fontSize: 11)),
+          const SizedBox(height: 8),
+          for (final k in _legacyStored)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(children: [
+                Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    color: _parse('${widget.initialConfig[k] ?? ''}') ?? Colors.transparent,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(_legacyLabels[k] ?? k,
+                      style: text.bodySmall!.copyWith(fontSize: 11.5), maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+                Text('${widget.initialConfig[k]}',
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: AppColors.textTertiary)),
+                const SizedBox(width: 8),
+                const StatusChip(label: 'Not used', color: AppColors.neutral, dense: true),
+              ]),
+            ),
+        ],
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Guest page theme', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text('Themes all three customer surfaces — ordering, feedback and valet. They share one dark design; '
+            'these controls are the parts of it you own.',
+            style: text.bodySmall),
+        if (!widget.isAdmin)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Row(children: [
+              const Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
+              const SizedBox(width: 6),
+              Expanded(child: Text('Only an admin can change branding.', style: text.bodySmall!.copyWith(fontSize: 11))),
+            ]),
+          ),
+        const SizedBox(height: AppSpacing.lg),
+        if (_live.contains('color_primary')) ...[
+          _accentRow(),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (_live.contains('font')) ...[
+          Text('BODY FONT', style: text.labelSmall),
+          const SizedBox(height: 6),
+          DropdownButtonFormField<String>(
+            initialValue: _font,
+            isExpanded: true,
+            dropdownColor: AppColors.cardRaised,
+            borderRadius: AppRadius.controlAll,
+            decoration: const InputDecoration(isDense: true),
+            items: [for (final f in _fonts) DropdownMenuItem(value: f, child: Text(f))],
+            onChanged: _busy ? null : (v) { if (v != null) setState(() => _font = v); },
+          ),
+          const SizedBox(height: 5),
+          Text('Body copy and buttons. Headings and big numbers are part of the design and stay as they are.',
+              style: text.bodySmall!.copyWith(fontSize: 11)),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (_live.contains('header_style')) ...[
+          _toggle('Hero wash', 'The band behind the restaurant name: an accent gradient fading into the dark, or a flat accent block.',
+              [for (final v in _options('header_style')) (v, _label(v))], _headerStyle,
+              (v) => setState(() => _headerStyle = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_live.contains('surface_style')) ...[
+          _toggle('Panels', 'Card material: frosted glass, an opaque slab, or glass tinted with your accent.',
+              [for (final v in _options('surface_style')) (v, _label(v))], _surfaceStyle,
+              (v) => setState(() => _surfaceStyle = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_live.contains('button_shape')) ...[
+          _toggle('Controls', 'Corner radius of buttons, chips and inputs.',
+              [for (final v in _options('button_shape')) (v, _label(v))], _buttonShape,
+              (v) => setState(() => _buttonShape = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_unsupported.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Row(children: [
+            const Icon(Icons.info_outline, size: 14, color: AppColors.textTertiary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('Your server also offers ${_unsupported.join(', ')} — update the app to edit ${_unsupported.length == 1 ? 'it' : 'them'} here.',
+                  style: text.bodySmall!.copyWith(fontSize: 11)),
+            ),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+        ],
+        const Divider(height: 28),
+        Text('Preview', style: text.titleSmall),
+        const SizedBox(height: 3),
+        Text('The guest page in miniature — dark shell, your ramp, your panels. Fonts render here only if installed '
+            'on this PC; guests always get the real webfont.',
+            style: text.bodySmall!.copyWith(fontSize: 11)),
+        const SizedBox(height: AppSpacing.sm),
+        _preview(),
+        if (_legacyStored.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.lg),
+          _retired(),
+        ],
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerRight,
+          child: ForkButton(
+            label: _busy ? 'Saving…' : 'Save guest page theme',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: (_busy || !widget.isAdmin) ? null : _save,
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+// ----------------------------------------------------------- write dialogs ----
+
+Future<void> _addInventory(
+    BuildContext context, RestClient rest, List<String> categories, bool isAdmin, VoidCallback reload) async {
+  final name = TextEditingController();
+  final stock = TextEditingController();
+  final unit = TextEditingController();
+  final messenger = ScaffoldMessenger.of(context);
+  // Local mutable copy of the managed list so the inline "Manage categories"
+  // affordance can refresh the picker without closing this dialog.
+  var cats = List<String>.from(categories);
+  String? category = cats.isNotEmpty ? cats.first : null;
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 400,
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('INVENTORY', style: Theme.of(ctx).textTheme.labelSmall),
+              const SizedBox(height: 6),
+              Text('Add inventory item', style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: AppSpacing.lg),
+              TextField(controller: name, decoration: const InputDecoration(labelText: 'Name', isDense: true)),
+              const SizedBox(height: AppSpacing.sm),
+              Row(children: [
+                Expanded(
+                  child: cats.isEmpty
+                      ? Text('No categories yet — add one via the tune icon.',
+                          style: Theme.of(ctx).textTheme.bodySmall)
+                      : DropdownButtonFormField<String>(
+                          initialValue: category,
+                          isExpanded: true,
+                          dropdownColor: AppColors.cardRaised,
+                          decoration: const InputDecoration(labelText: 'Category', isDense: true),
+                          items: [for (final c in cats) DropdownMenuItem(value: c, child: Text(c))],
+                          onChanged: (v) => setLocal(() => category = v),
+                        ),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                ForkIconButton(
+                  icon: Icons.tune,
+                  tooltip: 'Manage categories',
+                  onPressed: () async {
+                    final changed = await showDialog<bool>(
+                      context: ctx,
+                      builder: (_) => _InventoryCategoriesDialog(rest: rest, isAdmin: isAdmin, initial: cats),
+                    );
+                    if (changed != true) return;
+                    // Re-read the managed list so the picker reflects the edits,
+                    // and refresh the underlying inventory list too.
+                    try {
+                      final s = await rest.getMap('/restaurant/settings');
+                      final fresh = ((s['inventory_categories'] as List?) ?? const [])
+                          .map((e) => '$e'.trim())
+                          .where((e) => e.isNotEmpty)
+                          .toList();
+                      setLocal(() {
+                        cats = fresh;
+                        final cur = category;
+                        if (cur == null || !cats.any((c) => c.toLowerCase() == cur.toLowerCase())) {
+                          category = cats.isNotEmpty ? cats.first : null;
+                        }
+                      });
+                    } catch (_) {/* keep the current picker on refresh failure */}
+                    reload();
+                  },
+                ),
+              ]),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                  controller: stock,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Stock', isDense: true)),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(controller: unit, decoration: const InputDecoration(labelText: 'Unit (e.g. kg)', isDense: true)),
+              const SizedBox(height: AppSpacing.xl),
+              Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+                const SizedBox(width: AppSpacing.sm),
+                ForkButton(label: 'Add', icon: Icons.add, onPressed: () => Navigator.pop(ctx, true)),
+              ]),
+            ]),
+          ),
+        ),
+      ),
+    ),
+  );
+  if (ok == true) {
+    try {
+      await rest.post('/inventory', {
+        'name': name.text.trim(),
+        'category': (category ?? '').trim(),
+        'stock': num.tryParse(stock.text.trim()) ?? 0,
+        'unit': unit.text.trim(),
+      });
+      reload();
+      messenger.showSnackBar(const SnackBar(content: Text('Item added.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+  name.dispose();
+  stock.dispose();
+  unit.dispose();
+}
+
+Future<void> _addEmployee(BuildContext context, RestClient rest, VoidCallback reload) async {
+  final first = TextEditingController();
+  final last = TextEditingController();
+  final username = TextEditingController();
+  final password = TextEditingController();
+  final email = TextEditingController();
+  String role = 'employee';
+  final messenger = ScaffoldMessenger.of(context);
+  // Custom roles were missing from this dialog entirely, so a role created in
+  // Roles & Permissions could never be given to a NEW employee — only added
+  // afterwards. Load them and offer them alongside the built-ins; the value is
+  // the role's uuid, which the backend resolves against "Roles".
+  List<Map<String, dynamic>> customRoles = const [];
+  try {
+    final raw = await rest.get('/roles');
+    if (raw is List) {
+      customRoles = raw
+          .whereType<Map>()
+          .map((e) => {'id': '${e['id'] ?? ''}', 'name': '${e['role_name'] ?? ''}'})
+          .where((e) => (e['id'] as String).isNotEmpty && (e['name'] as String).isNotEmpty)
+          .toList();
+    }
+  } catch (_) {
+    // Roles are a nicety here — a failure must not block adding staff.
+  }
+  // The roles fetch above is an async gap — bail out if this screen is gone.
+  if (!context.mounted) {return;}
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 400,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('STAFF', style: Theme.of(ctx).textTheme.labelSmall),
+            const SizedBox(height: 6),
+            Text('Add employee', style: Theme.of(ctx).textTheme.titleMedium),
+            const SizedBox(height: AppSpacing.lg),
+            TextField(controller: first, decoration: const InputDecoration(labelText: 'First name', isDense: true)),
+            const SizedBox(height: AppSpacing.sm),
+            TextField(controller: last, decoration: const InputDecoration(labelText: 'Last name', isDense: true)),
+            const SizedBox(height: AppSpacing.sm),
+            TextField(controller: username, decoration: const InputDecoration(labelText: 'Username', isDense: true)),
+            const SizedBox(height: AppSpacing.sm),
+            TextField(
+                controller: password,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Password', isDense: true)),
+            const SizedBox(height: AppSpacing.sm),
+            TextField(controller: email, decoration: const InputDecoration(labelText: 'Email (optional)', isDense: true)),
+            const SizedBox(height: AppSpacing.md),
+            DropdownButtonFormField<String>(
+              initialValue: role,
+              dropdownColor: AppColors.cardRaised,
+              decoration: const InputDecoration(labelText: 'Role', isDense: true),
+              items: [
+                const DropdownMenuItem(value: 'employee', child: Text('Employee')),
+                const DropdownMenuItem(value: 'manager', child: Text('Manager')),
+                const DropdownMenuItem(value: 'cashier', child: Text('Cashier')),
+                const DropdownMenuItem(value: 'waiter', child: Text('Waiter')),
+                const DropdownMenuItem(value: 'captain', child: Text('Captain')),
+                const DropdownMenuItem(value: 'valet', child: Text('Valet')),
+                for (final r in customRoles)
+                  DropdownMenuItem(value: r['id'] as String, child: Text('${r['name']} (custom)')),
+              ],
+              onChanged: (v) => role = v ?? 'employee',
+            ),
+            const SizedBox(height: AppSpacing.xl),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton(label: 'Add', icon: Icons.person_add_alt, onPressed: () => Navigator.pop(ctx, true)),
+            ]),
+          ]),
+        ),
+      ),
+    ),
+  );
+  if (ok == true) {
+    try {
+      await rest.post('/restaurant/users', {
+        'emp_Fname': first.text.trim(),
+        'emp_Lname': last.text.trim(),
+        'username': username.text.trim(),
+        'password': password.text,
+        'email': email.text.trim(),
+        'role': role,
+      });
+      reload();
+      messenger.showSnackBar(const SnackBar(content: Text('Employee added.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+  first.dispose();
+  last.dispose();
+  username.dispose();
+  password.dispose();
+  email.dispose();
+}
+
+// ------------------------------------------------------------- roles (RBAC) ----
+
+const _coreRoles = <String>['admin', 'manager', 'cashier', 'waiter', 'captain', 'valet', 'employee'];
+
+// A stable colour per role so role chips/badges read at a glance (Discord-style).
+Color _roleColor(String role) {
+  switch (role.toLowerCase()) {
+    case 'admin':
+      return AppColors.danger; // red — highest authority
+    case 'manager':
+      return AppColors.copperHi; // purple
+    case 'captain':
+      return AppColors.info; // blue
+    case 'cashier':
+      return AppColors.success; // teal
+    case 'waiter':
+      return AppColors.warning; // orange
+    case 'valet':
+      return AppColors.copperDeep; // brown
+    case 'employee':
+      return AppColors.neutral; // slate
+    default:
+      return AppColors.copperMid; // indigo — custom roles
+  }
+}
+
+// A coloured role pill in the shared status voice (tint + dot + label — the
+// colour never travels alone). Optionally shows an "x" to remove it inline.
+// Custom-role names, keyed by their "Roles" uuid. Employee/role screens fetch
+// /roles anyway, so they warm this; anywhere that only has a bare role list can
+// then print a NAME instead of a raw guid. Falls back to a plain label rather
+// than leaking the id when the cache is cold.
+final Map<String, String> _customRoleNames = <String, String>{};
+
+void _cacheCustomRoleNames(List roles) {
+  for (final r in roles) {
+    if (r is! Map) continue;
+    final id = '${r['id'] ?? ''}'.trim();
+    final name = '${r['role_name'] ?? ''}'.trim();
+    if (id.isNotEmpty && name.isNotEmpty) _customRoleNames[id] = name;
+  }
+}
+
+final RegExp _uuidRe = RegExp(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$');
+
+/// A role as a person should read it: built-ins as-is, a custom role by name.
+String _roleLabel(String role) {
+  final r = role.trim();
+  if (!_uuidRe.hasMatch(r)) return r;
+  return _customRoleNames[r] ?? 'Custom role';
+}
+
+/// Comma-joined role labels for the account/profile rows.
+String _roleLabels(Iterable<String> roles) =>
+    roles.map(_roleLabel).where((s) => s.isNotEmpty).join(', ');
+
+Widget _roleChip(String role, {VoidCallback? onRemove}) {
+  final c = _roleColor(role);
+  return Container(
+    padding: EdgeInsets.fromLTRB(8, 3, onRemove == null ? 8 : 5, 3),
+    decoration: BoxDecoration(
+      color: AppColors.tint(c),
+      borderRadius: BorderRadius.circular(AppRadius.chip),
+      border: Border.all(color: AppColors.edge(c)),
+    ),
+    child: Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(width: 5, height: 5, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
+      const SizedBox(width: 5),
+      Text(role,
+          style: TextStyle(
+            fontSize: 10.5,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.3,
+            color: Color.lerp(c, Colors.white, 0.25),
+          )),
+      if (onRemove != null) ...[
+        const SizedBox(width: 3),
+        InkWell(
+          onTap: onRemove,
+          borderRadius: BorderRadius.circular(AppRadius.chip),
+          child: Icon(Icons.close, size: 12, color: c.withValues(alpha: 0.8)),
+        ),
+      ],
+    ]),
+  );
+}
+
+Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () async {
+        final r = await Future.wait([rest.getList('/roles'), rest.getList('/actions')]);
+        return {'roles': r[0], 'actions': r[1]};
+      },
+      builder: (context, data, reload) {
+        final roles = (data['roles'] as List?) ?? [];
+        final actions = (data['actions'] as List?) ?? [];
+        final text = Theme.of(context).textTheme;
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () async {
+              final created = await showDialog<bool>(
+                context: context,
+                builder: (_) => _CreateRoleDialog(rest: rest, actions: actions),
+              );
+              if (created == true) reload();
+            },
+            icon: const Icon(Icons.add_moderator),
+            label: const Text('New role'),
+          ),
+          body: ListView(padding: AppSpacing.pageNarrow, children: [
+            Padding(
+              padding: const EdgeInsets.only(bottom: AppSpacing.lg),
+              child: Text(
+                  'Custom roles are built from permissions and can be assigned to staff '
+                  '(tap an employee in the Employees tab).',
+                  style: text.bodySmall),
+            ),
+            // Built-in roles (always available — Admin grants everything and can
+            // only be given or taken away by the owner/super-admin).
+            const SectionHeader(title: 'Core roles', padding: EdgeInsets.only(bottom: 10)),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              for (final r in _coreRoles)
+                StatusChip(label: r == 'admin' ? 'admin (owner-grantable)' : r, color: _roleColor(r)),
+            ]),
+            const SizedBox(height: AppSpacing.xxl),
+            SectionHeader(title: 'Custom roles', count: roles.length, padding: const EdgeInsets.only(bottom: 10)),
+            if (roles.isEmpty)
+              _empty('No custom roles yet — create one with the button below.')
+            else
+              ...roles.map((r) {
+                final role = r as Map;
+                final roleName = _s(role, 'role_name');
+                final count = (role['actions_performable'] as List?)?.length ?? 0;
+                final c = _roleColor(roleName);
+                final messenger = ScaffoldMessenger.of(context);
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: ForkCard(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    onTap: () async {
+                      final saved = await showDialog<bool>(
+                        context: context,
+                        builder: (_) => _CreateRoleDialog(rest: rest, actions: actions, existing: role),
+                      );
+                      if (saved == true) reload();
+                    },
+                    child: Row(children: [
+                      Container(
+                        width: 38,
+                        height: 38,
+                        decoration: BoxDecoration(
+                          color: AppColors.tint(c),
+                          borderRadius: AppRadius.controlAll,
+                          border: Border.all(color: AppColors.edge(c)),
+                        ),
+                        child: Icon(Icons.shield_outlined, size: 16, color: c),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                          Text(roleName, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          const SizedBox(height: 3),
+                          Text('$count permission(s) · tap to edit', style: text.bodySmall),
+                        ]),
+                      ),
+                      const SizedBox(width: AppSpacing.md),
+                      ForkIconButton(
+                        icon: Icons.delete_outline,
+                        tooltip: 'Delete role',
+                        onPressed: () async {
+                          final ok = await _confirm(context, 'Delete role', 'Delete the "$roleName" role?');
+                          if (!ok) return;
+                          try {
+                            await rest.delete('/roles/${role['id']}');
+                            reload();
+                          } catch (e) {
+                            messenger.showSnackBar(SnackBar(content: Text('$e')));
+                          }
+                        },
+                      ),
+                    ]),
+                  ),
+                );
+              }),
+          ]),
+        );
+      },
+    );
+
+class _CreateRoleDialog extends StatefulWidget {
+  final RestClient rest;
+  final List<dynamic> actions;
+  final Map? existing; // when set, edit this role's permissions (name is locked)
+  const _CreateRoleDialog({required this.rest, required this.actions, this.existing});
+
+  @override
+  State<_CreateRoleDialog> createState() => _CreateRoleDialogState();
+}
+
+class _CreateRoleDialogState extends State<_CreateRoleDialog> {
+  final _name = TextEditingController();
+  final Set<String> _selected = {};
+  bool _saving = false;
+  String? _error;
+
+  bool get _isEdit => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    if (e != null) {
+      _name.text = _s(e, 'role_name', '');
+      for (final a in (e['actions_performable'] as List?) ?? const []) {
+        _selected.add('$a');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final name = _name.text.trim();
+    if (name.isEmpty) {
+      setState(() => _error = 'Role name is required.');
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      await widget.rest.post('/roles', {'role_name': name, 'actions_performable': _selected.toList()});
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      setState(() {
+        _error = '$e';
+        _saving = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final groups = <String, List<Map>>{};
+    for (final a in widget.actions) {
+      final m = a as Map;
+      (groups[_s(m, 'group', 'Other')] ??= []).add(m);
+    }
+    final groupNames = groups.keys.toList()..sort();
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 460,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('RBAC', style: text.labelSmall),
+          const SizedBox(height: 6),
+          Text(_isEdit ? 'Edit role · ${_name.text}' : 'Create role', style: text.titleMedium),
+          const SizedBox(height: AppSpacing.lg),
+          TextField(
+            controller: _name,
+            readOnly: _isEdit, // the name is the role's key — locked while editing
+            style: _isEdit ? const TextStyle(fontSize: 14, color: AppColors.textSecondary) : null,
+            decoration: const InputDecoration(
+              labelText: 'Role name (e.g. Floor Supervisor)',
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+            ),
+          Text('${_selected.length} PERMISSION(S) SELECTED', style: text.labelSmall),
+          const SizedBox(height: AppSpacing.sm),
+          SizedBox(
+            height: 320,
+            width: double.maxFinite,
+            child: ListView(children: [
+              for (final g in groupNames) ...[
+                SectionHeader(title: g, padding: const EdgeInsets.only(top: 10, bottom: 4)),
+                for (final a in groups[g]!)
+                  CheckboxListTile(
+                    dense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                    activeColor: AppColors.copper,
+                    checkColor: AppColors.onCopper,
+                    side: const BorderSide(color: AppColors.borderStrong),
+                    value: _selected.contains('${a['id']}'),
+                    title: Text(_s(a, 'action_name'),
+                        style: text.bodyLarge!.copyWith(fontSize: 13)),
+                    onChanged: (v) => setState(() {
+                      final id = '${a['id']}';
+                      if (v == true) {
+                        _selected.add(id);
+                      } else {
+                        _selected.remove(id);
+                      }
+                    }),
+                  ),
+              ],
+            ]),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            ForkButton.ghost(label: 'Cancel', onPressed: _saving ? null : () => Navigator.pop(context, false)),
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton(
+              label: _saving ? 'Saving…' : (_isEdit ? 'Save' : 'Create'),
+              icon: Icons.check,
+              onPressed: _saving ? null : _save,
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+}
+
+// Discord-style role manager: toggle roles on/off for an employee. Each role is
+// a switch that applies immediately (assign/remove). The superadmin keeps admin.
+class _ManageRolesSheet extends StatefulWidget {
+  final RestClient rest;
+  final Map employee;
+  final List customRoles; // [{role_name, ...}]
+  final bool isSuperadmin;
+  const _ManageRolesSheet({required this.rest, required this.employee, required this.customRoles, required this.isSuperadmin});
+
+  @override
+  State<_ManageRolesSheet> createState() => _ManageRolesSheetState();
+}
+
+class _ManageRolesSheetState extends State<_ManageRolesSheet> {
+  late Set<String> _assigned; // lowercased role names currently held
+  final Set<String> _busy = {}; // roles with an in-flight toggle
+  bool _changed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // A CUSTOM role comes back from the server as its "Roles" UUID, but every
+    // toggle in this sheet is keyed by role NAME. Without translating, a custom
+    // role that IS assigned matched nothing and its switch rendered OFF — so it
+    // looked like the assignment never saved, even though it had.
+    final byId = <String, String>{
+      for (final r in widget.customRoles)
+        '${(r as Map)['id'] ?? ''}'.toLowerCase().trim(): '${r['role_name'] ?? ''}'.toLowerCase().trim(),
+    };
+    final current = (widget.employee['role_all'] as List?)
+            ?.map((e) => '$e'.toLowerCase().trim())
+            .map((e) => byId[e] ?? e) // uuid -> name; built-ins pass through
+            .where((s) => s.isNotEmpty) ??
+        [_s(widget.employee, 'role', '').toLowerCase()];
+    _assigned = {...current}..removeWhere((s) => s.isEmpty);
+  }
+
+  List<String> get _allRoles {
+    final custom = widget.customRoles.map((r) => '${(r as Map)['role_name'] ?? ''}').where((s) => s.isNotEmpty);
+    final seen = <String>{};
+    final out = <String>[];
+    for (final r in [..._coreRoles, ...custom]) {
+      final key = r.toLowerCase();
+      if (seen.add(key)) out.add(r);
+    }
+    return out;
+  }
+
+  Future<void> _toggle(String role, bool add) async {
+    final key = role.toLowerCase();
+    // The superadmin must always remain an admin.
+    if (widget.isSuperadmin && key == 'admin' && !add) return;
+    setState(() => _busy.add(key));
+    final employeeId = '${widget.employee['employee_id'] ?? widget.employee['id'] ?? ''}';
+    try {
+      await widget.rest.post(add ? '/roles/assign' : '/roles/remove', {'employeeId': employeeId, 'role_name': role});
+      setState(() {
+        if (add) {
+          _assigned.add(key);
+        } else {
+          _assigned.remove(key);
+        }
+        _changed = true;
+      });
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy.remove(key));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final name = '${_s(widget.employee, 'emp_Fname')} ${_s(widget.employee, 'emp_Lname', '')}'.trim();
+    final display = name.isEmpty ? _s(widget.employee, 'employee_Username') : name;
+    final initials = display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join();
+    final all = _allRoles;
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, _) {},
+      child: SafeArea(
+        child: Padding(
+          padding: EdgeInsets.only(
+              left: AppSpacing.xl,
+              right: AppSpacing.xl,
+              bottom: AppSpacing.lg + MediaQuery.of(context).viewInsets.bottom),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              InitialsAvatar(
+                initials: initials.isEmpty ? '?' : initials,
+                color: widget.isSuperadmin ? AppColors.warning : AppColors.copper,
+              ),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    Flexible(
+                      child: Text(display, style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                    if (widget.isSuperadmin) ...[
+                      const SizedBox(width: 6),
+                      const Tooltip(
+                        message: 'Superadmin (owner)',
+                        child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
+                      ),
+                    ],
+                  ]),
+                  const SizedBox(height: 2),
+                  Text('MANAGE ROLES', style: text.labelSmall),
+                ]),
+              ),
+            ]),
+            const SizedBox(height: AppSpacing.sm),
+            // Currently-assigned roles as removable chips.
+            if (_assigned.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+                child: Wrap(spacing: 6, runSpacing: 6, children: [
+                  for (final role in all.where((r) => _assigned.contains(r.toLowerCase())))
+                    _roleChip(role,
+                        onRemove: (widget.isSuperadmin && role.toLowerCase() == 'admin') || _busy.contains(role.toLowerCase())
+                            ? null
+                            : () => _toggle(role, false)),
+                ]),
+              ),
+            const Divider(),
+            Flexible(
+              child: ListView(shrinkWrap: true, children: [
+                for (final role in all)
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                    secondary: Container(
+                      width: 30,
+                      height: 30,
+                      decoration: BoxDecoration(
+                        color: AppColors.tint(_roleColor(role)),
+                        borderRadius: AppRadius.controlAll,
+                        border: Border.all(color: AppColors.edge(_roleColor(role))),
+                      ),
+                      child: Icon(Icons.shield_outlined, size: 14, color: _roleColor(role)),
+                    ),
+                    title: Text(role, style: text.titleSmall),
+                    subtitle: _coreRoles.contains(role.toLowerCase())
+                        ? null
+                        : Text('Custom role', style: text.bodySmall!.copyWith(fontSize: 11)),
+                    value: _assigned.contains(role.toLowerCase()),
+                    onChanged: (widget.isSuperadmin && role.toLowerCase() == 'admin') || _busy.contains(role.toLowerCase())
+                        ? null
+                        : (v) => _toggle(role, v),
+                  ),
+              ]),
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              ForkButton(label: 'Done', icon: Icons.check, onPressed: () => Navigator.pop(context, _changed)),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
