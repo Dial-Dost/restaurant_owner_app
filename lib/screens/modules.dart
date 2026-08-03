@@ -3422,6 +3422,79 @@ class _SectionSelectorState extends State<_SectionSelector> {
 // the security boundary.
 const String _undoAuditPermissionId = '6f2a4c81-9d35-4b7e-a0c2-5e8b1d3f7a94';
 
+// 'Review Attendance' — the EXISTING gate on GET /attendance and the clock-in
+// review, which the leave routes reuse rather than minting a new Action. Whoever
+// reviews a shift is who reviews a day off.
+const String _attendanceReviewPermissionId = '2e7b9c40-1f83-4d6a-b902-5a8c3e1f6047';
+
+// The one analytics Action every /analytics/* route is gated on, including
+// /analytics/staff-performance and /analytics/concerns.
+const String _analyticsPermissionId = 'df75119b-e5f1-4f38-aba5-78a1cf182f56';
+
+// Whether this profile holds [actionId]. A UI convenience only — the server
+// re-checks every one of these, so a wrong answer here costs an affordance, not
+// a boundary. Mirrors the check `_mayUndo` has always used.
+bool _holdsAction(Profile p, String actionId) =>
+    p.isAdmin || p.actions.contains('*') || p.actions.contains(actionId);
+
+/// The UTC instant at which the restaurant-local day [dayKey] ("YYYY-MM-DD")
+/// begins, or ends when [end] is set.
+///
+/// Deliberately NOT the bare day key: `/audit-logs` compares `from`/`to` against
+/// `created_at`, a timestamptz, so a bare date is read as UTC midnight — which in
+/// Asia/Kolkata drops the first 5½ hours of the restaurant's own day off the
+/// front of "today" and adds them to the back of "yesterday". The offset is
+/// resolved from [RestaurantTime]'s transition table, so it is right across DST;
+/// where the table cannot answer (a zone this build predates) the device zone is
+/// the only honest fallback left, which is the same one RestaurantTime renders in.
+String _restaurantDayBoundIso(String dayKey, {bool end = false}) {
+  final base = DateTime.tryParse('${dayKey.trim()}T00:00:00Z');
+  if (base == null) return '';
+  final wall = end
+      ? base.add(const Duration(hours: 23, minutes: 59, seconds: 59, milliseconds: 999))
+      : base;
+  final probe = RestaurantTime.offsetMinutesAt(wall);
+  if (probe == null) {
+    return DateTime(wall.year, wall.month, wall.day, wall.hour, wall.minute, wall.second,
+            wall.millisecond)
+        .toUtc()
+        .toIso8601String();
+  }
+  // The offset depends on the instant and the instant is what we are solving
+  // for, so subtract once and re-ask. One correction settles everything except
+  // a wall time inside the hour a DST shift skips, which no day boundary is.
+  var instant = wall.subtract(Duration(minutes: probe));
+  final refined = RestaurantTime.offsetMinutesAt(instant);
+  if (refined != null && refined != probe) {
+    instant = wall.subtract(Duration(minutes: refined));
+  }
+  return instant.toIso8601String();
+}
+
+/// [days] before today in the restaurant's zone, as a "YYYY-MM-DD" day key.
+String _restaurantDayKeyBack(int days) {
+  final wall = RestaurantTime.nowWall();
+  return RestaurantTime.isoDate(wall.subtract(Duration(days: days)));
+}
+
+/// [months] calendar months before today in the restaurant's zone. Calendar, not
+/// 30-day blocks: "past 3 months" on the 31st means the 30th/28th of the month
+/// three back, not a date that does not exist.
+String _restaurantDayKeyMonthsBack(int months) {
+  final wall = RestaurantTime.nowWall();
+  var year = wall.year;
+  var month = wall.month - months;
+  while (month <= 0) {
+    month += 12;
+    year -= 1;
+  }
+  const lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  final leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+  final maxDay = month == 2 && leap ? 29 : lengths[month - 1];
+  final day = wall.day > maxDay ? maxDay : wall.day;
+  return RestaurantTime.isoDate(DateTime.utc(year, month, day));
+}
+
 // Audit log: searchable history of staff actions (proves the audit system is
 // recording). Backed by GET /audit-logs, paged 50 at a time with `?meta=1` so
 // the header reports the trail's REAL size; the search box re-queries the
@@ -3467,6 +3540,30 @@ class _AuditLogViewState extends State<_AuditLogView> {
   // search spans the whole trail rather than the pages scrolled in so far.
   String _query = '';
   Timer? _debounce;
+
+  // Mirrors the backend's Audit_log_category enum, in the same order the web
+  // dashboard lists it. 'All' is the absence of the filter, not a value.
+  static const List<String> _categories = [
+    'All', 'General', 'Bill', 'Orders', 'Valet', 'Inventory',
+    'Tables', 'Roles', 'Customer', 'Bookings', 'Menu',
+  ];
+
+  // Date presets. The last two open a picker; everything before them resolves
+  // to a range without a dialog, which is what an owner reaches for daily.
+  static const List<String> _presets = [
+    'All time', 'Today', 'Last 7 days', 'Last 30 days', 'Last 3 months', 'A day…', 'A range…',
+  ];
+  static const int _presetDay = 5;
+  static const int _presetRange = 6;
+
+  int _preset = 0;
+  // Inclusive restaurant day keys ("YYYY-MM-DD"); empty = unbounded that side.
+  // Converted to absolute instants only at request time, by
+  // [_restaurantDayBoundIso] — created_at is a timestamptz and a bare date would
+  // be read as UTC midnight, sliding the whole window by the tenant's offset.
+  String _from = '';
+  String _to = '';
+  String _category = 'All';
   // Bumped per request; a response whose serial is stale lost a race with a
   // newer filter and must not be merged into the list.
   int _serial = 0;
@@ -3508,8 +3605,13 @@ class _AuditLogViewState extends State<_AuditLogView> {
     });
     final offset = append ? _rows.length : 0;
     final q = _query.trim();
+    final fromIso = _from.isEmpty ? '' : _restaurantDayBoundIso(_from);
+    final toIso = _to.isEmpty ? '' : _restaurantDayBoundIso(_to, end: true);
     final path = '/audit-logs?meta=1&limit=${limit ?? _pageSize}&offset=$offset'
-        '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}';
+        '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}'
+        '${_category == 'All' ? '' : '&category=${Uri.encodeQueryComponent(_category)}'}'
+        '${fromIso.isEmpty ? '' : '&from=${Uri.encodeQueryComponent(fromIso)}'}'
+        '${toIso.isEmpty ? '' : '&to=${Uri.encodeQueryComponent(toIso)}'}';
     try {
       // ?meta=1 returns { logs, total, has_more } — the true row count, which is
       // what the header chip reports, instead of "however many are loaded".
@@ -3565,6 +3667,132 @@ class _AuditLogViewState extends State<_AuditLogView> {
       setState(() => _query = next);
       _load();
     });
+  }
+
+  /// Every filter change funnels through here, because all of them share one
+  /// rule: the request restarts at offset 0 AND everything already scrolled in
+  /// is discarded. Appending to a list built under different filters would mix
+  /// two result sets and make the count chip describe neither. `_load()` with
+  /// append:false already clears `_rows`/`_ids`; the bumped `_serial` inside it
+  /// also strands any page still in flight for the previous filter.
+  void _applyFilters(VoidCallback change) {
+    setState(() {
+      change();
+      // Dropped HERE rather than when the new page lands: if the request fails,
+      // leaving the old rows on screen would show a list that does not match the
+      // filter above it and a count chip that describes neither.
+      _rows.clear();
+      _ids.clear();
+      _total = 0;
+      _hasMore = false;
+    });
+    _load();
+  }
+
+  /// Resolves a preset to a day-key range. The two picker presets are handled by
+  /// the caller (they need a dialog and can be cancelled).
+  void _selectPreset(int i) {
+    if (i == _preset && i != _presetDay && i != _presetRange) return;
+    switch (i) {
+      case 1:
+        final today = RestaurantTime.todayIso();
+        _applyFilters(() { _preset = i; _from = today; _to = today; });
+      case 2:
+        _applyFilters(() { _preset = i; _from = _restaurantDayKeyBack(6); _to = RestaurantTime.todayIso(); });
+      case 3:
+        _applyFilters(() { _preset = i; _from = _restaurantDayKeyBack(29); _to = RestaurantTime.todayIso(); });
+      case 4:
+        _applyFilters(() { _preset = i; _from = _restaurantDayKeyMonthsBack(3); _to = RestaurantTime.todayIso(); });
+      case _presetDay:
+        _pickDay();
+      case _presetRange:
+        _pickRange();
+      default:
+        _applyFilters(() { _preset = 0; _from = ''; _to = ''; });
+    }
+  }
+
+  /// The window a picker starts from and is bounded by. `firstDate` is three
+  /// years back — further than any trail this app pages through — and the last
+  /// date is the restaurant's today, because there are no future audit entries.
+  DateTime get _pickerLast {
+    final w = RestaurantTime.nowWall();
+    return DateTime(w.year, w.month, w.day);
+  }
+
+  DateTime get _pickerFirst {
+    final l = _pickerLast;
+    return DateTime(l.year - 3, l.month, l.day);
+  }
+
+  DateTime _seedDay(String key) {
+    final parsed = DateTime.tryParse('${key}T00:00:00');
+    if (parsed == null) return _pickerLast;
+    final clamped = parsed.isAfter(_pickerLast)
+        ? _pickerLast
+        : (parsed.isBefore(_pickerFirst) ? _pickerFirst : parsed);
+    return DateTime(clamped.year, clamped.month, clamped.day);
+  }
+
+  Future<void> _pickDay() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _seedDay(_from.isEmpty ? RestaurantTime.todayIso() : _from),
+      firstDate: _pickerFirst,
+      lastDate: _pickerLast,
+      helpText: 'Entries from one day',
+    );
+    // A cancelled picker must leave the previous window alone — including the
+    // selected pill, which is why the preset is only written on success.
+    if (picked == null || !mounted) return;
+    final key = RestaurantTime.isoDate(picked);
+    _applyFilters(() { _preset = _presetDay; _from = key; _to = key; });
+  }
+
+  Future<void> _pickRange() async {
+    final seedFrom = _seedDay(_from.isEmpty ? _restaurantDayKeyBack(6) : _from);
+    final seedTo = _seedDay(_to.isEmpty ? RestaurantTime.todayIso() : _to);
+    final picked = await showDateRangePicker(
+      context: context,
+      initialDateRange: DateTimeRange(
+        start: seedFrom,
+        end: seedTo.isBefore(seedFrom) ? seedFrom : seedTo,
+      ),
+      firstDate: _pickerFirst,
+      lastDate: _pickerLast,
+      helpText: 'Entries between two days',
+    );
+    if (picked == null || !mounted) return;
+    _applyFilters(() {
+      _preset = _presetRange;
+      _from = RestaurantTime.isoDate(picked.start);
+      _to = RestaurantTime.isoDate(picked.end);
+    });
+  }
+
+  bool get _hasFilters =>
+      _query.isNotEmpty || _category != 'All' || _from.isNotEmpty || _to.isNotEmpty;
+
+  void _clearFilters() {
+    _search.clear();
+    _debounce?.cancel();
+    _applyFilters(() {
+      _preset = 0;
+      _from = '';
+      _to = '';
+      _category = 'All';
+      _query = '';
+    });
+  }
+
+  /// The window in words, in the RESTAURANT's zone — so the reader can tell a
+  /// preset's answer from the pill's label ("Last 7 days" vs "Jul 28 – Aug 3").
+  String get _rangeLabel {
+    if (_from.isEmpty && _to.isEmpty) return 'All time';
+    if (_from.isNotEmpty && _from == _to) return _fmtDay(_from);
+    if (_from.isEmpty) return 'Up to ${_fmtDay(_to)}';
+    if (_to.isEmpty) return 'From ${_fmtDay(_from)}';
+    return '${_fmtDay(_from)} – ${_fmtDay(_to)}';
   }
 
   /// After an undo, re-read exactly the window already scrolled in (one request)
@@ -3652,7 +3880,7 @@ class _AuditLogViewState extends State<_AuditLogView> {
         ),
       ),
       Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
         child: TextField(
           controller: _search,
           decoration: const InputDecoration(
@@ -3663,7 +3891,48 @@ class _AuditLogViewState extends State<_AuditLogView> {
           onChanged: _onSearchChanged,
         ),
       ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        child: _filterBar(context),
+      ),
       Expanded(child: _body(context)),
+    ]);
+  }
+
+  /// Date presets, the category filter, and what the two of them currently mean.
+  /// Every control here goes through [_applyFilters], so changing any one of
+  /// them restarts the trail at offset 0 rather than appending to a list built
+  /// under the old filter.
+  Widget _filterBar(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      ForkTabs(tabs: _presets, selected: _preset, onSelected: _selectPreset),
+      const SizedBox(height: 10),
+      Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        // The window in restaurant time, spelled out: a pill reading "Last 3
+        // months" does not say which days that is.
+        InfoChip(icon: Icons.event_outlined, label: _rangeLabel),
+        PopupMenuButton<String>(
+          tooltip: 'Filter by category',
+          color: AppColors.cardRaised,
+          onSelected: (v) {
+            if (v == _category) return;
+            _applyFilters(() => _category = v);
+          },
+          itemBuilder: (_) => [
+            for (final c in _categories)
+              CheckedPopupMenuItem<String>(value: c, checked: c == _category, child: Text(c)),
+          ],
+          child: InfoChip(
+            icon: Icons.filter_list,
+            label: _category == 'All' ? 'All categories' : _category,
+          ),
+        ),
+        if (_hasFilters)
+          ForkButton.ghost(label: 'Clear filters', icon: Icons.close, dense: true, onPressed: _clearFilters),
+        if (_loading && _rows.isNotEmpty)
+          Text('Reloading…', style: text.bodySmall),
+      ]),
     ]);
   }
 
@@ -3689,7 +3958,9 @@ class _AuditLogViewState extends State<_AuditLogView> {
       );
     }
     if (_rows.isEmpty) {
-      return _empty(_query.isEmpty ? 'No audit entries yet.' : 'No matching entries.');
+      return _empty(_hasFilters
+          ? 'No entries match these filters — try a wider date range or another category.'
+          : 'No audit entries yet.');
     }
     // The list stays interactive while a page is in flight — the foot is the
     // only thing that changes.
@@ -3816,6 +4087,214 @@ class _AuditLogViewState extends State<_AuditLogView> {
   }
 }
 
+// ---------------------------------------------------------------- concerns ---
+
+/// Severity bands, worst first — the order the screen renders them in.
+const List<String> _concernSeverities = ['high', 'medium', 'low'];
+
+Color _concernColor(String severity) => switch (severity) {
+      'high' => AppColors.danger,
+      'medium' => AppColors.warning,
+      _ => AppColors.info,
+    };
+
+/// What a band means in the owner's terms. "High" alone says how bad, not how
+/// soon — and how soon is the decision being made on this screen.
+String _concernBandTitle(String severity) => switch (severity) {
+      'high' => 'High — deal with today',
+      'medium' => 'Medium — deal with this week',
+      _ => 'Low — worth a look',
+    };
+
+/// One concern: what is wrong, WHO or WHAT it is happening to (by name), the
+/// server's suggested action, and a working way to go and fix it.
+///
+/// The routing is [_attentionCard]'s, deliberately: both screens read the same
+/// `deep_link`, so a row cannot send the Overview strip and this list to two
+/// different places. `_attentionFocus` drops any focus key the destination does
+/// not READ, which is why Attendance / Purchase Orders / Billing rows navigate
+/// with no focus payload at all rather than landing there and claiming the
+/// record "isn't in this list".
+Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav) {
+  final text = Theme.of(context).textTheme;
+  final severity = '${m['severity'] ?? 'low'}';
+  final colour = _concernColor(severity);
+  final count = _numOf(m['count']).round();
+  final title = '${m['title'] ?? m['label'] ?? ''}'.trim();
+  final advice = '${m['what_to_do'] ?? ''}'.trim();
+  final amount = m['amount'];
+
+  final link = (m['deep_link'] as Map?) ?? const {};
+  final deep = '${link['module'] ?? ''}';
+  final legacy = '${m['module'] ?? ''}';
+  final dest = nav == null ? null : (nav.canOpen(deep) ? deep : (nav.canOpen(legacy) ? legacy : null));
+  final focus = _attentionFocus(dest, '${m['key'] ?? ''}', link['params']);
+
+  final items = <Map>[for (final it in (m['items'] as List?) ?? const []) if (it is Map) it];
+  final shown = items.length > 5 ? items.sublist(0, 5) : items;
+  final more = count - shown.length;
+  final detail = '${m['detail'] ?? ''}'.trim();
+
+  return ForkCard(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        StatusChip(label: severity.toUpperCase(), color: colour, dense: true),
+        const SizedBox(width: AppSpacing.sm),
+        Expanded(
+          child: Text(title, style: text.titleSmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+        ),
+        if (amount != null) ...[
+          const SizedBox(width: AppSpacing.sm),
+          Text(_money(amount), style: text.titleSmall?.copyWith(color: AppColors.copperHi)),
+        ],
+      ]),
+      const SizedBox(height: 8),
+      Text('$count affected', style: text.labelSmall),
+      const SizedBox(height: 8),
+      // Names, not a count. A bare "6 items low on stock" sends the owner off to
+      // find out WHICH six; the server already knows and sends them.
+      if (shown.isNotEmpty) ...[
+        for (final it in shown)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 5, right: 7),
+                child: Icon(Icons.circle, size: 4, color: AppColors.textTertiary),
+              ),
+              Expanded(
+                child: Text('${it['label'] ?? ''}',
+                    style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+              ),
+              if ('${it['sub'] ?? ''}'.trim().isNotEmpty) ...[
+                const SizedBox(width: AppSpacing.sm),
+                Flexible(
+                  child: Text('${it['sub']}',
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(fontSize: 11, color: AppColors.textSecondary),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                ),
+              ],
+            ]),
+          ),
+        if (more > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 3),
+            child: Text('and $more more',
+                style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
+          ),
+      ] else if (detail.isNotEmpty)
+        Text(detail, style: text.bodySmall?.copyWith(color: AppColors.textSecondary)),
+      const SizedBox(height: 12),
+      // The suggested action, always — every concern on this screen carries one,
+      // and a problem stated without a next step is just bad news.
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: AppColors.tint(colour),
+          borderRadius: AppRadius.controlAll,
+          border: Border.all(color: AppColors.edge(colour)),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(Icons.tips_and_updates_outlined, size: 14, color: colour),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              advice.isEmpty
+                  // The server sends advice for every key it knows and a generic
+                  // sentence for one it does not, so this is a last resort — and
+                  // it still names a destination rather than shrugging.
+                  ? 'Open ${dest ?? legacy} and clear these $count.'
+                  : advice,
+              style: text.bodySmall,
+            ),
+          ),
+        ]),
+      ),
+      if (dest != null) ...[
+        const SizedBox(height: 10),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(
+            label: 'Open $dest',
+            icon: Icons.arrow_forward,
+            dense: true,
+            onPressed: () => nav!.openModule(dest, target: focus),
+          ),
+        ),
+      ],
+    ]),
+  );
+}
+
+/// Everything that needs a person, worst first.
+///
+/// Reads GET /analytics/concerns, which EXTENDS the Overview strip's
+/// `needs_attention` rather than re-detecting it — so a count here and a count
+/// on the Overview can never disagree. Gated on the same analytics permission as
+/// the rest of /analytics/*, which is what the module's keywords mirror.
+Widget concernsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+      load: () => rest.getMap('/analytics/concerns?days=30'),
+      builder: (context, data, reload) {
+        final nav = ModuleNavigator.of(context);
+        final text = Theme.of(context).textTheme;
+        final all = <Map>[for (final c in (data['concerns'] as List?) ?? const []) if (c is Map) c];
+        final totals = (data['totals'] as Map?) ?? const {};
+        final windowDays = _int(data['window_days']) ?? 30;
+
+        if (all.isEmpty) {
+          // Good news, not a failed load: an empty list is the state an owner is
+          // trying to reach, so it reads as an achievement rather than an error.
+          return EmptyState(
+            icon: Icons.verified_outlined,
+            title: 'Nothing needs your attention',
+            caption: 'No open concerns across stock, bills, approvals, staff, guest '
+                'feedback or suppliers in the last $windowDays days. Anything that '
+                'goes wrong shows up here on its own.',
+            action: ForkButton.ghost(
+                label: 'Check again', icon: Icons.refresh, dense: true, onPressed: reload),
+          );
+        }
+
+        final width = MediaQuery.sizeOf(context).width;
+        final cols = width >= 1500 ? 3 : (width >= 1000 ? 2 : 1);
+
+        final children = <Widget>[
+          SectionHeader(
+            title: 'Concerns',
+            count: all.length,
+            trailing: ForkButton.ghost(
+                label: 'Refresh', icon: Icons.refresh, dense: true, onPressed: reload),
+          ),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            for (final sev in _concernSeverities)
+              StatusChip(label: '${_int(totals[sev]) ?? 0} $sev', color: _concernColor(sev)),
+            InfoChip(icon: Icons.date_range, label: 'Last $windowDays days'),
+          ]),
+          const SizedBox(height: 16),
+        ];
+
+        for (final sev in _concernSeverities) {
+          final band = all.where((c) => '${c['severity'] ?? 'low'}' == sev).toList();
+          if (band.isEmpty) continue;
+          children.addAll([
+            SectionHeader(title: _concernBandTitle(sev), count: band.length),
+            _dashGrid([for (final c in band) _concernCard(context, c, nav)], cols),
+            const SizedBox(height: 20),
+          ]);
+        }
+
+        final generated = _s(data, 'generated_at', '');
+        if (generated.isNotEmpty) {
+          children.add(Text('Checked ${RestaurantTime.stamp(generated)}', style: text.labelSmall));
+        }
+
+        return ListView(padding: AppSpacing.pageNarrow, children: children);
+      },
+    );
+
 // Tables are uniform, tappable boxes (not organised by seat count — any table
 // can seat a flexible number of people). Tap a free table to seat guests; tap
 // an occupied one to see its single consolidated bill + APC, or release it.
@@ -3901,6 +4380,12 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
         final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
+        final legend = <Widget>[
+          StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
+          StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
+          StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
+        ];
+        final legendBelow = MediaQuery.sizeOf(context).width < 620;
         return Scaffold(
           backgroundColor: Colors.transparent,
           floatingActionButton: FloatingActionButton.extended(
@@ -3926,6 +4411,12 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                 }
                 return byKey.values.toList()..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
               }(),
+              // Every name on the floor, so a numbered run steps over the ones
+              // already taken instead of collecting "Table exists" from the
+              // server halfway through.
+              existing: [
+                for (final r in rows) _s(r as Map, 'table_name', ''),
+              ],
             ),
             icon: const Icon(Icons.add),
             label: const Text('Add table'),
@@ -3945,17 +4436,21 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                             ? 'Highlighted $focusTable — tap it to manage the bill.'
                             : '${focusTable ?? 'That table'} is not on this floor plan — it may have been removed, or belong to another outlet.',
                       ),
+                    // Legend doubles as the occupancy read-out — tint + label,
+                    // never colour alone. On a phone it moves to its own line:
+                    // three chips do not fit beside the title, and in the header
+                    // row they overflowed it by ~215px.
                     SectionHeader(
                       title: 'Floor plan',
                       count: rows.length,
-                      // Legend doubles as the occupancy read-out — tint + label,
-                      // never colour alone.
-                      trailing: Wrap(spacing: 6, runSpacing: 6, children: [
-                        StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
-                        StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
-                        StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
-                      ]),
+                      padding: EdgeInsets.only(bottom: legendBelow ? 8 : 14),
+                      trailing: legendBelow ? null : Wrap(spacing: 6, runSpacing: 6, children: legend),
                     ),
+                    if (legendBelow)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Wrap(spacing: 6, runSpacing: 6, children: legend),
+                      ),
                     // Floor SECTIONS — create / rename / un-label, and drag a
                     // table from one zone to another. See [_FloorSections].
                     _FloorSections(
@@ -4295,7 +4790,7 @@ class _FloorSectionsState extends State<_FloorSections> {
     }
   }
 
-  Widget _tableTile(Map m, {required bool canMove, required bool touch}) {
+  Widget _tableTile(Map m, {required bool canMove, required bool touch, required double width}) {
     final focused = widget.focusTable != null && _s(m, 'table_name') == widget.focusTable;
     Widget box({required bool focus}) => _TableBox(
           table: m,
@@ -4303,6 +4798,7 @@ class _FloorSectionsState extends State<_FloorSections> {
           profile: widget.profile,
           reload: widget.reload,
           focused: focus,
+          width: width,
         );
     if (!canMove) return box(focus: focused);
     // The dragged copy rides in the app overlay, outside any Scaffold, so it
@@ -4415,9 +4911,18 @@ class _FloorSectionsState extends State<_FloorSections> {
                   style: text.bodySmall,
                 )
               else
-                Wrap(spacing: 12, runSpacing: 12, children: [
-                  for (final m in members) _tableTile(m, canMove: canMove, touch: touch),
-                ]),
+                // Measured, not guessed: the tile sizes itself to the zone it is
+                // actually laid out in, which is what keeps a portrait phone at
+                // two across without touching the desktop breakpoints.
+                LayoutBuilder(
+                  builder: (context, box) {
+                    final tile = _tableTileWidth(box.maxWidth);
+                    return Wrap(spacing: 12, runSpacing: 12, children: [
+                      for (final m in members)
+                        _tableTile(m, canMove: canMove, touch: touch, width: tile),
+                    ]);
+                  },
+                ),
             ]),
           );
         },
@@ -4637,6 +5142,24 @@ class _NewSectionDialogState extends State<_NewSectionDialog> {
   }
 }
 
+/// Card width for one floor-plan tile inside a zone [available] px wide.
+///
+/// 168 is the design width and every desktop column keeps it. A portrait phone
+/// cannot: 390px leaves ~334 inside the page and zone padding, which is 2px
+/// short of two 168s, so the floor plan collapsed to ONE card per row — an
+/// owner scrolling past three tables to reach T4 mid-service. Below that
+/// threshold the tile takes half the row instead, so portrait is always at
+/// least 2-up, with a floor that keeps the name + status chip readable.
+double _tableTileWidth(double available) {
+  const preferred = 168.0;
+  const gap = 12.0; // the Wrap's spacing between tiles
+  if (!available.isFinite || available >= preferred * 2 + gap) return preferred;
+  // One pixel of slack, floored to whole pixels: a fractional layout width must
+  // not be what pushes the second card onto its own row.
+  final half = ((available - gap - 1) / 2).floorToDouble();
+  return half < 120 ? 120 : half;
+}
+
 class _TableBox extends StatelessWidget {
   final Map table;
   final RestClient rest;
@@ -4645,12 +5168,16 @@ class _TableBox extends StatelessWidget {
   // True when a caller (e.g. a notification's "Open T4") asked for this table —
   // draws the copper focus ring so the eye finds it in a full floor plan.
   final bool focused;
+
+  /// Set by the zone's [LayoutBuilder] so narrow screens still get two across.
+  final double width;
   const _TableBox({
     required this.table,
     required this.rest,
     required this.profile,
     required this.reload,
     this.focused = false,
+    this.width = 168,
   });
 
   @override
@@ -4706,7 +5233,7 @@ class _TableBox extends StatelessWidget {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOut,
-        width: 168,
+        width: width,
         // Min height (not fixed) so an extra row (waiter + payment-pending) grows
         // the card instead of overflowing the bottom.
         constraints: const BoxConstraints(minHeight: 128),
@@ -4781,8 +5308,8 @@ class _TableBox extends StatelessWidget {
             if (clubbedWith.isNotEmpty) ...[
               const SizedBox(height: 8),
               // Clubbed for a large party — name the tables it is joined to so
-              // nobody pulls one half away. Ellipsised (the box is only 168 wide)
-              // with the full set on the tooltip.
+              // nobody pulls one half away. Ellipsised (the box is 168px at its
+              // widest, less on a phone) with the full set on the tooltip.
               Tooltip(
                 message: 'Clubbed with ${clubbedWith.join(' + ')}',
                 child: Container(
@@ -5690,11 +6217,17 @@ class _TableSheetState extends State<_TableSheet> {
             const SizedBox(height: 20),
             const SectionHeader(title: 'Actions'),
             if (!_occupied)
+              // Scaled down rather than clipped: this sheet is now opened from a
+              // phone-width floor plan, where a full-size label of this length
+              // overflows its own button by ~20px.
               Center(
-                child: ForkButton(
-                  label: 'Seat guests & take order',
-                  icon: Icons.event_seat,
-                  onPressed: () => _seat(messenger),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: ForkButton(
+                    label: 'Seat guests & take order',
+                    icon: Icons.event_seat,
+                    onPressed: () => _seat(messenger),
+                  ),
                 ),
               )
             else ...[
@@ -5712,10 +6245,13 @@ class _TableSheetState extends State<_TableSheet> {
               ]),
               const SizedBox(height: 10),
               Center(
-                child: ForkButton.ghost(
-                  label: 'Release without payment',
-                  icon: Icons.logout,
-                  onPressed: () => _release(messenger),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: ForkButton.ghost(
+                    label: 'Release without payment',
+                    icon: Icons.logout,
+                    onPressed: () => _release(messenger),
+                  ),
                 ),
               ),
             ],
@@ -6544,28 +7080,127 @@ Future<void> _printTableQr(String tableName, String url) async {
   await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
 }
 
+/// What [allocateTableNames] worked out: the names to create, and the ones in
+/// that range it stepped over because the floor already has them.
+class TableNameRun {
+  /// Names to create, in order.
+  final List<String> names;
+
+  /// Names inside the scanned range that already exist. Reported rather than
+  /// swallowed — "I asked for 5 and got T4..T8" needs the reason on screen.
+  final List<String> skipped;
+  const TableNameRun(this.names, this.skipped);
+}
+
+/// Splits [seed] into a prefix and its trailing number ("T1" -> "T" + 1,
+/// "Patio 4" -> "Patio " + 4) and returns the next [count] FREE numbers from
+/// there, stepping over every name already in [existing]. Adding five tables
+/// from "T1" on a floor that already has T1..T3 yields T4..T8, not five
+/// collisions — that skipping is the explicit requirement.
+///
+/// A seed with no trailing number gets one appended ("Bar" -> Bar1, Bar2, …),
+/// and zero padding is kept ("T01" -> T02, T03) because that is how the floor
+/// was numbered to begin with. Matching is case-insensitive, the way the
+/// backend resolves a table name.
+TableNameRun allocateTableNames(String seed, int count, Iterable<String> existing) {
+  final trimmed = seed.trim();
+  if (trimmed.isEmpty || count < 1) return const TableNameRun([], []);
+  final match = RegExp(r'^(.*?)(\d+)$').firstMatch(trimmed);
+  final prefix = match?.group(1) ?? trimmed;
+  final digits = match?.group(2) ?? '1';
+  final start = int.tryParse(digits) ?? 1;
+  final width = digits.length;
+  final taken = {
+    for (final n in existing)
+      if (n.trim().isNotEmpty) n.trim().toLowerCase(),
+  };
+  final names = <String>[];
+  final skipped = <String>[];
+  // Bounded scan: a floor with a long run of taken numbers must still finish,
+  // and the loop must never depend on eventually finding a gap.
+  final limit = start + count + 500;
+  for (var n = start; names.length < count && n < limit; n++) {
+    final candidate = '$prefix${'$n'.padLeft(width, '0')}';
+    if (!taken.add(candidate.toLowerCase())) {
+      skipped.add(candidate);
+      continue;
+    }
+    names.add(candidate);
+  }
+  return TableNameRun(names, skipped);
+}
+
+/// Adds one table, or a numbered run of them. [existing] is every table name on
+/// the floor — it drives both the live preview in the dialog and the allocator,
+/// so a run never asks the server for a name that is already taken.
+///
+/// The permission is the backend's `Table Added` gate on POST /add-table, which
+/// a run reuses one row at a time: bulk adding is the same write, repeated, and
+/// gets no new authority. Placing tables into a zone that does not exist yet
+/// additionally needs the section grant, which is why the dialog only ever
+/// offers zones that are already on the floor.
 Future<void> _addTable(BuildContext context, RestClient rest, VoidCallback reload,
-    {List<String> sections = const []}) async {
+    {List<String> sections = const [], List<String> existing = const []}) async {
   final messenger = ScaffoldMessenger.of(context);
   final seats = await showDialog<_TableSeating>(
     context: context,
-    builder: (_) => _TableSeatingDialog(sections: sections),
+    builder: (_) => _TableSeatingDialog(sections: sections, existingNames: existing),
   );
   if (seats == null) return;
-  try {
-    await rest.post('/add-table', {
-      'table': {
-        'name': seats.name,
-        'capacity': seats.capacity,
-        'max_capacity': seats.maxCapacity,
-        // Omitted when Unassigned so the backend stores null.
-        if (seats.section.trim().isNotEmpty) 'section': seats.section.trim(),
-      },
-    });
-    reload();
-  } catch (e) {
-    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  // A single table keeps the old path exactly — the name typed is the name
+  // created, so "Patio" stays "Patio" instead of becoming "Patio1".
+  final run = seats.count <= 1
+      ? TableNameRun([seats.name], const [])
+      : allocateTableNames(seats.name, seats.count, existing);
+
+  final created = <String>[];
+  var failedName = '';
+  var error = '';
+  for (final name in run.names) {
+    try {
+      await rest.post('/add-table', {
+        'table': {
+          'name': name,
+          'capacity': seats.capacity,
+          'max_capacity': seats.maxCapacity,
+          // Omitted when Unassigned so the backend stores null.
+          if (seats.section.trim().isNotEmpty) 'section': seats.section.trim(),
+        },
+      });
+      created.add(name);
+    } catch (e) {
+      // Stop at the first rejection rather than firing the rest at a server
+      // that just refused: a partial batch has to be reported, not continued.
+      failedName = name;
+      error = '$e';
+      break;
+    }
   }
+  if (created.isNotEmpty) reload();
+  if (!context.mounted) return;
+
+  // One table, nothing skipped: behave exactly as before — silent on success,
+  // a snackbar on failure. Anything else gets the run report.
+  if (run.names.length <= 1 && run.skipped.isEmpty) {
+    if (error.isNotEmpty) messenger.showSnackBar(SnackBar(content: Text(error)));
+    return;
+  }
+  final notAttempted = run.names.skip(created.length + (failedName.isEmpty ? 0 : 1)).toList();
+  await _detailSheet(
+    context,
+    eyebrow: 'Floor',
+    title: created.isEmpty
+        ? 'No tables were added'
+        : 'Added ${created.length} table${created.length == 1 ? '' : 's'}',
+    children: [
+      if (created.isNotEmpty) _kv('Created', created.join(', ')),
+      if (run.skipped.isNotEmpty) _kv('Skipped', '${run.skipped.join(', ')} — already on the floor'),
+      if (failedName.isNotEmpty) _kv('Failed', '$failedName — $error'),
+      if (notAttempted.isNotEmpty) _kv('Not attempted', notAttempted.join(', ')),
+      if (seats.section.trim().isNotEmpty) _kv('Section', seats.section.trim()),
+      _kv('Seating', _seatsLabel({'capacity': seats.capacity, 'max_capacity': seats.maxCapacity})),
+    ],
+  );
 }
 
 /// What [_TableSeatingDialog] hands back: the table's name (add mode only), its
@@ -6577,7 +7212,17 @@ class _TableSeating {
   /// Zone the new table lands in. Empty = Unassigned (the field is then omitted
   /// from the request so the backend stores null).
   final String section;
-  const _TableSeating({required this.name, required this.capacity, required this.maxCapacity, this.section = ''});
+
+  /// How many tables to create from [name] onwards (add mode only). 1 is the
+  /// plain single add; more runs [allocateTableNames].
+  final int count;
+  const _TableSeating({
+    required this.name,
+    required this.capacity,
+    required this.maxCapacity,
+    this.section = '',
+    this.count = 1,
+  });
 }
 
 /// Add a table, or edit an existing one's seating. `existing` null == add mode.
@@ -6587,16 +7232,26 @@ class _TableSeatingDialog extends StatefulWidget {
   final Map? existing;
   /// Zones already on the floor, so a new table can be placed straight into one.
   final List<String> sections;
-  const _TableSeatingDialog({this.existing, this.sections = const []});
+
+  /// Every table name already on the floor, for the run preview. Named
+  /// [existingNames] because [existing] is the row being edited.
+  final List<String> existingNames;
+  const _TableSeatingDialog({this.existing, this.sections = const [], this.existingNames = const []});
 
   @override
   State<_TableSeatingDialog> createState() => _TableSeatingDialogState();
 }
 
+/// The most tables one run may create. High enough for a real floor being set
+/// up in one go, low enough that a slipped keystroke ("100" for "10") cannot
+/// fire a hundred writes at the server.
+const int _maxTableRun = 50;
+
 class _TableSeatingDialogState extends State<_TableSeatingDialog> {
   late final TextEditingController _name;
   late final TextEditingController _capacity;
   late final TextEditingController _max;
+  final _count = TextEditingController(text: '1');
   // True once the max has been typed into by hand — before that it tracks the
   // seat count, so the common "no extra chairs" case needs no thought.
   bool _maxTouched = false;
@@ -6622,14 +7277,31 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
       final c = _capacity.text.trim();
       if (_max.text != c) _max.text = c;
     });
+    // The preview has to answer "what will this actually create?" before the
+    // run happens, so it re-derives on every keystroke in either field.
+    if (_adding) {
+      _name.addListener(_refreshPreview);
+      _count.addListener(_refreshPreview);
+    }
   }
+
+  void _refreshPreview() => setState(() {});
 
   @override
   void dispose() {
     _name.dispose();
     _capacity.dispose();
     _max.dispose();
+    _count.dispose();
     super.dispose();
+  }
+
+  /// How many tables the run field is asking for, clamped to what a run may do.
+  /// Blank or unparseable reads as 1 — the plain single add.
+  int get _runCount {
+    final n = int.tryParse(_count.text.trim()) ?? 1;
+    if (n < 1) return 1;
+    return n > _maxTableRun ? _maxTableRun : n;
   }
 
   void _submit() {
@@ -6648,23 +7320,81 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
       setState(() => _error = 'Max capacity cannot be below the seat count ($cap).');
       return;
     }
-    Navigator.pop(context, _TableSeating(name: name, capacity: cap, maxCapacity: max, section: _section));
+    final typed = int.tryParse(_count.text.trim());
+    if (_adding && (typed == null || typed < 1 || typed > _maxTableRun)) {
+      setState(() => _error = 'How many must be a whole number from 1 to $_maxTableRun.');
+      return;
+    }
+    Navigator.pop(
+      context,
+      _TableSeating(
+        name: name,
+        capacity: cap,
+        maxCapacity: max,
+        section: _section,
+        count: _adding ? _runCount : 1,
+      ),
+    );
+  }
+
+  /// Spells out the run before it is committed: the names that will be created
+  /// and the ones being stepped over, so "why did I get T4 when I typed T1?"
+  /// is answered in the dialog rather than after the writes.
+  Widget _runPreview(TextTheme text) {
+    final run = allocateTableNames(_name.text, _runCount, widget.existingNames);
+    if (run.names.isEmpty && run.skipped.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        if (run.names.isNotEmpty)
+          Text('Creates ${run.names.join(', ')}',
+              style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.copperHi)),
+        if (run.skipped.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 3),
+            child: Text('Skips ${run.skipped.join(', ')} — already on the floor',
+                style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textTertiary)),
+          ),
+      ]),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    // 340 is the design width, but an AlertDialog on a phone is narrower than
+    // that — forcing it there overflows the fields sideways.
+    final room = MediaQuery.sizeOf(context).width - 80;
+    final width = room < 340 ? (room < 220 ? 220.0 : room) : 340.0;
     return AlertDialog(
       title: Text(_adding ? 'Add table' : 'Seating for ${_s(widget.existing!, 'table_name')}'),
       content: SizedBox(
-        width: 340,
+        width: width,
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          if (_adding)
-            TextField(
-              controller: _name,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: 'Table name (e.g. T7)'),
-            ),
+          if (_adding) ...[
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(
+                child: TextField(
+                  controller: _name,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Table name (e.g. T7)'),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              // The run counter. Numbering carries on from the name typed left
+              // of it and skips whatever is taken, so an owner setting up a
+              // floor types T1 / 12 instead of the dialog twelve times.
+              SizedBox(
+                width: 88,
+                child: TextField(
+                  controller: _count,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'How many'),
+                ),
+              ),
+            ]),
+            _runPreview(text),
+          ],
           TextField(
             controller: _capacity,
             autofocus: !_adding,
@@ -6696,8 +7426,12 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
           ],
           const SizedBox(height: 10),
           Text(
-            'A party larger than the max is offered a combination of adjacent '
-            'tables instead — staff always confirm the suggestion.',
+            _adding && _runCount > 1
+                ? 'Seats, max capacity and section apply to every table in the run. '
+                    'A party larger than the max is offered a combination of adjacent '
+                    'tables instead — staff always confirm the suggestion.'
+                : 'A party larger than the max is offered a combination of adjacent '
+                    'tables instead — staff always confirm the suggestion.',
             style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textTertiary),
           ),
           if (_error != null) ...[
@@ -6708,7 +7442,10 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
       ),
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-        FilledButton(onPressed: _submit, child: Text(_adding ? 'Add' : 'Save')),
+        FilledButton(
+          onPressed: _submit,
+          child: Text(_adding ? (_runCount > 1 ? 'Add $_runCount tables' : 'Add') : 'Save'),
+        ),
       ],
     );
   }
@@ -8003,6 +8740,47 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             .where((r) => stockColor(_s(r as Map, 'status', 'In Stock')) == AppColors.danger)
             .length;
 
+        // --- Sections -------------------------------------------------------
+        // Stock is segregated by CATEGORY, which is the tenant's own stored
+        // roster (`inventory_categories` on the restaurant settings, managed by
+        // the Categories dialog and cascaded on rename by
+        // POST /inventory-categories/rename) — not a grouping invented on this
+        // device. Same shape as the floor's zones: the roster is unioned with
+        // the labels the items themselves carry, so a category that exists but
+        // holds nothing still gets a heading, and an item labelled with a
+        // category that has since left the roster is never hidden.
+        //
+        // Keyed case-insensitively because that is how the rename/dedupe path
+        // treats a category name; the first spelling seen wins the casing.
+        // Uncategorised always renders LAST, so nothing is buried.
+        final byKey = <String, List<Map>>{};
+        final sectionLabel = <String, String>{};
+        for (final r in rows) {
+          final m = r as Map;
+          final c = _s(m, 'category', '').trim();
+          final key = c.toLowerCase();
+          byKey.putIfAbsent(key, () => <Map>[]).add(m);
+          if (c.isNotEmpty) sectionLabel.putIfAbsent(key, () => c);
+        }
+        for (final c in categories) {
+          final name = c.trim();
+          if (name.isEmpty) continue;
+          byKey.putIfAbsent(name.toLowerCase(), () => <Map>[]);
+          sectionLabel.putIfAbsent(name.toLowerCase(), () => name);
+        }
+        final namedKeys = byKey.keys.where((k) => k.isNotEmpty).toList()..sort();
+        final orderedKeys = <String>[...namedKeys, if (byKey.containsKey('')) ''];
+
+        // Flattened in render order so the list stays lazy: one entry per
+        // heading, one per item. [item] null marks the heading.
+        final entries = <({String key, Map? item})>[];
+        for (final key in orderedKeys) {
+          entries.add((key: key, item: null));
+          for (final m in byKey[key] ?? const <Map>[]) {
+            entries.add((key: key, item: m));
+          }
+        }
+
         // Manage the tenant's inventory categories (add/rename/delete). Rename
         // cascades onto items server-side, so reload to refresh when changed.
         Future<void> manageCategories() async {
@@ -8041,7 +8819,10 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             ]),
           ),
           Expanded(
-            child: rows.isEmpty
+            // Sections created before any stock is entered are a real state —
+            // don't hide the roster behind "no inventory", the way the floor
+            // plan hid an empty zone before it read the section list.
+            child: rows.isEmpty && namedKeys.isEmpty
                 ? const EmptyState(
                     icon: Icons.inventory_2_outlined,
                     title: 'No inventory yet',
@@ -8049,7 +8830,7 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   )
                 : ListView.builder(
                     padding: AppSpacing.pageNarrow,
-                    itemCount: rows.length + 1,
+                    itemCount: entries.length + 1,
                     itemBuilder: (c, i) {
                       if (i == 0) {
                         // Low-stock summary from the rows already loaded.
@@ -8070,10 +8851,55 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                             ),
                           ], narrow ? 1 : 3),
                           const SizedBox(height: AppSpacing.xxl),
-                          SectionHeader(title: 'Stock levels', count: rows.length),
+                          SectionHeader(
+                            title: 'Stock levels',
+                            count: rows.length,
+                            trailing: Text(
+                              '${namedKeys.length} section${namedKeys.length == 1 ? '' : 's'}',
+                              style: text.bodySmall,
+                            ),
+                          ),
+                          Text(
+                            'Grouped by category — manage the list with Categories above.',
+                            style: text.bodySmall,
+                          ),
                         ]);
                       }
-                      final it = rows[i - 1] as Map;
+                      final entry = entries[i - 1];
+                      final it = entry.item;
+                      if (it == null) {
+                        final members = byKey[entry.key] ?? const <Map>[];
+                        final short = members
+                            .where((m) => stockColor(_s(m, 'status', 'In Stock')) != AppColors.success)
+                            .length;
+                        return Padding(
+                          padding: const EdgeInsets.only(top: AppSpacing.lg),
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            SectionHeader(
+                              title: entry.key.isEmpty
+                                  ? 'Uncategorised'
+                                  : (sectionLabel[entry.key] ?? entry.key),
+                              count: members.length,
+                              padding: const EdgeInsets.only(bottom: 8),
+                              trailing: short == 0
+                                  ? null
+                                  : StatusChip(
+                                      label: '$short need${short == 1 ? 's' : ''} restocking',
+                                      color: AppColors.warning,
+                                      dense: true,
+                                    ),
+                            ),
+                            // A category on the roster with nothing in it is a
+                            // real, saved category — say so rather than letting
+                            // the empty heading read as a glitch.
+                            if (members.isEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 10),
+                                child: Text('Nothing in this section yet.', style: text.bodySmall),
+                              ),
+                          ]),
+                        );
+                      }
                       final status = _s(it, 'status', 'In Stock');
                       final color = stockColor(status);
                       final attention = color != AppColors.success;
@@ -8095,17 +8921,11 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                           ),
                           const SizedBox(width: AppSpacing.md),
                           Expanded(
-                            child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(_s(it, 'name'),
-                                      style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                                  const SizedBox(height: 6),
-                                  Wrap(spacing: 6, runSpacing: 6, children: [
-                                    InfoChip(icon: Icons.category_outlined, label: _s(it, 'category')),
-                                  ]),
-                                ]),
+                            // The category chip that used to sit under the name
+                            // is now the heading this row lives under, so it is
+                            // not repeated on every card.
+                            child: Text(_s(it, 'name'),
+                                style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
                           ),
                           const SizedBox(width: AppSpacing.md),
                           MicroStat(
@@ -8376,93 +9196,572 @@ class _VendorsSheetState extends State<_VendorsSheet> {
   }
 }
 
-Widget customersModule(RestClient rest, Profile p) => AsyncView<List>(
-      load: () => rest.getList('/get-customers'),
-      builder: (context, rows, reload) {
-        if (rows.isEmpty) return _empty('No customers.');
-        final text = Theme.of(context).textTheme;
-        String initialsOf(String name) {
-          final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
-          if (parts.isEmpty) return '?';
-          return parts.length == 1
-              ? parts.first.substring(0, 1)
-              : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
-        }
+String _guestInitials(String name) {
+  final parts = name.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();
+  if (parts.isEmpty) return '?';
+  return parts.length == 1
+      ? parts.first.substring(0, 1)
+      : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
+}
 
-        // A guest is a name, a number and a visit count — one full-width row
-        // each left most of a desktop window empty. Same 4/3/2/1 tiling as the
-        // Orders grid; the email and the booking state move into the tap.
-        final width = MediaQuery.sizeOf(context).width;
-        final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
-        final cards = <Widget>[];
-        for (final r in rows) {
-          final m = r as Map;
-          final name = _s(m, 'name', 'Guest');
-          final phone = _s(m, 'phone_number', '');
-          final email = _s(m, 'email', '');
-          final bookings = _int(m['booking_count']) ?? 0;
-          final booked = m['has_booking'] == true;
-          cards.add(ForkCard(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            // A tile ellipses long names and addresses; the tap shows them in
-            // full. Read-only by design — nothing on this screen mutates.
-            onTap: () => _detailSheet(
-              context,
-              eyebrow: 'Guest book',
-              title: name,
-              jumpTo: booked ? 'Bookings' : null,
-              children: [
-                _kv('Phone', phone.isEmpty ? '—' : phone),
-                _kv('Email', email.isEmpty ? '—' : email),
-                _kv('Bookings', '$bookings'),
-                _kv('Booking open', booked ? 'Yes' : 'No'),
-              ],
-            ),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                InitialsAvatar(initials: initialsOf(name)),
-                const SizedBox(width: AppSpacing.md),
-                Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                    Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                    const SizedBox(height: 2),
-                    Text(phone.isEmpty ? '—' : phone,
-                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  ]),
-                ),
-              ]),
-              const SizedBox(height: 10),
-              Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Expanded(
-                  child: email.isEmpty
-                      ? const SizedBox.shrink()
-                      : Text(email,
-                          style: text.bodySmall!.copyWith(fontSize: 11),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis),
-                ),
-                const SizedBox(width: 8),
-                MicroStat(value: '$bookings', label: 'Bookings', alignEnd: true),
-              ]),
-              if (booked) ...[
-                const SizedBox(height: 8),
-                const Align(
-                  alignment: Alignment.centerLeft,
-                  child: InfoChip(icon: Icons.event_available_outlined, label: 'Booking open'),
-                ),
-              ],
-            ]),
-          ));
+/// The three ways the guest book can be ranked — server sort key, the label the
+/// owner reads, and the figure the leaderboards put beside a name.
+const List<List<String>> _customerSorts = [
+  ['recent', 'Most recent'],
+  ['spend', 'Most spent'],
+  ['visits', 'Most visited'],
+];
+
+/// The server's own segmentation. Counts come off `segment_counts`, which spans
+/// the whole filtered set rather than the loaded page.
+const List<List<String>> _customerSegments = [
+  ['all', 'All guests'],
+  ['new', 'New'],
+  ['regular', 'Regular'],
+  ['high-spend', 'High spend'],
+  ['dormant', 'Dormant'],
+];
+
+String _customerSortLabel(String key) =>
+    _customerSorts.firstWhere((s) => s[0] == key, orElse: () => const ['', ''])[1];
+
+String _customerSegmentLabel(String key) =>
+    _customerSegments.firstWhere((s) => s[0] == key, orElse: () => const ['', ''])[1];
+
+/// The one figure a ranking is about, so a "most spent" list is never headed by
+/// a number that came from a different measure.
+String _customerRankValue(Map m, String sort) => switch (sort) {
+      'spend' => _money(m['total_spend']),
+      'visits' => '${_int(m['visits']) ?? 0} visit${(_int(m['visits']) ?? 0) == 1 ? '' : 's'}',
+      _ => _s(m, 'last_visit', '').isEmpty ? 'never' : _fmtDay(_s(m, 'last_visit', '')),
+    };
+
+/// The guest book: an overview band ranking the whole filtered set three ways,
+/// and the full list underneath sorted and segmented by the same controls.
+///
+/// EVERY ranking and every page comes from GET /customers/segments, which sorts
+/// and pages in SQL. Re-sorting a loaded page in the client would produce a
+/// "most spent" list that is really "most spent among the first fifty", and it
+/// would start lying the moment a restaurant has more guests than one page.
+Widget customersModule(RestClient rest, Profile p) => _CustomersView(rest: rest);
+
+class _CustomersView extends StatefulWidget {
+  final RestClient rest;
+  const _CustomersView({required this.rest});
+  @override
+  State<_CustomersView> createState() => _CustomersViewState();
+}
+
+class _CustomersViewState extends State<_CustomersView> {
+  static const int _pageSize = 50;
+  // How many names a leaderboard card shows.
+  static const int _leaderSize = 5;
+
+  final List<Map> _rows = [];
+  final Set<String> _ids = {};
+  final ScrollController _scroll = ScrollController();
+  final TextEditingController _searchField = TextEditingController();
+
+  // Leaderboards, keyed by sort. Each is its own server-ranked request over the
+  // SAME segment and search as the list, so the band answers "who tops this
+  // filter" and not "who tops the page".
+  final Map<String, List<Map>> _leaders = {};
+  // Per-ranking failures, so a card that could not be built says why instead of
+  // rendering as an empty leaderboard.
+  final Map<String, String> _leaderErrors = {};
+  bool _leadersLoading = false;
+
+  bool _loading = true;
+  bool _loadingMore = false;
+  bool _hasMore = false;
+  int _total = 0;
+  String? _error;
+  // Per-segment counts, and the search they were taken under.
+  //
+  // The server computes `segment_counts` over the set AFTER its own segment
+  // filter, so a response for segment=regular reports 0 dormant guests — true of
+  // that response, and a flat lie on a tab that is meant to say how many dormant
+  // guests exist. So only an UNSEGMENTED response updates these, and they are
+  // only shown while the search they were taken under is still in force.
+  Map<String, int> _counts = const {};
+  String? _countsQuery;
+  String _spendBasis = '';
+
+  String _sort = 'recent';
+  String _segment = 'all';
+  String _query = '';
+  Timer? _debounce;
+  int _serial = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _scroll.dispose();
+    _searchField.dispose();
+    super.dispose();
+  }
+
+  String _query4(String sort, {required int limit, required int offset, bool meta = false}) {
+    final q = _query.trim();
+    return '/customers/segments?limit=$limit&offset=$offset&sort=$sort'
+        '${meta ? '&meta=1' : ''}'
+        '${_segment == 'all' ? '' : '&segment=${Uri.encodeQueryComponent(_segment)}'}'
+        '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}';
+  }
+
+  /// One page of the list. [append] extends it; otherwise the list restarts at
+  /// offset 0 and the three leaderboards are re-ranked under the new filters.
+  Future<void> _load({bool append = false}) async {
+    if (append && (_loadingMore || !_hasMore)) return;
+    final serial = ++_serial;
+    setState(() {
+      if (append) {
+        _loadingMore = true;
+      } else {
+        _loading = true;
+        _error = null;
+      }
+    });
+    final offset = append ? _rows.length : 0;
+    try {
+      final res = await widget.rest
+          .getMap(_query4(_sort, limit: _pageSize, offset: offset, meta: true));
+      if (!mounted || serial != _serial) return;
+      final page = <Map>[for (final r in (res['customers'] as List?) ?? const []) if (r is Map) r];
+      setState(() {
+        if (!append) {
+          _rows.clear();
+          _ids.clear();
         }
-        return ListView(
-          padding: AppSpacing.pageNarrow,
-          children: [
-            SectionHeader(title: 'Guest book', count: rows.length),
-            _dashGrid(cards, cols),
-          ],
-        );
-      },
+        var added = 0;
+        for (final r in page) {
+          final id = _s(r, 'customer_id', '');
+          if (id.isNotEmpty && !_ids.add(id)) continue;
+          _rows.add(r);
+          added++;
+        }
+        _total = _int(res['total']) ?? _rows.length;
+        _hasMore = res['has_more'] == true && (!append || added > 0);
+        if (_s(res, 'segment', 'all') == 'all') {
+          _counts = <String, int>{
+            for (final e in ((res['segment_counts'] as Map?) ?? const {}).entries)
+              '${e.key}': _int(e.value) ?? 0,
+          };
+          _countsQuery = _query;
+        }
+        _spendBasis = _s(res, 'spend_basis', '');
+        _loading = false;
+        _loadingMore = false;
+      });
+      if (!append) await _loadLeaders(serial);
+    } catch (e) {
+      if (!mounted || serial != _serial) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+        _loadingMore = false;
+        if (append) _hasMore = false;
+      });
+    }
+  }
+
+  /// The overview band. Three small server-ranked reads, not a re-sort of what
+  /// is already on screen.
+  ///
+  /// Each ranking is awaited on its own so one failure costs one card. A failed
+  /// card SAYS it failed — it must not fall back to an empty list, which reads
+  /// identically to "no guests match" and would hide a broken endpoint.
+  Future<void> _loadLeaders(int serial) async {
+    final out = <String, List<Map>>{};
+    final failed = <String, String>{};
+    Future<void> rank(List<String> s) async {
+      try {
+        final rows = await widget.rest.getList(_query4(s[0], limit: _leaderSize, offset: 0));
+        out[s[0]] = [for (final r in rows) if (r is Map) r];
+      } catch (e) {
+        failed[s[0]] = '$e';
+      }
+    }
+
+    setState(() => _leadersLoading = true);
+    await Future.wait([for (final s in _customerSorts) rank(s)]);
+    if (!mounted || serial != _serial) return;
+    setState(() {
+      _leaders
+        ..clear()
+        ..addAll(out);
+      _leaderErrors
+        ..clear()
+        ..addAll(failed);
+      _leadersLoading = false;
+    });
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients || _loading || _loadingMore || !_hasMore) return;
+    final pos = _scroll.position;
+    if (pos.pixels >= pos.maxScrollExtent - 400) _load(append: true);
+  }
+
+  /// Sort, segment and search all share one rule: the request restarts at offset
+  /// 0, the loaded rows are dropped, and the leaderboards are re-ranked. A list
+  /// that kept its old rows under a new sort would be ordered by neither.
+  void _applyFilter(VoidCallback change) {
+    setState(() {
+      change();
+      _rows.clear();
+      _ids.clear();
+      _total = 0;
+      _hasMore = false;
+      _leaders.clear();
+      _leaderErrors.clear();
+    });
+    _load();
+  }
+
+  void _onSearchChanged(String v) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      final next = v.trim();
+      if (!mounted || next == _query) return;
+      _applyFilter(() => _query = next);
+    });
+  }
+
+  /// The number on a segment tab, or null when there is no honest one to show.
+  ///
+  /// The active tab reports the server's `total` for exactly what is listed
+  /// below it. The others can only use counts captured from an unsegmented
+  /// response taken under the same search — anything else would be a number
+  /// describing a different question.
+  int? _segmentCount(String seg) {
+    if (seg == _segment) return _total;
+    final usable = _countsQuery != null && _countsQuery == _query;
+    if (!usable || _counts.isEmpty) return null;
+    if (seg == 'all') return _counts.values.reduce((a, b) => a + b);
+    return _counts[seg];
+  }
+
+  void _guestSheet(Map m) {
+    final visits = _int(m['visits']) ?? 0;
+    final since = _int(m['days_since_last_visit']);
+    final rating = m['avg_rating'];
+    final feedbacks = _int(m['feedbacks']) ?? 0;
+    _detailSheet(
+      context,
+      eyebrow: 'Guest book · ${_customerSegmentLabel(_s(m, 'segment', 'all'))}',
+      title: _s(m, 'name', 'Guest'),
+      children: [
+        _kv('Phone', _s(m, 'phone', '')),
+        _kv('Email', _s(m, 'email', '')),
+        _kv('Visits', '$visits'),
+        _kv('Bills', '${_int(m['bills']) ?? 0}'),
+        _kv('Total spent', _money(m['total_spend'])),
+        _kv('Average per visit', _money(m['avg_spend_per_visit'])),
+        _kv('Of which tax', _money(m['total_tax'])),
+        _kv('Of which service charge', _money(m['total_service_charge'])),
+        _kv('Pre-tax spend', _money(m['pre_tax_spend'])),
+        _kv('Last visit',
+            _s(m, 'last_visit', '').isEmpty ? 'Never' : _fmtDay(_s(m, 'last_visit', ''))),
+        _kv('Days since', since == null ? '—' : '$since'),
+        // Never a bare 0 for "we have no ratings" — the count says which it is.
+        _kv('Guest rating',
+            rating == null || feedbacks == 0 ? 'No feedback yet' : '${_score(rating)} / 5 from $feedbacks'),
+        if (_spendBasis.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(_spendBasis, style: Theme.of(context).textTheme.bodySmall),
+        ],
+      ],
     );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final loaded = _rows.length;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+        child: SectionHeader(
+          title: 'Guest book',
+          // The server's count for the current filters, not how many rows have
+          // been paged in.
+          count: _loading && loaded == 0 ? null : _total,
+          padding: const EdgeInsets.only(bottom: 12),
+          trailing: loaded == 0 || loaded >= _total ? null : TickTag('$loaded loaded'),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+        child: TextField(
+          controller: _searchField,
+          decoration: const InputDecoration(
+            prefixIcon: Icon(Icons.search, size: 18),
+            hintText: 'Find a guest by name, phone or email…',
+            isDense: true,
+          ),
+          onChanged: _onSearchChanged,
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // One sort control. It orders the leaderboard band AND the list below
+          // it, so the two can never disagree about what "most spent" means.
+          ForkTabs(
+            tabs: [for (final s in _customerSorts) s[1]],
+            selected: _customerSorts.indexWhere((s) => s[0] == _sort).clamp(0, _customerSorts.length - 1),
+            onSelected: (i) {
+              final next = _customerSorts[i][0];
+              if (next == _sort) return;
+              _applyFilter(() => _sort = next);
+            },
+          ),
+          const SizedBox(height: 10),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            for (final seg in _customerSegments)
+              _SegmentChip(
+                label: seg[1],
+                count: _segmentCount(seg[0]),
+                selected: _segment == seg[0],
+                onTap: () {
+                  if (_segment == seg[0]) return;
+                  _applyFilter(() => _segment = seg[0]);
+                },
+              ),
+          ]),
+        ]),
+      ),
+      Expanded(child: _body(context)),
+    ]);
+  }
+
+  Widget _body(BuildContext context) {
+    if (_loading && _rows.isEmpty) {
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          for (var i = 0; i < 6; i++)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: SkeletonBox(height: 78, radius: AppRadius.card),
+            ),
+        ],
+      );
+    }
+    if (_error != null && _rows.isEmpty) {
+      return EmptyState(
+        icon: Icons.error_outline,
+        title: "Couldn't load the guest book",
+        caption: _error!,
+        action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: _load),
+      );
+    }
+    if (_rows.isEmpty) {
+      return _empty(_query.isEmpty && _segment == 'all'
+          ? 'No guests on record yet.'
+          : 'No guests match these filters.');
+    }
+
+    final text = Theme.of(context).textTheme;
+    final width = MediaQuery.sizeOf(context).width;
+    final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+    final bandCols = width >= 1120 ? 3 : (width >= 760 ? 2 : 1);
+
+    return ListView(
+      controller: _scroll,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      children: [
+        SectionHeader(
+          title: 'Overview',
+          trailing: TickTag(_segment == 'all' && _query.isEmpty
+              ? 'across all $_total guests'
+              : 'across the $_total matching'),
+        ),
+        _dashGrid([
+          for (final s in _customerSorts) _leaderCard(context, s[0], s[1]),
+        ], bandCols),
+        const SizedBox(height: 20),
+        SectionHeader(
+          title: '${_customerSegmentLabel(_segment)} · ${_customerSortLabel(_sort).toLowerCase()}',
+          count: _total,
+        ),
+        _dashGrid([for (final m in _rows) _guestCard(context, m)], cols),
+        const SizedBox(height: 12),
+        _pagingFoot(context, text),
+      ],
+    );
+  }
+
+  /// One ranking of the whole filtered set. Says so in as many words, because a
+  /// top-five that silently meant "of the page" would be indistinguishable.
+  Widget _leaderCard(BuildContext context, String sort, String title) {
+    final text = Theme.of(context).textTheme;
+    final rows = _leaders[sort] ?? const <Map>[];
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      selected: sort == _sort,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(title, style: text.titleSmall)),
+          if (sort == _sort) const TickTag('sorting the list'),
+        ]),
+        const SizedBox(height: 8),
+        if (_leaderErrors.containsKey(sort))
+          Text("Couldn't rank: ${_leaderErrors[sort]}",
+              style: text.bodySmall?.copyWith(color: AppColors.danger))
+        else if (_leadersLoading && rows.isEmpty)
+          const SkeletonBox(height: 84, radius: AppRadius.card)
+        else if (rows.isEmpty)
+          Text('Nothing to rank under these filters.', style: text.bodySmall)
+        else
+          for (var i = 0; i < rows.length; i++)
+            InkWell(
+              onTap: () => _guestSheet(rows[i]),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(children: [
+                  SizedBox(
+                    width: 18,
+                    child: Text('${i + 1}', style: text.labelSmall),
+                  ),
+                  Expanded(
+                    child: Text(_s(rows[i], 'name', 'Guest'),
+                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  Text(_customerRankValue(rows[i], sort),
+                      style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+                ]),
+              ),
+            ),
+      ]),
+    );
+  }
+
+  Widget _guestCard(BuildContext context, Map m) {
+    final text = Theme.of(context).textTheme;
+    final name = _s(m, 'name', 'Guest');
+    final phone = _s(m, 'phone', '');
+    final visits = _int(m['visits']) ?? 0;
+    final last = _s(m, 'last_visit', '');
+    final segment = _s(m, 'segment', '');
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      onTap: () => _guestSheet(m),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          InitialsAvatar(initials: _guestInitials(name)),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 2),
+              Text(phone.isEmpty ? '—' : phone,
+                  style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ]),
+          ),
+        ]),
+        const SizedBox(height: 10),
+        // Wrapped rather than spaced across a Row: a lifetime spend can run to
+        // seven figures, and three intrinsic-width stats on one line overflow
+        // the narrowest column this grid produces.
+        Wrap(spacing: AppSpacing.lg, runSpacing: 8, children: [
+          MicroStat(value: _money(m['total_spend']), label: 'Spent'),
+          MicroStat(value: '$visits', label: 'Visits'),
+          MicroStat(value: last.isEmpty ? 'never' : _fmtDay(last), label: 'Last'),
+        ]),
+        if (segment.isNotEmpty && segment != '—') ...[
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: InfoChip(icon: Icons.sell_outlined, label: _customerSegmentLabel(segment)),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  Widget _pagingFoot(BuildContext context, TextTheme text) {
+    if (_loadingMore) {
+      return Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        const SizedBox(
+          width: 13,
+          height: 13,
+          child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.copper),
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        Text('Loading the next $_pageSize…', style: text.bodySmall),
+      ]);
+    }
+    if (_hasMore) {
+      return Center(
+        child: ForkButton.ghost(
+          label: 'Load more (${_rows.length} of $_total)',
+          icon: Icons.expand_more,
+          dense: true,
+          onPressed: () => _load(append: true),
+        ),
+      );
+    }
+    return Center(
+      child: Text(
+        _error ?? 'All $_total shown',
+        textAlign: TextAlign.center,
+        style: text.bodySmall?.copyWith(color: _error == null ? null : AppColors.danger),
+      ),
+    );
+  }
+}
+
+/// A segment filter pill carrying its own server-side count.
+class _SegmentChip extends StatelessWidget {
+  const _SegmentChip({
+    required this.label,
+    required this.count,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final int? count;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? AppColors.tint(AppColors.copper) : AppColors.inset,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: selected ? AppColors.edge(AppColors.copper) : AppColors.border),
+          ),
+          child: Text(
+            // The count is part of the label, so selection is never the only
+            // thing colour is carrying.
+            count == null ? label : '$label · $count',
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+              color: selected ? AppColors.copperHi : AppColors.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 // Month-by-month business summary, up to 3 years back.
 Widget historyModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
@@ -14858,6 +16157,12 @@ class _AttendanceViewState extends State<_AttendanceView> {
   List _team = [];
   List _pending = [];
 
+  /// The window GET /attendance actually summarised, as it sent it back. The
+  /// team cards are totals over this range, so the detail has to name it rather
+  /// than let "last 30 days" in a heading stand in for the server's answer.
+  String _from = '';
+  String _to = '';
+
   bool get _isManager =>
       widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin') ||
       widget.profile.role == 'manager' || widget.profile.roleAll.contains('manager');
@@ -14874,13 +16179,24 @@ class _AttendanceViewState extends State<_AttendanceView> {
       final me = await widget.rest.getMap('/attendance/me');
       List team = const [];
       List pending = const [];
+      var from = '';
+      var to = '';
       if (_isManager) {
         final t = await widget.rest.getMap('/attendance').catchError((_) => <String, dynamic>{});
         team = (t['rows'] as List?) ?? const [];
         pending = (t['pending'] as List?) ?? const [];
+        from = _s(t, 'from', '');
+        to = _s(t, 'to', '');
       }
       if (!mounted) return;
-      setState(() { _me = me; _team = team; _pending = pending; _loading = false; });
+      setState(() {
+        _me = me;
+        _team = team;
+        _pending = pending;
+        _from = from;
+        _to = to;
+        _loading = false;
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() { _error = '$e'; _loading = false; });
@@ -14888,6 +16204,109 @@ class _AttendanceViewState extends State<_AttendanceView> {
   }
 
   String _hm(int mins) => '${mins ~/ 60}h ${mins % 60}m';
+
+  /// Length of a shift in minutes — an open one measured to now. A duration is
+  /// a difference between two instants, so it is computed on the raw
+  /// timestamps; only the clock TIMES either side of it are rendered in the
+  /// restaurant's zone.
+  int? _shiftMinutes(String clockIn, String clockOut) {
+    final from = DateTime.tryParse(clockIn.trim());
+    if (from == null) return null;
+    final to = clockOut.trim().isEmpty ? DateTime.now() : DateTime.tryParse(clockOut.trim());
+    if (to == null) return null;
+    final mins = to.toUtc().difference(from.toUtc()).inMinutes;
+    return mins < 0 ? 0 : mins;
+  }
+
+  /// Approve or reject a pending clock-in. The backend gates both on the
+  /// existing 'Review Attendance' permission — this is the same call the row
+  /// buttons make, kept in one place so the detail sheet cannot drift from it.
+  Future<void> _review(Map m, bool ok) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.rest.post('/attendance/${m['id']}/${ok ? 'approve' : 'reject'}');
+      await _load();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  /// The full record behind a pending-approval card: who, when they clocked in
+  /// (restaurant time, spelled out with its offset), whether the shift is still
+  /// open, how long it has run — and the review actions themselves, so the
+  /// decision can be made from the detail rather than from the summary row.
+  void _pendingSheet(Map m) {
+    final clockIn = _s(m, 'clock_in', '');
+    final clockOut = _s(m, 'clock_out', '');
+    final mins = _shiftMinutes(clockIn, clockOut);
+    _detailSheet(
+      context,
+      eyebrow: 'Attendance · pending approval',
+      title: _s(m, 'name', 'Employee'),
+      children: [
+        _kv('Clocked in', clockIn.isEmpty ? '—' : RestaurantTime.stamp(clockIn)),
+        _kv('Clocked out', clockOut.isEmpty ? 'Still on shift' : RestaurantTime.stamp(clockOut)),
+        _kv('Length', mins == null ? '—' : '${_hm(mins)}${clockOut.isEmpty ? ' so far' : ''}'),
+        _kv('Status', 'Awaiting approval'),
+        const SizedBox(height: 14),
+        Text(
+          'Approving keeps the clock-in time above exactly as recorded — the '
+          'decision is stamped separately.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 10),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          ForkButton(
+            label: 'Approve',
+            icon: Icons.check,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _review(m, true);
+            },
+          ),
+          ForkButton.ghost(
+            label: 'Reject',
+            icon: Icons.close,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _review(m, false);
+            },
+          ),
+        ]),
+      ],
+    );
+  }
+
+  /// A team member's roll-up. GET /attendance summarises per EMPLOYEE — total
+  /// minutes, shift count, whether one is open — so this states exactly that
+  /// and the window it covers. There is no per-shift endpoint behind it and no
+  /// action a manager can take on a total, so none is offered.
+  void _teamSheet(Map m) {
+    final mins = (num.tryParse('${m['minutes'] ?? 0}') ?? 0).toInt();
+    final shifts = (num.tryParse('${m['shifts'] ?? 0}') ?? 0).toInt();
+    final open = m['open'] == true;
+    final range = (_from.isEmpty || _to.isEmpty) ? '' : '${_fmtDay(_from)} – ${_fmtDay(_to)}';
+    _detailSheet(
+      context,
+      eyebrow: 'Attendance · team hours',
+      title: _s(m, 'name', 'Employee'),
+      children: [
+        _kv('Hours', _hm(mins)),
+        _kv('Shifts', '$shifts'),
+        _kv('Average shift', shifts == 0 ? '—' : _hm(mins ~/ shifts)),
+        _kv('Right now', open ? 'On shift' : 'Off shift'),
+        if (range.isNotEmpty) _kv('Period', range),
+        const SizedBox(height: 14),
+        Text(
+          'Totals count approved shifts only — a pending or rejected clock-in '
+          'adds nothing here. An open shift is counted up to this moment.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
+    );
+  }
 
   Future<void> _toggle(bool clockIn) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -15019,19 +16438,14 @@ class _AttendanceViewState extends State<_AttendanceView> {
           ..._pending.map((x) {
             final m = x as Map;
             final label = _fmtTime(_s(m, 'clock_in'));
-            Future<void> review(bool ok) async {
-              final messenger = ScaffoldMessenger.of(context);
-              try {
-                await widget.rest.post('/attendance/${m['id']}/${ok ? 'approve' : 'reject'}');
-                await _load();
-              } catch (e) {
-                messenger.showSnackBar(SnackBar(content: Text('$e')));
-              }
-            }
             return Padding(
               padding: const EdgeInsets.only(bottom: 10),
               child: ForkCard(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                // The row shows a start time and a state; the shift itself —
+                // full timestamps, how long it has run, and the same review
+                // actions — is one tap away.
+                onTap: () => _pendingSheet(m),
                 child: Row(children: [
                   InitialsAvatar(initials: initialsOf(_s(m, 'name', '')), color: AppColors.warning),
                   const SizedBox(width: AppSpacing.md),
@@ -15062,9 +16476,9 @@ class _AttendanceViewState extends State<_AttendanceView> {
                     ]),
                   ),
                   const SizedBox(width: AppSpacing.md),
-                  ForkButton(label: 'Approve', icon: Icons.check, dense: true, onPressed: () => review(true)),
+                  ForkButton(label: 'Approve', icon: Icons.check, dense: true, onPressed: () => _review(m, true)),
                   const SizedBox(width: AppSpacing.sm),
-                  ForkButton.ghost(label: 'Reject', icon: Icons.close, dense: true, onPressed: () => review(false)),
+                  ForkButton.ghost(label: 'Reject', icon: Icons.close, dense: true, onPressed: () => _review(m, false)),
                 ]),
               ),
             );
@@ -15084,6 +16498,8 @@ class _AttendanceViewState extends State<_AttendanceView> {
                 padding: const EdgeInsets.only(bottom: 10),
                 child: ForkCard(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  // Tap for the roll-up behind the two figures on the row.
+                  onTap: () => _teamSheet(m),
                   child: Row(children: [
                     InitialsAvatar(initials: initialsOf(_s(m, 'name', ''))),
                     const SizedBox(width: AppSpacing.md),
@@ -15299,6 +16715,78 @@ class _OutletsViewState extends State<_OutletsView> {
     await _load();
   }
 
+  /// Everything the card ellipses — address, phone, hours, 30-day revenue, what
+  /// "Main" means — plus the actions that already exist for this outlet. Tap
+  /// used to switch the whole app straight from the card; switching is now a
+  /// named button here (and still on the card), because re-scoping every other
+  /// module is not what a stray tap on a list should do.
+  ///
+  /// Nothing new is offered: switching keeps the admin/manager gate the app-bar
+  /// switcher holds, and edit / activate / delete are the same calls the card's
+  /// menu makes, which the backend gates on its own.
+  void _outletSheet(Map o, {double? revenue}) {
+    final isDefault = o['is_default'] == true;
+    final active = o['is_active'] != false;
+    final current = _isCurrentOutlet(o);
+    _detailSheet(
+      context,
+      eyebrow: 'Multi-outlet',
+      title: _s(o, 'outlet_name', 'Outlet'),
+      children: [
+        _kv('Status', current ? 'Viewing now' : (active ? 'Active' : 'Inactive')),
+        _kv('Role', isDefault ? 'Main outlet — the default this login lands on' : 'Branch'),
+        _kv('Address', _s(o, 'outlet_add', '—')),
+        _kv('Phone', _s(o, 'outlet_phone', '—')),
+        _kv('Hours', _s(o, 'outlet_hours', '—')),
+        _kv('Revenue (30d)', revenue == null ? 'Not in the roll-up' : '₹${revenue.toStringAsFixed(0)}'),
+        const SizedBox(height: 14),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          if (_canSwitchOutlet && !current)
+            ForkButton(
+              label: 'Switch to this outlet',
+              icon: Icons.login,
+              dense: true,
+              onPressed: () {
+                Navigator.of(context).pop();
+                _switchToOutlet(o);
+              },
+            ),
+          ForkButton.ghost(
+            label: 'Edit',
+            icon: Icons.edit_outlined,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _outletDialog(existing: o);
+            },
+          ),
+          // The main outlet can be neither deactivated nor deleted — the card's
+          // own menu hides both for exactly that reason.
+          if (!isDefault)
+            ForkButton.ghost(
+              label: active ? 'Deactivate' : 'Activate',
+              icon: active ? Icons.pause_circle_outline : Icons.play_circle_outline,
+              dense: true,
+              onPressed: () {
+                Navigator.of(context).pop();
+                _toggleActive(o);
+              },
+            ),
+          if (!isDefault)
+            ForkButton.ghost(
+              label: 'Delete',
+              icon: Icons.delete_outline,
+              dense: true,
+              onPressed: () {
+                Navigator.of(context).pop();
+                _delete(o);
+              },
+            ),
+        ]),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
@@ -15337,8 +16825,10 @@ class _OutletsViewState extends State<_OutletsView> {
         // Copper selection ring marks the outlet the app is scoped to — always
         // paired with the labelled "Viewing" chip (never colour alone).
         selected: current,
-        // Admin/manager: tapping the card switches the app into this outlet.
-        onTap: _canSwitchOutlet && !current ? () => _switchToOutlet(o) : null,
+        // Every outlet opens its detail — including the one being viewed, which
+        // had no tap at all before. Switching lives inside it, and on the card's
+        // own "Open" button for whoever is allowed to switch.
+        onTap: () => _outletSheet(o, revenue: rev),
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
           Row(children: [
@@ -15455,7 +16945,10 @@ class _OutletsViewState extends State<_OutletsView> {
         SectionHeader(
           title: 'Manage outlets',
           padding: const EdgeInsets.only(top: 8, bottom: 10),
-          trailing: _canSwitchOutlet ? Text('Tap an outlet to switch', style: text.bodySmall) : null,
+          trailing: Text(
+            _canSwitchOutlet ? 'Tap an outlet for details and to switch' : 'Tap an outlet for details',
+            style: text.bodySmall,
+          ),
         ),
         _dashGrid(outletCards, narrow ? 1 : 2),
       ]),
@@ -16372,25 +17865,521 @@ class _ValetCheckInDialogState extends State<_ValetCheckInDialog> {
   }
 }
 
+// ------------------------------------------------------------- performance ---
+
+/// The four measures GET /analytics/staff-performance scores, in the order the
+/// detail sheet lists them, with the label the owner reads.
+///
+/// The WEIGHTING is deliberately not here. The server sends the nominal weights
+/// and, per employee, the `effective_weights` it renormalised over whatever it
+/// could actually measure — so a client that hardcoded "APC is 35%" would print
+/// a different sum than the score it sits beside the moment one measure drops
+/// out. Everything shown about weight comes off the payload.
+const List<List<String>> _perfComponents = [
+  ['apc', 'Average per cover'],
+  ['rating', 'Guest rating'],
+  ['attendance', 'Attendance'],
+  ['tat', 'Table turnaround'],
+];
+
+/// Colour band for a 0-100 score. Redundant with the number it decorates — the
+/// score itself is always the chip's label, so nothing here is colour-only.
+Color _perfScoreColor(double score) => score >= 80
+    ? AppColors.success
+    : score >= 60
+        ? AppColors.info
+        : score >= 40
+            ? AppColors.warning
+            : AppColors.danger;
+
+/// True when a component carries a usable score. `available` and a non-null
+/// `score` must agree — the server keeps them in step (a raw value with no
+/// benchmark to score it against is reported unavailable) and this is the one
+/// place the app decides between "here is the number" and "not enough data".
+bool _perfMeasured(Map? c) => c != null && c['available'] == true && c['score'] != null;
+
+/// One measure, spelled out: what it scored, what was actually measured, how
+/// much of the total it carried — or, when it could not be measured, the
+/// server's own sentence explaining why. Never a zero standing in for a blank.
+Widget _perfComponentRow(BuildContext context, String label, Map? c, double effectiveWeight) {
+  final text = Theme.of(context).textTheme;
+  final measured = _perfMeasured(c);
+  final note = '${c?['note'] ?? ''}'.trim();
+  final unit = '${c?['unit'] ?? ''}'.trim();
+  final sample = _int(c?['sample']) ?? 0;
+  final value = c?['value'];
+  final pct = (effectiveWeight * 100).round();
+
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 7),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text(label, style: text.titleSmall)),
+        const SizedBox(width: AppSpacing.sm),
+        if (measured)
+          StatusChip(
+            label: '${_numOf(c!['score']).round()} / 100',
+            color: _perfScoreColor(_numOf(c['score'])),
+            dense: true,
+          )
+        else
+          // Never "0". A measure with nothing behind it is excluded from the
+          // score, and saying zero would read as "they scored nothing".
+          const StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
+      ]),
+      if (measured && value != null) ...[
+        const SizedBox(height: 3),
+        Text(
+          '${_score(value)}${unit.isEmpty ? '' : ' $unit'}'
+          '${sample > 0 ? ' · from $sample observation${sample == 1 ? '' : 's'}' : ''}',
+          style: text.bodySmall,
+        ),
+      ],
+      if (note.isNotEmpty) ...[
+        const SizedBox(height: 3),
+        Text(note, style: text.bodySmall?.copyWith(color: AppColors.textTertiary)),
+      ],
+      const SizedBox(height: 3),
+      Text(
+        measured
+            ? 'Counts for $pct% of this score.'
+            : 'Left out of the score — the measures that could be taken were '
+                'reweighted between them to still make 100%.',
+        style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary),
+      ),
+    ]),
+  );
+}
+
+// -------------------------------------------------------------------- leave ---
+
+String _leaveTypeLabel(String t) => switch (t) {
+      'sick' => 'Sick leave',
+      'casual' => 'Casual leave',
+      'unpaid' => 'Unpaid leave',
+      'holiday' => 'Holiday',
+      _ => t.isEmpty ? 'Leave' : t,
+    };
+
+Color _leaveStatusColor(String s) => switch (s) {
+      'approved' => AppColors.success,
+      'rejected' => AppColors.danger,
+      _ => AppColors.warning,
+    };
+
+/// "Aug 3" for a single day, "Aug 3 – Aug 7" for a range. Both ends are
+/// inclusive restaurant calendar days, which is what the server stores.
+String _leaveRange(Map l) {
+  final from = _s(l, 'start_day', '');
+  final to = _s(l, 'end_day', '');
+  if (from.isEmpty) return '—';
+  return from == to ? _fmtDay(from) : '${_fmtDay(from)} – ${_fmtDay(to)}';
+}
+
+/// Whether [dayKey] falls inside this leave's inclusive range. String compare is
+/// exact for "YYYY-MM-DD" and needs no zone of its own — both sides are already
+/// restaurant calendar days.
+bool _leaveCovers(Map l, String dayKey) {
+  final from = _s(l, 'start_day', '');
+  final to = _s(l, 'end_day', from);
+  return from.isNotEmpty && from.compareTo(dayKey) <= 0 && to.compareTo(dayKey) >= 0;
+}
+
+/// File a leave. For yourself this needs no permission (it is a request, not a
+/// decision, exactly like clocking in); for anyone else the server requires
+/// 'Review Attendance' and will say so.
+Future<void> _requestLeave(
+  BuildContext context,
+  RestClient rest,
+  Profile p, {
+  required String empId,
+  required String empName,
+  required VoidCallback reload,
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final today = RestaurantTime.todayIso();
+  var type = 'casual';
+  var from = today;
+  var to = today;
+  final reason = TextEditingController();
+
+  final submitted = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) {
+        Future<void> pick(bool isStart) async {
+          final seed = DateTime.tryParse('${isStart ? from : to}T00:00:00') ?? DateTime.now();
+          final wall = RestaurantTime.nowWall();
+          final picked = await showDatePicker(
+            context: ctx,
+            initialDate: seed,
+            // A leave can be filed for the recent past (someone was off sick
+            // yesterday and it was never recorded) and for the year ahead.
+            firstDate: DateTime(wall.year - 1, wall.month, wall.day),
+            lastDate: DateTime(wall.year + 1, wall.month, wall.day),
+          );
+          if (picked == null) return;
+          final key = RestaurantTime.isoDate(picked);
+          setLocal(() {
+            if (isStart) {
+              from = key;
+              // The server rejects an end before the start; move it rather than
+              // let the owner submit something that cannot be accepted.
+              if (to.compareTo(from) < 0) to = from;
+            } else {
+              to = key;
+              if (to.compareTo(from) < 0) from = to;
+            }
+          });
+        }
+
+        return AlertDialog(
+          title: Text('Request leave — $empName'),
+          content: SizedBox(
+            width: 400,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              DropdownButtonFormField<String>(
+                initialValue: type,
+                isExpanded: true,
+                dropdownColor: AppColors.cardRaised,
+                decoration: const InputDecoration(labelText: 'Type', isDense: true),
+                items: const [
+                  DropdownMenuItem(value: 'casual', child: Text('Casual leave')),
+                  DropdownMenuItem(value: 'sick', child: Text('Sick leave')),
+                  DropdownMenuItem(value: 'unpaid', child: Text('Unpaid leave')),
+                  DropdownMenuItem(value: 'holiday', child: Text('Holiday')),
+                ],
+                onChanged: (v) => setLocal(() => type = v ?? 'casual'),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              Row(children: [
+                Expanded(
+                  child: ForkButton.ghost(
+                    label: 'From ${_fmtDay(from)}',
+                    icon: Icons.event,
+                    dense: true,
+                    onPressed: () => pick(true),
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                Expanded(
+                  child: ForkButton.ghost(
+                    label: 'To ${_fmtDay(to)}',
+                    icon: Icons.event,
+                    dense: true,
+                    onPressed: () => pick(false),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: AppSpacing.md),
+              TextField(
+                controller: reason,
+                decoration: const InputDecoration(labelText: 'Reason (optional)', isDense: true),
+              ),
+            ]),
+          ),
+          actions: [
+            ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+            ForkButton(label: 'Send request', icon: Icons.send, onPressed: () => Navigator.pop(ctx, true)),
+          ],
+        );
+      },
+    ),
+  );
+  if (submitted != true) return;
+
+  try {
+    await rest.post('/leaves', {
+      // Omitted for yourself so the server takes the actor's own id and asks for
+      // no permission; naming someone else is what makes it a managed action.
+      if (empId != p.employeeId) 'emp_id': empId,
+      'leave_type': type,
+      'start_day': from,
+      'end_day': to,
+      if (reason.text.trim().isNotEmpty) 'reason': reason.text.trim(),
+    });
+    messenger.showSnackBar(SnackBar(content: Text('Leave requested for $empName.')));
+    reload();
+  } catch (e) {
+    // The backend's message is already a sentence ("X already has an approved
+    // leave covering …") — show it rather than a generic failure.
+    messenger.showSnackBar(SnackBar(content: Text('$e'), backgroundColor: AppColors.danger));
+  }
+}
+
+Future<void> _decideLeave(
+  BuildContext context,
+  RestClient rest,
+  Map leave,
+  bool approve,
+  VoidCallback reload,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final id = _s(leave, 'id', '');
+  if (id.isEmpty) return;
+  try {
+    final res = await rest.post('/leaves/${Uri.encodeComponent(id)}/${approve ? 'approve' : 'reject'}');
+    // `changed:false` means someone else already decided it exactly this way —
+    // report that honestly instead of claiming this tap did something.
+    final changed = (res is Map) ? res['changed'] != false : true;
+    messenger.showSnackBar(SnackBar(
+      content: Text(changed
+          ? 'Leave ${approve ? 'approved' : 'rejected'}.'
+          : 'Already ${approve ? 'approved' : 'rejected'} — nothing changed.'),
+    ));
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e'), backgroundColor: AppColors.danger));
+  }
+}
+
+/// One leave in the detail sheet, with its decision controls when the viewer
+/// holds 'Review Attendance'.
+Widget _leaveRow(
+  BuildContext context,
+  RestClient rest,
+  Map l,
+  bool canReview,
+  VoidCallback reload,
+) {
+  final text = Theme.of(context).textTheme;
+  final status = _s(l, 'status', 'requested');
+  final days = _int(l['days']) ?? 1;
+  final reason = _s(l, 'reason', '');
+  final requestedBy = _s(l, 'requested_by_name', '');
+  final decidedBy = _s(l, 'decided_by_name', '');
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(
+          child: Text('${_leaveTypeLabel(_s(l, 'leave_type', ''))} · ${_leaveRange(l)}',
+              style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        StatusChip(label: status, color: _leaveStatusColor(status), dense: true),
+      ]),
+      const SizedBox(height: 3),
+      Text(
+        '$days day${days == 1 ? '' : 's'}'
+        '${requestedBy.isEmpty || requestedBy == '—' ? '' : ' · filed by $requestedBy'}'
+        '${decidedBy.isEmpty || decidedBy == '—' ? '' : ' · decided by $decidedBy'}',
+        style: text.bodySmall,
+      ),
+      if (reason.isNotEmpty && reason != '—') ...[
+        const SizedBox(height: 2),
+        Text(reason, style: text.bodySmall?.copyWith(color: AppColors.textTertiary)),
+      ],
+      if (canReview && status == 'requested') ...[
+        const SizedBox(height: 6),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          ForkButton(
+            label: 'Approve',
+            icon: Icons.check,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _decideLeave(context, rest, l, true, reload);
+            },
+          ),
+          ForkButton.ghost(
+            label: 'Reject',
+            icon: Icons.close,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _decideLeave(context, rest, l, false, reload);
+            },
+          ),
+        ]),
+      ],
+    ]),
+  );
+}
+
+/// Everything known about one team member: who they are, what they scored and
+/// WHY, and their leave record with the decisions that can be taken on it.
+void _employeeSheet(
+  BuildContext context,
+  RestClient rest,
+  Profile p, {
+  required Map employee,
+  required String display,
+  required List<String> roleLabels,
+  required Map? perfRow,
+  required Map perfMeta,
+  required String perfNote,
+  required List<Map> leaves,
+  required String leaveNote,
+  required bool canReview,
+  required VoidCallback reload,
+}) {
+  final text = Theme.of(context).textTheme;
+  final empId = '${employee['employee_id'] ?? employee['id'] ?? ''}';
+  final score = perfRow?['score'];
+  final components = (perfRow?['components'] as Map?) ?? const {};
+  final effective = (perfRow?['effective_weights'] as Map?) ?? const {};
+  final windowDays = _int(perfMeta['window_days']);
+  final measured = _int(perfRow?['components_available']) ?? 0;
+
+  _detailSheet(
+    context,
+    eyebrow: 'Employees',
+    title: display,
+    children: [
+      _kv('Username', '@${_s(employee, 'employee_Username')}'),
+      _kv('Roles', roleLabels.isEmpty ? '—' : roleLabels.join(', ')),
+      const SizedBox(height: 14),
+      Text('PERFORMANCE', style: text.labelSmall),
+      const SizedBox(height: 8),
+      if (perfRow == null)
+        Text(
+          perfNote.isEmpty
+              ? 'No performance figures were returned for this person.'
+              : perfNote,
+          style: text.bodySmall?.copyWith(color: AppColors.textTertiary),
+        )
+      else ...[
+        Row(children: [
+          if (score == null)
+            const StatusChip(label: 'Not enough data', color: AppColors.neutral)
+          else
+            StatusChip(
+              label: '${_numOf(score).round()} / 100',
+              color: _perfScoreColor(_numOf(score)),
+            ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Text(
+              score == null
+                  ? 'Not one of the four measures below could be taken, so there is '
+                      'no score — this is not a score of zero.'
+                  : 'Built from $measured of ${_perfComponents.length} measures'
+                      '${windowDays == null ? '' : ' over the last $windowDays days'}.',
+              style: text.bodySmall,
+            ),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        for (final c in _perfComponents)
+          _perfComponentRow(
+            context,
+            c[1],
+            components[c[0]] as Map?,
+            _numOf(effective[c[0]]),
+          ),
+      ],
+      const SizedBox(height: 14),
+      Text('LEAVE', style: text.labelSmall),
+      const SizedBox(height: 8),
+      if (leaveNote.isNotEmpty)
+        Text(leaveNote, style: text.bodySmall?.copyWith(color: AppColors.textTertiary))
+      else if (leaves.isEmpty)
+        Text('No leave on record in this window.', style: text.bodySmall)
+      else
+        for (final l in leaves) _leaveRow(context, rest, l, canReview, reload),
+      // Filing for yourself always; for someone else only with the permission
+      // the server enforces, so this is never a button that 403s.
+      if (empId.isNotEmpty && (canReview || empId == p.employeeId)) ...[
+        const SizedBox(height: 10),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(
+            label: 'Request leave',
+            icon: Icons.event_busy,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _requestLeave(context, rest, p,
+                  empId: empId, empName: display, reload: reload);
+            },
+          ),
+        ),
+      ],
+    ],
+  );
+}
+
+/// The roster. One compact card per person carrying their performance score;
+/// everything behind that score — the four measures, their notes and their
+/// weights — plus the leave record and its decisions live in the tap.
+///
+/// Performance and leave are BOTH optional reads: each is gated on a permission
+/// (and a plan feature) this user may not hold, and each is fetched separately
+/// so a refusal costs its own section and not the roster. A refusal is reported
+/// in words, never swallowed into an empty list that would read as "no leave".
 Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () async {
+        // Reports the failure instead of hiding it: an empty payload here would
+        // be indistinguishable from "this person genuinely has no data".
+        Future<Map<String, dynamic>> optional(String path) async {
+          try {
+            return await rest.getMap(path);
+          } catch (e) {
+            return <String, dynamic>{'__error': '$e'};
+          }
+        }
+
+        final canPerf = _holdsAction(p, _analyticsPermissionId) && p.featureEnabled('analytics');
+        final canLeave = _holdsAction(p, _attendanceReviewPermissionId) && p.featureEnabled('attendance');
         final results = await Future.wait<dynamic>([
           rest.getMap('/restaurant/users'),
           rest.getList('/roles').catchError((_) => <dynamic>[]),
           p.isAdmin
               ? rest.getMap('/restaurant/password-requests').catchError((_) => <String, dynamic>{})
               : Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+          canPerf
+              ? optional('/analytics/staff-performance?days=30')
+              : Future<Map<String, dynamic>>.value(<String, dynamic>{}),
+          // meta=1 for the envelope (and its window), 500 = the server's own cap,
+          // which comfortably covers a roster's worth of leave in one page.
+          canLeave
+              ? optional('/leaves?meta=1&limit=500')
+              : Future<Map<String, dynamic>>.value(<String, dynamic>{}),
         ]);
         return {
           'users': ((results[0] as Map)['users'] as List?) ?? [],
           'roles': (results[1] as List?) ?? [],
           'requests': ((results[2] as Map)['requests'] as List?) ?? [],
+          'performance': results[3] as Map,
+          'leaves': results[4] as Map,
+          'can_perf': canPerf,
+          'can_leave': canLeave,
         };
       },
       builder: (context, data, reload) {
         final rows = (data['users'] as List?) ?? [];
         final roles = (data['roles'] as List?) ?? [];
         final requests = (data['requests'] as List?) ?? [];
+        final perf = (data['performance'] as Map?) ?? const {};
+        final leavePage = (data['leaves'] as Map?) ?? const {};
+        final canPerf = data['can_perf'] == true;
+        final canReview = data['can_leave'] == true;
+
+        // Both sections say WHY they are empty rather than looking like an
+        // employee with nothing to show.
+        final perfError = _s(perf, '__error', '');
+        final perfNote = !canPerf
+            ? 'Performance scores need the analytics permission, which this login does not hold.'
+            : (perfError.isEmpty ? '' : "Performance scores couldn't be loaded: $perfError");
+        final leaveError = _s(leavePage, '__error', '');
+        final leaveNote = !canReview
+            ? 'Leave records need the Review Attendance permission, which this login does not hold.'
+            : (leaveError.isEmpty ? '' : "Leave records couldn't be loaded: $leaveError");
+
+        final perfByEmp = <String, Map>{
+          for (final r in (perf['rows'] as List?) ?? const [])
+            if (r is Map) '${r['employee_id'] ?? ''}': r,
+        }..remove('');
+        final leavesByEmp = <String, List<Map>>{};
+        for (final l in (leavePage['leaves'] as List?) ?? const []) {
+          if (l is! Map) continue;
+          final id = '${l['emp_id'] ?? ''}';
+          if (id.isEmpty) continue;
+          leavesByEmp.putIfAbsent(id, () => <Map>[]).add(l);
+        }
+        final today = RestaurantTime.todayIso();
+
         // A CUSTOM role is stored on the employee as its "Roles" uuid, so the chips
         // rendered a raw guid like "d61c1438-4b6f-...". Map it back to the role's
         // name; anything unrecognised (a built-in like "waiter") passes through.
@@ -16401,6 +18390,140 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         // Share the names with screens that only receive a bare role list.
         _cacheCustomRoleNames(roles);
         final text = Theme.of(context).textTheme;
+
+        // Same 4/3/2/1 tiling the Guest book and Orders grids use — a name, a
+        // handle, a couple of role chips and a score do not need a full window
+        // each, which is what the one-row-per-person list spent on them.
+        final width = MediaQuery.sizeOf(context).width;
+        final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+
+        final cards = <Widget>[];
+        for (final r in rows) {
+          final u = r as Map;
+          final isSuper = u['is_superadmin'] == true;
+          final empId = '${u['employee_id'] ?? u['id'] ?? ''}';
+          final roleAll = (u['role_all'] as List?)?.map((e) => '$e').where((s) => s.isNotEmpty).toList() ??
+              [_s(u, 'role', 'staff')];
+          final roleLabels = [for (final role in roleAll) roleNameById[role] ?? _roleLabel(role)];
+          final name = '${_s(u, 'emp_Fname')} ${_s(u, 'emp_Lname', '')}'.trim();
+          final display = name.isEmpty ? _s(u, 'employee_Username') : name;
+          final initials =
+              display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join();
+          final perfRow = perfByEmp[empId];
+          final score = perfRow?['score'];
+          final myLeaves = leavesByEmp[empId] ?? const <Map>[];
+          final pending = myLeaves.where((l) => _s(l, 'status', '') == 'requested').length;
+          final onLeaveNow =
+              myLeaves.any((l) => _s(l, 'status', '') == 'approved' && _leaveCovers(l, today));
+
+          cards.add(ForkCard(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            onTap: () => _employeeSheet(
+              context,
+              rest,
+              p,
+              employee: u,
+              display: display,
+              roleLabels: roleLabels,
+              perfRow: perfRow,
+              perfMeta: perf,
+              perfNote: perfNote,
+              leaves: myLeaves,
+              leaveNote: leaveNote,
+              canReview: canReview,
+              reload: reload,
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                InitialsAvatar(
+                  initials: initials.isEmpty ? '?' : initials,
+                  color: isSuper ? AppColors.warning : AppColors.copper,
+                ),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                    Row(children: [
+                      Flexible(
+                        child: Text(display,
+                            style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ),
+                      if (isSuper) ...[
+                        const SizedBox(width: 6),
+                        const Tooltip(
+                          message: 'Superadmin (owner)',
+                          child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
+                        ),
+                      ],
+                    ]),
+                    const SizedBox(height: 2),
+                    Text('@${_s(u, 'employee_Username')}',
+                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ]),
+                ),
+                PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert, size: 18, color: AppColors.textSecondary),
+                  onSelected: (v) async {
+                    if (v == 'roles') {
+                      final changed = await showModalBottomSheet<bool>(
+                        context: context,
+                        showDragHandle: true,
+                        isScrollControlled: true,
+                        builder: (_) => _ManageRolesSheet(rest: rest, employee: u, customRoles: roles, isSuperadmin: isSuper),
+                      );
+                      if (changed == true) reload();
+                    } else if (v == 'leave') {
+                      await _requestLeave(context, rest, p,
+                          empId: empId, empName: display, reload: reload);
+                    } else if (v == 'password') {
+                      await _resetPassword(context, rest, u);
+                    } else if (v == 'remove') {
+                      await _removeEmployee(context, rest, u, reload);
+                    }
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(value: 'roles', child: ListTile(leading: Icon(Icons.shield_outlined), title: Text('Manage roles'), dense: true)),
+                    if (empId.isNotEmpty && (canReview || empId == p.employeeId))
+                      const PopupMenuItem(value: 'leave', child: ListTile(leading: Icon(Icons.event_busy), title: Text('Request leave'), dense: true)),
+                    if (p.isAdmin)
+                      const PopupMenuItem(value: 'password', child: ListTile(leading: Icon(Icons.password), title: Text('Reset password'), dense: true)),
+                    if (p.isAdmin && !isSuper)
+                      const PopupMenuItem(value: 'remove', child: ListTile(leading: Icon(Icons.person_remove, color: AppColors.danger), title: Text('Remove', style: TextStyle(color: AppColors.danger)), dense: true)),
+                  ],
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                // Two chips is what a card column fits; the rest are named in
+                // full on the detail sheet rather than overflowing the tile.
+                for (final label in roleLabels.take(2)) _roleChip(label),
+                if (roleLabels.length > 2) _roleChip('+${roleLabels.length - 2}'),
+              ]),
+              const SizedBox(height: 10),
+              // A Wrap, not a Row: a chip carries its own intrinsic width, and
+              // squeezing one into an Expanded makes it clip its OWN label
+              // rather than shrink. Two chips side by side do not fit the
+              // narrowest column this grid produces, so they flow instead.
+              Wrap(spacing: 8, runSpacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                // Where the scores could not be read at all, the reason is
+                // stated ONCE above the grid rather than repeated on every card.
+                if (perfNote.isEmpty)
+                  score == null
+                      ? const StatusChip(
+                          label: 'Not enough data', color: AppColors.neutral, dense: true)
+                      : StatusChip(
+                          label: '${_numOf(score).round()} / 100 score',
+                          color: _perfScoreColor(_numOf(score)),
+                          dense: true),
+                if (onLeaveNow)
+                  const InfoChip(icon: Icons.beach_access_outlined, label: 'On leave')
+                else if (pending > 0)
+                  StatusChip(
+                      label: '$pending to review', color: AppColors.warning, dense: true),
+              ]),
+            ]),
+          ));
+        }
+
         return Scaffold(
           backgroundColor: Colors.transparent,
           floatingActionButton: FloatingActionButton.extended(
@@ -16419,79 +18542,27 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   children: [
                     if (p.isAdmin && requests.isNotEmpty)
                       _PasswordRequestsBanner(rest: rest, requests: requests, reload: reload),
-                    ...rows.map((r) {
-                      final u = r as Map;
-                      final isSuper = u['is_superadmin'] == true;
-                      final roleAll = (u['role_all'] as List?)?.map((e) => '$e').where((s) => s.isNotEmpty).toList() ??
-                          [_s(u, 'role', 'staff')];
-                      final name = '${_s(u, 'emp_Fname')} ${_s(u, 'emp_Lname', '')}'.trim();
-                      final display = name.isEmpty ? _s(u, 'employee_Username') : name;
-                      final initials =
-                          display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join();
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
-                        child: ForkCard(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                          child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-                            InitialsAvatar(
-                              initials: initials.isEmpty ? '?' : initials,
-                              color: isSuper ? AppColors.warning : AppColors.copper,
-                            ),
-                            const SizedBox(width: AppSpacing.md),
-                            Expanded(
-                              child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                                Row(children: [
-                                  Flexible(
-                                    child: Text(display,
-                                        style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                                  ),
-                                  if (isSuper) ...[
-                                    const SizedBox(width: 6),
-                                    const Tooltip(
-                                      message: 'Superadmin (owner)',
-                                      child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
-                                    ),
-                                  ],
-                                ]),
-                                const SizedBox(height: 2),
-                                Text('@${_s(u, 'employee_Username')}', style: text.bodySmall),
-                                const SizedBox(height: 8),
-                                Wrap(spacing: 6, runSpacing: 6, children: [
-                                  // Local map first (freshest), then the shared cache.
-                                  for (final role in roleAll) _roleChip(roleNameById[role] ?? _roleLabel(role)),
-                                ]),
-                              ]),
-                            ),
-                            const SizedBox(width: AppSpacing.md),
-                            PopupMenuButton<String>(
-                              icon: const Icon(Icons.more_vert, size: 18, color: AppColors.textSecondary),
-                              onSelected: (v) async {
-                                if (v == 'roles') {
-                                  final changed = await showModalBottomSheet<bool>(
-                                    context: context,
-                                    showDragHandle: true,
-                                    isScrollControlled: true,
-                                    builder: (_) => _ManageRolesSheet(rest: rest, employee: u, customRoles: roles, isSuperadmin: isSuper),
-                                  );
-                                  if (changed == true) reload();
-                                } else if (v == 'password') {
-                                  await _resetPassword(context, rest, u);
-                                } else if (v == 'remove') {
-                                  await _removeEmployee(context, rest, u, reload);
-                                }
-                              },
-                              itemBuilder: (_) => [
-                                const PopupMenuItem(value: 'roles', child: ListTile(leading: Icon(Icons.shield_outlined), title: Text('Manage roles'), dense: true)),
-                                if (p.isAdmin)
-                                  const PopupMenuItem(value: 'password', child: ListTile(leading: Icon(Icons.password), title: Text('Reset password'), dense: true)),
-                                if (p.isAdmin && !isSuper)
-                                  const PopupMenuItem(value: 'remove', child: ListTile(leading: Icon(Icons.person_remove, color: AppColors.danger), title: Text('Remove', style: TextStyle(color: AppColors.danger)), dense: true)),
-                              ],
-                            ),
-                          ]),
-                        ),
-                      );
-                    }),
+                    SectionHeader(
+                      title: 'Team',
+                      count: rows.length,
+                      trailing: perfNote.isEmpty && perf.isNotEmpty
+                          ? InfoChip(
+                              icon: Icons.speed,
+                              label: 'Scored over ${_int(perf['window_days']) ?? 30} days')
+                          : null,
+                    ),
+                    // Said once, above the grid, rather than on every card.
+                    if (perfNote.isNotEmpty || leaveNote.isNotEmpty) ...[
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          if (perfNote.isNotEmpty) Text(perfNote, style: text.bodySmall),
+                          if (leaveNote.isNotEmpty) Text(leaveNote, style: text.bodySmall),
+                        ]),
+                      ),
+                    ],
+                    _dashGrid(cards, cols),
+                    const SizedBox(height: 76), // clears the FAB
                   ],
                 ),
         );

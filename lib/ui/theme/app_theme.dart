@@ -124,6 +124,16 @@ abstract final class AppTheme {
         space: 1,
       ),
       iconTheme: const IconThemeData(color: AppColors.textSecondary, size: 18),
+      // Same colour an M3 IconButton already resolves to (colorScheme
+      // .onSurfaceVariant), so nothing moves — but it must be spelled out.
+      // AppBar hands its iconTheme/actionsIconTheme down as
+      // `iconButtonTheme.style?.copyWith(...)`, which evaluates to null when
+      // the app leaves this theme empty; the AppBar's icon colours are then
+      // silently dropped and every IconButton falls back to the dark-theme
+      // default. On the light chrome that is invisible ink.
+      iconButtonTheme: IconButtonThemeData(
+        style: IconButton.styleFrom(foregroundColor: AppColors.textSecondary),
+      ),
       tooltipTheme: TooltipThemeData(
         decoration: BoxDecoration(
           color: AppColors.cardRaised,

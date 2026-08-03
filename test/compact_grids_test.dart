@@ -34,9 +34,18 @@ class _FakeApi extends ApiClient {
 
   @override
   Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
-    if (routes.containsKey(path)) return routes[path];
+    if (routes.containsKey(path)) return _resolve(routes[path], path);
+    // Query-carrying endpoints (the guest book pages, sorts and segments in the
+    // URL) are matched by prefix, longest key first, so one route can answer a
+    // whole family and a callable route can vary its reply by query string.
+    final prefixes = routes.keys.where(path.startsWith).toList()
+      ..sort((a, b) => b.length.compareTo(a.length));
+    if (prefixes.isNotEmpty) return _resolve(routes[prefixes.first], path);
     throw ApiException('No fake route for $path', 404);
   }
+
+  dynamic _resolve(dynamic route, String path) =>
+      route is dynamic Function(String) ? route(path) : route;
 }
 
 Future<RestClient> _signIn(_FakeApi api) async {
@@ -80,10 +89,37 @@ Future<void> _mount(WidgetTester tester, Widget Function(RestClient) module, Map
 Map<String, dynamic> _guest(int i) => {
       'customer_id': 'c$i',
       'name': 'Guest $i Lastname',
-      'phone_number': '90000000$i',
+      'phone': '90000000$i',
       'email': 'guest$i@example.com',
-      'booking_count': i % 5,
-      'has_booking': i % 3 == 0,
+      'visits': i % 5,
+      'total_spend': 100.0 * i,
+      'total_service_charge': 0,
+      'total_tax': 0,
+      'pre_tax_spend': 100.0 * i,
+      'avg_spend_per_visit': 100.0,
+      'last_visit': '2026-08-0${(i % 9) + 1}T12:00:00Z',
+      'days_since_last_visit': i,
+      'bills': i % 5,
+      'avg_rating': null,
+      'feedbacks': 0,
+      'segment': 'regular',
+    };
+
+/// GET /customers/segments answers two shapes: the enveloped page the list asks
+/// for with `meta=1`, and the bare array each leaderboard asks for.
+dynamic Function(String) _segmentsRoute(List<Map<String, dynamic>> guests) => (String path) {
+      final limit = int.tryParse(RegExp(r'limit=(\d+)').firstMatch(path)?.group(1) ?? '') ?? 50;
+      final page = guests.take(limit).toList();
+      if (!path.contains('meta=1')) return page;
+      return {
+        'customers': page,
+        'total': guests.length,
+        'has_more': guests.length > page.length,
+        'sort': 'recent',
+        'segment': 'all',
+        'segment_counts': {'new': 0, 'regular': guests.length, 'high-spend': 0, 'dormant': 0},
+        'spend_basis': 'tax-inclusive grand total of settled bills',
+      };
     };
 
 Map<String, dynamic> _dish(int i) => {
@@ -125,28 +161,31 @@ void main() {
   testWidgets('Guest book: empty, one guest, and a full book all render', (tester) async {
     _desktop(tester);
 
-    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!), {'/get-customers': <dynamic>[]});
+    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
+        {'/customers/segments': _segmentsRoute(const [])});
     expect(find.text('Nothing to show'), findsOneWidget);
-    expect(find.text('Guest book'), findsNothing);
 
-    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!), {'/get-customers': [_guest(1)]});
-    expect(find.text('Guest 1 Lastname'), findsOneWidget);
+    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
+        {'/customers/segments': _segmentsRoute([_guest(1)])});
+    // The name is on the tile AND in all three leaderboards, so it is not unique.
+    expect(find.text('Guest 1 Lastname'), findsWidgets);
     expect(find.text('900000001'), findsOneWidget);
 
     await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
-        {'/get-customers': [for (var i = 0; i < 40; i++) _guest(i)]});
-    // Every guest is built, not just the first screenful.
-    expect(find.text('Guest 0 Lastname'), findsOneWidget);
+        {'/customers/segments': _segmentsRoute([for (var i = 0; i < 40; i++) _guest(i)])});
+    // Every guest on the page is built, not just the first screenful.
+    expect(find.text('Guest 0 Lastname'), findsWidgets);
     expect(find.text('Guest 39 Lastname'), findsOneWidget);
   });
 
   testWidgets('Guest book: the tap opens the contact details the tile ellipses', (tester) async {
     _desktop(tester);
-    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!), {'/get-customers': [_guest(1)]});
+    await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
+        {'/customers/segments': _segmentsRoute([_guest(1)])});
 
-    await tester.tap(find.text('Guest 1 Lastname'));
+    await tester.tap(find.text('Guest 1 Lastname').last);
     await tester.pumpAndSettle();
-    expect(find.text('GUEST BOOK'), findsOneWidget);
+    expect(find.text('GUEST BOOK · REGULAR'), findsOneWidget);
     expect(find.text('EMAIL'), findsOneWidget);
     expect(find.text('guest1@example.com'), findsWidgets);
   });
