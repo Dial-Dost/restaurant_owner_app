@@ -1,0 +1,462 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:restaurant_owner_app/models/profile.dart';
+import 'package:restaurant_owner_app/screens/modules.dart' as m;
+import 'package:restaurant_owner_app/services/api_client.dart';
+import 'package:restaurant_owner_app/services/auth_controller.dart';
+import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/widgets/charts.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
+import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+
+/// Overview dashboard: the empty-restaurant case, the "a card that leads
+/// nowhere must not be tappable" rule, and which charts answer the pointer.
+class _FakeApi extends ApiClient {
+  _FakeApi(this.routes);
+  final Map<String, dynamic> routes;
+  final List<String> calls = <String>[];
+
+  @override
+  Future<LoginResult> login(String restaurantName, String username, String password, {String? outletId}) async =>
+      LoginResult(
+        'test-token',
+        Profile.fromJson(<String, dynamic>{
+          'employeeId': 'e1',
+          'restaurantName': 'CSR Organics',
+          'role': 'admin',
+          'actions_set': ['*'],
+          'action_names': <String>[],
+        }),
+      );
+
+  @override
+  Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
+    calls.add('$method $path');
+    if (routes.containsKey(path)) return routes[path];
+    throw ApiException('No fake route for $path', 404);
+  }
+}
+
+Future<RestClient> _signIn(_FakeApi api) async {
+  SharedPreferences.setMockInitialValues(<String, Object>{});
+  final auth = AuthController(api: api);
+  await auth.login('CSR Organics', 'admin', 'admin123');
+  return RestClient(auth);
+}
+
+/// Every label the shell can show — the "this owner sees everything" case.
+const _allVisible = [
+  'Overview', 'Orders', 'Kitchen', 'Menu', 'Tables', 'Waitlist', 'Inventory',
+  'Purchase Orders', 'Bookings', 'Customers', 'Feedback', 'Analytics', 'History',
+  'Employees', 'Settings',
+];
+
+Widget _host(
+  Widget child, {
+  List<String> visible = _allVisible,
+  OpenModuleCallback? openModule,
+}) =>
+    MaterialApp(
+      theme: AppTheme.dark(),
+      home: ModuleNavigator(
+        openModule: openModule ?? (_, {Map<String, dynamic>? target}) {},
+        visibleLabels: visible,
+        clearFocus: () {},
+        child: child,
+      ),
+    );
+
+/// The Overview is a lazy ListView, so anything below the fold is simply not
+/// built. A desktop-sized window is what the dense grid is designed for anyway.
+void _wideWindow(WidgetTester tester) {
+  tester.view.physicalSize = const Size(1600, 3000);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+}
+
+/// The ForkCard a metric tile is built from, located by its own label.
+ForkCard _tileFor(WidgetTester tester, String label) => tester.widget<ForkCard>(
+      find.ancestor(of: find.text(label), matching: find.byType(ForkCard)).first,
+    );
+
+// Live shape of GET /analytics/overview, trimmed to one row per section.
+const _insights = <String, dynamic>{
+  'window_days': 30,
+  'headline': {
+    'revenue': {'value': 184320.5, 'previous': 150000, 'pct_change': 22.88, 'direction': 'up', 'compared_to': 'previous 30 days'},
+    'bills': {'value': 412, 'previous': 380, 'pct_change': 8.42, 'direction': 'up', 'compared_to': 'previous 30 days'},
+    'covers': {'value': 1180, 'previous': 1180, 'pct_change': 0, 'direction': 'flat', 'compared_to': 'previous 30 days'},
+    'apc': {'value': 156.2, 'previous': null, 'pct_change': null, 'direction': 'flat', 'compared_to': 'previous 30 days'},
+    'today_revenue': 8420,
+    'yesterday_revenue': 11250,
+  },
+  'top_dishes_by_revenue': [
+    {'name': 'Paneer Tikka', 'category': 'Starters', 'quantity': 214, 'revenue': 42800, 'share_pct': 23.2},
+    {'name': 'Dal Makhani', 'category': 'Mains', 'quantity': 180, 'revenue': 27000, 'share_pct': 14.6},
+  ],
+  'top_staff': [
+    {'employee_id': 'e9', 'employee_name': 'Asha', 'orders': 91, 'revenue': 61200, 'avg_rating': 4.6, 'hours_worked': 148.5, 'ranked_by': 'revenue'},
+  ],
+  'kitchen': {
+    'avg_prep_ms': 742000, 'p90_prep_ms': 1380000, 'slowest_section': 'Tandoor',
+    'slowest_section_avg_ms': 1100000, 'slowest_dish': 'Biryani', 'slowest_dish_avg_ms': 1620000,
+    'orders_timed': 388,
+  },
+  'peak': {
+    'hour': 20, 'hour_orders': 96, 'hour_revenue': 41200,
+    'weekday': 'Saturday', 'weekday_orders': 140, 'weekday_revenue': 63400,
+  },
+  'needs_attention': <dynamic>[],
+};
+
+/// The Overview picks its column count off the WINDOW width, but it is laid out
+/// inside the shell's body — the fixed sidebar is 224px of that window it never
+/// gets. This host reproduces that geometry without touching the shell: at a
+/// 1100px window the grid goes to four across while each card is really
+/// (1100 - 224 - 32 - 42) / 4 ≈ 200px wide.
+Widget _shellGeometry(Widget child, {List<String> visible = _allVisible}) => _host(
+      Row(children: [
+        const SizedBox(width: 224),
+        Expanded(child: child),
+      ]),
+      visible: visible,
+    );
+
+void _window(WidgetTester tester, double width, [double height = 3000]) {
+  tester.view.physicalSize = Size(width, height);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+}
+
+/// 14 days of revenue — the minimum the week-on-week delta needs — collapsing to
+/// nothing in the last 7, which is the widest the delta line ever prints.
+Map<String, dynamic> _dailySeries() => {
+      'series': [
+        for (var i = 0; i < 14; i++)
+          {'date': '2026-07-${(i + 1).toString().padLeft(2, '0')}', 'revenue': i < 7 ? 9000 : 0, 'orders': 10},
+      ],
+    };
+
+void main() {
+  // A brand-new restaurant answers every read with nothing (here: 404 on every
+  // route, which is what the module's own catch handlers see). It must render,
+  // and it must never print the raw shape of missing data at the owner.
+  testWidgets('Overview renders on a completely empty payload', (tester) async {
+    final api = _FakeApi(const <String, dynamic>{});
+    final rest = await _signIn(api);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('Welcome'), findsOneWidget);
+
+    // RichText catches Text as well as the StatCard's spans, so this covers
+    // every glyph actually on screen.
+    for (final rt in tester.widgetList<RichText>(find.byType(RichText))) {
+      final shown = rt.text.toPlainText(includeSemanticsLabels: false, includePlaceholders: false);
+      expect(shown.contains('NaN'), isFalse, reason: 'NaN leaked into "$shown"');
+      expect(shown.toLowerCase().contains('null'), isFalse, reason: 'null leaked into "$shown"');
+      expect(shown.contains('Infinity'), isFalse, reason: 'Infinity leaked into "$shown"');
+    }
+
+    // Nothing to summarise from the other tabs, so no hollow Operations block.
+    expect(find.text('Operations'), findsNothing);
+  });
+
+  // An unreachable destination must produce an INERT card, not a dead control:
+  // no chevron, no hover lift, nothing to click in a dense grid of tiles.
+  testWidgets('a metric card with no reachable destination is not tappable', (tester) async {
+    final api = _FakeApi(const {'/analytics/overview?days=30': _insights});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    // This user has no Analytics module at all.
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      visible: const ['Overview'],
+    ));
+    await tester.pumpAndSettle();
+
+    expect(_tileFor(tester, 'REVENUE (INCL. TAX)').onTap, isNull);
+    expect(_tileFor(tester, 'BUSIEST HOUR').onTap, isNull);
+    // The chevron is the promise of a tap, so it must be absent too.
+    expect(
+      find.descendant(
+        of: find.ancestor(of: find.text('REVENUE (INCL. TAX)'), matching: find.byType(ForkCard)).first,
+        matching: find.byIcon(Icons.chevron_right),
+      ),
+      findsNothing,
+    );
+    // The top-selling bars lead to Menu, which is gated here as well.
+    expect(tester.widget<HBarRow>(find.byType(HBarRow).first).onTap, isNull);
+  });
+
+  testWidgets('the same card opens its module when that module is reachable', (tester) async {
+    final api = _FakeApi(const {'/analytics/overview?days=30': _insights});
+    final rest = await _signIn(api);
+    final opened = <String>[];
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      openModule: (label, {Map<String, dynamic>? target}) => opened.add('$label:$target'),
+    ));
+    await tester.pumpAndSettle();
+
+    expect(_tileFor(tester, 'REVENUE (INCL. TAX)').onTap, isNotNull);
+    await tester.tap(find.text('REVENUE (INCL. TAX)'));
+    await tester.pump();
+    // No focus payload: a whole-module summary has no record to focus, and an
+    // unread key would make the destination claim the record is missing.
+    expect(opened, ['Analytics:null']);
+  });
+
+  testWidgets('a top-selling bar is hoverable and drills into the menu', (tester) async {
+    final api = _FakeApi(const {'/analytics/overview?days=30': _insights});
+    final rest = await _signIn(api);
+    final opened = <String>[];
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      openModule: (label, {Map<String, dynamic>? target}) => opened.add('$label:$target'),
+    ));
+    await tester.pumpAndSettle();
+
+    final bar = tester.widget<HBarRow>(
+      find.ancestor(of: find.text('Paneer Tikka'), matching: find.byType(HBarRow)).first,
+    );
+    expect(bar.onTap, isNotNull);
+    expect(bar.tooltip, contains('Paneer Tikka'));
+    expect(bar.tooltip, contains('214 sold'));
+
+    await tester.tap(find.text('Paneer Tikka'));
+    await tester.pump();
+    expect(opened, ['Menu:null']);
+  });
+
+  // The revenue drill-down passes neither onTap nor tooltipBuilder, so
+  // _ChartHitBox must leave those bars a plain visual. Asserted at the widget
+  // boundary because a chart that silently grows a hover state is exactly how
+  // it starts promising a drill-down that does not exist (BUG 19).
+  testWidgets('the revenue drill-down chart stays inert', (tester) async {
+    final api = _FakeApi(const {
+      '/orders/daily-revenue?days=14': {
+        'series': [
+          {'date': '2026-07-30', 'revenue': 4200, 'orders': 12},
+          {'date': '2026-07-31', 'revenue': 5100, 'orders': 15},
+        ],
+      },
+    });
+    final rest = await _signIn(api);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Revenue this month — all channels'));
+    await tester.pumpAndSettle();
+
+    final bars = tester.widget<WeekdayBars>(find.byType(WeekdayBars));
+    expect(bars.onTap, isNull);
+    expect(bars.tooltipBuilder, isNull);
+  });
+
+  testWidgets('cross-tab metrics report real figures from their own endpoints', (tester) async {
+    final api = _FakeApi(const {
+      '/inventory': [
+        {'id': 'i1', 'name': 'Tomatoes', 'status': 'Low Stock'},
+        {'id': 'i2', 'name': 'Paneer', 'status': 'In Stock'},
+        {'id': 'i3', 'name': 'Saffron', 'status': 'Out of Stock'},
+      ],
+      '/purchase-orders': {
+        'orders': [
+          {'id': 'po1', 'status': 'ordered', 'total_cost': 4200},
+          {'id': 'po2', 'status': 'draft', 'total_cost': 800},
+          {'id': 'po3', 'status': 'received', 'total_cost': 9999},
+        ],
+      },
+      '/get-bookings?window=upcoming': [
+        {'booking_id': 'b1', 'customer_name': 'Later', 'status': 'Confirmed', 'booking_date_time': '2026-08-09T20:00:00Z', 'number_of_people': 6},
+        {'booking_id': 'b2', 'customer_name': 'Sooner', 'status': 'Confirmed', 'booking_date_time': '2026-08-04T19:30:00Z', 'number_of_people': 2},
+        {'booking_id': 'b3', 'customer_name': 'Gone', 'status': 'Cancelled', 'booking_date_time': '2026-08-05T19:30:00Z', 'number_of_people': 4},
+      ],
+      '/waitlist': {
+        'entries': [
+          {'id': 'w1', 'name': 'Rahul', 'position': 1, 'party_size': 2, 'status': 'waiting'},
+          {'id': 'w2', 'name': 'Meera', 'position': 2, 'party_size': 4, 'status': 'waiting'},
+          {'id': 'w3', 'name': 'Seated', 'position': 3, 'party_size': 2, 'status': 'seated'},
+        ],
+      },
+      '/bills/open?limit=1': {'bills': <dynamic>[], 'total': 3, 'outstanding_total': 5240.5},
+    });
+    final rest = await _signIn(api);
+    final opened = <String>[];
+
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      openModule: (label, {Map<String, dynamic>? target}) => opened.add(label),
+    ));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Operations'), findsOneWidget);
+    // 3 items, one low and one out — counted off the same `status` string the
+    // Inventory screen colours its rows by.
+    expect(find.text('1 out of stock · 1 low'), findsOneWidget);
+    // draft + ordered are open; the received PO is not, and its cost is not
+    // counted as money on order.
+    expect(_tileFor(tester, 'PURCHASE ORDERS OPEN').onTap, isNotNull);
+    expect(find.text('₹5000.00 on order'), findsOneWidget);
+    // Cancelled bookings are not upcoming, and "next" is the soonest by date.
+    expect(find.textContaining('party of 2'), findsOneWidget);
+    expect(find.text('next up Rahul'), findsOneWidget);
+    expect(find.text('₹5240.50 uncollected'), findsOneWidget);
+
+    await tester.tap(find.text('INVENTORY ITEMS'));
+    await tester.pump();
+    expect(opened, ['Inventory']);
+  });
+
+  // 1100px is the exact width where the stat grid goes to four across, and the
+  // "▲ 100.0% vs prior week" line under the revenue card is a fixed-width Row
+  // with nothing to give. The card is the first thing on the page, so this is
+  // the overflow an owner on a 1100px window sees before anything else.
+  testWidgets('the revenue delta line survives the four-across breakpoint', (tester) async {
+    for (final width in [1100.0, 1120.0, 1280.0]) {
+      final api = _FakeApi({'/orders/daily-revenue?days=14': _dailySeries()});
+      final rest = await _signIn(api);
+      _window(tester, width);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpWidget(_shellGeometry(m.overviewModule(rest, rest.auth.profile!)));
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull, reason: 'metric tile overflowed at ${width}px');
+      // Degraded, not dropped: the comparison window is what makes the number
+      // mean anything, so it must still be on screen.
+      expect(find.textContaining('vs prior week'), findsOneWidget, reason: 'delta lost at ${width}px');
+    }
+  });
+
+  // The server always sends the kitchen object, zeroed, so this used to be two
+  // tiles reading "—" under a heading — indistinguishable from a failed load.
+  testWidgets('a restaurant that has never timed a ticket says so once', (tester) async {
+    final api = _FakeApi(const {
+      '/analytics/overview?days=30': {
+        'window_days': 30,
+        'headline': <String, dynamic>{},
+        'top_dishes_by_revenue': <dynamic>[],
+        'top_staff': <dynamic>[],
+        'kitchen': {
+          'avg_prep_ms': 0, 'p90_prep_ms': 0, 'orders_timed': 0,
+          'slowest_section': '', 'slowest_dish': '',
+          'slowest_section_avg_ms': 0, 'slowest_dish_avg_ms': 0,
+        },
+        'peak': <String, dynamic>{},
+        'needs_attention': <dynamic>[],
+      },
+    });
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('AVG PREP'), findsNothing);
+    expect(find.text('SLOWEST 10%'), findsNothing);
+    expect(find.textContaining('No timed orders yet'), findsOneWidget);
+  });
+
+  // The sweep above cannot speak for the headline tiles: with `headline: {}` the
+  // whole block is skipped, so an assertion about them there is vacuous. Give it
+  // a POPULATED headline whose figures are null — the shape a partial server
+  // response really has — and assert the contract that actually holds: a tile may
+  // show a dash, but never a bare one. APC/today/yesterday each pair theirs with
+  // a sub-line saying why, which is what makes it read as "nothing yet" instead
+  // of "failed to load".
+  testWidgets('a headline figure that is missing explains itself', (tester) async {
+    final api = _FakeApi(const {
+      '/analytics/overview?days=30': {
+        'window_days': 30,
+        'headline': {
+          'revenue': {'value': 1200, 'previous': 1000, 'pct_change': 20, 'direction': 'up', 'compared_to': 'prior 30 days'},
+          'bills': {'value': 4, 'previous': 3, 'pct_change': 33, 'direction': 'up', 'compared_to': 'prior 30 days'},
+          'covers': {'value': 9, 'previous': 8, 'pct_change': 12, 'direction': 'up', 'compared_to': 'prior 30 days'},
+          'apc': {'value': null, 'previous': null, 'pct_change': null, 'direction': 'flat', 'compared_to': 'prior 30 days'},
+          'today_revenue': null,
+          'yesterday_revenue': null,
+        },
+        'top_dishes_by_revenue': <dynamic>[],
+        'top_staff': <dynamic>[],
+        'kitchen': <String, dynamic>{},
+        'peak': <String, dynamic>{},
+        'needs_attention': <dynamic>[],
+      },
+    });
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    // The headline block really did build — otherwise this test proves nothing,
+    // which is exactly how the previous version of this check passed.
+    expect(find.textContaining('REVENUE'), findsWidgets);
+
+    // Every dash carries an explanation somewhere on the page.
+    final dashes = tester.widgetList<Text>(find.text('—')).length;
+    if (dashes > 0) {
+      expect(
+        find.textContaining(RegExp('nothing (recorded|settled)', caseSensitive: false)),
+        findsWidgets,
+        reason: 'a headline tile shows a dash with nothing saying why',
+      );
+    }
+    // And never a raw null/NaN leaking into the UI.
+    for (final t in tester.widgetList<Text>(find.byType(Text))) {
+      final d = t.data ?? '';
+      expect(d.contains('null'), isFalse, reason: 'raw null rendered: "$d"');
+      expect(d.contains('NaN'), isFalse, reason: 'NaN rendered: "$d"');
+    }
+  });
+
+  // The same block with real timings is untouched.
+  testWidgets('kitchen timings still render once tickets have been timed', (tester) async {
+    final api = _FakeApi(const {'/analytics/overview?days=30': _insights});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('AVG PREP'), findsOneWidget);
+    expect(find.text('across 388 timed order(s)'), findsOneWidget);
+    expect(find.textContaining('No timed orders yet'), findsNothing);
+  });
+
+  // A gated module must not even be asked for: the tile could never be shown,
+  // so the request is pure cost (and would 403 anyway).
+  testWidgets('gated modules are not fetched and get no tile', (tester) async {
+    final api = _FakeApi(const <String, dynamic>{});
+    final rest = await _signIn(api);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      visible: const ['Overview'],
+    ));
+    await tester.pumpAndSettle();
+
+    expect(api.calls, isNot(contains('GET /inventory')));
+    expect(api.calls, isNot(contains('GET /purchase-orders')));
+    expect(api.calls, isNot(contains('GET /get-bookings?window=upcoming')));
+    expect(api.calls, isNot(contains('GET /waitlist')));
+    expect(api.calls, isNot(contains('GET /bills/open?limit=1')));
+    expect(find.text('Operations'), findsNothing);
+  });
+}

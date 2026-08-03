@@ -71,6 +71,11 @@ String _money(dynamic v) {
   return n == null ? '—' : '₹${n.toStringAsFixed(2)}';
 }
 
+// Free text cut to [max] characters with an ellipsis. Cuts on RUNES, so a name
+// carrying an emoji or a non-BMP script cannot be split into half a code point.
+String _capped(String s, int max) =>
+    s.runes.length <= max ? s : '${String.fromCharCodes(s.runes.take(max - 1))}…';
+
 // Whole-number JSON field (capacity, max_capacity, party size…); null when absent.
 int? _int(dynamic v) => num.tryParse('${v ?? ''}')?.round();
 
@@ -496,6 +501,60 @@ Widget _actionTile(BuildContext context, String label, int count, IconData icon,
   );
 }
 
+/// Column count for the Overview's dense metric grid. Deliberately tighter than
+/// the stat-card breakpoints: each tile carries ONE figure, so a wide window
+/// should pack six across rather than spend a quarter of the screen per number.
+int _metricCols(double width) =>
+    width >= 1500 ? 6 : (width >= 1180 ? 5 : (width >= 900 ? 4 : (width >= 640 ? 3 : 2)));
+
+/// One dense Overview figure: label, number, one qualifying line, and a chevron
+/// only when it leads somewhere.
+///
+/// This is what the Overview's loose `Wrap`s of bare text became — every figure
+/// is a card now. [onTap] null renders the tile genuinely inert (no chevron, no
+/// hover lift, no click cursor), because a dead tap in a dense grid is worse
+/// than an obviously static readout.
+Widget _metricTile(
+  BuildContext context, {
+  required String label,
+  required String value,
+  String? sub,
+  Color subColor = AppColors.textSecondary,
+  IconData? icon,
+  Color accent = AppColors.copperHi,
+  VoidCallback? onTap,
+}) {
+  final text = Theme.of(context).textTheme;
+  return ForkCard(
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    onTap: onTap,
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+      Row(children: [
+        if (icon != null) ...[
+          Icon(icon, size: 13, color: accent),
+          const SizedBox(width: 6),
+        ],
+        Expanded(
+          child: Text(label.toUpperCase(), maxLines: 1, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        ),
+        if (onTap != null) const Icon(Icons.chevron_right, size: 14, color: AppColors.textTertiary),
+      ]),
+      const SizedBox(height: 6),
+      Text(value,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: text.displaySmall!.copyWith(fontSize: 20, color: AppColors.textPrimary)),
+      if (sub != null && sub.isNotEmpty) ...[
+        const SizedBox(height: 3),
+        Text(sub,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 10.5, height: 1.25, color: subColor)),
+      ],
+    ]),
+  );
+}
+
 /// Focus keys each destination module actually READS — mirrors the `idOf(...)`
 /// / `tableName` reads in the module bodies below.
 ///
@@ -821,11 +880,11 @@ Color _stageColor(String status) {
 /// server does not send them. They close the "Needs attention" section from
 /// here rather than getting their own heading below — the page used to render
 /// that heading twice, with two different counts, one immediately after the
-/// other. [columns] lays those tiles out on the page's grid.
+/// other. [columns] lays those tiles out on the page's grid, [metricColumns]
+/// the denser grid the single-figure tiles use.
 List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? nav,
-    {List<Widget> liveTiles = const [], int columns = 1}) {
+    {List<Widget> liveTiles = const [], int columns = 1, int metricColumns = 2}) {
   if (ins.isEmpty && liveTiles.isEmpty) return const [];
-  final text = Theme.of(context).textTheme;
 
   double n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
   String ms(dynamic v) {
@@ -833,6 +892,16 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
     if (total <= 0) return '—';
     return '${total ~/ 60}m ${total % 60}s';
   }
+
+  /// Where a summary card lands, or null when that module is gated for this
+  /// user — the tile then renders inert instead of offering a dead tap.
+  ///
+  /// Nothing here forwards a focus payload. Each of these cards summarises a
+  /// WHOLE module rather than one record, so there is no id to hand over, and
+  /// sending an unread key is exactly what makes a destination claim a record
+  /// "isn't in this list" (see [_attentionFocus]).
+  VoidCallback? jump(String label) =>
+      (nav != null && nav.canOpen(label)) ? () => nav.openModule(label) : null;
 
   final dishes = (ins['top_dishes_by_revenue'] as List?) ?? const [];
   final staff = (ins['top_staff'] as List?) ?? const [];
@@ -846,26 +915,28 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
   final out = <Widget>[];
 
   // --- headline deltas: a number with no comparison is not an insight --------
-  Widget metric(String label, Map? m, {bool money = true}) {
+  Widget metric(String label, Map? m, {bool money = true, IconData? icon}) {
     final mm = m ?? const {};
     final pct = mm['pct_change'];
     final dir = '${mm['direction'] ?? 'flat'}';
     final arrow = dir == 'up' ? '▲' : dir == 'down' ? '▼' : '–';
     final colour = dir == 'up' ? AppColors.success : dir == 'down' ? AppColors.danger : AppColors.textSecondary;
-    return Padding(
-      padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(label.toUpperCase(),
-            style: const TextStyle(
-                fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 0.7, color: AppColors.textSecondary)),
-        const SizedBox(height: 2),
-        Text(money ? _money(mm['value']) : '${n(mm['value']).round()}',
-            style: text.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
-        // Pair the arrow with a sign and the window in words — colour alone is
-        // not information, and an unlabelled arrow invites the wrong reading.
-        Text(pct == null ? 'no prior baseline' : '$arrow ${n(pct).abs().toStringAsFixed(1)}% ${mm['compared_to'] ?? ''}',
-            style: TextStyle(fontSize: 10, color: pct == null ? AppColors.textSecondary : colour)),
-      ]),
+    return _metricTile(
+      context,
+      label: label,
+      icon: icon,
+      value: money ? _money(mm['value']) : '${n(mm['value']).round()}',
+      // Pair the arrow with a sign and the window in words — colour alone is
+      // not information, and an unlabelled arrow invites the wrong reading.
+      // A figure the server did not send renders as a dash, and "no prior
+      // baseline" under it reads as a broken tile rather than an empty one.
+      sub: mm['value'] == null
+          ? 'nothing recorded in this window'
+          : pct == null
+              ? 'no prior baseline'
+              : '$arrow ${n(pct).abs().toStringAsFixed(1)}% ${mm['compared_to'] ?? ''}'.trim(),
+      subColor: pct == null ? AppColors.textSecondary : colour,
+      onTap: jump('Analytics'),
     );
   }
 
@@ -876,19 +947,28 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
         trailing: Text('incl. tax',
             style: TextStyle(fontSize: 10.5, color: AppColors.textSecondary)),
       ),
-      Wrap(children: [
+      _dashGrid([
         // Settled bill totals — WITH tax and service charge. The APC card above is
         // deliberately pre-tax, so both are labelled rather than left ambiguous.
-        metric('revenue (incl. tax)', head['revenue'] as Map?),
-        metric('bills', head['bills'] as Map?, money: false),
-        metric('covers', head['covers'] as Map?, money: false),
-        metric('APC (incl. tax)', head['apc'] as Map?),
-      ]),
-      Row(children: [
-        MicroStat(value: _money(head['today_revenue']), label: 'today'),
-        const SizedBox(width: AppSpacing.lg),
-        MicroStat(value: _money(head['yesterday_revenue']), label: 'yesterday'),
-      ]),
+        metric('revenue (incl. tax)', head['revenue'] as Map?, icon: Icons.payments),
+        metric('bills', head['bills'] as Map?, money: false, icon: Icons.receipt_long),
+        metric('covers', head['covers'] as Map?, money: false, icon: Icons.groups),
+        metric('APC (incl. tax)', head['apc'] as Map?, icon: Icons.person),
+        // Same rule as the deltas above: a caption that assumes a number under
+        // a dash is what makes an empty restaurant look like a broken one.
+        _metricTile(context,
+            label: 'today',
+            icon: Icons.today,
+            value: _money(head['today_revenue']),
+            sub: head['today_revenue'] == null ? 'nothing settled yet' : 'settled so far',
+            onTap: jump('Analytics')),
+        _metricTile(context,
+            label: 'yesterday',
+            icon: Icons.history,
+            value: _money(head['yesterday_revenue']),
+            sub: head['yesterday_revenue'] == null ? 'nothing settled' : 'settled in full',
+            onTap: jump('Analytics')),
+      ], metricColumns),
       const SizedBox(height: AppSpacing.lg),
     ]);
   }
@@ -909,14 +989,23 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
   // --- top sellers ----------------------------------------------------------
   if (dishes.isNotEmpty) {
     final top = n((dishes.first as Map)['revenue']);
+    // One lookup for the whole list: null keeps every bar a plain readout.
+    final openMenu = jump('Menu');
     out.add(const SectionHeader(title: 'Top selling dishes'));
     for (final d in dishes) {
       final m = d as Map;
+      final name = '${m['name'] ?? ''}';
+      final sold = n(m['quantity']).round();
+      final category = '${m['category'] ?? ''}';
       out.add(HBarRow(
-        label: '${m['name'] ?? ''}',
+        label: name,
         fraction: top > 0 ? (n(m['revenue']) / top).clamp(0.0, 1.0) : 0,
         value: _money(m['revenue']),
-        sub: '${n(m['quantity']).round()} sold · ${n(m['share_pct']).toStringAsFixed(1)}% of sales',
+        sub: '$sold sold · ${n(m['share_pct']).toStringAsFixed(1)}% of sales',
+        // Hover reads the row in full even when the label had to ellipsise.
+        tooltip: '$name — ${_money(m['revenue'])} from $sold sold'
+            '${category.isEmpty ? '' : ' · $category'}',
+        onTap: openMenu,
       ));
     }
     out.add(const SizedBox(height: AppSpacing.lg));
@@ -925,21 +1014,25 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
   // --- staff ---------------------------------------------------------------
   if (staff.isNotEmpty) {
     final top = n((staff.first as Map)['revenue']);
+    final openStaff = jump('Employees');
     out.add(const SectionHeader(title: 'Best performing staff'));
     for (final sm in staff) {
       final m = sm as Map;
       final rating = m['avg_rating'];
       final hours = m['hours_worked'];
+      final name = '${m['employee_name'] ?? ''}';
       final bits = <String>[
         '${n(m['orders']).round()} orders',
         if (rating != null) '${n(rating).toStringAsFixed(1)}★',
         if (hours != null) '${n(hours).toStringAsFixed(1)}h',
       ];
       out.add(HBarRow(
-        label: '${m['employee_name'] ?? ''}',
+        label: name,
         fraction: top > 0 ? (n(m['revenue']) / top).clamp(0.0, 1.0) : 0,
         value: _money(m['revenue']),
         sub: bits.join(' · '),
+        tooltip: '$name — ${_money(m['revenue'])} · ${bits.join(' · ')}',
+        onTap: openStaff,
       ));
     }
     // Name the signal — "best" should never imply we weigh things we do not measure.
@@ -954,54 +1047,111 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
   }
 
   // --- kitchen + peak trade ------------------------------------------------
+  // Every figure that used to sit here as a loose MicroStat / footnote line is
+  // now its own tile, so the slowest section and dish are as reachable as the
+  // averages instead of being 10px grey text under them.
   if (kitchen.isNotEmpty || peak.isNotEmpty) {
-    out.add(const SectionHeader(title: 'Kitchen & peak trade'));
-    out.add(Wrap(children: [
-      if (kitchen.isNotEmpty) ...[
-        Padding(
-          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
-          child: MicroStat(value: ms(kitchen['avg_prep_ms']), label: 'avg prep'),
-        ),
-        Padding(
-          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
-          child: MicroStat(value: ms(kitchen['p90_prep_ms']), label: 'slowest 10%'),
-        ),
+    final timed = n(kitchen['orders_timed']).round();
+    final section = '${kitchen['slowest_section'] ?? ''}';
+    final dish = '${kitchen['slowest_dish'] ?? ''}';
+    // The server always sends the kitchen object, zeroed, so a restaurant that
+    // has never timed a ticket used to get two tiles reading nothing but "—".
+    // A dash is a value that failed to arrive; nothing failed here, the kitchen
+    // simply has no history yet — so the block says that once, in one tile, and
+    // drops the readouts that have nothing to report.
+    final hasTiming = timed > 0 || n(kitchen['avg_prep_ms']) > 0 || n(kitchen['p90_prep_ms']) > 0;
+    final tiles = <Widget>[
+      if (kitchen.isNotEmpty && !hasTiming)
+        _metricTile(context,
+            label: 'kitchen timing',
+            icon: Icons.timer_off_outlined,
+            value: 'Not yet',
+            sub: 'No timed orders yet — prep times start once tickets are bumped.',
+            onTap: jump('Kitchen')),
+      if (kitchen.isNotEmpty && hasTiming) ...[
+        _metricTile(context,
+            label: 'avg prep',
+            icon: Icons.timer,
+            value: ms(kitchen['avg_prep_ms']),
+            sub: timed > 0 ? 'across $timed timed order(s)' : 'mean ticket time',
+            onTap: jump('Kitchen')),
+        _metricTile(context,
+            label: 'slowest 10%',
+            icon: Icons.speed,
+            value: ms(kitchen['p90_prep_ms']),
+            sub: 'p90 ticket time',
+            onTap: jump('Kitchen')),
       ],
       if (peak['hour'] != null)
-        Padding(
-          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
-          child: MicroStat(
+        _metricTile(context,
+            label: 'busiest hour',
+            icon: Icons.schedule,
             value: '${n(peak['hour']).round().toString().padLeft(2, '0')}:00',
-            label: 'busiest hour (${n(peak['hour_orders']).round()})',
-          ),
-        ),
+            sub: '${n(peak['hour_orders']).round()} order(s) · ${_money(peak['hour_revenue'])}',
+            onTap: jump('Analytics')),
       if ('${peak['weekday'] ?? ''}'.isNotEmpty)
-        Padding(
-          padding: const EdgeInsets.only(right: AppSpacing.lg, bottom: AppSpacing.sm),
-          child: MicroStat(
+        _metricTile(context,
+            label: 'busiest day',
+            icon: Icons.calendar_today,
             value: '${peak['weekday']}',
-            label: 'busiest day (${n(peak['weekday_orders']).round()})',
-          ),
-        ),
-    ]));
-    if ('${kitchen['slowest_section'] ?? ''}'.isNotEmpty) {
-      out.add(Padding(
-        padding: const EdgeInsets.only(top: 4, left: 4),
-        child: Text(
-          'Slowest section ${kitchen['slowest_section']} (${ms(kitchen['slowest_section_avg_ms'])})'
-          '${'${kitchen['slowest_dish'] ?? ''}'.isEmpty ? '' : ' · slowest dish ${kitchen['slowest_dish']} (${ms(kitchen['slowest_dish_avg_ms'])})'}',
-          style: TextStyle(fontSize: 10, color: AppColors.textSecondary),
-        ),
-      ));
+            sub: '${n(peak['weekday_orders']).round()} order(s) · ${_money(peak['weekday_revenue'])}',
+            onTap: jump('Analytics')),
+      // "— average" under a named section would be the same empty tile in a
+      // different shape, so an untimed section states what it is instead.
+      if (section.isNotEmpty)
+        _metricTile(context,
+            label: 'slowest section',
+            icon: Icons.soup_kitchen,
+            value: section,
+            sub: n(kitchen['slowest_section_avg_ms']) > 0
+                ? '${ms(kitchen['slowest_section_avg_ms'])} average'
+                : 'not timed yet',
+            onTap: jump('Kitchen')),
+      if (dish.isNotEmpty)
+        _metricTile(context,
+            label: 'slowest dish',
+            icon: Icons.restaurant,
+            value: dish,
+            sub: n(kitchen['slowest_dish_avg_ms']) > 0
+                ? '${ms(kitchen['slowest_dish_avg_ms'])} average'
+                : 'not timed yet',
+            onTap: jump('Kitchen')),
+    ];
+    if (tiles.isNotEmpty) {
+      out.add(const SectionHeader(title: 'Kitchen & peak trade'));
+      out.add(_dashGrid(tiles, metricColumns));
+      out.add(const SizedBox(height: AppSpacing.lg));
     }
-    out.add(const SizedBox(height: AppSpacing.lg));
   }
 
   return out;
 }
 
-Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
+  // Read ABOVE the AsyncView, because load() has no context: which cross-tab
+  // summaries are worth asking for at all. Every one of those endpoints is
+  // permission-gated server-side as well — this only avoids firing a request
+  // whose answer the user could never be shown.
+  final shellNav = ModuleNavigator.of(shell);
+  bool can(String label) => shellNav?.canOpen(label) ?? false;
+  // Open bills are settled on the floor plan but priced by the bills
+  // permission, which rides with Orders for most roles.
+  final wantsBills = can('Tables') || can('Orders');
+
+  return AsyncView<Map<String, dynamic>>(
       load: () async {
+        // An optional cross-tab read. `null` means "not available to this user"
+        // — gated here, or refused by the server — which is NOT the same as
+        // zero, so the tile is dropped rather than reporting a confident 0.
+        Future<dynamic> maybe(bool wanted, Future<dynamic> Function() get) async {
+          if (!wanted) return null;
+          try {
+            return await get();
+          } catch (_) {
+            return null;
+          }
+        }
+
         final r = await Future.wait<dynamic>([
           rest.getMap('/orders/apc').catchError((_) => <String, dynamic>{}),
           rest.getMap('/feedback/summary').catchError((_) => <String, dynamic>{}),
@@ -1014,8 +1164,31 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           // the whole order and inventory lists no longer have to be pulled here
           // just to count them.
           rest.getMap('/analytics/overview?days=30').catchError((_) => <String, dynamic>{}),
+          // The cross-tab metrics below. /analytics/overview composes none of
+          // them, so each comes from the very endpoint its own module reads —
+          // which is what stops the Overview quoting a number the destination
+          // screen then contradicts.
+          maybe(can('Inventory'), () => rest.getList('/inventory')),
+          maybe(can('Purchase Orders'), () => rest.getMap('/purchase-orders')),
+          maybe(can('Bookings'), () => rest.getList('/get-bookings?window=upcoming')),
+          maybe(can('Waitlist'), () => rest.getMap('/waitlist')),
+          // limit=1: the page itself is thrown away. `total` and
+          // `outstanding_total` are computed over EVERY open bill regardless of
+          // paging, so one row is all this costs.
+          maybe(wantsBills, () => rest.getMap('/bills/open?limit=1')),
         ]);
-        return {'apc': r[0], 'feedback': r[1], 'daily': r[2], 'tables': r[3], 'insights': r[4]};
+        return {
+          'apc': r[0],
+          'feedback': r[1],
+          'daily': r[2],
+          'tables': r[3],
+          'insights': r[4],
+          'inventory': r[5],
+          'purchaseOrders': r[6],
+          'bookings': r[7],
+          'waitlist': r[8],
+          'openBills': r[9],
+        };
       },
       builder: (context, data, reload) {
         final apc = (data['apc'] as Map?) ?? {};
@@ -1033,7 +1206,11 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
 
         final text = Theme.of(context).textTheme;
         final width = MediaQuery.sizeOf(context).width;
-        final cols = width >= 1100 ? 4 : (width >= 760 ? 2 : 1);
+        // The charted stat cards need real width, but a 1000px window was
+        // spending ~490px on each of two of them; three fit comfortably.
+        final cols = width >= 1100 ? 4 : (width >= 900 ? 3 : (width >= 620 ? 2 : 1));
+        // The single-figure tiles pack far tighter than the charted stat cards.
+        final metricCols = _metricCols(width);
 
         // Daily revenue series (already fetched) feeds the stat-card chart.
         final dailyValues = [for (final d in daily) num0((d as Map)['revenue'])];
@@ -1224,6 +1401,121 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
         VoidCallback? jumpTo(String label, [Map<String, dynamic>? target]) =>
             (nav != null && nav.canOpen(label)) ? () => nav.openModule(label, target: target) : null;
 
+        // ---- one live figure from each of the other tabs --------------------
+        // A null read means the module is gated (or the server refused), and a
+        // metric nobody can act on is left out entirely rather than shown as 0.
+        // None of these tiles forwards a focus payload: they summarise a whole
+        // module, so there is no record id to hand over.
+        final opsTiles = <Widget>[];
+
+        final invRows = data['inventory'] as List?;
+        if (invRows != null) {
+          // Counted off the SAME `status` string the Inventory screen tints its
+          // rows by, so the two surfaces cannot report different numbers.
+          int stock(String kind) => invRows
+              .where((r) => _s(r as Map, 'status', 'In Stock').toLowerCase().contains(kind))
+              .length;
+          final low = stock('low');
+          final gone = stock('out');
+          opsTiles.add(_metricTile(context,
+            label: 'inventory items',
+            icon: Icons.inventory_2,
+            accent: gone > 0 ? AppColors.danger : (low > 0 ? AppColors.warning : AppColors.copperHi),
+            value: '${invRows.length}',
+            sub: invRows.isEmpty
+                ? 'nothing tracked yet'
+                : (low + gone == 0
+                    ? 'all in stock'
+                    : [if (gone > 0) '$gone out of stock', if (low > 0) '$low low'].join(' · ')),
+            onTap: jumpTo('Inventory'),
+          ));
+        }
+
+        final poData = data['purchaseOrders'] as Map?;
+        if (poData != null) {
+          final poRows = <Map>[for (final o in (poData['orders'] as List?) ?? const []) if (o is Map) o];
+          // draft + ordered = money committed but not yet on the shelf; received
+          // and cancelled are finished with.
+          final open = [
+            for (final o in poRows)
+              if (_s(o, 'status', 'draft') == 'draft' || _s(o, 'status', 'draft') == 'ordered') o,
+          ];
+          final committed = open.fold<double>(0, (s, o) => s + _numOf(o['total_cost']));
+          opsTiles.add(_metricTile(context,
+            label: 'purchase orders open',
+            icon: Icons.local_shipping,
+            value: '${open.length}',
+            sub: open.isEmpty ? '${poRows.length} raised in total' : '${_money(committed)} on order',
+            onTap: jumpTo('Purchase Orders'),
+          ));
+        }
+
+        final bookingRows = data['bookings'] as List?;
+        if (bookingRows != null) {
+          final live = <Map>[
+            for (final b in bookingRows)
+              if (b is Map && _s(b, 'status', '').toLowerCase() != 'cancelled') b,
+          ];
+          // The soonest by its OWN timestamp: /get-bookings orders the window
+          // for display, and "next" has to actually be the next one.
+          Map? next;
+          DateTime? nextAt;
+          for (final b in live) {
+            final at = DateTime.tryParse(_s(b, 'booking_date_time', ''));
+            if (at == null) continue;
+            if (nextAt == null || at.isBefore(nextAt)) {
+              nextAt = at;
+              next = b;
+            }
+          }
+          final party = next == null ? null : _int(next['number_of_people']);
+          opsTiles.add(_metricTile(context,
+            label: 'upcoming reservations',
+            icon: Icons.event_seat,
+            value: '${live.length}',
+            sub: next == null
+                ? (live.isEmpty ? 'nothing booked' : 'no date on the next booking')
+                : 'next ${_fmtDmy(_s(next, 'booking_date_time', ''))}'
+                    '${party == null ? '' : ' · party of $party'}',
+            onTap: jumpTo('Bookings'),
+          ));
+        }
+
+        final waitData = data['waitlist'] as Map?;
+        if (waitData != null) {
+          // Server order is queue order — the same order the Waitlist screen
+          // renders — so the head of the list IS the next party.
+          final waiting = <Map>[
+            for (final e in (waitData['entries'] as List?) ?? const [])
+              if (e is Map && _s(e, 'status', 'waiting') == 'waiting') e,
+          ];
+          opsTiles.add(_metricTile(context,
+            label: 'walk-ins waiting',
+            icon: Icons.hourglass_top,
+            accent: waiting.isEmpty ? AppColors.copperHi : AppColors.warning,
+            value: '${waiting.length}',
+            sub: waiting.isEmpty ? 'queue is empty' : 'next up ${_s(waiting.first, 'name', 'guest')}',
+            onTap: jumpTo('Waitlist'),
+          ));
+        }
+
+        final openBills = data['openBills'] as Map?;
+        if (openBills != null) {
+          final billCount = _int(openBills['total']) ?? 0;
+          opsTiles.add(_metricTile(context,
+            label: 'open bills',
+            icon: Icons.point_of_sale,
+            accent: billCount > 0 ? AppColors.warning : AppColors.copperHi,
+            value: '$billCount',
+            // Tax-inclusive and priced across every open bill, not just the
+            // one row this screen asked the server for.
+            sub: billCount == 0
+                ? 'nothing outstanding'
+                : '${_money(openBills['outstanding_total'])} uncollected',
+            onTap: jumpTo('Tables') ?? jumpTo('Orders'),
+          ));
+        }
+
         return ListView(padding: AppSpacing.pageNarrow, children: [
           Text('Welcome${p.firstName.isNotEmpty ? ', ${p.firstName}' : ''}', style: text.headlineMedium),
           const SizedBox(height: AppSpacing.xs),
@@ -1238,7 +1530,19 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                 tag: 'MTD',
                 caption: 'Revenue this month — all channels',
                 chart: dailyValues.length >= 2 ? CopperBarcode(values: dailyValues) : null,
-                footer: weekDeltaPct == null ? null : DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
+                // "▲ 12.4% vs prior week" is a fixed-width Row with nothing to
+                // give, and the four-across grid starts at a 1100px WINDOW —
+                // which, once the sidebar and the page padding are taken out,
+                // leaves each card ~165px of text width. That is 8px short.
+                // Scale the line down rather than drop the window it compares
+                // against: a delta with no stated baseline is not an insight.
+                footer: weekDeltaPct == null
+                    ? null
+                    : FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
+                      ),
               ),
             ),
             _TappableStat(
@@ -1273,6 +1577,15 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           ], cols),
           const SizedBox(height: 28),
 
+          // ---- ACROSS THE OTHER TABS -----------------------------------------
+          // Inventory, purchase orders, reservations, the walk-in queue and the
+          // money still on the floor — one figure each, packed several to a row.
+          if (opsTiles.isNotEmpty) ...[
+            const SectionHeader(title: 'Operations'),
+            _dashGrid(opsTiles, metricCols),
+            const SizedBox(height: 28),
+          ],
+
           // ---- QUICK INSIGHTS ------------------------------------------------
           // One server read (/analytics/overview), composed from the same helpers
           // the detail screens use, so a figure here cannot disagree with the
@@ -1282,7 +1595,7 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           // and low stock now arrive from the server naming the actual offenders,
           // so only the signal it does not send — tables under their APC target,
           // which is a live floor reading — is still counted here.
-          ..._overviewInsights(context, ins, nav, columns: cols, liveTiles: [
+          ..._overviewInsights(context, ins, nav, columns: cols, metricColumns: metricCols, liveTiles: [
             if (tablesBelow > 0)
               // Routed through the same filter the server-composed rows use, so
               // this tile cannot forward a key Tables does not read: `apc_status`
@@ -1310,6 +1623,7 @@ Widget overviewModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
         ]);
       },
     );
+});
 
 // Start a takeaway/delivery order (no table): pick the channel, then the order
 // entry screen provisions a virtual table on send.
@@ -1326,6 +1640,146 @@ Future<void> _newTakeawayOrder(BuildContext context, RestClient rest, VoidCallba
   if (type == null || !context.mounted) return;
   await Navigator.of(context).push(MaterialPageRoute(builder: (_) => OrderEntryScreen(rest: rest, orderType: type)));
   reload();
+}
+
+// ---- orders: the three sections and the 24h live window ---------------------
+
+// Which section an order belongs in. The backend's stage codes are 8=Pending,
+// 1=Preparing, 2=Served, 3=Bill Verification, 4=Paid, 5=Cancelled,
+// 6=Payment Pending Approval, 7=Closed; /orders sends them as labels, so that
+// is what is matched here.
+//
+//  0 UPCOMING — 8 Pending. Not accepted yet: guest QR tickets and the
+//    pre-orders a waiting party placed from the queue. Nothing has been cooked,
+//    so it is not "ongoing" — it is work the owner has not agreed to yet.
+//  1 CURRENT  — 1 Preparing, 2 Served, 3 Bill Verification, 6 Payment Pending
+//    Approval, and anything unrecognised. Everything mid-flight, from the
+//    moment it is accepted until the money is confirmed. Served belongs here
+//    (the user said so explicitly) and so does a bill awaiting verification: an
+//    eaten-but-unpaid table is still the floor's problem.
+//  2 PAID     — 4 Paid, 7 Closed, 5 Cancelled. All three are terminal: the
+//    ticket is off the floor and nothing further will happen to it. Cancelled
+//    lives here rather than in a fourth section because three were asked for,
+//    and it can never be mistaken for revenue on screen — the card keeps its
+//    red "Cancelled" status chip and its lock line.
+int _orderSection(String status) {
+  final s = status.trim().toLowerCase();
+  if (s == 'pending') return 0;
+  if (s == 'paid' || s == 'closed' || _isCancelled(s)) return 2;
+  return 1;
+}
+
+const List<String> _orderSectionTitles = ['Upcoming', 'Current', 'Paid'];
+
+// Shown on the Paid header only while that section is actually holding a
+// cancelled ticket, because that is the one case where a bare "Paid" would
+// misdescribe what is under it.
+const String _orderPaidCaption = 'Settled, closed and cancelled';
+
+const int _ordersLiveWindowHours = 24;
+
+// Age of an order in hours, measured on ONE basis at both ends.
+//
+// THE BASIS. A created_at that carries a zone (`…Z`, `…+05:30` — what the
+// backend sends) denotes an instant, so the age is the plain UTC instant
+// difference: elapsed time is not a property of any wall clock. A zone-less
+// created_at denotes no instant at all; the rest of the app reads it as the
+// restaurant's own wall clock (see RestaurantTime.wallOf), so it is aged
+// against the restaurant's wall clock now — again both ends on one carrier.
+//
+// It must not be mixed. wallOf() shifts a row by the restaurant's offset AT THE
+// ORDER'S INSTANT while nowWall() shifts by the offset in force NOW; subtracting
+// one from the other buries the difference between those offsets in the answer,
+// which across a DST change is a whole hour landing on a 24h cut-off.
+//
+// Null when the row carries no parseable created_at — and a row we cannot date
+// is never aged out.
+double? _orderAgeHours(Map o, {DateTime? now}) {
+  final iso = _s(o, 'created_at', '').trim();
+  if (iso.isEmpty) return null;
+  if (_isoCarriesZone.hasMatch(iso)) {
+    final placed = DateTime.tryParse(iso);
+    if (placed == null) return null;
+    return (now ?? DateTime.now()).toUtc().difference(placed.toUtc()).inMinutes / 60.0;
+  }
+  final placed = RestaurantTime.wallOf(iso);
+  if (placed == null) return null;
+  final instant = now ?? DateTime.now();
+  final off = RestaurantTime.offsetMinutesAt(instant.toUtc());
+  // RestaurantTime.nowWall(), with the clock passed in: device time is the only
+  // honest fallback when this build's table cannot render the zone.
+  final wallNow = off == null ? instant.toLocal() : instant.toUtc().add(Duration(minutes: off));
+  return wallNow.difference(placed).inMinutes / 60.0;
+}
+
+// Mirrors RestaurantTime's own zone test: a timestamp ending in Z/±hh:mm is an
+// instant, anything else is a bare wall clock.
+final RegExp _isoCarriesZone = RegExp(r'(?:[Zz]|[+-]\d{2}:?\d{2})$');
+
+/// [_orderAgeHours] with an injectable clock. The 24h live window is the one
+/// rule on this screen that can make a ticket disappear, and its correctness is
+/// a statement about two timestamps taken at different instants — which cannot
+/// be exercised against the real `DateTime.now()`.
+@visibleForTesting
+double? orderAgeHoursAt(Map order, DateTime now) => _orderAgeHours(order, now: now);
+
+// True once an unpaid ticket has outlived the live window — it stays on the
+// page (see below) but says why it is still here.
+bool _orderStale(Map o) =>
+    _orderSection(_s(o, 'status', 'open')) != 2 &&
+    (_orderAgeHours(o) ?? 0) >= _ordersLiveWindowHours;
+
+// The live window: "after 24 hours of the order being created, clear it from
+// the orders page". What actually clears is deliberately narrower than that.
+//
+// SETTLED tickets (paid / closed / cancelled) drop off at 24h. They are the
+// clutter, and nothing is lost — they are HIDDEN, not deleted; History still
+// holds every one of them, and the footer under the grid says so.
+//
+// An UNPAID ticket never ages out. A bill that disappears at the 24h mark is
+// money quietly written off, which is the exact failure this screen exists to
+// prevent, so a stale unpaid order stays put and is flagged instead.
+//
+// A focused order is never hidden either: a tapped notification has to land on
+// its record rather than on "that order isn't in this list".
+bool _orderAgedOut(Map o, {required bool focused}) {
+  if (focused) return false;
+  if (_orderSection(_s(o, 'status', 'open')) != 2) return false;
+  final age = _orderAgeHours(o);
+  return age != null && age >= _ordersLiveWindowHours;
+}
+
+// The one place the page accounts for what the live window took off it. Shown
+// under the grid and inside the empty state, because an order disappearing with
+// no explanation is what made this screen untrustworthy in the first place.
+Widget _ordersHiddenNote(BuildContext context, int hidden, ModuleNavigator? nav) {
+  final text = Theme.of(context).textTheme;
+  // History is a permissioned module. Pointing a user who cannot open it at
+  // "they are in History" sends them to a door that is locked for them, so the
+  // promise is only made to someone who can actually walk through it — the
+  // reassurance that nothing was deleted still holds either way.
+  final canOpenHistory = nav != null && nav.canOpen('History');
+  return Row(children: [
+    const Icon(Icons.history, size: 14, color: AppColors.textTertiary),
+    const SizedBox(width: 7),
+    Expanded(
+      child: Text(
+        '$hidden settled order${hidden == 1 ? '' : 's'} placed over '
+        '$_ordersLiveWindowHours hours ago ${hidden == 1 ? 'is' : 'are'} hidden here. '
+        '${canOpenHistory ? 'Nothing was deleted — they are in History.' : 'Nothing was deleted — they are kept on record, and anyone with History access can still pull them up.'}',
+        style: text.bodySmall,
+      ),
+    ),
+    if (canOpenHistory) ...[
+      const SizedBox(width: 8),
+      ForkButton.ghost(
+        label: 'History',
+        icon: Icons.calendar_month,
+        dense: true,
+        onPressed: () => nav.openModule('History'),
+      ),
+    ],
+  ]);
 }
 
 Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
@@ -1348,6 +1802,15 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             (focusId != null && '${o['id']}' == focusId) ||
             (focusId == null && focusTable != null && _s(o, 'table') == focusTable);
         final focusFound = focusId != null || focusTable != null ? rows.any((o) => isFocused(o as Map)) : false;
+        // The live window (see [_orderAgedOut]): settled tickets older than a
+        // day come off the page. `hidden` is reported to the user rather than
+        // swallowed — an order vanishing with no explanation is the complaint
+        // this whole screen was reworked over.
+        final live = <Map>[
+          for (final o in rows.cast<Map>())
+            if (!_orderAgedOut(o, focused: isFocused(o))) o,
+        ];
+        final hidden = rows.length - live.length;
         // The focused order first, then orders awaiting approval (auto-push off),
         // then NEWEST FIRST. That last tiebreaker matters: Dart's List.sort is not
         // stable, so a comparator that returned 0 for every remaining pair let the
@@ -1355,9 +1818,9 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // long-cancelled ticket kept surfacing at the top of the list.
         int placedAt(Map o) =>
             DateTime.tryParse(_s(o, 'created_at'))?.millisecondsSinceEpoch ?? 0;
-        final sorted = [...rows]..sort((a, b) {
-            final fa = isFocused(a as Map) ? 0 : 1;
-            final fb = isFocused(b as Map) ? 0 : 1;
+        final sorted = [...live]..sort((a, b) {
+            final fa = isFocused(a) ? 0 : 1;
+            final fb = isFocused(b) ? 0 : 1;
             if (fa != fb) return fa - fb;
             final pa = _s(a, 'status').toLowerCase() == 'pending' ? 0 : 1;
             final pb = _s(b, 'status').toLowerCase() == 'pending' ? 0 : 1;
@@ -1370,7 +1833,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // approval and settle all live on the table, one hop away.
         final focusedTable = !focusFound
             ? ''
-            : _s(sorted.firstWhere((o) => isFocused(o as Map)) as Map, 'table', '');
+            : _s(sorted.firstWhere(isFocused), 'table', '');
         // Header strip above the grid: which outlet, and (when a notification
         // sent us here) whether that order is actually in this list.
         final header = <Widget>[
@@ -1417,7 +1880,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             icon: const Icon(Icons.takeout_dining),
             label: const Text('Takeaway / Delivery'),
           ),
-          body: rows.isEmpty
+          body: sorted.isEmpty
               ? Column(children: [
                   if (header.isNotEmpty)
                     Padding(
@@ -1434,6 +1897,13 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                       caption: 'New orders appear here the moment they are placed.',
                     ),
                   ),
+                  // Everything the page had was settled and aged out — say where
+                  // it went rather than leaving an unexplained empty screen.
+                  if (hidden > 0)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                      child: _ordersHiddenNote(context, hidden, nav),
+                    ),
                 ])
               : Builder(builder: (c) {
           // One order used to own a full-width row, so on a desktop window most
@@ -1444,9 +1914,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
           // module), so the list is small and bounded.
           final width = MediaQuery.sizeOf(c).width;
           final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
-          final cards = <Widget>[];
-          for (var i = 0; i < sorted.length; i++) {
-            final o = sorted[i] as Map;
+          Widget orderCard(Map o) {
             final items = (o['items'] as List?) ?? [];
             final status = _s(o, 'status', 'open');
             final pending = status.toLowerCase() == 'pending';
@@ -1474,7 +1942,17 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             // elapsed minutes since the bark, this is the wall-clock instant the
             // order entered the books — the one the tally is reconciled against.
             final placedLabel = _fmtTime(_s(o, 'created_at'));
+            // Past the live window but still owing money, so it was deliberately
+            // NOT cleared. Flagged so the owner knows why yesterday's ticket is
+            // still on today's page.
+            final stale = _orderStale(o);
             final chips = <Widget>[
+              if (stale)
+                const StatusChip(
+                  label: 'Over 24h · unsettled',
+                  color: AppColors.warning,
+                  dense: true,
+                ),
               if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
               if (placedLabel.isNotEmpty) InfoChip(icon: Icons.access_time, label: 'Placed $placedLabel'),
               InfoChip(icon: Icons.room_service_outlined, label: _s(o, 'taken_by_employee_name')),
@@ -1598,7 +2076,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
               );
             }
 
-            cards.add(ForkCard(
+            return ForkCard(
               selected: pending || focused,
               onTap: openDetail,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -1638,9 +2116,15 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   const SizedBox(width: 8),
                   Text(_money(o['total']), style: text.titleSmall),
                 ]),
-                if (focused || orderType != 'dine_in') ...[
+                if (stale || focused || orderType != 'dine_in') ...[
                   const SizedBox(height: 8),
                   Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (stale)
+                      const StatusChip(
+                        label: 'Over 24h · unsettled',
+                        color: AppColors.warning,
+                        dense: true,
+                      ),
                     if (focused)
                       const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
                     if (orderType != 'dine_in')
@@ -1699,7 +2183,16 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   ]),
                 ],
               ]),
-            ));
+            );
+          }
+
+          // Grouped, in the order the owner works them: what has not been
+          // accepted yet, what is on the floor, what is done. A section with
+          // nothing in it collapses away — an empty "Upcoming" box every day of
+          // the week trains the eye to skip the headings entirely.
+          final grouped = <List<Map>>[[], [], []];
+          for (final o in sorted) {
+            grouped[_orderSection(_s(o, 'status', 'open'))].add(o);
           }
           return ListView(
             padding: AppSpacing.pageNarrow,
@@ -1708,7 +2201,19 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                 Column(children: header),
                 const SizedBox(height: 14),
               ],
-              _dashGrid(cards, cols),
+              for (var s = 0; s < grouped.length; s++)
+                if (grouped[s].isNotEmpty) ...[
+                  SectionHeader(
+                    title: _orderSectionTitles[s],
+                    count: grouped[s].length,
+                    trailing: s == 2 && grouped[s].any((o) => _isCancelled(_s(o, 'status', '')))
+                        ? Text(_orderPaidCaption, style: Theme.of(c).textTheme.bodySmall)
+                        : null,
+                  ),
+                  _dashGrid([for (final o in grouped[s]) orderCard(o)], cols),
+                  const SizedBox(height: 22),
+                ],
+              if (hidden > 0) _ordersHiddenNote(c, hidden, nav),
             ],
           );
         }),
@@ -1976,10 +2481,15 @@ Widget menuModule(RestClient rest, Profile p) {
         final narrow = width < 760;
         final tabs = ['All', ...cats];
 
-        // One template-style menu row: leading tile, name + quiet cost line,
-        // section tag, right-aligned price MicroStat + availability chip, and
-        // the assign/toggle/delete actions.
-        Widget itemRow(Map item) => Builder(builder: (context) {
+        // Tiles, not rows: a menu line is a picture, a name and a price, and a
+        // full-width row per dish left two thirds of a desktop window empty.
+        // Same 4/3/2/1 breakpoints as the Orders grid.
+        final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+
+        // One menu tile: leading image, name + quiet cost line, section tag,
+        // price and the availability toggle. Editing, section assignment and
+        // delete live behind the tap.
+        Widget itemCard(Map item) => Builder(builder: (context) {
               final text = Theme.of(context).textTheme;
               final soldOut = item['available'] == false;
               final station = _s(item, 'station', '');
@@ -2001,7 +2511,9 @@ Widget menuModule(RestClient rest, Profile p) {
               final name = Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
                 Text(
                   _s(item, 'name'),
-                  maxLines: 1,
+                  // Two lines on a narrow tile: a dish name that ellipses at the
+                  // first word is worse than a slightly taller card.
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: text.titleSmall!.copyWith(
                     decoration: soldOut ? TextDecoration.lineThrough : null,
@@ -2012,19 +2524,18 @@ Widget menuModule(RestClient rest, Profile p) {
                   const SizedBox(height: 3),
                   Text(detail, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.bodySmall),
                 ],
-                // The guest-facing description, flattened to a single quiet line
-                // (the full text is in the edit dialog).
-                if (blurb.isNotEmpty) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    blurb.replaceAll('\n', ' '),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: text.bodySmall!.copyWith(color: AppColors.textTertiary, fontSize: 11.5),
-                  ),
-                ],
                 const SizedBox(height: 6),
-                _sectionTag(station, managed: managed),
+                // A leftover label reads "TANDOORI GRILL · UNASSIGNED", which is
+                // wider than a tile column — scale it down rather than let it
+                // overflow the card.
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: _sectionTag(station, managed: managed),
+                  ),
+                ),
               ]);
               final availability = AnimatedSwitcher(
                 duration: AppDurations.base,
@@ -2037,55 +2548,80 @@ Widget menuModule(RestClient rest, Profile p) {
                   dense: true,
                 ),
               );
-              final actions = Row(mainAxisSize: MainAxisSize.min, children: [
-                ForkIconButton(
-                  icon: Icons.soup_kitchen_outlined,
-                  tooltip: 'Assign kitchen section',
-                  onPressed: () => assignStation(item),
-                ),
-                const SizedBox(width: 6),
-                ForkIconButton(
-                  icon: soldOut ? Icons.visibility_off_outlined : Icons.visibility_outlined,
-                  tooltip: soldOut ? 'Mark available' : 'Mark sold out',
-                  onPressed: () => toggleAvailable(item),
-                ),
-                const SizedBox(width: 6),
-                ForkIconButton(
-                  icon: Icons.delete_outline,
-                  tooltip: 'Delete item',
-                  onPressed: () => deleteItem(item),
-                ),
-              ]);
-              if (narrow) {
-                return ForkCard(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  onTap: () => saveItem(existing: Map<String, dynamic>.from(item)),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      tile,
-                      const SizedBox(width: AppSpacing.md),
-                      Expanded(child: name),
-                      const SizedBox(width: AppSpacing.md),
-                      MicroStat(value: _money(item['price']), label: 'Price', alignEnd: true),
+              // Everything the tile has no room for — the guest-facing blurb and
+              // the three destructive-ish actions — is one tap away, so a mis-tap
+              // in a dense grid can never delete a dish or re-route its section.
+              void openDetail() {
+                _detailSheet(
+                  context,
+                  eyebrow: _s(item, 'category', 'Menu'),
+                  title: _s(item, 'name'),
+                  children: [
+                    _kv('Price', _money(item['price'])),
+                    if (detail.isNotEmpty) _kv('Costing', detail),
+                    _kv('Kitchen section', station.isEmpty ? '—' : station),
+                    _kv('Availability', soldOut ? 'Sold out' : 'Available'),
+                    if (blurb.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text(blurb, style: text.bodySmall!.copyWith(color: AppColors.textTertiary)),
+                    ],
+                    const SizedBox(height: 14),
+                    Wrap(spacing: 8, runSpacing: 8, children: [
+                      ForkButton(
+                        label: 'Edit item',
+                        icon: Icons.edit_outlined,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          saveItem(existing: Map<String, dynamic>.from(item));
+                        },
+                      ),
+                      ForkButton.ghost(
+                        label: 'Kitchen section',
+                        icon: Icons.soup_kitchen_outlined,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          assignStation(item);
+                        },
+                      ),
+                      ForkButton.ghost(
+                        label: 'Delete item',
+                        icon: Icons.delete_outline,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          deleteItem(item);
+                        },
+                      ),
                     ]),
-                    const SizedBox(height: AppSpacing.md),
-                    Row(children: [availability, const Spacer(), actions]),
-                  ]),
+                  ],
                 );
               }
+
               return ForkCard(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                onTap: () => saveItem(existing: Map<String, dynamic>.from(item)),
-                child: Row(children: [
-                  tile,
-                  const SizedBox(width: AppSpacing.md),
-                  Expanded(child: name),
-                  const SizedBox(width: AppSpacing.md),
-                  MicroStat(value: _money(item['price']), label: 'Price', alignEnd: true),
-                  const SizedBox(width: AppSpacing.lg),
-                  availability,
-                  const SizedBox(width: AppSpacing.lg),
-                  actions,
+                onTap: openDetail,
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    tile,
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(child: name),
+                    const SizedBox(width: AppSpacing.md),
+                    MicroStat(value: _money(item['price']), label: 'Price', alignEnd: true),
+                  ]),
+                  const SizedBox(height: AppSpacing.md),
+                  Row(children: [
+                    availability,
+                    const Spacer(),
+                    // 86-ing a dish is the one menu action taken mid-service, so
+                    // it stays on the tile rather than behind a tap.
+                    ForkIconButton(
+                      icon: soldOut ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                      tooltip: soldOut ? 'Mark available' : 'Mark sold out',
+                      onPressed: () => toggleAvailable(item),
+                    ),
+                  ]),
                 ]),
               );
             });
@@ -2139,10 +2675,7 @@ Widget menuModule(RestClient rest, Profile p) {
                   )
                 else ...[
                   SectionHeader(title: 'Search results', count: matches.length),
-                  for (var i = 0; i < matches.length; i++) ...[
-                    if (i > 0) const SizedBox(height: 10),
-                    itemRow(matches[i]),
-                  ],
+                  _dashGrid([for (final m in matches) itemCard(m)], cols),
                 ],
               ] else if (rows.isEmpty)
                 EmptyState(
@@ -2163,10 +2696,7 @@ Widget menuModule(RestClient rest, Profile p) {
                       onPressed: () => deleteCategory(showCats[ci]),
                     ),
                   ),
-                  for (var i = 0; i < byCat[showCats[ci]]!.length; i++) ...[
-                    if (i > 0) const SizedBox(height: 10),
-                    itemRow(byCat[showCats[ci]]![i]),
-                  ],
+                  _dashGrid([for (final it in byCat[showCats[ci]]!) itemCard(it)], cols),
                 ],
             ],
           );
@@ -6677,6 +7207,14 @@ bool _orderBarked(Map o) => !o.containsKey('barked_at') || o['barked_at'] != nul
 // recessed InfoChip pill from the template.
 Widget _stationBadge(String station) => InfoChip(label: station.toUpperCase());
 
+/// Column count for the kitchen board. Deliberately COARSER than the 4/3/2/1
+/// grid the rest of the app uses: a ticket's whole point is its item list, every
+/// line of which must stay readable at arm's length without a tap, so a column
+/// is never allowed below ~500px — the width a "12 × Paneer Butter Masala"
+/// line plus its station tag, timer and serve controls actually needs. The board
+/// therefore tops out at 3 across where Orders would already be at 4.
+int _kdsColumns(double width) => width >= 1620 ? 3 : (width >= 1100 ? 2 : 1);
+
 class _KdsHome extends StatefulWidget {
   final RestClient rest;
   const _KdsHome({required this.rest});
@@ -6846,11 +7384,20 @@ class _KdsHomeState extends State<_KdsHome> {
                           mentionHistory: false,
                         )
                       : _empty('No active tickets for $selected.'))
-                  : ListView.separated(
+                  : ListView(
                       padding: const EdgeInsets.all(16),
-                      itemCount: visible.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 14),
-                      itemBuilder: (c, i) => _KdsCard(order: visible[i] as Map, rest: widget.rest, reload: reload, station: selected),
+                      children: [
+                        _dashGrid([
+                          for (final o in visible)
+                            _KdsCard(
+                              key: ValueKey('kds-${(o as Map)['id']}'),
+                              order: o,
+                              rest: widget.rest,
+                              reload: reload,
+                              station: selected,
+                            ),
+                        ], _kdsColumns(MediaQuery.sizeOf(context).width)),
+                      ],
                     ),
             ),
           ]);
@@ -6929,36 +7476,41 @@ class _ExpoViewState extends State<_ExpoView> {
           final text = Theme.of(context).textTheme;
           return RefreshIndicator(
             onRefresh: () async => reload(),
-            child: ListView.separated(
+            // Same coarse tiling as the ticket board: a pass card is read the
+            // same way a ticket is, and every item chip stays on it.
+            child: ListView(
               physics: const AlwaysScrollableScrollPhysics(),
               padding: const EdgeInsets.all(16),
-              itemCount: tables.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 14),
-              itemBuilder: (c, i) {
-                final t = tables[i] as Map;
-                final items = (t['items'] as List?) ?? [];
-                final ready = (t['ready_count'] as num?)?.toInt() ?? 0;
-                final pending = (t['pending_count'] as num?)?.toInt() ?? 0;
-                return ForkCard(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(children: [
-                      Expanded(
-                        child: Text('Table ${_s(t, 'table')}',
-                            style: text.titleMedium, overflow: TextOverflow.ellipsis),
-                      ),
-                      StatusChip(label: '$ready ready', color: AppColors.success, dense: true),
-                      const SizedBox(width: 6),
-                      StatusChip(
-                          label: '$pending pending',
-                          color: pending > 0 ? AppColors.warning : AppColors.neutral,
-                          dense: true),
-                    ]),
-                    const SizedBox(height: AppSpacing.md),
-                    Wrap(spacing: 6, runSpacing: 6, children: [for (final it in items) _expoChip(it as Map)]),
-                  ]),
-                );
-              },
+              children: [
+                _dashGrid([
+                  for (final r in tables)
+                    Builder(builder: (context) {
+                      final t = r as Map;
+                      final items = (t['items'] as List?) ?? [];
+                      final ready = (t['ready_count'] as num?)?.toInt() ?? 0;
+                      final pending = (t['pending_count'] as num?)?.toInt() ?? 0;
+                      return ForkCard(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Row(children: [
+                            Expanded(
+                              child: Text('Table ${_s(t, 'table')}',
+                                  style: text.titleMedium, overflow: TextOverflow.ellipsis),
+                            ),
+                            StatusChip(label: '$ready ready', color: AppColors.success, dense: true),
+                            const SizedBox(width: 6),
+                            StatusChip(
+                                label: '$pending pending',
+                                color: pending > 0 ? AppColors.warning : AppColors.neutral,
+                                dense: true),
+                          ]),
+                          const SizedBox(height: AppSpacing.md),
+                          Wrap(spacing: 6, runSpacing: 6, children: [for (final it in items) _expoChip(it as Map)]),
+                        ]),
+                      );
+                    }),
+                ], _kdsColumns(MediaQuery.sizeOf(context).width)),
+              ],
             ),
           );
         },
@@ -6996,7 +7548,7 @@ class _KdsCard extends StatefulWidget {
   final RestClient rest;
   final VoidCallback reload;
   final String station;
-  const _KdsCard({required this.order, required this.rest, required this.reload, this.station = 'All'});
+  const _KdsCard({super.key, required this.order, required this.rest, required this.reload, this.station = 'All'});
 
   @override
   State<_KdsCard> createState() => _KdsCardState();
@@ -7076,9 +7628,12 @@ class _KdsCardState extends State<_KdsCard> {
     final card = ForkCard(
       padding: const EdgeInsets.all(16),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Expanded, not Flexible + Spacer: on a narrow docket column the table
+        // name gives way to the timer and the stage, never the reverse.
         Row(children: [
-          Flexible(
-            child: Text('Table ${_s(o, 'table')}', style: text.titleMedium, overflow: TextOverflow.ellipsis),
+          Expanded(
+            child: Text('Table ${_s(o, 'table')}',
+                style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
           ),
           const SizedBox(width: AppSpacing.sm),
           if (barked)
@@ -7089,7 +7644,6 @@ class _KdsCardState extends State<_KdsCard> {
             )
           else
             const InfoChip(icon: Icons.campaign_outlined, label: 'Idle timer'),
-          const Spacer(),
           const SizedBox(width: AppSpacing.sm),
           AnimatedSwitcher(
             duration: AppDurations.base,
@@ -7166,24 +7720,31 @@ class _KdsCardState extends State<_KdsCard> {
               curve: Curves.easeOut,
               opacity: (held || !barked || cancelled) ? 0.55 : 1,
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Row(children: [
+                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Expanded(
-                    child: Row(children: [
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text('${m['quantity'] ?? 1} ×', style: qtyStyle),
                       const SizedBox(width: 7),
-                      Flexible(
-                        child: Text('${m['name'] ?? ''}',
-                            overflow: TextOverflow.ellipsis,
-                            style: lineStyle.copyWith(
-                              decoration: served ? TextDecoration.lineThrough : null,
-                              color: (served || held) ? AppColors.textSecondary : null,
-                            )),
+                      // Narrowing the ticket must never cost the chef a dish
+                      // name: the name WRAPS onto as many lines as it needs
+                      // (no ellipsis, no "+3 more") and the tags flow after it.
+                      // The card grows downwards instead — a docket is tall.
+                      Expanded(
+                        child: Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            Text('${m['name'] ?? ''}',
+                                style: lineStyle.copyWith(
+                                  decoration: served ? TextDecoration.lineThrough : null,
+                                  color: (served || held) ? AppColors.textSecondary : null,
+                                )),
+                            if (stationLabel.isNotEmpty) _stationBadge(stationLabel),
+                            if (held) const StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
+                          ],
+                        ),
                       ),
-                      if (stationLabel.isNotEmpty) ...[const SizedBox(width: 6), _stationBadge(stationLabel)],
-                      if (held) ...[
-                        const SizedBox(width: 6),
-                        const StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
-                      ],
                     ]),
                   ),
                   if (cancelled)
@@ -7266,7 +7827,10 @@ class _KdsCardState extends State<_KdsCard> {
           );
         }),
         const SizedBox(height: 14),
-        Row(children: [
+        // Bump / serve / hold stay ON the ticket — a chef mid-service cannot be
+        // sent through a sheet — so on a narrow docket column they wrap onto a
+        // second line instead of being squeezed or dropped.
+        Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
           if (cancelled)
             // Read-only footer: the caption replaces every stage action, and the
             // reason travels with it. Printing the KOT stays available (no write).
@@ -7280,33 +7844,43 @@ class _KdsCardState extends State<_KdsCard> {
                 ),
               ]),
             )
-          else if (!barked)
-            ForkButton(
-              label: 'Bark to kitchen',
-              icon: Icons.campaign,
-              onPressed: () => _barkOrder(ScaffoldMessenger.of(context), widget.rest, id, widget.reload),
-            )
-          else if (status.toLowerCase() == 'preparing')
-            ForkButton(
-              label: 'Mark Served',
-              icon: Icons.room_service_outlined,
-              onPressed: () => _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Served', widget.reload),
-            )
           else
-            ForkButton.ghost(
-              label: 'Back to Preparing',
-              icon: Icons.undo,
-              onPressed: () => _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Preparing', widget.reload),
+            Expanded(
+              child: Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  if (!barked)
+                    ForkButton(
+                      label: 'Bark to kitchen',
+                      icon: Icons.campaign,
+                      onPressed: () => _barkOrder(ScaffoldMessenger.of(context), widget.rest, id, widget.reload),
+                    )
+                  else if (status.toLowerCase() == 'preparing')
+                    ForkButton(
+                      label: 'Mark Served',
+                      icon: Icons.room_service_outlined,
+                      onPressed: () =>
+                          _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Served', widget.reload),
+                    )
+                  else
+                    ForkButton.ghost(
+                      label: 'Back to Preparing',
+                      icon: Icons.undo,
+                      onPressed: () =>
+                          _advanceOrder(ScaffoldMessenger.of(context), widget.rest, id, 'Preparing', widget.reload),
+                    ),
+                  if (barked)
+                    ForkButton.ghost(
+                      label: orderPaused ? 'Resume' : 'Hold',
+                      icon: orderPaused ? Icons.play_arrow : Icons.pause,
+                      onPressed: () => _post('/orders/$id/${orderPaused ? 'resume' : 'pause'}'),
+                    ),
+                ],
+              ),
             ),
-          if (barked && !cancelled) ...[
-            const SizedBox(width: AppSpacing.sm),
-            ForkButton.ghost(
-              label: orderPaused ? 'Resume' : 'Hold',
-              icon: orderPaused ? Icons.play_arrow : Icons.pause,
-              onPressed: () => _post('/orders/$id/${orderPaused ? 'resume' : 'pause'}'),
-            ),
-          ],
-          if (!cancelled) const Spacer(),
+          const SizedBox(width: AppSpacing.sm),
           ForkIconButton(
             icon: Icons.print_outlined,
             tooltip: 'Print KOT',
@@ -7815,37 +8389,77 @@ Widget customersModule(RestClient rest, Profile p) => AsyncView<List>(
               : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
         }
 
-        return ListView.builder(
+        // A guest is a name, a number and a visit count — one full-width row
+        // each left most of a desktop window empty. Same 4/3/2/1 tiling as the
+        // Orders grid; the email and the booking state move into the tap.
+        final width = MediaQuery.sizeOf(context).width;
+        final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+        final cards = <Widget>[];
+        for (final r in rows) {
+          final m = r as Map;
+          final name = _s(m, 'name', 'Guest');
+          final phone = _s(m, 'phone_number', '');
+          final email = _s(m, 'email', '');
+          final bookings = _int(m['booking_count']) ?? 0;
+          final booked = m['has_booking'] == true;
+          cards.add(ForkCard(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            // A tile ellipses long names and addresses; the tap shows them in
+            // full. Read-only by design — nothing on this screen mutates.
+            onTap: () => _detailSheet(
+              context,
+              eyebrow: 'Guest book',
+              title: name,
+              jumpTo: booked ? 'Bookings' : null,
+              children: [
+                _kv('Phone', phone.isEmpty ? '—' : phone),
+                _kv('Email', email.isEmpty ? '—' : email),
+                _kv('Bookings', '$bookings'),
+                _kv('Booking open', booked ? 'Yes' : 'No'),
+              ],
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                InitialsAvatar(initials: initialsOf(name)),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                    Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const SizedBox(height: 2),
+                    Text(phone.isEmpty ? '—' : phone,
+                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ]),
+                ),
+              ]),
+              const SizedBox(height: 10),
+              Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Expanded(
+                  child: email.isEmpty
+                      ? const SizedBox.shrink()
+                      : Text(email,
+                          style: text.bodySmall!.copyWith(fontSize: 11),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis),
+                ),
+                const SizedBox(width: 8),
+                MicroStat(value: '$bookings', label: 'Bookings', alignEnd: true),
+              ]),
+              if (booked) ...[
+                const SizedBox(height: 8),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: InfoChip(icon: Icons.event_available_outlined, label: 'Booking open'),
+                ),
+              ],
+            ]),
+          ));
+        }
+        return ListView(
           padding: AppSpacing.pageNarrow,
-          itemCount: rows.length + 1,
-          itemBuilder: (c, i) {
-            if (i == 0) {
-              return SectionHeader(title: 'Guest book', count: rows.length);
-            }
-            final m = rows[i - 1] as Map;
-            final email = m['email'];
-            final name = _s(m, 'name', 'Guest');
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: ForkCard(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                child: Row(children: [
-                  InitialsAvatar(initials: initialsOf(name)),
-                  const SizedBox(width: AppSpacing.md),
-                  Expanded(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                      Text(name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      const SizedBox(height: 2),
-                      Text('${_s(m, 'phone_number')}${email != null ? ' · $email' : ''}',
-                          style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                    ]),
-                  ),
-                  const SizedBox(width: AppSpacing.md),
-                  MicroStat(value: '${m['booking_count'] ?? 0}', label: 'Bookings', alignEnd: true),
-                ]),
-              ),
-            );
-          },
+          children: [
+            SectionHeader(title: 'Guest book', count: rows.length),
+            _dashGrid(cards, cols),
+          ],
         );
       },
     );
@@ -13343,12 +13957,24 @@ class _BillingViewState extends State<_BillingView> {
     return '₹${(n / 100).toStringAsFixed(0)}';
   }
 
-  int? _daysUntil(String? iso) {
+  // Time left to [iso], null when absent/unparseable. Deliberately a Duration and
+  // not a day count: Duration.inDays truncates toward zero, which collapses
+  // "ends in 20 hours" and "ended 20 hours ago" into the same 0.
+  Duration? _timeUntil(String? iso) {
     if (iso == null || iso.isEmpty) return null;
     final dt = DateTime.tryParse(iso);
     if (dt == null) return null;
-    return dt.difference(DateTime.now()).inDays;
+    return dt.difference(DateTime.now());
   }
+
+  String _plural(int n, String unit) => '$n $unit${n == 1 ? '' : 's'}';
+
+  // Rounded UP, so a period with 20 hours left reads as "1 day" rather than "0".
+  int _daysLeft(Duration d) => (d.inMinutes / Duration.minutesPerDay).ceil();
+
+  // Rounded DOWN on the overdue side, so "overdue by N days" only claims whole
+  // elapsed days and stays silent for the first 24 hours.
+  int _daysLate(Duration d) => (-d.inMinutes / Duration.minutesPerDay).floor();
 
   Future<void> _choose(Map plan) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -13399,8 +14025,23 @@ class _BillingViewState extends State<_BillingView> {
     final invoices = (_info['invoices'] as List?) ?? const [];
     final status = '${sub?['status'] ?? ''}';
     final currentPlanId = sub?['plan_id'];
-    final trialDays = status == 'trial' ? _daysUntil(sub?['trial_ends_at'] as String?) : null;
-    final periodDays = status == 'active' ? _daysUntil(sub?['current_period_end'] as String?) : null;
+    final trialLeft = status == 'trial' ? _timeUntil(_s(sub ?? const {}, 'trial_ends_at', '')) : null;
+    final periodLeft = _timeUntil(_s(sub ?? const {}, 'current_period_end', ''));
+    // A period end in the past is never a countdown — but it is not a failure
+    // yet either. The charge is presented on the due date and settles
+    // asynchronously (a UPI/card mandate can take hours to confirm), and the
+    // platform re-tries a soft decline on a nightly cycle, so the first hours
+    // past the boundary are a renewal IN FLIGHT, not a renewal that failed.
+    //
+    // 48 hours: long enough to cover the initial presentation plus one nightly
+    // retry, short enough that a genuinely dead card is called out within two
+    // days. The server's own verdict always wins — once it manages to invoice a
+    // lapsed subscription it flips the status to past_due/suspended, and that
+    // escalates immediately whatever the clock says.
+    const graceAfterPeriodEnd = Duration(hours: 48);
+    final lapsed = status == 'active' && periodLeft != null && periodLeft.isNegative;
+    final renewing = lapsed && -periodLeft <= graceAfterPeriodEnd;
+    final overdue = status == 'past_due' || status == 'suspended' || (lapsed && !renewing);
     const labels = {
       'accounting': 'Accounting & cash', 'analytics': 'Analytics', 'inventory': 'Inventory & purchasing',
       'valet': 'Valet', 'coupons': 'Coupons', 'attendance': 'Attendance', 'multi_outlet': 'Multi-outlet',
@@ -13408,11 +14049,31 @@ class _BillingViewState extends State<_BillingView> {
 
     final text = Theme.of(context).textTheme;
     final narrow = MediaQuery.sizeOf(context).width < 760;
+    String renewal() {
+      if (overdue) {
+        final late = periodLeft == null ? 0 : _daysLate(periodLeft);
+        return late >= 1 ? 'Payment overdue by ${_plural(late, 'day')}' : 'Payment overdue';
+      }
+      // Inside the grace window the honest statement is that the period ended
+      // and the charge has not confirmed — not that anything went wrong.
+      if (renewing) return 'Renewing — payment not confirmed yet';
+      if (status != 'active' || periodLeft == null) return '';
+      final days = _daysLeft(periodLeft);
+      return days <= 0 ? 'Renews today' : 'Renews in ${_plural(days, 'day')}';
+    }
+
+    String trial() {
+      if (trialLeft == null) return '';
+      if (trialLeft.isNegative) return 'Trial expired';
+      final days = _daysLeft(trialLeft);
+      return days <= 0 ? 'Trial ends today' : 'Trial — ${_plural(days, 'day')} left';
+    }
+
     final subCaption = [
-      if (trialDays != null) trialDays >= 0 ? 'Trial — $trialDays day(s) left' : 'Trial expired',
-      if (periodDays != null) 'Renews in $periodDays day(s)',
+      trial(),
+      renewal(),
       if (sub == null) 'Unlimited starter (no plan assigned).',
-    ].join(' · ');
+    ].where((s) => s.isNotEmpty).join(' · ');
 
     return RefreshIndicator(
       onRefresh: _load,
@@ -13421,17 +14082,39 @@ class _BillingViewState extends State<_BillingView> {
           value: '${plan?['name'] ?? 'No plan'}',
           caption: subCaption.isEmpty ? 'CURRENT PLAN' : 'CURRENT PLAN · ${subCaption.toUpperCase()}',
           tag: status.isNotEmpty ? status : null,
-          tagColor: AppColors.copperHi,
-          footer: pending == null
-              ? null
-              : Row(mainAxisSize: MainAxisSize.min, children: [
-                  const StatusChip(label: 'Scheduled', color: AppColors.warning, dense: true),
+          tagColor: overdue ? AppColors.danger : (renewing ? AppColors.warning : AppColors.copperHi),
+          // Overdue outranks a scheduled downgrade: the plan may be about to be
+          // cut off, which is the one thing the owner must see first. A renewal
+          // still inside its grace window ranks the same way but says the
+          // milder, true thing — nothing has failed yet.
+          footer: overdue
+              ? Row(mainAxisSize: MainAxisSize.min, children: [
+                  const StatusChip(label: 'Renewal failed', color: AppColors.danger, dense: true),
                   const SizedBox(width: AppSpacing.sm),
                   Flexible(
-                    child: Text('Switches to ${pending['name']} at period end.',
-                        style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    child: Text('This subscription did not renew. Settle it to keep your plan.',
+                        style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
                   ),
-                ]),
+                ])
+              : renewing
+                  ? Row(mainAxisSize: MainAxisSize.min, children: [
+                      const StatusChip(label: 'Renewing', color: AppColors.warning, dense: true),
+                      const SizedBox(width: AppSpacing.sm),
+                      Flexible(
+                        child: Text('The billing period ended and the payment has not confirmed yet.',
+                            style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+                      ),
+                    ])
+                  : pending == null
+                  ? null
+                  : Row(mainAxisSize: MainAxisSize.min, children: [
+                      const StatusChip(label: 'Scheduled', color: AppColors.warning, dense: true),
+                      const SizedBox(width: AppSpacing.sm),
+                      Flexible(
+                        child: Text('Switches to ${pending['name']} at period end.',
+                            style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ),
+                    ]),
         ),
         const SizedBox(height: AppSpacing.xxl),
         SectionHeader(title: 'Plans', count: plans.length),
@@ -14798,6 +15481,23 @@ class _OutletsViewState extends State<_OutletsView> {
   }
 }
 
+// A valet metadata chip. Every field behind one of these is FREE TEXT with no
+// length limit on the way in — the parking-location field is a bare TextField,
+// and a real attendant types "Basement level 3, pillar B14, nose out" into it —
+// while the tile that shows it is one column of a grid (~340px, less on a
+// phone). [InfoChip] is a Row around a plain Text with nothing to give, so an
+// unbounded label overflows it rather than truncating.
+//
+// So the value is capped to something a chip can carry, and whatever survives
+// is scaled down to the column — the same treatment the menu tile gives its
+// section tag. The full value is never lost: it is one tap away on the detail
+// sheet, spelled out in full.
+Widget _valetChip(IconData icon, String label, {int max = 26}) => FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.centerLeft,
+      child: InfoChip(icon: icon, label: _capped(label, max)),
+    );
+
 Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () => rest.getMap('/valet-info'),
       builder: (context, data, reload) {
@@ -15045,6 +15745,19 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
 
         final text = Theme.of(context).textTheme;
 
+        // Vehicles tile 4/3/2/1 like the Orders grid — a plate, a stage and a
+        // handful of chips never needed a full desktop row each.
+        final width = MediaQuery.sizeOf(context).width;
+        final vehicleCols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+
+        // Every ops action reloads the page underneath, so a sheet launched from
+        // a vehicle tile steps out of the way first rather than sitting on data
+        // it can't refresh (same rule the bay sheet already follows).
+        void runFromSheet(VoidCallback action) {
+          Navigator.of(context).pop();
+          action();
+        }
+
         // --- Clickable bays --------------------------------------------------
         // A bay used to be an inert number on a card. Tapping one now shows what
         // is actually parked in it — vehicle, owner, since when, keys — with the
@@ -15131,17 +15844,18 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                                       StatusChip(label: valetLabel(status), color: valetColor(status)),
                                     ]),
                                     const SizedBox(height: 10),
+                                    // Same free-text exposure as the tile — the
+                                    // bay sheet is narrower still on a phone.
                                     Wrap(spacing: 6, runSpacing: 6, children: [
                                       if (customer.isNotEmpty && customer != '—')
-                                        InfoChip(icon: Icons.person_outline, label: customer),
+                                        _valetChip(Icons.person_outline, customer),
                                       if (since.isNotEmpty)
                                         InfoChip(icon: Icons.schedule, label: 'Since ${_fmtTime(since)}'),
                                       if (location.isNotEmpty)
-                                        InfoChip(icon: Icons.pin_drop_outlined, label: location),
-                                      InfoChip(
-                                        icon: Icons.key,
-                                        label: keyHolder.isEmpty ? 'Keys not taken' : 'Keys with $keyHolder',
-                                      ),
+                                        _valetChip(Icons.pin_drop_outlined, location),
+                                      _valetChip(Icons.key,
+                                          keyHolder.isEmpty ? 'Keys not taken' : 'Keys with $keyHolder',
+                                          max: 30),
                                       if (eta != null && eta > 0)
                                         InfoChip(icon: Icons.timer_outlined, label: 'ETA $eta min'),
                                     ]),
@@ -15294,187 +16008,161 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                 caption: 'Checked-in vehicles appear here with their bay, keys and stage.',
               )
             else
-              ...active.map((v) {
-                final m = v as Map;
-                final id = _s(m, 'booking_id');
-                final status = _s(m, 'status', 'Vehicle added');
-                final nx = _valetNext(status);
-                final location = _s(m, 'parking_location', '');
-                final keyHolder = _s(m, 'key_holder', '');
-                final notes = _s(m, 'condition_notes', '');
-                final eta = m['eta_minutes'] is num ? (m['eta_minutes'] as num).toInt() : int.tryParse('${m['eta_minutes'] ?? ''}');
-                final requestStage = status == 'Request to bring car (from customer)' || status == 'Request accepted (from valet)';
-                final customer = _s(m, 'customer_name', '');
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 14),
-                  child: ForkCard(
-                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            color: AppColors.inset,
-                            borderRadius: AppRadius.controlAll,
-                            border: Border.all(color: AppColors.border),
+              _dashGrid([
+                for (final v in active)
+                  Builder(builder: (context) {
+                    final m = v as Map;
+                    final id = _s(m, 'booking_id');
+                    final status = _s(m, 'status', 'Vehicle added');
+                    final nx = _valetNext(status);
+                    final location = _s(m, 'parking_location', '');
+                    final keyHolder = _s(m, 'key_holder', '');
+                    final notes = _s(m, 'condition_notes', '');
+                    final eta = m['eta_minutes'] is num
+                        ? (m['eta_minutes'] as num).toInt()
+                        : int.tryParse('${m['eta_minutes'] ?? ''}');
+                    final requestStage = status == 'Request to bring car (from customer)' ||
+                        status == 'Request accepted (from valet)';
+                    final customer = _s(m, 'customer_name', '');
+
+                    // Bay / location / keys / condition / charge and the ETA
+                    // quote no longer fit beside a plate on a tile, so they move
+                    // here rather than being dropped. The stage action stays on
+                    // the tile — see below.
+                    void openDetail() {
+                      _detailSheet(
+                        context,
+                        eyebrow: 'On valet',
+                        title: _s(m, 'number_plate', 'Vehicle'),
+                        children: [
+                          _kv('Stage', valetLabel(status)),
+                          _kv('Owner', customer.isEmpty ? '—' : customer),
+                          _kv('Bay', _s(m, 'bay_name', '—')),
+                          _kv('Parked at', location.isEmpty ? '—' : location),
+                          _kv('Keys', keyHolder.isEmpty ? 'Not taken' : 'With $keyHolder'),
+                          _kv('Checked in', _fmtTime(_s(m, 'booking_date_time', '')).isEmpty
+                              ? '—'
+                              : _fmtTime(_s(m, 'booking_date_time', ''))),
+                          if (eta != null && eta > 0) _kv('ETA quoted', '$eta min'),
+                          if (notes.isNotEmpty) ...[
+                            const SizedBox(height: 10),
+                            Text(notes,
+                                style: text.bodySmall!.copyWith(
+                                    fontStyle: FontStyle.italic, color: AppColors.textTertiary)),
+                          ],
+                          if (requestStage) ...[
+                            const SizedBox(height: 14),
+                            Text('QUOTE ETA', style: text.labelSmall),
+                            const SizedBox(height: 6),
+                            Wrap(spacing: 8, runSpacing: 8, children: [
+                              for (final mins in const [5, 10, 15])
+                                ForkButton.ghost(
+                                  label: '$mins min',
+                                  dense: true,
+                                  onPressed: () => runFromSheet(() => setEta(id, mins)),
+                                ),
+                            ]),
+                          ],
+                          const SizedBox(height: 14),
+                          Wrap(spacing: 8, runSpacing: 8, children: [
+                            ForkButton.ghost(
+                                label: 'Bay',
+                                icon: Icons.local_parking,
+                                dense: true,
+                                onPressed: () => runFromSheet(() => assignBay(id))),
+                            ForkButton.ghost(
+                                label: 'Location',
+                                icon: Icons.edit_location_alt,
+                                dense: true,
+                                onPressed: () => runFromSheet(() => editLocation(m))),
+                            ForkButton.ghost(
+                                label: keyHolder.isEmpty ? 'Take keys' : 'Hand over',
+                                icon: Icons.key,
+                                dense: true,
+                                onPressed: () => runFromSheet(() => keysAction(m))),
+                            ForkButton.ghost(
+                                label: 'Condition',
+                                icon: Icons.note_alt_outlined,
+                                dense: true,
+                                onPressed: () => runFromSheet(() => editCondition(m))),
+                            ForkButton.ghost(
+                                label: 'Charge',
+                                icon: Icons.receipt_long,
+                                dense: true,
+                                onPressed: () => runFromSheet(() => chargeToTable(m))),
+                          ]),
+                        ],
+                      );
+                    }
+
+                    return ForkCard(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      onTap: openDetail,
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Row(children: [
+                          Container(
+                            width: 34,
+                            height: 34,
+                            decoration: BoxDecoration(
+                              color: AppColors.inset,
+                              borderRadius: AppRadius.controlAll,
+                              border: Border.all(color: AppColors.border),
+                            ),
+                            child: const Icon(Icons.directions_car_outlined, size: 16, color: AppColors.copper),
                           ),
-                          child: const Icon(Icons.directions_car_outlined, size: 18, color: AppColors.copper),
-                        ),
-                        const SizedBox(width: AppSpacing.md),
-                        Expanded(
-                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            Text(_s(m, 'number_plate', 'Vehicle'),
-                                style: text.titleMedium!.copyWith(fontFamily: 'monospace', letterSpacing: 2),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(_s(m, 'number_plate', 'Vehicle'),
+                                style: text.titleSmall!.copyWith(fontFamily: 'monospace', letterSpacing: 1.5),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis),
-                            const SizedBox(height: 6),
-                            // Ops depth: owner / bay / where it's parked / keys / ETA.
-                            Wrap(spacing: 6, runSpacing: 6, children: [
-                              if (customer.isNotEmpty && customer != '—')
-                                InfoChip(icon: Icons.person_outline, label: customer),
-                              if (_s(m, 'bay_name', '').isNotEmpty)
-                                InfoChip(icon: Icons.local_parking, label: 'Bay ${_s(m, 'bay_name')}'),
-                              if (location.isNotEmpty)
-                                InfoChip(icon: Icons.pin_drop_outlined, label: location),
-                              if (keyHolder.isNotEmpty)
-                                InfoChip(icon: Icons.key, label: keyHolder),
-                              if (requestStage && eta != null && eta > 0)
-                                InfoChip(icon: Icons.schedule, label: 'ETA $eta min'),
-                            ]),
-                          ]),
-                        ),
-                        const SizedBox(width: AppSpacing.md),
-                        // Cross-fade as the vehicle advances through the flow.
-                        AnimatedSwitcher(
-                          duration: AppDurations.base,
-                          switchInCurve: Curves.easeOut,
-                          switchOutCurve: Curves.easeIn,
-                          child: StatusChip(
-                            key: ValueKey('valet-$id-$status'),
-                            label: valetLabel(status),
-                            color: valetColor(status),
                           ),
-                        ),
-                      ]),
-                      if (notes.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 10),
-                          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            const Icon(Icons.sticky_note_2_outlined, size: 13, color: AppColors.textTertiary),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(notes,
-                                  style: text.bodySmall!
-                                      .copyWith(fontStyle: FontStyle.italic, color: AppColors.textTertiary)),
+                          const SizedBox(width: 8),
+                          // Cross-fade as the vehicle advances through the flow.
+                          AnimatedSwitcher(
+                            duration: AppDurations.base,
+                            switchInCurve: Curves.easeOut,
+                            switchOutCurve: Curves.easeIn,
+                            child: StatusChip(
+                              key: ValueKey('valet-$id-$status'),
+                              label: valetLabel(status),
+                              color: valetColor(status),
+                              dense: true,
                             ),
-                          ]),
-                        ),
-                      if (requestStage)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 10),
-                          child: Wrap(spacing: 6, runSpacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: [
-                            Text('QUOTE ETA', style: text.labelSmall),
-                            const SizedBox(width: 4),
-                            for (final mins in const [5, 10, 15])
-                              MouseRegion(
-                                cursor: SystemMouseCursors.click,
-                                child: GestureDetector(
-                                  onTap: () => setEta(id, mins),
-                                  child: AnimatedContainer(
-                                    duration: AppDurations.fast,
-                                    curve: Curves.easeOut,
-                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                                    decoration: BoxDecoration(
-                                      color: eta == mins ? AppColors.tint(AppColors.copper) : AppColors.inset,
-                                      borderRadius: BorderRadius.circular(AppRadius.chip),
-                                      border: Border.all(
-                                        color: eta == mins
-                                            ? AppColors.copper.withValues(alpha: 0.55)
-                                            : AppColors.border,
-                                      ),
-                                    ),
-                                    child: Text('$mins min',
-                                        style: TextStyle(
-                                          fontSize: 11,
-                                          fontWeight: FontWeight.w600,
-                                          letterSpacing: 0.2,
-                                          color: eta == mins ? AppColors.copperHi : AppColors.textSecondary,
-                                        )),
-                                  ),
-                                ),
-                              ),
-                          ]),
-                        ),
-                      const SizedBox(height: 12),
-                      Container(height: 1, color: AppColors.divider),
-                      const SizedBox(height: 8),
-                      // The stage action ("Call car", "Car at entrance"…) is the
-                      // one control on this card that must never be squeezed out
-                      // or hidden. Wide: it sits at the end of the row. Narrow:
-                      // it takes its own full-width line ABOVE the ops buttons
-                      // instead of being crushed by five siblings — no overlay,
-                      // nothing stacked on top of an action.
-                      LayoutBuilder(builder: (context, box) {
-                        final ops = <Widget>[
-                          ForkButton.subtle(
-                            label: 'Bay',
-                            icon: Icons.local_parking,
-                            onPressed: () => assignBay(id),
                           ),
-                          ForkButton.subtle(
-                            label: 'Location',
-                            icon: Icons.edit_location_alt,
-                            onPressed: () => editLocation(m),
+                        ]),
+                        const SizedBox(height: 10),
+                        // Where the car is and who holds the keys — the two
+                        // things an attendant is asked at the desk.
+                        Wrap(spacing: 6, runSpacing: 6, children: [
+                          if (customer.isNotEmpty && customer != '—')
+                            _valetChip(Icons.person_outline, customer),
+                          if (_s(m, 'bay_name', '').isNotEmpty)
+                            _valetChip(Icons.local_parking, 'Bay ${_s(m, 'bay_name')}'),
+                          if (location.isNotEmpty) _valetChip(Icons.pin_drop_outlined, location),
+                          if (keyHolder.isNotEmpty) _valetChip(Icons.key, keyHolder),
+                          if (requestStage && eta != null && eta > 0)
+                            InfoChip(icon: Icons.schedule, label: 'ETA $eta min'),
+                        ]),
+                        // The stage action ("Call car", "Car at entrance"…) is
+                        // the one control that must never move behind a tap: a
+                        // guest is standing at the desk when it is pressed.
+                        if (nx != null) ...[
+                          const SizedBox(height: 12),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: ForkButton(
+                              label: nx.label,
+                              dense: true,
+                              onPressed: () =>
+                                  post('/update_valet_state', {'booking_id': id, 'state': nx.next}),
+                            ),
                           ),
-                          ForkButton.subtle(
-                            label: keyHolder.isEmpty ? 'Take keys' : 'Hand over',
-                            icon: Icons.key,
-                            onPressed: () => keysAction(m),
-                          ),
-                          ForkButton.subtle(
-                            label: 'Condition',
-                            icon: Icons.note_alt_outlined,
-                            onPressed: () => editCondition(m),
-                          ),
-                          ForkButton.subtle(
-                            label: 'Charge',
-                            icon: Icons.receipt_long,
-                            onPressed: () => chargeToTable(m),
-                          ),
-                        ];
-                        final primary = nx == null
-                            ? null
-                            : ForkButton(
-                                label: nx.label,
-                                dense: true,
-                                onPressed: () =>
-                                    post('/update_valet_state', {'booking_id': id, 'state': nx.next}),
-                              );
-                        if (box.maxWidth < 560) {
-                          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            if (primary != null) ...[
-                              Align(alignment: Alignment.centerLeft, child: primary),
-                              const SizedBox(height: 8),
-                            ],
-                            Wrap(spacing: 2, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: ops),
-                          ]);
-                        }
-                        return Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-                          Expanded(
-                            child: Wrap(
-                                spacing: 2,
-                                runSpacing: 4,
-                                crossAxisAlignment: WrapCrossAlignment.center,
-                                children: ops),
-                          ),
-                          if (primary != null) ...[const SizedBox(width: 10), primary],
-                        ]);
-                      }),
-                    ]),
-                  ),
-                );
-              }),
+                        ],
+                      ]),
+                    );
+                  }),
+              ], vehicleCols),
           ]),
         );
       },

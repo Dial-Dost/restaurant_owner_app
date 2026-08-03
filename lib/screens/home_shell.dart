@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/profile.dart';
@@ -56,7 +57,17 @@ const _allModules = <_Module>[
 /// The signed-in shell: a permission-gated sidebar plus the selected module.
 class HomeShell extends StatefulWidget {
   final AuthController auth;
-  const HomeShell({super.key, required this.auth});
+
+  /// Whether this session runs the built-in printer agent. Always true in the
+  /// app; a test passes false because the agent opens a real socket and a
+  /// keep-alive timer that the fake-async harness cannot own.
+  ///
+  /// Deliberately a parameter and not an ambient `FLUTTER_TEST` probe: shipped
+  /// behaviour must not be switchable by whatever happens to be in the process
+  /// environment of the machine it runs on.
+  final bool startPrinterAgent;
+
+  const HomeShell({super.key, required this.auth, this.startPrinterAgent = true});
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -79,6 +90,20 @@ class _HomeShellState extends State<HomeShell> {
   // refetches. Never decremented, so clearing a focus does not remount (and the
   // module keeps its scroll position).
   int _focusTick = 0;
+  // Back trail: the modules visited BEFORE the current one, oldest first.
+  // Stored as labels rather than indices because the visible module list is
+  // permission- and plan-dependent — an index recorded now can address a
+  // different module (or none) later in the same session.
+  final List<String> _history = <String>[];
+  // A workspace trail, not a browser history: far more hops than anyone walks
+  // back through, and it stops a long shift growing the list without bound.
+  static const int _historyLimit = 20;
+  // Lets Escape ask whether the narrow-layout drawer is open before deciding
+  // what it is meant to dismiss.
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  // The one Escape handler, kept alive across builds so Actions is not handed a
+  // fresh Action (and a fresh listener) on every rebuild.
+  late final _ShellDismissAction _dismissAction = _ShellDismissAction(this);
 
   @override
   void initState() {
@@ -116,9 +141,11 @@ class _HomeShellState extends State<HomeShell> {
       }).catchError((_) {});
     }
     // Start the built-in printer agent: connect to realtime + listen for bills.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      PrinterService.instance.start(widget.auth);
-    });
+    if (widget.startPrinterAgent) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        PrinterService.instance.start(widget.auth);
+      });
+    }
   }
 
   @override
@@ -145,7 +172,9 @@ class _HomeShellState extends State<HomeShell> {
     if (!mounted) return;
     setState(() => _refreshTick++);
     // Rejoin the realtime printer subscription for the newly selected outlet.
-    PrinterService.instance.stop().then((_) => PrinterService.instance.start(widget.auth));
+    if (widget.startPrinterAgent) {
+      PrinterService.instance.stop().then((_) => PrinterService.instance.start(widget.auth));
+    }
   }
 
   Widget _outletSwitcher() {
@@ -189,6 +218,10 @@ class _HomeShellState extends State<HomeShell> {
     final focused = target != null && target.isNotEmpty;
     if (idx == _index && !focused) return;
     setState(() {
+      // A focus request that lands on the module already open changes no tab,
+      // so there is nothing to come back to. A real hop is recorded — including
+      // a focus-driven one — so Back undoes the notification that sent us here.
+      if (idx != _index) _pushHistory(_currentLabel);
       _index = idx;
       if (focused) {
         // Remount the destination (bumped tick -> new KeyedSubtree key) so it
@@ -207,6 +240,113 @@ class _HomeShellState extends State<HomeShell> {
   void _clearFocus() {
     if (_focus == null) return;
     setState(() => _focus = null);
+  }
+
+  // ------------------------------------------------------------ back trail ---
+
+  String get _currentLabel =>
+      _index >= 0 && _index < _visibleLabels.length ? _visibleLabels[_index] : '';
+
+  // Records the module being LEFT. Never the one being opened (that would make
+  // Back a no-op) and never the same label twice in a row, so one press always
+  // changes the screen. Call inside setState — it is part of a navigation.
+  void _pushHistory(String label) {
+    if (label.isEmpty || (_history.isNotEmpty && _history.last == label)) return;
+    _history.add(label);
+    if (_history.length > _historyLimit) _history.removeAt(0);
+  }
+
+  // The module Back would return to, or null when there is nothing to go back
+  // to — including a trail whose every entry has since been hidden from this
+  // user (plan downgrade, role change), which must read as "no history" rather
+  // than as a button that does nothing.
+  String? get _backTarget {
+    for (var i = _history.length - 1; i >= 0; i--) {
+      if (_visibleLabels.contains(_history[i])) return _history[i];
+    }
+    return null;
+  }
+
+  void _goBack() {
+    setState(() {
+      while (_history.isNotEmpty) {
+        final label = _history.removeLast();
+        final idx = _visibleLabels.indexOf(label);
+        if (idx < 0) continue; // module retired mid-session — keep walking back
+        _index = idx;
+        // Back is a plain jump, so it must not re-raise the focus banner of the
+        // screen it is leaving.
+        _focus = null;
+        return;
+      }
+    });
+  }
+
+  // --------------------------------------------------------------- dismiss ---
+
+  // True when the caret sits in a text field. Escape there means "I am typing",
+  // never "leave this module" — and leaving would also throw the typed text
+  // away, because a module holds its query in the builder closure. Tested
+  // against the widget rather than a list of known screens, so every search box
+  // in the app (and every one added later) is covered.
+  bool get _editingText {
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    if (ctx == null) return false;
+    return ctx.widget is EditableText || ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  bool get _drawerIsOpen => _scaffoldKey.currentState?.isDrawerOpen ?? false;
+
+  // Escape reaches the shell as a DismissIntent, so it is only asked to act on
+  // presses that nothing closer to the focus claimed. Reporting "not for me"
+  // (rather than swallowing the key) leaves it free to travel on.
+  bool get _canDismiss {
+    if (_drawerIsOpen) return true; // innermost thing on screen wins
+    if (_editingText) return false;
+    return _backTarget != null;
+  }
+
+  void _dismiss() {
+    if (_drawerIsOpen) {
+      // Close the nav and leave the tab alone: dismissing the drawer AND
+      // navigating would be two undos for one keypress.
+      _scaffoldKey.currentState?.closeDrawer();
+      return;
+    }
+    _goBack();
+  }
+
+  // The one "make module i active" path for a deliberate tab choice (sidebar,
+  // drawer), so every such jump lands in the back trail.
+  void _selectIndex(int i) {
+    setState(() {
+      if (i != _index) {
+        _pushHistory(_currentLabel);
+        _index = i;
+      }
+      // A deliberate sidebar jump is not a notification follow-up — drop any
+      // pending focus so a stale banner cannot reappear.
+      _focus = null;
+    });
+  }
+
+  // Lives at the head of the AppBar title — the leftmost thing in the chrome,
+  // present in both the wide and the narrow layout, so it is reachable with the
+  // sidebar collapsed, hidden in the drawer, or absent entirely. The AppBar's
+  // own `leading` slot is deliberately left alone: on narrow windows that slot
+  // is the drawer button.
+  Widget _backButton() {
+    final target = _backTarget;
+    return IconButton(
+      tooltip: target == null ? 'No previous tab' : 'Back to $target',
+      icon: const Icon(Icons.arrow_back, size: 18),
+      color: AppColors.textSecondary,
+      // Greyed out rather than removed: a control that appears and disappears
+      // as you navigate is harder to aim at than one that is always in place.
+      disabledColor: AppColors.textTertiary.withValues(alpha: 0.45),
+      visualDensity: VisualDensity.compact,
+      onPressed: target == null ? null : _goBack,
+    );
   }
 
   void _toggleSidebar() {
@@ -317,12 +457,7 @@ class _HomeShellState extends State<HomeShell> {
               active: i == _index,
               collapsed: collapsed,
               onTap: () {
-                // A deliberate sidebar jump is not a notification follow-up —
-                // drop any pending focus so a stale banner cannot reappear.
-                setState(() {
-                  _index = i;
-                  _focus = null;
-                });
+                _selectIndex(i);
                 if (inDrawer) Navigator.of(context).pop(); // close the drawer
               },
             ),
@@ -365,15 +500,46 @@ class _HomeShellState extends State<HomeShell> {
       ),
     );
 
+    return PopScope(
+      // With an empty trail the platform's own back gesture keeps its normal
+      // meaning (leave the app); with history it walks the trail instead.
+      canPop: _backTarget == null,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _goBack();
+      },
+      // Escape does the same on desktop — but as a DismissIntent rather than a
+      // direct binding, so it is offered to the focused widget first: a dialog,
+      // a menu, or a search field that would rather clear itself. Only an
+      // Escape nobody nearer the focus wanted walks the back trail. (A field
+      // opts in by wrapping itself in `Actions(actions: {DismissIntent: ...})`;
+      // until one does, `_canDismiss` keeps the shell off any text editor.)
+      child: Shortcuts(
+        shortcuts: const {SingleActivator(LogicalKeyboardKey.escape): _ShellEscapeIntent()},
+        child: Actions(
+          actions: {_ShellEscapeIntent: _dismissAction},
+          child: Focus(
+            autofocus: true,
+            child: _scaffold(p, rest, current, visible, body, narrow),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _scaffold(Profile p, RestClient rest, _Module current, List<_Module> visible,
+      Widget body, bool narrow) {
     return Scaffold(
+      key: _scaffoldKey,
       backgroundColor: AppColors.bg,
       appBar: AppBar(
         backgroundColor: AppColors.bgDeep,
         surfaceTintColor: Colors.transparent,
         scrolledUnderElevation: 0,
         elevation: 0,
-        titleSpacing: narrow ? 0 : 16,
+        titleSpacing: narrow ? 0 : 8,
         title: Row(children: [
+          _backButton(),
+          const SizedBox(width: 2),
           const Icon(Icons.auto_awesome, size: 14, color: AppColors.copperHi),
           const SizedBox(width: 8),
           Text(current.label,
@@ -440,6 +606,42 @@ class _HomeShellState extends State<HomeShell> {
               ],
             ),
     );
+  }
+}
+
+/// Escape, as the shell means it: close the drawer, else step back one tab.
+///
+/// Deliberately its OWN intent rather than the framework's [DismissIntent].
+/// Scaffold registers `DismissIntent: _DismissDrawerAction` around its subtree,
+/// and `Actions.maybeFind` stops at the first MAPPING walking up from the
+/// focused widget — not the first ENABLED one. So while the shell dispatched
+/// DismissIntent, any focus inside the Scaffold (the AppBar, the nav rail, a
+/// card's button — one Tab press) resolved to Scaffold's action, which reports
+/// itself disabled with no drawer open, and the key was declared unhandled.
+/// Escape-as-Back simply died. Moving the mapping around could not fix it: the
+/// AppBar is not inside `body`, so no single placement covers every focus site.
+///
+/// Nothing else in the tree maps this intent, so the shell's action is found
+/// from anywhere under the [Shortcuts] that produces it.
+class _ShellEscapeIntent extends Intent {
+  const _ShellEscapeIntent();
+}
+
+/// The guard lives in [isEnabled] rather than in the module screens because a
+/// focused text field cannot stop this intent reaching us — it can only be
+/// recognised once it does.
+class _ShellDismissAction extends Action<_ShellEscapeIntent> {
+  _ShellDismissAction(this._shell);
+
+  final _HomeShellState _shell;
+
+  @override
+  bool isEnabled(_ShellEscapeIntent intent) => _shell.mounted && _shell._canDismiss;
+
+  @override
+  Object? invoke(_ShellEscapeIntent intent) {
+    _shell._dismiss();
+    return null;
   }
 }
 
