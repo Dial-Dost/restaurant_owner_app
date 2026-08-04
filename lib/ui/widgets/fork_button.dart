@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
+import 'status_chip.dart';
 
 enum ForkButtonKind { primary, ghost, subtle }
 
@@ -104,7 +105,9 @@ class _ForkButtonState extends State<ForkButton> {
                 Icon(widget.icon, size: widget.dense ? 14 : 15, color: fg),
                 const SizedBox(width: 7),
               ],
-              Text(
+              // Same rule as the chips: a button stacked in a narrow column
+              // gives way rather than overflowing (see ChipLabel).
+              ChipLabel(
                 widget.label,
                 style: TextStyle(
                   fontSize: widget.dense ? 12 : 13,

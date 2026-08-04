@@ -34,28 +34,40 @@ class SectionHeader extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 9),
-          Text(title, style: text.titleMedium),
-          if (count != null) ...[
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-              decoration: BoxDecoration(
-                color: AppColors.inset,
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(color: AppColors.border),
-              ),
-              child: Text(
-                '$count',
-                style: const TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.textSecondary,
+          // The title group takes everything the trailing widget does not, which
+          // is what keeps the trailing flush right — the job the old Spacer did.
+          // Doing it this way also bounds the title, so on a phone at a raised
+          // text scale it ellipsises instead of pushing the header off screen.
+          Expanded(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(title, style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
                 ),
-              ),
+                if (count != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: AppColors.inset,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Text(
+                      '$count',
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
-          ],
-          const Spacer(),
-          ?trailing,
+          ),
+          if (trailing != null) ...[const SizedBox(width: 8), trailing!],
         ],
       ),
     );

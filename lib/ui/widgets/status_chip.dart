@@ -2,6 +2,40 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
 
+/// The label inside a pill, made to survive a narrow parent.
+///
+/// Every chip in this file is a `Row(mainAxisSize: min)`, which sizes its
+/// children to their natural width and then overflows — yellow-and-black
+/// stripes — the moment the parent is narrower than that. A tile column, a Wrap
+/// run and a 1.3x system text scale all produce exactly that, and patching it at
+/// one call site at a time is what let it recur on three different screens.
+///
+/// So it lives here, once. [Flexible] with a LOOSE fit is deliberate on both
+/// sides of the choice:
+///   * bounded parent — the label is capped at what is left and ellipsises, so
+///     the chip degrades to "12 seats · ma…" instead of overflowing;
+///   * unbounded parent (a plain Row, a horizontal scroller) — a loose flex
+///     child under `MainAxisSize.min` is laid out at its natural width and does
+///     NOT assert, so ample space renders exactly as before.
+///
+/// Truncation, never scaling: shrinking the glyphs would trade an overflow for
+/// type nobody can read, which is the opposite of what a 1.3x scale was asked
+/// for. Call sites that carry genuinely unbounded free text still cap the VALUE
+/// (and keep the full one a tap away) — that is about meaning, not layout.
+class ChipLabel extends StatelessWidget {
+  const ChipLabel(this.label, {super.key, required this.style});
+
+  final String label;
+  final TextStyle style;
+
+  @override
+  Widget build(BuildContext context) {
+    return Flexible(
+      child: Text(label, style: style, maxLines: 1, overflow: TextOverflow.ellipsis),
+    );
+  }
+}
+
 /// Status chip — tinted pill with a solid dot and a text label.
 /// Status is never conveyed by color alone; the label always ships.
 ///
@@ -40,7 +74,7 @@ class StatusChip extends StatelessWidget {
             decoration: BoxDecoration(color: color, shape: BoxShape.circle),
           ),
           SizedBox(width: dense ? 5 : 6),
-          Text(
+          ChipLabel(
             label,
             style: TextStyle(
               fontSize: dense ? 10.5 : 11.5,
@@ -79,7 +113,7 @@ class InfoChip extends StatelessWidget {
             Icon(icon, size: 12, color: AppColors.textTertiary),
             const SizedBox(width: 5),
           ],
-          Text(
+          ChipLabel(
             label,
             style: const TextStyle(
               fontSize: 11,

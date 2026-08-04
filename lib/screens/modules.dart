@@ -2526,15 +2526,12 @@ Widget menuModule(RestClient rest, Profile p) {
                 ],
                 const SizedBox(height: 6),
                 // A leftover label reads "TANDOORI GRILL · UNASSIGNED", which is
-                // wider than a tile column — scale it down rather than let it
-                // overflow the card.
+                // wider than a tile column. The chip ellipsises itself now
+                // (ChipLabel), so the old scale-down wrapper is gone — stacking
+                // it on top would shrink the type a second time.
                 Align(
                   alignment: Alignment.centerLeft,
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerLeft,
-                    child: _sectionTag(station, managed: managed),
-                  ),
+                  child: _sectionTag(station, managed: managed),
                 ),
               ]);
               final availability = AnimatedSwitcher(
@@ -5273,19 +5270,29 @@ class _TableBox extends StatelessWidget {
               if (paymentPending) const StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
             ]),
             const SizedBox(height: 8),
-            Row(children: [
-              AnimatedSwitcher(
-                duration: AppDurations.base,
-                switchInCurve: Curves.easeOut,
-                switchOutCurve: Curves.easeIn,
-                child: StatusChip(
-                    key: ValueKey('table-$name-$status'),
-                    label: status,
-                    color: stateColor,
-                    dense: true),
-              ),
-              if (apcTick != null) ...[const Spacer(), apcTick],
-            ]),
+            // State and APC tick share one line while they fit and the tick sits
+            // hard right, exactly as a Row + Spacer did. A Wrap is what makes the
+            // pair degrade: at a raised text scale the tick drops to its own run
+            // instead of pushing the row off a 168px card. The chips themselves
+            // ellipsise (see ChipLabel), so neither path can overflow.
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                AnimatedSwitcher(
+                  duration: AppDurations.base,
+                  switchInCurve: Curves.easeOut,
+                  switchOutCurve: Curves.easeIn,
+                  child: StatusChip(
+                      key: ValueKey('table-$name-$status'),
+                      label: status,
+                      color: stateColor,
+                      dense: true),
+                ),
+                ?apcTick,
+              ],
+            ),
             if (occupied && otp.isNotEmpty) ...[
               const SizedBox(height: 8),
               // Copper-accented, kept prominent — staff read this aloud to guests.
@@ -7080,8 +7087,9 @@ Future<void> _printTableQr(String tableName, String url) async {
   await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
 }
 
-/// What [allocateTableNames] worked out: the names to create, and the ones in
-/// that range it stepped over because the floor already has them.
+/// What [allocateTableNames] worked out: the names to create, the ones in that
+/// range it stepped over because the floor already has them, and — when it could
+/// not deliver the run that was asked for — the reason, in words.
 class TableNameRun {
   /// Names to create, in order.
   final List<String> names;
@@ -7089,8 +7097,38 @@ class TableNameRun {
   /// Names inside the scanned range that already exist. Reported rather than
   /// swallowed — "I asked for 5 and got T4..T8" needs the reason on screen.
   final List<String> skipped;
-  const TableNameRun(this.names, this.skipped);
+
+  /// Empty when the run is exactly what was asked for. Otherwise the sentence to
+  /// put in front of the owner: a seed whose number cannot be counted from, or a
+  /// scan that ran out of free numbers before filling the request.
+  ///
+  /// It exists because the alternative is a create that reports success having
+  /// written nothing. An empty [names] must never be left for the caller to
+  /// interpret — silence on a create is the worst failure there is.
+  final String problem;
+
+  /// True when every name asked for was allocated.
+  bool get complete => problem.isEmpty;
+
+  const TableNameRun(this.names, this.skipped, {this.problem = ''});
 }
+
+/// How many candidate numbers past the request one run may examine.
+///
+/// The scan has to be bounded: a floor with a long unbroken run of taken numbers
+/// must still finish, and the loop must never depend on eventually finding a
+/// gap. It scales with the request because asking for more tables is also asking
+/// to step over more of them — a flat bound short-changed big runs first.
+/// Examining a few thousand candidates is a set lookup each; the cost is the
+/// user waiting for nothing, not the CPU.
+int _tableScanWindow(int count) => 500 + 100 * count;
+
+/// A run's names as something a person can read. A scan that stepped over
+/// hundreds of taken names is not made clearer by printing every one of them —
+/// and the full paragraph does not fit the dialog it is shown in.
+String _tableNameList(List<String> names, {int show = 12}) => names.length <= show
+    ? names.join(', ')
+    : '${names.take(show).join(', ')} … and ${names.length - show} more';
 
 /// Splits [seed] into a prefix and its trailing number ("T1" -> "T" + 1,
 /// "Patio 4" -> "Patio " + 4) and returns the next [count] FREE numbers from
@@ -7108,7 +7146,22 @@ TableNameRun allocateTableNames(String seed, int count, Iterable<String> existin
   final match = RegExp(r'^(.*?)(\d+)$').firstMatch(trimmed);
   final prefix = match?.group(1) ?? trimmed;
   final digits = match?.group(2) ?? '1';
-  final start = int.tryParse(digits) ?? 1;
+  final window = _tableScanWindow(count);
+  // A trailing number can be unusable in two ways, and BOTH used to end as a
+  // silent no-op: too many digits for an int at all (tryParse null, which the
+  // old `?? 1` quietly renumbered from one), or close enough to the top of the
+  // range that `start + count + window` wraps NEGATIVE — which made `n < limit`
+  // false on the first pass, so the loop never ran and the caller was handed an
+  // empty run it read as "one table, nothing skipped" and reported as success.
+  final start = int.tryParse(digits);
+  if (start == null || start + count + window < start) {
+    return TableNameRun(
+      const [],
+      const [],
+      problem: 'No tables were numbered: the number at the end of "$trimmed" is too large to '
+          'count on from. Start the run from a smaller number.',
+    );
+  }
   final width = digits.length;
   final taken = {
     for (final n in existing)
@@ -7116,10 +7169,9 @@ TableNameRun allocateTableNames(String seed, int count, Iterable<String> existin
   };
   final names = <String>[];
   final skipped = <String>[];
-  // Bounded scan: a floor with a long run of taken numbers must still finish,
-  // and the loop must never depend on eventually finding a gap.
-  final limit = start + count + 500;
-  for (var n = start; names.length < count && n < limit; n++) {
+  final limit = start + count + window;
+  var n = start;
+  for (; names.length < count && n < limit; n++) {
     final candidate = '$prefix${'$n'.padLeft(width, '0')}';
     if (!taken.add(candidate.toLowerCase())) {
       skipped.add(candidate);
@@ -7127,7 +7179,20 @@ TableNameRun allocateTableNames(String seed, int count, Iterable<String> existin
     }
     names.add(candidate);
   }
-  return TableNameRun(names, skipped);
+  if (names.length == count) return TableNameRun(names, skipped);
+  // The scan hit its bound with the request unfilled. Say exactly that: a short
+  // run and a long Skipped list otherwise read as "nothing matched", and the
+  // owner has no way to tell it from a floor that is genuinely full.
+  // Named from the first candidate actually examined, not the seed: a seed with
+  // no number of its own ("Bar") starts the scan at "Bar1".
+  final first = '$prefix${'$start'.padLeft(width, '0')}';
+  final last = '$prefix${'${n - 1}'.padLeft(width, '0')}';
+  return TableNameRun(
+    names,
+    skipped,
+    problem: 'Only ${names.length} of the $count asked for could be numbered: every other name from '
+        '"$first" up to "$last" is already on the floor. Start the run from a higher number.',
+  );
 }
 
 /// Adds one table, or a numbered run of them. [existing] is every table name on
@@ -7179,9 +7244,12 @@ Future<void> _addTable(BuildContext context, RestClient rest, VoidCallback reloa
   if (created.isNotEmpty) reload();
   if (!context.mounted) return;
 
-  // One table, nothing skipped: behave exactly as before — silent on success,
-  // a snackbar on failure. Anything else gets the run report.
-  if (run.names.length <= 1 && run.skipped.isEmpty) {
+  // One table, nothing skipped and nothing to explain: behave exactly as before
+  // — silent on success, a snackbar on failure. Anything else gets the run
+  // report, and `run.problem` is explicitly part of "anything else": a run that
+  // allocated no names at all lands here with both lists empty, and taking the
+  // quiet path would report success having created nothing.
+  if (run.names.length <= 1 && run.skipped.isEmpty && run.complete) {
     if (error.isNotEmpty) messenger.showSnackBar(SnackBar(content: Text(error)));
     return;
   }
@@ -7193,10 +7261,12 @@ Future<void> _addTable(BuildContext context, RestClient rest, VoidCallback reloa
         ? 'No tables were added'
         : 'Added ${created.length} table${created.length == 1 ? '' : 's'}',
     children: [
-      if (created.isNotEmpty) _kv('Created', created.join(', ')),
-      if (run.skipped.isNotEmpty) _kv('Skipped', '${run.skipped.join(', ')} — already on the floor'),
+      // First, above the lists: why the run is not what was asked for.
+      if (run.problem.isNotEmpty) _kv('Numbering', run.problem),
+      if (created.isNotEmpty) _kv('Created', _tableNameList(created)),
+      if (run.skipped.isNotEmpty) _kv('Skipped', '${_tableNameList(run.skipped)} — already on the floor'),
       if (failedName.isNotEmpty) _kv('Failed', '$failedName — $error'),
-      if (notAttempted.isNotEmpty) _kv('Not attempted', notAttempted.join(', ')),
+      if (notAttempted.isNotEmpty) _kv('Not attempted', _tableNameList(notAttempted)),
       if (seats.section.trim().isNotEmpty) _kv('Section', seats.section.trim()),
       _kv('Seating', _seatsLabel({'capacity': seats.capacity, 'max_capacity': seats.maxCapacity})),
     ],
@@ -7342,17 +7412,21 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
   /// is answered in the dialog rather than after the writes.
   Widget _runPreview(TextTheme text) {
     final run = allocateTableNames(_name.text, _runCount, widget.existingNames);
-    if (run.names.isEmpty && run.skipped.isEmpty) return const SizedBox.shrink();
+    if (run.names.isEmpty && run.skipped.isEmpty && run.complete) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: 10),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // A run that cannot be numbered says so HERE, before the writes — the
+        // owner gets to fix the seed instead of reading about it afterwards.
+        if (run.problem.isNotEmpty)
+          Text(run.problem, style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.warning)),
         if (run.names.isNotEmpty)
-          Text('Creates ${run.names.join(', ')}',
+          Text('Creates ${_tableNameList(run.names)}',
               style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.copperHi)),
         if (run.skipped.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 3),
-            child: Text('Skips ${run.skipped.join(', ')} — already on the floor',
+            child: Text('Skips ${_tableNameList(run.skipped)} — already on the floor',
                 style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textTertiary)),
           ),
       ]),
@@ -8801,22 +8875,28 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         body: Column(children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-            child: Row(children: [
-              const Spacer(),
-              ForkButton.ghost(
-                label: 'Categories',
-                icon: Icons.category_outlined,
-                dense: true,
-                onPressed: manageCategories,
-              ),
-              const SizedBox(width: AppSpacing.sm),
-              ForkButton.ghost(
-                label: 'Vendors',
-                icon: Icons.local_shipping_outlined,
-                dense: true,
-                onPressed: () => _manageVendors(context, rest),
-              ),
-            ]),
+            // Wrap, not Row+Spacer: the buttons are non-flex, so a Row hands
+            // them unbounded width and overflows once a 1.3x scale grows the
+            // labels past a phone width. A Wrap drops them to a second run.
+            child: Wrap(
+              alignment: WrapAlignment.end,
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.sm,
+              children: [
+                ForkButton.ghost(
+                  label: 'Categories',
+                  icon: Icons.category_outlined,
+                  dense: true,
+                  onPressed: manageCategories,
+                ),
+                ForkButton.ghost(
+                  label: 'Vendors',
+                  icon: Icons.local_shipping_outlined,
+                  dense: true,
+                  onPressed: () => _manageVendors(context, rest),
+                ),
+              ],
+            ),
           ),
           Expanded(
             // Sections created before any stock is entered are a real state —
@@ -8928,13 +9008,24 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                                 style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
                           ),
                           const SizedBox(width: AppSpacing.md),
-                          MicroStat(
-                            value: '${it['stock'] ?? 0} ${_s(it, 'unit', '')}'.trim(),
-                            label: 'on hand',
-                            alignEnd: true,
+                          // The stat and the pill are non-flex by default, so a
+                          // Row hands them unbounded width and the card
+                          // overflows on a phone. Flexed as a pair, they get a
+                          // bound to ellipsise against and the name keeps its
+                          // share.
+                          Flexible(
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Flexible(
+                                child: MicroStat(
+                                  value: '${it['stock'] ?? 0} ${_s(it, 'unit', '')}'.trim(),
+                                  label: 'on hand',
+                                  alignEnd: true,
+                                ),
+                              ),
+                              const SizedBox(width: 14),
+                              Flexible(child: StatusChip(label: status, color: color, dense: narrow)),
+                            ]),
                           ),
-                          const SizedBox(width: 14),
-                          StatusChip(label: status, color: color, dense: narrow),
                           PopupMenuButton<String>(
                             tooltip: 'Stock',
                             iconColor: AppColors.textSecondary,
@@ -15044,51 +15135,77 @@ class _WaitlistViewState extends State<_WaitlistView> {
                 ]),
           ),
           const SizedBox(width: AppSpacing.md),
-          MicroStat(value: '${e['minutes_waiting'] ?? 0}m', label: 'waited', alignEnd: true),
-          const SizedBox(width: 14),
-          StatusChip(
-            label: called ? 'Called' : status,
-            color: called
-                ? AppColors.warning
-                : status == 'waiting'
-                    ? AppColors.info
-                    : AppColors.neutral,
-            dense: true,
+          // The waited-stat and the status chip both grow with the system text
+          // scale while the 40px position box does not, so on a phone card they
+          // squeeze the middle column until an InfoChip cannot even fit its own
+          // icon and padding (37px of irreducible chrome) and overflows by a
+          // hairline. Letting them share one Wrap means the pair drops to its
+          // own run instead of starving the name and its chips.
+          Flexible(
+            child: Wrap(
+              alignment: WrapAlignment.end,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 14,
+              runSpacing: 6,
+              children: [
+                MicroStat(value: '${e['minutes_waiting'] ?? 0}m', label: 'waited', alignEnd: true),
+                StatusChip(
+                  label: called ? 'Called' : status,
+                  color: called
+                      ? AppColors.warning
+                      : status == 'waiting'
+                          ? AppColors.info
+                          : AppColors.neutral,
+                  dense: true,
+                ),
+              ],
+            ),
           ),
         ]),
         if (preItems.isNotEmpty || members.isNotEmpty) _details(preItems, members),
         const SizedBox(height: AppSpacing.md),
-        Row(children: [
-          if (status == 'waiting') ...[
-            ForkButton(
-              label: 'Call',
-              icon: Icons.notifications_outlined,
-              dense: true,
-              onPressed: busy
-                  ? null
-                  : () => _act(id, () => widget.rest.post('/waitlist/$id/call'), ok: 'Notified ${_s(e, 'name')}'),
-            ),
-            const SizedBox(width: AppSpacing.sm),
+        // Seating actions left, destructive ones hard right — a Row + Spacer
+        // while they fit. A Wrap is what makes the pair degrade: a Row gives
+        // every non-flex child maxWidth infinity, so four natural-width buttons
+        // overflowed a portrait phone by 113px before either group could shrink.
+        // Now the destructive pair drops to its own run instead.
+        Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          spacing: AppSpacing.sm,
+          runSpacing: AppSpacing.sm,
+          children: [
+            Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+              if (status == 'waiting')
+                ForkButton(
+                  label: 'Call',
+                  icon: Icons.notifications_outlined,
+                  dense: true,
+                  onPressed: busy
+                      ? null
+                      : () =>
+                          _act(id, () => widget.rest.post('/waitlist/$id/call'), ok: 'Notified ${_s(e, 'name')}'),
+                ),
+              _tintButton('Seat', Icons.event_seat_outlined, AppColors.success, busy ? null : () => _seat(e)),
+            ]),
+            Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+              ForkButton.ghost(
+                label: 'No-show',
+                dense: true,
+                onPressed: busy
+                    ? null
+                    : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'no_show'})),
+              ),
+              _tintButton(
+                'Remove',
+                Icons.close,
+                AppColors.danger,
+                busy
+                    ? null
+                    : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'cancelled'})),
+              ),
+            ]),
           ],
-          _tintButton('Seat', Icons.event_seat_outlined, AppColors.success, busy ? null : () => _seat(e)),
-          const Spacer(),
-          ForkButton.ghost(
-            label: 'No-show',
-            dense: true,
-            onPressed: busy
-                ? null
-                : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'no_show'})),
-          ),
-          const SizedBox(width: AppSpacing.sm),
-          _tintButton(
-            'Remove',
-            Icons.close,
-            AppColors.danger,
-            busy
-                ? null
-                : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'cancelled'})),
-          ),
-        ]),
+        ),
       ]),
     );
 
@@ -16978,18 +17095,15 @@ class _OutletsViewState extends State<_OutletsView> {
 // length limit on the way in — the parking-location field is a bare TextField,
 // and a real attendant types "Basement level 3, pillar B14, nose out" into it —
 // while the tile that shows it is one column of a grid (~340px, less on a
-// phone). [InfoChip] is a Row around a plain Text with nothing to give, so an
-// unbounded label overflows it rather than truncating.
+// phone).
 //
-// So the value is capped to something a chip can carry, and whatever survives
-// is scaled down to the column — the same treatment the menu tile gives its
-// section tag. The full value is never lost: it is one tap away on the detail
-// sheet, spelled out in full.
-Widget _valetChip(IconData icon, String label, {int max = 26}) => FittedBox(
-      fit: BoxFit.scaleDown,
-      alignment: Alignment.centerLeft,
-      child: InfoChip(icon: icon, label: _capped(label, max)),
-    );
+// The cap here is about MEANING, not layout: a chip carrying a whole sentence
+// tells the reader nothing at a glance, so the value is trimmed to a glanceable
+// length and the full one is one tap away on the detail sheet. Fitting it to
+// the column is [InfoChip]'s own job now — it ellipsises (see ChipLabel), and
+// the scale-down wrapper that used to sit here would shrink the type twice.
+Widget _valetChip(IconData icon, String label, {int max = 26}) =>
+    InfoChip(icon: icon, label: _capped(label, max));
 
 Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () => rest.getMap('/valet-info'),
@@ -17898,17 +18012,36 @@ Color _perfScoreColor(double score) => score >= 80
 /// place the app decides between "here is the number" and "not enough data".
 bool _perfMeasured(Map? c) => c != null && c['available'] == true && c['score'] != null;
 
+/// One measure's share of the score, or null when the server did not report one.
+///
+/// `_numOf` turns anything unreadable into 0.0, which here would be a fabricated
+/// figure: "Counts for 0% of this score." printed beside a measure that plainly
+/// did count. An older server sends no `effective_weights` at all and a trimmed
+/// payload can drop one key, so absent, non-numeric and unparseable all have to
+/// come back as unknown — not zero.
+double? _perfWeight(Map? effectiveWeights, String key) {
+  final raw = effectiveWeights?[key];
+  if (raw == null) return null;
+  if (raw is num) return raw.toDouble();
+  return double.tryParse('$raw'.trim());
+}
+
 /// One measure, spelled out: what it scored, what was actually measured, how
 /// much of the total it carried — or, when it could not be measured, the
 /// server's own sentence explaining why. Never a zero standing in for a blank.
-Widget _perfComponentRow(BuildContext context, String label, Map? c, double effectiveWeight) {
+///
+/// [effectiveWeight] is null when the server did not report a share for this
+/// measure. Unknown is NOT zero: a scored measure plainly counted for something,
+/// and printing "Counts for 0% of this score." beside it would be a made-up
+/// figure contradicting the score right next to it.
+Widget _perfComponentRow(BuildContext context, String label, Map? c, double? effectiveWeight) {
   final text = Theme.of(context).textTheme;
   final measured = _perfMeasured(c);
   final note = '${c?['note'] ?? ''}'.trim();
   final unit = '${c?['unit'] ?? ''}'.trim();
   final sample = _int(c?['sample']) ?? 0;
   final value = c?['value'];
-  final pct = (effectiveWeight * 100).round();
+  final pct = effectiveWeight == null ? null : (effectiveWeight * 100).round();
 
   return Padding(
     padding: const EdgeInsets.symmetric(vertical: 7),
@@ -17941,10 +18074,12 @@ Widget _perfComponentRow(BuildContext context, String label, Map? c, double effe
       ],
       const SizedBox(height: 3),
       Text(
-        measured
-            ? 'Counts for $pct% of this score.'
-            : 'Left out of the score — the measures that could be taken were '
-                'reweighted between them to still make 100%.',
+        !measured
+            ? 'Left out of the score — the measures that could be taken were '
+                'reweighted between them to still make 100%.'
+            : pct == null
+                ? 'It counted towards this score, but the server did not say by how much.'
+                : 'Counts for $pct% of this score.',
         style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary),
       ),
     ]),
@@ -18218,7 +18353,10 @@ void _employeeSheet(
   final empId = '${employee['employee_id'] ?? employee['id'] ?? ''}';
   final score = perfRow?['score'];
   final components = (perfRow?['components'] as Map?) ?? const {};
-  final effective = (perfRow?['effective_weights'] as Map?) ?? const {};
+  // Absent on an older server, and a trimmed payload can drop a single key. Kept
+  // nullable all the way down so a missing share reads as unknown rather than 0%
+  // — see [_perfWeight].
+  final effective = perfRow?['effective_weights'] as Map?;
   final windowDays = _int(perfMeta['window_days']);
   final measured = _int(perfRow?['components_available']) ?? 0;
 
@@ -18266,7 +18404,7 @@ void _employeeSheet(
             context,
             c[1],
             components[c[0]] as Map?,
-            _numOf(effective[c[0]]),
+            _perfWeight(effective, c[0]),
           ),
       ],
       const SizedBox(height: 14),

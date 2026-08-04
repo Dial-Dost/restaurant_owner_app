@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
+import 'status_chip.dart';
 
 /// The reference design's "| Hig" / "| Lo" corner tag — a short copper tick
 /// followed by a tiny label.
@@ -24,7 +25,9 @@ class TickTag extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 5),
-        Text(
+        // Same rule as the pills in status_chip.dart — a tick sits beside a
+        // StatusChip in the same narrow tile row, so it has to give way too.
+        ChipLabel(
           label,
           style: const TextStyle(
             fontSize: 10.5,
@@ -69,7 +72,7 @@ class MicroStat extends StatelessWidget {
               Icon(icon, size: 13, color: AppColors.textSecondary),
               const SizedBox(width: 5),
             ],
-            Text(
+            ChipLabel(
               value,
               style: const TextStyle(
                 fontSize: 13,
@@ -81,6 +84,8 @@ class MicroStat extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 3),
+        // The caption wraps rather than truncates — it is the only place the
+        // stat says WHAT it is, and a Column child is already width-bounded.
         Text(label.toUpperCase(), style: text.labelSmall),
       ],
     );

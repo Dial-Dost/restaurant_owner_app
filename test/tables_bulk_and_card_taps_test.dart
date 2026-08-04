@@ -162,6 +162,88 @@ void main() {
       expect(run.names, ['T1', 'T3', 'T4']);
       expect(run.skipped, ['T2']);
     });
+
+    test('an ordinary run reports no problem at all', () {
+      expect(m.allocateTableNames('T1', 3, const []).problem, isEmpty);
+      expect(m.allocateTableNames('T1', 3, const []).complete, isTrue);
+      // Stepping over taken names is normal, not a problem.
+      expect(m.allocateTableNames('T1', 2, const ['T1']).problem, isEmpty);
+    });
+
+    // --- A trailing number that will not count ---------------------------
+    // `start + count + window` is int64 arithmetic. A seed near the top of the
+    // range wrapped it NEGATIVE, `n < limit` was false on the first pass, the
+    // loop never ran, and an empty run came back with an empty skipped list —
+    // which _addTable read as "one table, nothing skipped" and reported as
+    // success having created nothing.
+
+    test('a trailing number at the top of the int64 range is refused, loudly', () {
+      final run = m.allocateTableNames('T9223372036854775807', 5, const []);
+      expect(run.names, isEmpty);
+      expect(run.skipped, isEmpty);
+      expect(run.complete, isFalse, reason: 'an empty run must never look like a finished one');
+      expect(run.problem, contains('too large to count on from'));
+      expect(run.problem, contains('T9223372036854775807'),
+          reason: 'the owner has to be told WHICH name could not be used');
+    });
+
+    test('a trailing number too long for an int is refused rather than renumbered', () {
+      // 20 digits: int.tryParse gives null. The old `?? 1` silently restarted at
+      // one and emitted 20-wide zero-padded names nobody asked for.
+      final run = m.allocateTableNames('T99999999999999999999', 3, const []);
+      expect(run.names, isEmpty);
+      expect(run.complete, isFalse);
+      expect(run.problem, contains('too large to count on from'));
+    });
+
+    test('a big-but-usable trailing number still numbers normally', () {
+      // The guard is about arithmetic that cannot work, not about long numbers:
+      // this one has room above it, so it must behave like any other seed.
+      final run = m.allocateTableNames('T1000000000000', 3, const []);
+      expect(run.names, ['T1000000000000', 'T1000000000001', 'T1000000000002']);
+      expect(run.problem, isEmpty);
+    });
+
+    // --- Running out of free numbers inside the scan window ---------------
+
+    test('exhausting the scan window says so instead of reporting an empty run', () {
+      // A wall of taken names longer than anything the scan will examine: the
+      // run comes back short, and the REASON is the point. "No tables were
+      // added" beside a thousand-name Skipped list is not an explanation.
+      final wall = [for (var i = 1; i <= 3000; i++) 'T$i'];
+      final run = m.allocateTableNames('T1', 5, wall);
+      expect(run.names, isEmpty);
+      expect(run.complete, isFalse);
+      expect(run.problem, contains('Only 0 of the 5'));
+      expect(run.problem, contains('already on the floor'));
+      // Named ends, so the owner knows where to restart from.
+      expect(run.problem, contains('"T1"'));
+      expect(run.problem, contains('"T1005"'), reason: 'the last name examined must be quoted');
+    });
+
+    test('a partly-filled run reports what it managed and why it stopped', () {
+      // Free at T2 only; everything else up to the bound is taken.
+      final wall = [for (var i = 1; i <= 3000; i++) if (i != 2) 'T$i'];
+      final run = m.allocateTableNames('T1', 4, wall);
+      expect(run.names, ['T2']);
+      expect(run.complete, isFalse);
+      expect(run.problem, contains('Only 1 of the 4'));
+    });
+
+    test('the scan window scales with the size of the run', () {
+      // 700 taken names is past the old flat 500-candidate bound. A run of 5
+      // now reaches past it, and a run of 50 reaches further still — asking for
+      // more tables is also asking to step over more of them.
+      final wall = [for (var i = 1; i <= 700; i++) 'T$i'];
+      final five = m.allocateTableNames('T1', 5, wall);
+      expect(five.names, ['T701', 'T702', 'T703', 'T704', 'T705']);
+      expect(five.problem, isEmpty);
+
+      final fifty = m.allocateTableNames('T1', 50, [for (var i = 1; i <= 5000; i++) 'T$i']);
+      expect(fifty.names.first, 'T5001');
+      expect(fifty.names, hasLength(50));
+      expect(fifty.problem, isEmpty);
+    });
   });
 
   // --- 2. The run, end to end ------------------------------------------------
@@ -228,6 +310,56 @@ void main() {
     expect(find.text('T2, T3'), findsOneWidget);
     expect(find.textContaining('T4 — '), findsOneWidget);
     expect(find.text('T5'), findsOneWidget); // not attempted
+  });
+
+  testWidgets('Add table: a seed that cannot be numbered never reports silent success',
+      (tester) async {
+    _size(tester, 1400, 1000);
+    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
+
+    await tester.tap(find.text('Add table'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Table name (e.g. T7)'), 'T9223372036854775807');
+    await tester.enterText(find.widgetWithText(TextField, 'How many'), '3');
+    await tester.pumpAndSettle();
+
+    // Said before any write, so the seed can just be fixed.
+    expect(find.textContaining('too large to count on from'), findsOneWidget);
+
+    await tester.tap(find.text('Add 3 tables'));
+    await tester.pumpAndSettle();
+
+    // Nothing was written…
+    expect(api.calls, isEmpty);
+    // …and the run said so. This used to close silently: names and skipped both
+    // came back empty, which the "one table, nothing skipped" shortcut treated
+    // as a plain successful single add.
+    expect(find.text('No tables were added'), findsOneWidget);
+    expect(find.textContaining('too large to count on from'), findsOneWidget);
+  });
+
+  testWidgets('Add table: running out of free numbers is stated, not left to inference',
+      (tester) async {
+    _size(tester, 1400, 1000);
+    // Far more consecutive taken names than the scan will examine for a run of 3.
+    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!),
+        _tableRoutes([for (var i = 1; i <= 2000; i++) _table('T$i')]));
+
+    await tester.tap(find.text('Add table'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'Table name (e.g. T7)'), 'T1');
+    await tester.enterText(find.widgetWithText(TextField, 'How many'), '3');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add 3 tables'));
+    await tester.pumpAndSettle();
+
+    expect(api.calls, isEmpty);
+    expect(find.text('No tables were added'), findsOneWidget);
+    // The old report was "No tables were added" plus a several-hundred-name
+    // Skipped list, and never once said the scan had run out of room.
+    expect(find.textContaining('Only 0 of the 3'), findsOneWidget);
+    expect(find.textContaining('already on the floor'), findsWidgets);
   });
 
   // --- 3. Portrait phone -----------------------------------------------------

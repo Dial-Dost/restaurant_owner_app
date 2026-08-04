@@ -164,17 +164,44 @@ void main() {
     await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
         {'/customers/segments': _segmentsRoute(const [])});
     expect(find.text('Nothing to show'), findsOneWidget);
+    // The screen's own chrome outlives the empty state. Under /get-customers the
+    // whole module was one AsyncView, so an empty book had no header at all and
+    // this asserted findsNothing; the /customers/segments version keeps the
+    // header, the search box and the segment tabs mounted around the body,
+    // because they are how you get OUT of an empty result.
+    expect(find.text('Guest book'), findsOneWidget);
+    expect(find.text('Find a guest by name, phone or email…'), findsOneWidget);
+    // The tab says nought rather than going blank — an honest count, not a gap.
+    expect(find.text('All guests · 0'), findsOneWidget);
+    // But nothing that would claim to rank an empty set: the three sort names
+    // appear once each, on the sort tabs, and NOT again as leaderboard headings.
+    expect(find.text('Overview'), findsNothing);
+    for (final band in ['Most recent', 'Most spent', 'Most visited']) {
+      expect(find.text(band), findsOneWidget, reason: '"$band" must be the tab only on an empty book');
+    }
 
     await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
         {'/customers/segments': _segmentsRoute([_guest(1)])});
-    // The name is on the tile AND in all three leaderboards, so it is not unique.
-    expect(find.text('Guest 1 Lastname'), findsWidgets);
+    // Four, and exactly four: the guest's own card, plus one line in each of the
+    // three server-ranked leaderboards in the overview band. (This was loosened
+    // to findsWidgets during the /customers/segments migration, which would have
+    // accepted a band that silently dropped a ranking.)
+    expect(find.text('Overview'), findsOneWidget);
+    for (final band in ['Most recent', 'Most spent', 'Most visited']) {
+      expect(find.text(band), findsNWidgets(2),
+          reason: '"$band" must be both a sort tab and a leaderboard heading');
+    }
+    expect(find.text('Guest 1 Lastname'), findsNWidgets(4),
+        reason: 'one guest card + one line in each of the three leaderboards');
+    // The phone is on the card only — the leaderboards carry the ranking figure.
     expect(find.text('900000001'), findsOneWidget);
 
     await _mount(tester, (r) => m.customersModule(r, r.auth.profile!),
         {'/customers/segments': _segmentsRoute([for (var i = 0; i < 40; i++) _guest(i)])});
-    // Every guest on the page is built, not just the first screenful.
-    expect(find.text('Guest 0 Lastname'), findsWidgets);
+    // Every guest on the page is built, not just the first screenful. Guest 0 is
+    // inside every leaderboard's top five, so it is the same 1 + 3 as above…
+    expect(find.text('Guest 0 Lastname'), findsNWidgets(4));
+    // …while Guest 39 is on no leaderboard, so its card is the only match.
     expect(find.text('Guest 39 Lastname'), findsOneWidget);
   });
 

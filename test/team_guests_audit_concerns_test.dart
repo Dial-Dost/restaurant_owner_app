@@ -357,6 +357,68 @@ void main() {
     expect(inSheet(find.textContaining('Left out of the score')), findsOneWidget);
   });
 
+  // `effective_weights` is not guaranteed: an older server sends none, and a
+  // trimmed payload can drop a single key. Coercing that to 0.0 printed "Counts
+  // for 0% of this score." beside a measure that plainly did count — a figure
+  // the app invented, contradicting the score directly above it.
+  testWidgets('Employees: a missing weight reads as unknown, never as 0%', (tester) async {
+    _desktop(tester);
+    final perf = _performance();
+    // A whole-key drop, the older-server shape.
+    (perf['rows'] as List)[0].remove('effective_weights');
+    await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
+
+    await tester.tap(find.text('Asha Rao'));
+    await tester.pumpAndSettle();
+    final sheet = find.byType(Dialog);
+    Finder inSheet(Finder f) => find.descendant(of: sheet, matching: f);
+
+    expect(inSheet(find.text('Counts for 0% of this score.')), findsNothing,
+        reason: 'an unreported share must never be printed as zero');
+    // Three measures were scored; each says its share is unknown rather than nil.
+    expect(inSheet(find.text('It counted towards this score, but the server did not say by how much.')),
+        findsNWidgets(3));
+    // The one measure that genuinely was excluded still says so.
+    expect(inSheet(find.textContaining('Left out of the score')), findsOneWidget);
+  });
+
+  testWidgets('Employees: one dropped weight leaves the reported ones alone', (tester) async {
+    _desktop(tester);
+    final perf = _performance();
+    (((perf['rows'] as List)[0] as Map)['effective_weights'] as Map).remove('rating');
+    await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
+
+    await tester.tap(find.text('Asha Rao'));
+    await tester.pumpAndSettle();
+    final sheet = find.byType(Dialog);
+    Finder inSheet(Finder f) => find.descendant(of: sheet, matching: f);
+
+    expect(inSheet(find.text('Counts for 41% of this score.')), findsOneWidget);
+    expect(inSheet(find.text('Counts for 24% of this score.')), findsOneWidget);
+    // Only the dropped one is unknown, and it is not reported as 0%.
+    expect(inSheet(find.text('It counted towards this score, but the server did not say by how much.')),
+        findsOneWidget);
+    expect(inSheet(find.text('Counts for 0% of this score.')), findsNothing);
+  });
+
+  testWidgets('Employees: a weight the server really did send as 0 is still shown as 0%',
+      (tester) async {
+    _desktop(tester);
+    final perf = _performance();
+    // `tat` is excluded, so the server reports a genuine zero share for it. The
+    // fix must not turn a REPORTED zero into "unknown" — only an absent one.
+    ((((perf['rows'] as List)[0] as Map)['components'] as Map)['tat'] as Map)
+      ..['available'] = true
+      ..['score'] = 55;
+    await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
+
+    await tester.tap(find.text('Asha Rao'));
+    await tester.pumpAndSettle();
+    final sheet = find.byType(Dialog);
+    expect(find.descendant(of: sheet, matching: find.text('Counts for 0% of this score.')),
+        findsOneWidget);
+  });
+
   testWidgets('Employees: leave shows on the card and can be decided from the sheet',
       (tester) async {
     _desktop(tester);
