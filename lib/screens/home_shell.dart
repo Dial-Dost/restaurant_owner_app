@@ -190,15 +190,11 @@ class _HomeShellState extends State<HomeShell> {
   Widget _outletSwitcher() {
     final activeId = widget.auth.selectedOutletId ?? (_outlets.isNotEmpty ? '${_outlets.first['id']}' : '');
     final isAll = activeId == 'all';
-    // The button sits on the chrome and so takes chrome ink, but the menu it
-    // opens is a dark card: its contents must keep taking workspace ink, which
-    // is why the item colours are left to the theme rather than following the
-    // button's.
     return PopupMenuButton<String>(
       tooltip: isAll ? 'Viewing all outlets (combined)' : 'Switch outlet',
       color: AppColors.cardRaised,
       icon: Icon(isAll ? Icons.layers : Icons.store_mall_directory,
-          color: isAll ? AppColors.chromeAccent : AppColors.chromeIcon),
+          color: isAll ? AppColors.copperHi : AppColors.textSecondary),
       onSelected: _selectOutlet,
       itemBuilder: (_) => [
         CheckedPopupMenuItem<String>(
@@ -354,10 +350,10 @@ class _HomeShellState extends State<HomeShell> {
     return IconButton(
       tooltip: target == null ? 'No previous tab' : 'Back to $target',
       icon: const Icon(Icons.arrow_back, size: 18),
-      color: AppColors.chromeIcon,
+      color: AppColors.textSecondary,
       // Greyed out rather than removed: a control that appears and disappears
       // as you navigate is harder to aim at than one that is always in place.
-      disabledColor: AppColors.chromeTextDisabled,
+      disabledColor: AppColors.textTertiary.withValues(alpha: 0.45),
       visualDensity: VisualDensity.compact,
       onPressed: target == null ? null : _goBack,
     );
@@ -377,22 +373,20 @@ class _HomeShellState extends State<HomeShell> {
         height: 30,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(8),
-          // Deep end of the copper ramp: on paper the light end (copperHi)
-          // has no edge to speak of — 1.5:1 — and the tile just fogs out.
           gradient: const LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [AppColors.chromeAccent, AppColors.copperShadow],
+            colors: [AppColors.copperHi, AppColors.copperDeep],
           ),
           boxShadow: [
             BoxShadow(
-              color: AppColors.copperShadow.withValues(alpha: 0.28),
+              color: AppColors.copperShadow.withValues(alpha: 0.6),
               blurRadius: 12,
               offset: const Offset(0, 3),
             ),
           ],
         ),
-        child: const Icon(Icons.restaurant_menu, size: 16, color: AppColors.chromeSurface),
+        child: const Icon(Icons.restaurant_menu, size: 16, color: AppColors.onCopper),
       ),
       const SizedBox(width: 10),
       Expanded(
@@ -406,17 +400,15 @@ class _HomeShellState extends State<HomeShell> {
                   fontSize: 13,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.3,
-                  color: AppColors.chromeText,
+                  color: AppColors.textPrimary,
                 )),
             const SizedBox(height: 2),
-            const Text('OWNER WORKSPACE',
+            Text('OWNER WORKSPACE',
                 style: TextStyle(
                   fontSize: 9,
                   fontWeight: FontWeight.w600,
                   letterSpacing: 1.2,
-                  // Full strength, not a faded tint: at 9px this is the
-                  // smallest type in the chrome and has the least to spare.
-                  color: AppColors.chromeTextMuted,
+                  color: AppColors.textSecondary.withValues(alpha: 0.8),
                 )),
           ],
         ),
@@ -426,7 +418,7 @@ class _HomeShellState extends State<HomeShell> {
       if (!inDrawer)
         IconButton(
           tooltip: 'Collapse sidebar',
-          icon: const Icon(Icons.chevron_left, color: AppColors.chromeIcon),
+          icon: const Icon(Icons.chevron_left, color: AppColors.textTertiary),
           visualDensity: VisualDensity.compact,
           onPressed: _toggleSidebar,
         ),
@@ -440,21 +432,17 @@ class _HomeShellState extends State<HomeShell> {
     return Column(
       children: [
         Padding(
-          padding: EdgeInsets.fromLTRB(collapsed ? 8 : 18, 18, collapsed ? 8 : 8, 12),
+          padding: EdgeInsets.fromLTRB(collapsed ? 8 : 18, 18, collapsed ? 8 : 8, 14),
           child: collapsed
               ? Center(
                   child: IconButton(
                     tooltip: 'Expand sidebar',
-                    icon: const Icon(Icons.chevron_right, color: AppColors.chromeIcon),
+                    icon: const Icon(Icons.chevron_right, color: AppColors.textTertiary),
                     onPressed: _toggleSidebar,
                   ),
                 )
               : _brandMark(p, inDrawer: inDrawer),
         ),
-        // Separates the lockup from the nav on paper, where the dark theme's
-        // white hairline reads as nothing at all.
-        const Divider(height: 1, thickness: 1, color: AppColors.chromeDivider),
-        const SizedBox(height: 10),
         if (!collapsed)
           const Padding(
             padding: EdgeInsets.only(left: 20, bottom: 8),
@@ -465,31 +453,23 @@ class _HomeShellState extends State<HomeShell> {
                     fontSize: 10,
                     fontWeight: FontWeight.w600,
                     letterSpacing: 1.1,
-                    color: AppColors.chromeTextMuted,
+                    color: AppColors.textTertiary,
                   )),
             ),
           ),
         Expanded(
-          // The nav is longer than any window, so this list always scrolls —
-          // and the app-wide thumb is translucent white, which on paper is
-          // 1.03:1. The chrome brings its own.
-          child: ScrollbarTheme(
-            data: ScrollbarThemeData(
-              thumbColor: WidgetStateProperty.all(AppColors.chromeScrollThumb),
-            ),
-            child: ListView.builder(
-              padding: EdgeInsets.symmetric(horizontal: collapsed ? 8 : 12),
-              itemCount: visible.length,
-              itemBuilder: (context, i) => _NavItem(
-                label: visible[i].label,
-                icon: visible[i].icon,
-                active: i == _index,
-                collapsed: collapsed,
-                onTap: () {
-                  _selectIndex(i);
-                  if (inDrawer) Navigator.of(context).pop(); // close the drawer
-                },
-              ),
+          child: ListView.builder(
+            padding: EdgeInsets.symmetric(horizontal: collapsed ? 8 : 12),
+            itemCount: visible.length,
+            itemBuilder: (context, i) => _NavItem(
+              label: visible[i].label,
+              icon: visible[i].icon,
+              active: i == _index,
+              collapsed: collapsed,
+              onTap: () {
+                _selectIndex(i);
+                if (inDrawer) Navigator.of(context).pop(); // close the drawer
+              },
             ),
           ),
         ),
@@ -562,14 +542,7 @@ class _HomeShellState extends State<HomeShell> {
       key: _scaffoldKey,
       backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: AppColors.chromeSurface,
-        // Reaches the title text, and (via the theme's iconButtonTheme) the
-        // drawer button the narrow layout implies for us.
-        foregroundColor: AppColors.chromeText,
-        iconTheme: const IconThemeData(color: AppColors.chromeIcon, size: 22),
-        actionsIconTheme: const IconThemeData(color: AppColors.chromeIcon, size: 22),
-        // Light chrome wants dark status-bar glyphs on Android.
-        systemOverlayStyle: SystemUiOverlayStyle.dark,
+        backgroundColor: AppColors.bgDeep,
         surfaceTintColor: Colors.transparent,
         scrolledUnderElevation: 0,
         elevation: 0,
@@ -577,22 +550,19 @@ class _HomeShellState extends State<HomeShell> {
         title: Row(children: [
           _backButton(),
           const SizedBox(width: 2),
-          const Icon(Icons.auto_awesome, size: 14, color: AppColors.chromeAccent),
+          const Icon(Icons.auto_awesome, size: 14, color: AppColors.copperHi),
           const SizedBox(width: 8),
           Text(current.label,
               style: const TextStyle(
                 fontSize: 17,
                 fontWeight: FontWeight.w600,
                 letterSpacing: -0.2,
-                color: AppColors.chromeText,
+                color: AppColors.textPrimary,
               )),
         ]),
-        // The seam, not a divider inside the chrome: this line is where the
-        // paper stops and the workspace starts, so it is drawn in the edge
-        // ink rather than the near-invisible white hairline used on dark.
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(1),
-          child: Divider(height: 1, thickness: 1, color: AppColors.chromeEdge),
+          child: Divider(height: 1, thickness: 1, color: AppColors.divider),
         ),
         actions: [
           if (_outlets.length > 1) _outletSwitcher(),
@@ -613,8 +583,6 @@ class _HomeShellState extends State<HomeShell> {
             Padding(
               padding: const EdgeInsets.only(right: 8),
               child: TextButton.icon(
-                // Not the theme's copper foreground: copper on paper is 2.1:1.
-                style: TextButton.styleFrom(foregroundColor: AppColors.chromeText),
                 onPressed: widget.auth.logout,
                 icon: const Icon(Icons.logout, size: 16),
                 label: const Text('Sign out'),
@@ -626,7 +594,7 @@ class _HomeShellState extends State<HomeShell> {
       ),
       drawer: narrow
           ? Drawer(
-              backgroundColor: AppColors.chromeSurface,
+              backgroundColor: AppColors.bgDeep,
               child: SafeArea(child: _navList(visible, p, inDrawer: true)),
             )
           : null,
@@ -639,37 +607,12 @@ class _HomeShellState extends State<HomeShell> {
                   curve: Curves.easeInOut,
                   width: _sidebarCollapsed ? 68 : 224,
                   decoration: const BoxDecoration(
-                    color: AppColors.chromeSurface,
-                    border: Border(right: BorderSide(color: AppColors.chromeEdge)),
+                    color: AppColors.bgDeep,
+                    border: Border(right: BorderSide(color: AppColors.divider)),
                   ),
                   child: _navList(visible, p, inDrawer: false, collapsed: _sidebarCollapsed),
                 ),
-                // The shading that sells the seam has to be painted by the
-                // workspace: a Row paints the body after the sidebar, so a
-                // shadow cast from the sidebar's own decoration would be
-                // covered up by the very thing it falls on.
-                Expanded(
-                  child: Stack(children: [
-                    Positioned.fill(child: body),
-                    const Positioned(
-                      left: 0,
-                      top: 0,
-                      bottom: 0,
-                      width: 16,
-                      child: IgnorePointer(
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.centerLeft,
-                              end: Alignment.centerRight,
-                              colors: [Color(0x8C000000), Color(0x00000000)],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ]),
-                ),
+                Expanded(child: body),
               ],
             ),
     );
@@ -712,8 +655,8 @@ class _ShellDismissAction extends Action<_ShellEscapeIntent> {
   }
 }
 
-/// A single sidebar entry on the light chrome: quiet dark ink when idle, a
-/// dark pill with the copper tick when selected, and a copper hover wash.
+/// A single sidebar entry with the reference's copper tick indicator, quiet
+/// inactive ink, and a subtle hover wash.
 class _NavItem extends StatefulWidget {
   const _NavItem({
     required this.label,
@@ -739,14 +682,11 @@ class _NavItemState extends State<_NavItem> {
   @override
   Widget build(BuildContext context) {
     final active = widget.active;
-    // Active flips to light ink because the item itself flips to a dark pill;
-    // the two must always move together.
     final fg = active
-        ? AppColors.onChromeActive
+        ? AppColors.textPrimary
         : _hovered
-            ? AppColors.chromeText
-            : AppColors.chromeTextMuted;
-    final iconFg = active ? AppColors.chromeActiveAccent : AppColors.chromeIcon;
+            ? AppColors.textPrimary.withValues(alpha: 0.85)
+            : AppColors.textSecondary;
 
     final item = MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -763,9 +703,9 @@ class _NavItemState extends State<_NavItem> {
           ),
           decoration: BoxDecoration(
             color: active
-                ? AppColors.chromeActive
+                ? Colors.white.withValues(alpha: 0.06)
                 : _hovered
-                    ? AppColors.chromeHover
+                    ? Colors.white.withValues(alpha: 0.03)
                     : Colors.transparent,
             borderRadius: BorderRadius.circular(9),
           ),
@@ -781,11 +721,11 @@ class _NavItemState extends State<_NavItem> {
                   height: active ? 14 : 0,
                   margin: const EdgeInsets.only(right: 9),
                   decoration: BoxDecoration(
-                    color: AppColors.chromeActiveAccent,
+                    color: AppColors.copperHi,
                     borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-              Icon(widget.icon, size: 17, color: iconFg),
+              Icon(widget.icon, size: 17, color: active ? AppColors.copperHi : fg),
               if (!widget.collapsed) ...[
                 const SizedBox(width: 10),
                 Expanded(

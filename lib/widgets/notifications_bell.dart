@@ -394,12 +394,8 @@ class _NotificationsBellState extends State<NotificationsBell> {
       icon: Badge.count(
         count: _unread,
         isLabelVisible: _unread > 0,
-        // The bell now sits on the light chrome, where AppColors.copper is only
-        // 2.77:1 against the paper — under the 3:1 a non-text indicator needs,
-        // and an unread badge nobody notices defeats its own purpose. The darker
-        // chrome accent reads 5.13:1 on the paper with white numerals at 6.07:1.
-        backgroundColor: AppColors.chromeAccent,
-        textColor: Colors.white,
+        backgroundColor: AppColors.copper,
+        textColor: AppColors.onCopper,
         child: const Icon(Icons.notifications_outlined),
       ),
     );
