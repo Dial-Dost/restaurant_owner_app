@@ -789,20 +789,30 @@ Future<void> _detailSheet(
                 ),
               ),
               const SizedBox(height: AppSpacing.lg),
-              Row(children: [
-                ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
-                const Spacer(),
-                if (canJump)
-                  ForkButton(
-                    label: 'View in $jumpTo',
-                    icon: Icons.arrow_forward,
-                    dense: true,
-                    onPressed: () {
-                      Navigator.pop(ctx);
-                      nav!.openModule(jumpTo, target: jumpTarget);
-                    },
-                  ),
-              ]),
+              // A Wrap, not Row + Spacer. The card asks for 460px and gets what
+              // the window allows — 264px on a 390px phone — where "Close" and
+              // "View in Analytics" together overflowed by 75px with neither
+              // able to give. Wrapped, the jump drops onto its own line instead,
+              // and on any real desktop width this lays out exactly as before.
+              Wrap(
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: AppSpacing.md,
+                runSpacing: AppSpacing.sm,
+                children: [
+                  ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+                  if (canJump)
+                    ForkButton(
+                      label: 'View in $jumpTo',
+                      icon: Icons.arrow_forward,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        nav!.openModule(jumpTo, target: jumpTarget);
+                      },
+                    ),
+                ],
+              ),
             ]),
           ),
         ),
@@ -812,18 +822,34 @@ Future<void> _detailSheet(
 }
 
 // Quiet label / value line used inside the Overview drill-downs.
+//
+// Wraps rather than rows. The sheet asks for 460px but gets whatever the window
+// allows — 266px of usable width on a 390px phone — and neither the trailing
+// qualifier nor the figure itself could give: "₹98765432.10" beside "3 order(s)"
+// overflowed a Row by 75px with the label already squeezed to nothing. Every
+// leaf here is bounded by the wrap, so the qualifier drops under the label
+// instead, and the figure is never the thing that gets truncated.
 Widget _detailRow(BuildContext context, String label, String value, {String? trailing}) {
   final text = Theme.of(context).textTheme;
   return Padding(
     padding: const EdgeInsets.symmetric(vertical: 5),
-    child: Row(children: [
-      Expanded(child: Text(label, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis)),
-      if (trailing != null) ...[
-        Text(trailing, style: text.bodySmall),
-        const SizedBox(width: AppSpacing.md),
+    child: Wrap(
+      alignment: WrapAlignment.spaceBetween,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: AppSpacing.md,
+      runSpacing: 2,
+      children: [
+        Text(label, style: text.bodyMedium, maxLines: 2, overflow: TextOverflow.ellipsis),
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: AppSpacing.md,
+          children: [
+            if (trailing != null) Text(trailing, style: text.bodySmall),
+            Text(value, style: text.titleSmall),
+          ],
+        ),
       ],
-      Text(value, style: text.titleSmall),
-    ]),
+    ),
   );
 }
 
@@ -1230,25 +1256,128 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
         // round-trips are made when a card is opened.
         final nav = ModuleNavigator.of(context);
 
+        // Covers actually seated right now, so the occupancy read-out can say
+        // how many PEOPLE are in, not only how many tables are lit.
+        final seatedCovers = tables.fold<int>(
+            0, (s, t) => s + ((t as Map)['occupied'] == true ? (_int(t['covers']) ?? 1) : 0));
+        final occupancyRead = totalTables == 0
+            ? 'No tables are set up yet'
+            : '$occupied of $totalTables tables occupied '
+                '(${(occupied / totalTables * 100).round()}%) · $seatedCovers cover(s) seated';
+
+        // --- chart read-outs --------------------------------------------------
+        // A single letter is enough on an axis but not in a hover card, where
+        // "T" is either Tuesday or Thursday.
+        const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        String dayTitle(Map d) {
+          final iso = '${d['date'] ?? ''}';
+          final short = _fmtDay(iso);
+          final wd = DateTime.tryParse(iso)?.weekday;
+          return wd == null ? (short.isEmpty ? 'That day' : short) : '${dayNames[(wd - 1).clamp(0, 6)]}, $short';
+        }
+
+        // What a revenue mark says on hover, indexed into `daily`.
+        String dayRead(int i) {
+          if (i < 0 || i >= daily.length) return '';
+          final d = daily[i] as Map;
+          return '${dayTitle(d)} · ${_money(d['revenue'])} · ${_int(d['orders']) ?? 0} order(s)';
+        }
+
+        // One day off the revenue series. Every revenue mark on this page maps
+        // its own index back into `daily` BEFORE calling this, so a bar can
+        // never name one day in its hover card and then open another.
+        void openDay(int i) {
+          if (i < 0 || i >= daily.length) return;
+          final d = daily[i] as Map;
+          final rev = num0(d['revenue']);
+          final orders = _int(d['orders']) ?? 0;
+          final windowTotal = dailyValues.fold<double>(0, (a, b) => a + b);
+          var best = 0.0;
+          for (final v in dailyValues) {
+            if (v > best) best = v;
+          }
+          final prev = i > 0 ? num0((daily[i - 1] as Map)['revenue']) : null;
+          _detailSheet(
+            context,
+            eyebrow: 'Revenue · one day',
+            title: dayTitle(d),
+            jumpTo: 'Analytics',
+            children: [
+              Wrap(
+                spacing: AppSpacing.xxl,
+                runSpacing: AppSpacing.md,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  MicroStat(value: _money(rev), label: 'settled'),
+                  MicroStat(value: '$orders', label: 'order(s)'),
+                  // A day only means something against the window it sits in.
+                  DonutGauge(
+                    fraction: best <= 0 ? 0 : (rev / best).clamp(0.0, 1.0),
+                    size: 46,
+                    tooltip: best <= 0
+                        ? 'Nothing was settled in this window'
+                        : 'Best day in the window was ${_money(best)}',
+                  ),
+                ],
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              _detailRow(context, 'Average per order',
+                  orders == 0 ? '—' : _money(rev / orders)),
+              _detailRow(context, 'Share of the last ${daily.length} days',
+                  windowTotal <= 0 ? '—' : '${(rev / windowTotal * 100).toStringAsFixed(1)}%'),
+              if (prev != null)
+                _detailRow(context, 'The day before', _money(prev),
+                    trailing: prev <= 0
+                        ? null
+                        : '${rev >= prev ? '+' : ''}${((rev - prev) / prev * 100).toStringAsFixed(1)}%'),
+            ],
+          );
+        }
+
         void openRevenue() {
           const dayLetters = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
           final last7 = daily.length <= 7 ? daily : daily.sublist(daily.length - 7);
+          // last7 is a TAIL slice of `daily`, so a bar index has to be shifted
+          // back by everything the slice dropped before it can name a day.
+          final tailFrom = daily.length - last7.length;
           _detailSheet(
             context,
             eyebrow: 'Revenue',
             title: 'Last ${daily.length} days',
             jumpTo: 'Analytics',
             children: [
-              Row(children: [
-                MicroStat(value: _money(apc['total_revenue']), label: 'MTD revenue'),
-                const SizedBox(width: AppSpacing.xxl),
-                MicroStat(value: '${(apc['orders'] as List?)?.length ?? 0}', label: 'bills this month'),
-                const Spacer(),
-                if (weekDeltaPct != null) DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
-              ]),
+              // A Wrap, not a Row: the sheet is a fixed 460px and each of these
+              // carries its own intrinsic width, so a long money figure beside
+              // "▲ 100.0% vs prior week" — or an ordinary 1.3x text scale —
+              // overflowed a Row by ~160px with nothing able to give.
+              Wrap(
+                spacing: AppSpacing.xxl,
+                runSpacing: AppSpacing.md,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  MicroStat(value: _money(apc['total_revenue']), label: 'MTD revenue'),
+                  MicroStat(value: '${(apc['orders'] as List?)?.length ?? 0}', label: 'bills this month'),
+                  if (weekDeltaPct != null)
+                    // Scaled down rather than shortened, exactly as the revenue
+                    // card does it: DeltaText is a Row(min) whose label is laid
+                    // out unbounded, so bounding it from out here cannot make it
+                    // give — and a delta with no stated baseline is not an
+                    // insight, so the window it compares against has to survive.
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      alignment: Alignment.centerLeft,
+                      child: DeltaText(pct: weekDeltaPct, suffix: ' vs prior week'),
+                    ),
+                ],
+              ),
               const SizedBox(height: AppSpacing.lg),
               if (dailyValues.length >= 2) ...[
-                CopperBarcode(values: dailyValues, height: 54),
+                CopperBarcode(
+                  values: dailyValues,
+                  height: 54,
+                  onTap: openDay,
+                  tooltipBuilder: dayRead,
+                ),
                 const SizedBox(height: AppSpacing.lg),
               ],
               if (last7.isNotEmpty) ...[
@@ -1260,6 +1389,8 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                           .clamp(0, 6)],
                   ],
                   highlight: last7.length - 1,
+                  onTap: (i) => openDay(tailFrom + i),
+                  tooltipBuilder: (i) => dayRead(tailFrom + i),
                 ),
                 const SizedBox(height: AppSpacing.lg),
               ],
@@ -1288,11 +1419,16 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
             title: 'How APC is calculated',
             jumpTo: 'Analytics',
             children: [
-              Row(children: [
-                MicroStat(value: _money(apc['monthly_apc']), label: 'APC (pre-tax)'),
-                const SizedBox(width: AppSpacing.xxl),
-                MicroStat(value: covers.toStringAsFixed(0), label: 'covers'),
-              ]),
+              // Wrapped for the same reason as the revenue header above.
+              Wrap(
+                spacing: AppSpacing.xxl,
+                runSpacing: AppSpacing.md,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  MicroStat(value: _money(apc['monthly_apc']), label: 'APC (pre-tax)'),
+                  MicroStat(value: covers.toStringAsFixed(0), label: 'covers'),
+                ],
+              ),
               const SizedBox(height: AppSpacing.lg),
               ForkCard(
                 inset: true,
@@ -1320,11 +1456,28 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
             title: 'Occupied right now',
             jumpTo: 'Tables',
             children: [
-              Row(children: [
-                DonutGauge(fraction: totalTables == 0 ? 0 : occupied / totalTables, size: 54),
-                const SizedBox(width: AppSpacing.lg),
+              Wrap(
+                spacing: AppSpacing.lg,
+                runSpacing: AppSpacing.md,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                DonutGauge(
+                  fraction: totalTables == 0 ? 0 : occupied / totalTables,
+                  size: 54,
+                  tooltip: occupancyRead,
+                  // The floor plan is where an occupancy figure is acted on. The
+                  // sheet's own "View in Tables" goes to the same place, so the
+                  // gauge is a shortcut to it and not a second, different answer.
+                  onTap: (nav != null && nav.canOpen('Tables'))
+                      ? () {
+                          Navigator.of(context).pop();
+                          nav.openModule('Tables');
+                        }
+                      : null,
+                ),
                 MicroStat(value: '$occupied of $totalTables', label: 'tables occupied'),
-              ]),
+                ],
+              ),
               const SizedBox(height: AppSpacing.lg),
               const SectionHeader(title: 'Tables'),
               if (occupiedRows.isEmpty)
@@ -1347,30 +1500,51 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
 
         void openRating() {
           final cats = (fb['categoryAverages'] as Map?) ?? const {};
+          // Every category bar leads to the same place — Feedback owns the
+          // responses behind all of them, and a category is not a record there,
+          // so nothing is forwarded to focus on.
+          final openFeedback = (nav != null && nav.canOpen('Feedback'))
+              ? () {
+                  Navigator.of(context).pop();
+                  nav.openModule('Feedback');
+                }
+              : null;
           _detailSheet(
             context,
             eyebrow: 'Guest feedback',
             title: 'Rating summary',
             jumpTo: 'Feedback',
             children: [
-              Row(children: [
-                MicroStat(value: '${fb['averageRating'] ?? 0} / 5', label: 'average rating'),
-                const SizedBox(width: AppSpacing.xxl),
-                MicroStat(value: '${fb['totalResponses'] ?? 0}', label: 'responses'),
-                const SizedBox(width: AppSpacing.xxl),
-                MicroStat(value: '${fb['last30DaysResponses'] ?? 0}', label: 'last 30 days'),
-              ]),
+              // Three of these never fitted one 460px row at a raised text scale.
+              Wrap(
+                spacing: AppSpacing.xxl,
+                runSpacing: AppSpacing.md,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  MicroStat(value: '${fb['averageRating'] ?? 0} / 5', label: 'average rating'),
+                  MicroStat(value: '${fb['totalResponses'] ?? 0}', label: 'responses'),
+                  MicroStat(value: '${fb['last30DaysResponses'] ?? 0}', label: 'last 30 days'),
+                ],
+              ),
               const SizedBox(height: AppSpacing.lg),
               const SectionHeader(title: 'By category'),
               if (cats.isEmpty)
                 Text('No category ratings collected yet.', style: text.bodySmall)
               else
                 for (final e in cats.entries)
-                  HBarRow(
-                    label: _s((e.value as Map?) ?? const {}, 'label', '${e.key}'),
-                    fraction: num0(((e.value as Map?) ?? const {})['average']) / 5,
-                    value: '${((e.value as Map?) ?? const {})['average'] ?? '—'}',
-                  ),
+                  Builder(builder: (_) {
+                    final c = (e.value as Map?) ?? const {};
+                    final label = _s(c, 'label', '${e.key}');
+                    final n = _int(c['count'] ?? c['responses']);
+                    return HBarRow(
+                      label: label,
+                      fraction: num0(c['average']) / 5,
+                      value: '${c['average'] ?? '—'}',
+                      tooltip: '$label — ${_score(c['average'])} / 5'
+                          '${n == null ? '' : ' from $n response(s)'}',
+                      onTap: openFeedback,
+                    );
+                  }),
             ],
           );
         }
@@ -1529,7 +1703,18 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                 value: _money(apc['total_revenue']),
                 tag: 'MTD',
                 caption: 'Revenue this month — all channels',
-                chart: dailyValues.length >= 2 ? CopperBarcode(values: dailyValues) : null,
+                // DELIBERATE: hover, but NO onTap on a chart that lives inside
+                // an already-tappable card. A per-bar tap here would be the
+                // deepest hit target, so it would win the arena and swallow the
+                // card's own tap — the same pixel would open one day on the
+                // chart and the whole window one pixel below it. So the strip
+                // only READS here (the day and its takings), every pixel of the
+                // card opens the revenue drill-down, and the identical strip
+                // inside that sheet — where nothing else is competing for the
+                // tap — is the one that drills into a single day.
+                chart: dailyValues.length >= 2
+                    ? CopperBarcode(values: dailyValues, tooltipBuilder: dayRead)
+                    : null,
                 // "▲ 12.4% vs prior week" is a fixed-width Row with nothing to
                 // give, and the four-across grid starts at a 1100px WINDOW —
                 // which, once the sidebar and the page padding are taken out,
@@ -1561,7 +1746,13 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                 caption: 'Tables occupied right now',
                 chart: Align(
                   alignment: Alignment.centerLeft,
-                  child: DonutGauge(fraction: totalTables == 0 ? 0 : occupied / totalTables, size: 46),
+                  // Same rule as the revenue strip above: the gauge reads, the
+                  // card acts. Its onTap lives in the drill-down instead.
+                  child: DonutGauge(
+                    fraction: totalTables == 0 ? 0 : occupied / totalTables,
+                    size: 46,
+                    tooltip: occupancyRead,
+                  ),
                 ),
               ),
             ),
@@ -14655,6 +14846,30 @@ class _WaitlistViewState extends State<_WaitlistView> {
   String? _busyId;
   Timer? _poll;
 
+  /// 0 = Queue (everyone), 1 = Walk-ins (called, awaiting a table),
+  /// 2 = Reservations (a pointer to Bookings — this endpoint holds walk-ins only).
+  int _tab = 0;
+
+  /// The table lists [_previewRows] until the footer link asks for the rest, so
+  /// a forty-party Saturday does not push the rail off the bottom of the page.
+  bool _showAll = false;
+  static const int _previewRows = 8;
+
+  /// Below this the right rail stacks under the main column instead of beside it.
+  static const double _twoColumnMin = 1000;
+  static const double _railWidth = 320;
+
+  // The queue table. Fixed cells are multiplied by the system text scale so a
+  // 1.3x label still fits its own box; the two free-text columns flex, which is
+  // what keeps the row from ever overflowing.
+  static const List<String> _cols = [
+    'Position', 'Party', 'Name', 'Phone', 'People', 'Wait Time', 'Status', 'Actions',
+  ];
+  static const List<int> _colFlex = [0, 0, 3, 3, 0, 0, 0, 0];
+  static const List<double> _colWidth = [56, 42, 0, 0, 60, 74, 100, 56];
+  static const double _colGap = 8;
+  static const double _fixedCols = 56 + 42 + 60 + 74 + 100 + 56;
+
   @override
   void initState() {
     super.initState();
@@ -14914,62 +15129,643 @@ class _WaitlistViewState extends State<_WaitlistView> {
     // A seated party's un-answered pre-order outlives the queue itself, so this
     // section renders whether or not anyone is still waiting.
     final pendingSection = _pendingPreorderSection();
+    // Called = notified, on their way to a table. The one real sub-list this
+    // endpoint supports: GET /waitlist returns waiting + called and nothing else.
+    final called = [for (final e in ordered) if (_s(e as Map, 'status', 'waiting') == 'called') e];
 
-    if (ordered.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: _load,
-        child: ListView(padding: AppSpacing.pageNarrow, children: [
-          ?banner,
-          ...pendingSection,
-          _qrCard(),
-          const EmptyState(
-            icon: Icons.hourglass_empty,
-            title: 'Queue is empty',
-            caption: 'Walk-ins who scan the entrance QR appear here in arrival order.',
-          ),
-        ]),
-      );
-    }
     return RefreshIndicator(
       onRefresh: _load,
-      child: ListView(padding: AppSpacing.pageNarrow, children: [
-        ?banner,
-        ...pendingSection,
-        _qrCard(),
-        const SizedBox(height: AppSpacing.xl),
-        SectionHeader(title: 'In the queue', count: ordered.length),
-        for (final raw in ordered) _card(raw as Map, focused: focusId != null && '${raw['id']}' == focusId),
-      ]),
+      child: LayoutBuilder(builder: (context, c) {
+        final wide = c.maxWidth >= _twoColumnMin;
+        final mainWidth = wide ? c.maxWidth - _railWidth - AppSpacing.xl : c.maxWidth;
+        final main = <Widget>[
+          ?banner,
+          _hero(mainWidth),
+          const SizedBox(height: AppSpacing.lg),
+          _statStrip(ordered, mainWidth),
+          const SizedBox(height: AppSpacing.xl),
+          ...pendingSection,
+          _queuePanel(ordered, called, focusId, mainWidth),
+        ];
+        final rail = <Widget>[
+          _joinCard(),
+          const SizedBox(height: AppSpacing.lg),
+          _summaryCard(ordered, called),
+          const SizedBox(height: AppSpacing.lg),
+          _toBeSeatedCard(called),
+        ];
+        return ListView(padding: AppSpacing.pageNarrow, children: [
+          if (wide)
+            Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: main)),
+              const SizedBox(width: AppSpacing.xl),
+              SizedBox(
+                width: _railWidth,
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: rail),
+              ),
+            ])
+          else ...[
+            ...main,
+            const SizedBox(height: AppSpacing.xl),
+            ...rail,
+          ],
+          const SizedBox(height: AppSpacing.xl),
+          _closingBanner(c.maxWidth),
+        ]);
+      }),
     );
   }
 
   String get _queueUrl => '${AppConfig.orderBaseUrl}/queue/${widget.profile.restaurantUsername}';
 
+  /// The system text scale, floored at 1. Every fixed column in the queue table
+  /// is multiplied by it — a box that does not grow with its own label is how
+  /// the 1.3x header overflow happened in the first place.
+  double get _scale {
+    final s = MediaQuery.textScalerOf(context).scale(1);
+    return s < 1 ? 1 : s;
+  }
+
+  int _guestCount(List entries) {
+    var total = 0;
+    for (final raw in entries) {
+      final n = _int((raw as Map)['party_size']) ?? 1;
+      total += n < 1 ? 1 : n;
+    }
+    return total;
+  }
+
+  Widget _roundBadge(IconData icon, {Color color = AppColors.copper, double size = 34}) => Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: AppColors.tint(color),
+          border: Border.all(color: AppColors.edge(color)),
+        ),
+        child: Icon(icon, size: size * 0.48, color: Color.lerp(color, Colors.white, 0.25)),
+      );
+
+  // The Party cell. It used to be the same groups icon on every row — 42px of a
+  // desktop table carrying no information — while the phone layout showed
+  // "2-item pre-order · 2 in party" as chips. So the form factor most hosts
+  // actually use was the one that could not tell a party holding a pre-order
+  // from a plain one without opening the menu on each of up to 40 rows.
+  // The icon now states which it is, and a party bigger than the booking carries
+  // its member count, so the column earns its width.
+  Widget _partyCell(List<Map> preItems, List<Map> members) {
+    final hasPre = preItems.isNotEmpty;
+    final badge = _roundBadge(
+      hasPre ? Icons.restaurant_menu : Icons.groups_outlined,
+      color: hasPre ? AppColors.copperHi : AppColors.copper,
+      size: 30,
+    );
+    final bits = [
+      if (hasPre) '${preItems.length}-item pre-order',
+      if (members.isNotEmpty) '${members.length} in party',
+    ];
+    if (bits.isEmpty) {return badge;}
+    return Tooltip(
+      message: bits.join(' · '),
+      waitDuration: const Duration(milliseconds: 250),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          badge,
+          if (members.isNotEmpty)
+            Positioned(
+              right: -2,
+              bottom: -2,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: AppColors.surface,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppColors.edge(AppColors.copper)),
+                ),
+                child: Text('${members.length}',
+                    style: const TextStyle(
+                        fontSize: 9, fontWeight: FontWeight.w700, color: AppColors.copperHi)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   // The entrance "Join the queue" QR — how a walk-in gets INTO the queue when
-  // tables are full. Print/display it at the door; it points at the public
-  // /queue/<slug> page on the web app.
-  Widget _qrCard() {
+  // tables are full. The motif is ornament only: it is dropped whole below 620px
+  // rather than squeezed in beside the copy it would otherwise crowd.
+  Widget _hero(double w) {
     final text = Theme.of(context).textTheme;
     return ForkCard(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: AppColors.tint(AppColors.copper),
+            borderRadius: AppRadius.tileAll,
+            border: Border.all(color: AppColors.edge(AppColors.copper)),
+          ),
+          child: const Icon(Icons.qr_code_2, size: 21, color: AppColors.copperHi),
+        ),
+        const SizedBox(width: AppSpacing.lg),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Entrance “Join the queue” QR', style: text.titleMedium),
+            const SizedBox(height: 6),
+            Text(
+                'Display this at your door. When all tables are full, guests scan it to join this waitlist — and can browse the menu and pre-order while they wait.',
+                style: text.bodySmall),
+          ]),
+        ),
+        if (w >= 620) ...[
+          const SizedBox(width: AppSpacing.lg),
+          const _QueueMotif(),
+        ],
+      ]),
+    );
+  }
+
+  /// Four figures, all read off data this screen already holds.
+  ///
+  /// The reference's "estimated wait" and "tables free in the next 30 min" are
+  /// deliberately NOT here: GET /waitlist carries no turn-time and /get-tables no
+  /// ETA, so both would have been invented. What IS true is shown instead — how
+  /// long the parties in the queue have actually been waiting, and how many
+  /// tables are free right now.
+  Widget _statStrip(List ordered, double w) {
+    final mins = [for (final e in ordered) _int((e as Map)['minutes_waiting']) ?? 0]..sort();
+    final guests = _guestCount(ordered);
+    final avg = ordered.isEmpty ? 0.0 : guests / ordered.length;
+    final s = _scale;
+    final cols = w >= 900 * s ? 4 : (w >= 520 * s ? 2 : 1);
+    return _dashGrid([
+      _statTile(
+        figure: '${ordered.length}',
+        unit: 'Groups',
+        caption: 'Current queue',
+        icon: Icons.groups_outlined,
+      ),
+      _statTile(
+        figure: mins.isEmpty ? '0' : (mins.first == mins.last ? '${mins.first}' : '${mins.first}–${mins.last}'),
+        unit: 'Min',
+        caption: 'Waited so far, shortest to longest',
+        icon: Icons.schedule,
+      ),
+      _statTile(
+        figure: '${_freeTables.length}',
+        unit: 'Free',
+        caption: 'Tables ready to seat now',
+        icon: Icons.table_restaurant_outlined,
+      ),
+      _statTile(
+        figure: avg == 0 ? '0' : avg.toStringAsFixed(avg % 1 == 0 ? 0 : 1),
+        unit: 'People',
+        caption: 'Average party size',
+        icon: Icons.person_outline,
+      ),
+    ], cols);
+  }
+
+  Widget _statTile({
+    required String figure,
+    required String unit,
+    required String caption,
+    required IconData icon,
+  }) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text.rich(
+                  TextSpan(text: figure, style: text.displaySmall!.copyWith(fontSize: 22), children: [
+                    TextSpan(
+                        text: '  $unit',
+                        style: text.bodySmall!.copyWith(fontSize: 11, fontWeight: FontWeight.w500)),
+                  ]),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 4),
+                Text(caption.toUpperCase(), style: text.labelSmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+              ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        _roundBadge(icon),
+      ]),
+    );
+  }
+
+  // ---- the tabbed queue panel ----------------------------------------------
+
+  Widget _queuePanel(List ordered, List called, String? focusId, double w) {
+    final text = Theme.of(context).textTheme;
+    final s = _scale;
+    final rows = _tab == 1 ? called : ordered;
+    // Below this the eight columns cannot hold a phone number, so the row becomes
+    // a stacked record instead of a grid nobody can read. See _entryRow.
+    final table = w >= _fixedCols * s + _colGap * (_cols.length - 1) + 220;
+    final capped = _showAll || rows.length <= _previewRows ? rows : rows.sublist(0, _previewRows);
+
+    return ForkCard(
+      padding: EdgeInsets.zero,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+          child: Wrap(
+            alignment: WrapAlignment.spaceBetween,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: AppSpacing.md,
+            runSpacing: AppSpacing.sm,
+            children: [
+              ForkTabs(
+                tabs: ['Queue (${ordered.length})', 'Walk-ins', 'Reservations'],
+                selected: _tab,
+                onSelected: (i) => setState(() {
+                  _tab = i;
+                  _showAll = false;
+                }),
+              ),
+              Text(_tabCaption(), style: text.bodySmall!.copyWith(fontSize: 11)),
+            ],
+          ),
+        ),
+        const Divider(height: 1, thickness: 1, color: AppColors.divider),
+        if (_tab == 2)
+          _reservationsPanel()
+        else if (rows.isEmpty)
+          _emptyPanel()
+        else ...[
+          if (table) _headerRow(s),
+          for (var i = 0; i < capped.length; i++)
+            _entryRow(
+              capped[i] as Map,
+              table: table,
+              s: s,
+              focused: focusId != null && '${(capped[i] as Map)['id']}' == focusId,
+              last: i == capped.length - 1 && rows.length <= _previewRows,
+            ),
+          if (rows.length > _previewRows) _viewAllFooter(rows.length),
+        ],
+      ]),
+    );
+  }
+
+  String _tabCaption() => switch (_tab) {
+        1 => 'Notified — waiting for a table',
+        2 => 'Booked ahead, not a walk-in',
+        _ => 'Everyone still in the queue',
+      };
+
+  Widget _headerRow(double s) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+        decoration: const BoxDecoration(
+          color: AppColors.inset,
+          border: Border(bottom: BorderSide(color: AppColors.divider)),
+        ),
+        child: _tableRow([
+          for (var i = 0; i < _cols.length; i++)
+            Text(
+              _cols[i],
+              textAlign: i == _cols.length - 1 ? TextAlign.right : TextAlign.left,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.3,
+                color: AppColors.textTertiary,
+              ),
+            ),
+        ], s),
+      );
+
+  /// Header and body share this one spec, which is the only reason the columns
+  /// line up. Every cell is either flexible (ellipsises) or a fixed box that
+  /// scales with the text — nothing here can push the row past its parent.
+  Widget _tableRow(List<Widget> cells, double s) => Row(
+        children: [
+          for (var i = 0; i < cells.length; i++) ...[
+            if (i > 0) const SizedBox(width: _colGap),
+            if (_colFlex[i] > 0)
+              Expanded(flex: _colFlex[i], child: cells[i])
+            else
+              SizedBox(width: _colWidth[i] * s, child: cells[i]),
+          ],
+        ],
+      );
+
+  Widget _rowShell({required bool focused, required bool last, required Widget child}) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: focused ? AppColors.tint(AppColors.copper) : null,
+          border: last ? null : const Border(bottom: BorderSide(color: AppColors.divider)),
+        ),
+        child: child,
+      );
+
+  Widget _entryRow(Map e, {required bool table, required double s, required bool focused, required bool last}) {
+    final text = Theme.of(context).textTheme;
+    final status = _s(e, 'status', 'waiting');
+    final called = status == 'called';
+    final phone = _s(e, 'phone', '');
+    final preItems = (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    final members = (e['party_members'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    // Status is never colour alone — the chip always ships its label.
+    final chip = StatusChip(
+      label: called ? 'Notified' : (status == 'waiting' ? 'Waiting' : status),
+      color: called
+          ? AppColors.warning
+          : status == 'waiting'
+              ? AppColors.info
+              : AppColors.neutral,
+      dense: true,
+    );
+
+    if (table) {
+      return _rowShell(
+        focused: focused,
+        last: last,
+        child: _tableRow([
+          Align(alignment: Alignment.centerLeft, child: _positionCell(e, called)),
+          Align(alignment: Alignment.centerLeft, child: _partyCell(preItems, members)),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            if (focused)
+              Text('From your notification',
+                  style: text.bodySmall!.copyWith(fontSize: 10.5, color: AppColors.copperHi),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis),
+          ]),
+          // Mandatory at join now, so it is always there to call back on — right
+          // next to the party size where staff look.
+          Text(phone.isEmpty ? '—' : phone, style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+          Text('${e['party_size'] ?? 1}',
+              style: text.bodyMedium!.copyWith(color: AppColors.textPrimary),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+          Text('${e['minutes_waiting'] ?? 0}m',
+              style: text.bodyMedium!.copyWith(color: AppColors.textPrimary),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+          Align(alignment: Alignment.centerLeft, child: chip),
+          Align(alignment: Alignment.centerRight, child: _actionsMenu(e, preItems, members)),
+        ], s),
+      );
+    }
+
+    // Phone degradation: eight columns at 390px would give each about 35px — less
+    // than a phone number needs — so the row unpacks into a record instead. Every
+    // field is still here, at full width, in a Wrap that can only ever drop to a
+    // new run.
+    return _rowShell(
+      focused: focused,
+      last: last,
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: AppColors.inset,
-              borderRadius: AppRadius.controlAll,
-              border: Border.all(color: AppColors.border),
-            ),
-            child: const Icon(Icons.qr_code_2, size: 18, color: AppColors.copper),
-          ),
+          _positionCell(e, called),
           const SizedBox(width: AppSpacing.md),
-          Expanded(child: Text('Entrance “Join the queue” QR', style: text.titleSmall)),
+          Expanded(child: Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis)),
+          const SizedBox(width: AppSpacing.sm),
+          _actionsMenu(e, preItems, members),
         ]),
         const SizedBox(height: AppSpacing.sm),
-        Text(
-            'Display this at your door. When all tables are full, guests scan it to join this waitlist (and can browse the menu + pre-order while they wait).',
-            style: text.bodySmall),
+        Wrap(spacing: 6, runSpacing: 6, children: [
+          if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+          chip,
+          InfoChip(icon: Icons.groups_outlined, label: 'Party of ${e['party_size'] ?? 1}'),
+          if (phone.isNotEmpty) InfoChip(icon: Icons.phone_outlined, label: phone),
+          InfoChip(icon: Icons.schedule, label: '${e['minutes_waiting'] ?? 0}m waited'),
+          if (preItems.isNotEmpty)
+            InfoChip(icon: Icons.restaurant_menu, label: '${preItems.length}-item pre-order'),
+          if (members.isNotEmpty) InfoChip(icon: Icons.person_outline, label: '${members.length} in party'),
+        ]),
+      ]),
+    );
+  }
+
+  // Queue position — swaps to the warning bell once the party is called.
+  Widget _positionCell(Map e, bool called) {
+    final text = Theme.of(context).textTheme;
+    return AnimatedSwitcher(
+      duration: AppDurations.base,
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      child: called
+          ? Container(
+              key: const ValueKey('called'),
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: AppColors.tint(AppColors.warning),
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.edge(AppColors.warning)),
+              ),
+              child: const Icon(Icons.notifications_active, size: 18, color: AppColors.warning),
+            )
+          : Container(
+              key: ValueKey('pos-${e['position']}'),
+              width: 40,
+              height: 40,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: AppColors.inset,
+                borderRadius: AppRadius.controlAll,
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Text('${e['position'] ?? '–'}',
+                  maxLines: 1,
+                  overflow: TextOverflow.clip,
+                  style: text.titleMedium!.copyWith(color: AppColors.copperHi)),
+            ),
+    );
+  }
+
+  /// Every row action, in one menu.
+  ///
+  /// Order is the safety rule: the harmless work is on top, the two ways to drop
+  /// a party from the queue are last and behind a divider, so the item under the
+  /// cursor when the menu opens is never destructive. Remove also asks first —
+  /// it is the one that takes a guest's place away with no undo.
+  Widget _actionsMenu(Map e, List<Map> preItems, List<Map> members) {
+    final id = '${e['id']}';
+    final busy = _busyId == id;
+    final status = _s(e, 'status', 'waiting');
+    final name = _s(e, 'name');
+    // The trigger is an InkWell, which asserts on a Material ancestor — and a
+    // module is mounted straight under the shell, with no Scaffold of its own.
+    // Transparent Material: no pixels, just the ink surface the well demands.
+    return Material(
+      type: MaterialType.transparency,
+      child: PopupMenuButton<String>(
+        tooltip: 'Actions',
+        enabled: !busy,
+        position: PopupMenuPosition.under,
+        itemBuilder: (_) => [
+          if (status == 'waiting') _menuItem('call', Icons.notifications_outlined, 'Call'),
+          _menuItem('seat', Icons.event_seat_outlined, 'Seat', color: AppColors.success),
+          _menuItem('details', Icons.badge_outlined, 'Party details'),
+          const PopupMenuDivider(),
+          _menuItem('no_show', Icons.do_not_disturb_on_outlined, 'No-show', color: AppColors.danger),
+          _menuItem('remove', Icons.close, 'Remove', color: AppColors.danger),
+        ],
+        onSelected: (v) {
+          switch (v) {
+            case 'call':
+              _act(id, () => widget.rest.post('/waitlist/$id/call'), ok: 'Notified $name');
+            case 'seat':
+              _seat(e);
+            case 'details':
+              _partyDetails(e, preItems, members);
+            case 'no_show':
+              _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'no_show'}));
+            case 'remove':
+              _confirmRemove(e);
+          }
+        },
+        child: Container(
+          width: 34,
+          height: 34,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            borderRadius: AppRadius.controlAll,
+            border: Border.all(color: AppColors.border),
+          ),
+          child: Icon(Icons.more_horiz,
+              size: 18, color: busy ? AppColors.textTertiary : AppColors.textSecondary),
+        ),
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _menuItem(String value, IconData icon, String label,
+      {Color color = AppColors.textSecondary}) {
+    final fg = color == AppColors.textSecondary
+        ? AppColors.textPrimary
+        : Color.lerp(color, Colors.white, 0.25)!;
+    return PopupMenuItem<String>(
+      value: value,
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, size: 16, color: color == AppColors.textSecondary ? AppColors.textSecondary : fg),
+        const SizedBox(width: 10),
+        ChipLabel(label, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: fg)),
+      ]),
+    );
+  }
+
+  Future<void> _confirmRemove(Map e) async {
+    final id = '${e['id']}';
+    final name = _s(e, 'name');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove $name from the queue?'),
+        content: const Text(
+            'They lose their place in line. Use No-show instead if they were called and never turned up.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Keep them')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'cancelled'}),
+        ok: '$name removed from the queue');
+  }
+
+  /// The pre-order lines and the party members — what the row itself has no
+  /// column for. Reached from the row's "..." menu.
+  Future<void> _partyDetails(Map e, List<Map> preItems, List<Map> members) {
+    final text = Theme.of(context).textTheme;
+    final phone = _s(e, 'phone', '');
+    return _detailSheet(
+      context,
+      eyebrow: 'In the queue',
+      title: _s(e, 'name'),
+      children: [
+        _detailRow(context, 'Party size', '${e['party_size'] ?? 1}'),
+        _detailRow(context, 'Phone', phone.isEmpty ? '—' : phone),
+        _detailRow(context, 'Waiting', '${e['minutes_waiting'] ?? 0}m'),
+        _detailRow(context, 'Position', '${e['position'] ?? '–'}'),
+        if (preItems.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.md),
+          Text('PRE-ORDER', style: text.labelSmall),
+          for (final it in preItems)
+            _detailRow(
+              context,
+              '${_s(it, 'name')} ×${_int(it['quantity']) ?? 1}',
+              _numOf(it['price']) > 0 ? _money(it['price']) : '—',
+              trailing: _s(it, 'note', '').isEmpty ? null : _s(it, 'note', ''),
+            ),
+        ],
+        if (members.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.md),
+          Text('PARTY MEMBERS', style: text.labelSmall),
+          for (final mm in members) _detailRow(context, _s(mm, 'name'), _s(mm, 'phone', '—')),
+        ],
+      ],
+    );
+  }
+
+  Widget _emptyPanel() => EmptyState(
+        icon: Icons.hourglass_empty,
+        title: _tab == 1 ? 'Nobody waiting for a table' : 'Queue is empty',
+        caption: _tab == 1
+            ? 'Parties you call appear here until you seat them.'
+            : 'Walk-ins who scan the entrance QR appear here in arrival order.',
+      );
+
+  // Reservations are booked ahead and live in Bookings — this endpoint holds
+  // walk-ins only. The jump is hidden outright when Bookings is not reachable for
+  // this user, and carries no target: only keys the destination reads may travel.
+  Widget _reservationsPanel() {
+    final nav = ModuleNavigator.of(context);
+    final canOpen = nav?.canOpen('Bookings') ?? false;
+    return EmptyState(
+      icon: Icons.event_available_outlined,
+      title: 'Reservations are booked ahead',
+      caption: 'This queue holds walk-ins. Tables booked in advance have their own arrival times.',
+      action: canOpen
+          ? ForkButton(
+              label: 'Open Bookings',
+              icon: Icons.arrow_forward,
+              dense: true,
+              onPressed: () => nav!.openModule('Bookings'),
+            )
+          : null,
+    );
+  }
+
+  Widget _viewAllFooter(int total) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.subtle(
+            label: _showAll ? 'Show fewer' : 'View all waitlist ($total)',
+            icon: _showAll ? Icons.expand_less : Icons.arrow_forward,
+            onPressed: () => setState(() => _showAll = !_showAll),
+          ),
+        ),
+      );
+
+  // ---- right rail -----------------------------------------------------------
+
+  Widget _joinCard() {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          _roundBadge(Icons.qr_code_2, size: 30),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(child: Text('Join the queue', style: text.titleSmall)),
+        ]),
         const SizedBox(height: AppSpacing.lg),
         // Paper exception: the QR keeps its white quiet zone so it stays
         // scannable — printed-output styling, black on white.
@@ -14977,258 +15773,207 @@ class _WaitlistViewState extends State<_WaitlistView> {
           child: Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
-            child: QrImageView(data: _queueUrl, size: 180, backgroundColor: Colors.white),
+            child: QrImageView(data: _queueUrl, size: 160, backgroundColor: Colors.white),
           ),
         ),
-        const SizedBox(height: AppSpacing.sm),
-        Center(
-          child: SelectableText(_queueUrl,
-              textAlign: TextAlign.center, style: text.bodySmall!.copyWith(fontSize: 11)),
+        const SizedBox(height: AppSpacing.md),
+        Text('Scan to join waitlist', textAlign: TextAlign.center, style: text.titleSmall),
+        const SizedBox(height: 2),
+        Text('Browse menu & pre-order while you wait',
+            textAlign: TextAlign.center, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        ForkCard(
+          inset: true,
+          padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+          child: Row(children: [
+            // Selectable, not truncated: the whole URL has to be readable off the
+            // screen when someone is typing it onto a printed sign.
+            Expanded(
+              child: SelectableText(_queueUrl, style: text.bodySmall!.copyWith(fontSize: 11)),
+            ),
+            const SizedBox(width: 6),
+            ForkIconButton(icon: Icons.copy, tooltip: 'Copy the join link', onPressed: _copyLink),
+          ]),
         ),
       ]),
     );
   }
 
-  // Expandable breakdown of a party's pre-order items (name ×qty, price, note)
-  // and its members (name + phone). Compact; collapsed by default.
-  Widget _details(List<Map> preItems, List<Map> members) {
+  Future<void> _copyLink() async {
+    final messenger = ScaffoldMessenger.of(context);
+    await Clipboard.setData(ClipboardData(text: _queueUrl));
+    messenger.showSnackBar(const SnackBar(content: Text('Queue link copied')));
+  }
+
+  /// Only figures GET /waitlist actually supports. "Served today" and "no-shows
+  /// today" are not here on purpose: the endpoint returns waiting + called rows
+  /// and nothing else, so both would have been guesses.
+  Widget _summaryCard(List ordered, List called) => ForkCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const SectionHeader(title: 'Queue summary', padding: EdgeInsets.only(bottom: 10)),
+          _summaryRow('Total in queue', '${ordered.length}', 'groups'),
+          _summaryRow('Guests waiting', '${_guestCount(ordered)}', 'people'),
+          _summaryRow('Notified', '${called.length}', 'groups'),
+          _summaryRow('Pre-orders to confirm', '${_pendingPreorders.length}', 'holds'),
+        ]),
+      );
+
+  Widget _summaryRow(String label, String figure, String unit) {
     final text = Theme.of(context).textTheme;
-    return Theme(
-      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-      child: ExpansionTile(
-        dense: true,
-        tilePadding: EdgeInsets.zero,
-        visualDensity: VisualDensity.compact,
-        iconColor: AppColors.copperHi,
-        collapsedIconColor: AppColors.textTertiary,
-        childrenPadding: const EdgeInsets.only(left: 8, bottom: 4),
-        expandedCrossAxisAlignment: CrossAxisAlignment.start,
-        title: Text(
-          [
-            if (preItems.isNotEmpty) '${preItems.length}-item pre-order',
-            if (members.isNotEmpty) '${members.length} in party',
-          ].join(' · '),
-          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textPrimary),
-        ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Wrap(
+        alignment: WrapAlignment.spaceBetween,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: AppSpacing.md,
+        runSpacing: 2,
         children: [
-          if (preItems.isNotEmpty) ...[
-            Text('PRE-ORDER', style: text.labelSmall),
-            const SizedBox(height: 2),
-            for (final it in preItems)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: Text(
-                  '• ${_s(it, 'name')} ×${it['quantity'] ?? 1}'
-                  '${(num.tryParse('${it['price'] ?? ''}') ?? 0) > 0 ? ' — ${_money(it['price'])}' : ''}'
-                  '${_s(it, 'note', '').isNotEmpty ? '  (${_s(it, 'note', '')})' : ''}',
-                  style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
-                ),
-              ),
-          ],
-          if (members.isNotEmpty) ...[
-            if (preItems.isNotEmpty) const SizedBox(height: 6),
-            Text('PARTY MEMBERS', style: text.labelSmall),
-            const SizedBox(height: 2),
-            for (final mm in members)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: Text(
-                  '• ${_s(mm, 'name')}${_s(mm, 'phone', '').isNotEmpty ? ' · ${_s(mm, 'phone', '')}' : ''}',
-                  style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
-                ),
-              ),
-          ],
+          Text(label, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+          Text.rich(
+            TextSpan(text: figure, style: text.titleSmall, children: [
+              TextSpan(text: ' $unit', style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+            ]),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
         ],
       ),
     );
   }
 
-  // Tinted quiet action — the StatusChip voice as a button (Seat = success,
-  // Remove = danger). The tint never ships without its text label.
-  Widget _tintButton(String label, IconData icon, Color color, VoidCallback? onPressed) {
-    final enabled = onPressed != null;
-    final fg = Color.lerp(color, Colors.white, 0.25)!;
-    return MouseRegion(
-      cursor: enabled ? SystemMouseCursors.click : MouseCursor.defer,
-      child: GestureDetector(
-        onTap: onPressed,
-        child: AnimatedContainer(
-          duration: AppDurations.fast,
-          curve: Curves.easeOut,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-          decoration: BoxDecoration(
-            color: color.withValues(alpha: enabled ? 0.12 : 0.05),
-            borderRadius: AppRadius.controlAll,
-            border: Border.all(color: AppColors.edge(color)),
-          ),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [
-            Icon(icon, size: 14, color: fg),
-            const SizedBox(width: 7),
-            Text(label,
-                style: TextStyle(
-                    fontSize: 12, fontWeight: FontWeight.w600, letterSpacing: 0.2, color: fg)),
-          ]),
+  Widget _toBeSeatedCard(List called) {
+    final text = Theme.of(context).textTheme;
+    final shown = called.length > 4 ? called.sublist(0, 4) : called;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        SectionHeader(
+          title: 'Walk-ins to be seated',
+          count: called.isEmpty ? null : called.length,
+          padding: const EdgeInsets.only(bottom: 4),
+          trailing: called.isEmpty
+              ? null
+              : ForkButton.subtle(
+                  label: 'View all',
+                  onPressed: () => setState(() {
+                    _tab = 1;
+                    _showAll = false;
+                  }),
+                ),
         ),
-      ),
+        // Said once, for the whole card: the dot beside each row is decoration on
+        // top of this sentence, never the only thing carrying the state.
+        Text('Notified — waiting for a table.', style: text.bodySmall!.copyWith(fontSize: 11)),
+        const SizedBox(height: AppSpacing.md),
+        if (shown.isEmpty)
+          Text('Nobody has been called yet. Call a party from the queue and they show up here.',
+              style: text.bodySmall)
+        else
+          for (final raw in shown) _seatSoonRow(raw as Map),
+      ]),
     );
   }
 
-  Widget _card(Map e, {bool focused = false}) {
-    final status = _s(e, 'status', 'waiting');
-    final id = '${e['id']}';
-    final preItems = (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
-    final members = (e['party_members'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
-    final pre = preItems.length;
-    final phone = _s(e, 'phone', '');
-    final called = status == 'called';
-    final busy = _busyId == id;
+  Widget _seatSoonRow(Map e) {
     final text = Theme.of(context).textTheme;
-
-    final card = ForkCard(
-      selected: focused,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          // Queue position — swaps to the warning bell once the party is called.
-          AnimatedSwitcher(
-            duration: AppDurations.base,
-            switchInCurve: Curves.easeOut,
-            switchOutCurve: Curves.easeIn,
-            child: called
-                ? Container(
-                    key: const ValueKey('called'),
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: AppColors.tint(AppColors.warning),
-                      borderRadius: AppRadius.controlAll,
-                      border: Border.all(color: AppColors.edge(AppColors.warning)),
-                    ),
-                    child: const Icon(Icons.notifications_active, size: 18, color: AppColors.warning),
-                  )
-                : SizedBox(
-                    key: ValueKey('pos-${e['position']}'),
-                    width: 40,
-                    child: Text(
-                      '${e['position'] ?? '–'}',
-                      textAlign: TextAlign.center,
-                      style: text.displaySmall!.copyWith(fontSize: 24, color: AppColors.copperHi),
-                    ),
-                  ),
-          ),
-          const SizedBox(width: AppSpacing.md),
-          Expanded(
-            child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 6),
-                  Wrap(spacing: 6, runSpacing: 6, children: [
-                    if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
-                    InfoChip(icon: Icons.groups_outlined, label: 'Party of ${e['party_size'] ?? 1}'),
-                    // Mandatory at join now, so it is always there to call back
-                    // on — right next to the party size where staff look.
-                    if (phone.isNotEmpty) InfoChip(icon: Icons.phone_outlined, label: phone),
-                    if (pre > 0) InfoChip(icon: Icons.restaurant_menu, label: '$pre-item pre-order'),
-                  ]),
-                ]),
-          ),
-          const SizedBox(width: AppSpacing.md),
-          // The waited-stat and the status chip both grow with the system text
-          // scale while the 40px position box does not, so on a phone card they
-          // squeeze the middle column until an InfoChip cannot even fit its own
-          // icon and padding (37px of irreducible chrome) and overflows by a
-          // hairline. Letting them share one Wrap means the pair drops to its
-          // own run instead of starving the name and its chips.
-          Flexible(
-            child: Wrap(
-              alignment: WrapAlignment.end,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 14,
-              runSpacing: 6,
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(children: [
+        InitialsAvatar(initials: _guestInitials(_s(e, 'name', '')), size: 30),
+        const SizedBox(width: AppSpacing.md),
+        Expanded(
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                MicroStat(value: '${e['minutes_waiting'] ?? 0}m', label: 'waited', alignEnd: true),
-                StatusChip(
-                  label: called ? 'Called' : status,
-                  color: called
-                      ? AppColors.warning
-                      : status == 'waiting'
-                          ? AppColors.info
-                          : AppColors.neutral,
-                  dense: true,
-                ),
-              ],
-            ),
-          ),
-        ]),
-        if (preItems.isNotEmpty || members.isNotEmpty) _details(preItems, members),
-        const SizedBox(height: AppSpacing.md),
-        // Seating actions left, destructive ones hard right — a Row + Spacer
-        // while they fit. A Wrap is what makes the pair degrade: a Row gives
-        // every non-flex child maxWidth infinity, so four natural-width buttons
-        // overflowed a portrait phone by 113px before either group could shrink.
-        // Now the destructive pair drops to its own run instead.
-        Wrap(
-          alignment: WrapAlignment.spaceBetween,
-          spacing: AppSpacing.sm,
-          runSpacing: AppSpacing.sm,
-          children: [
-            Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
-              if (status == 'waiting')
-                ForkButton(
-                  label: 'Call',
-                  icon: Icons.notifications_outlined,
-                  dense: true,
-                  onPressed: busy
-                      ? null
-                      : () =>
-                          _act(id, () => widget.rest.post('/waitlist/$id/call'), ok: 'Notified ${_s(e, 'name')}'),
-                ),
-              _tintButton('Seat', Icons.event_seat_outlined, AppColors.success, busy ? null : () => _seat(e)),
-            ]),
-            Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
-              ForkButton.ghost(
-                label: 'No-show',
-                dense: true,
-                onPressed: busy
-                    ? null
-                    : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'no_show'})),
-              ),
-              _tintButton(
-                'Remove',
-                Icons.close,
-                AppColors.danger,
-                busy
-                    ? null
-                    : () => _act(id, () => widget.rest.post('/waitlist/$id/cancel', {'status': 'cancelled'})),
-              ),
-            ]),
-          ],
+                Text(_s(e, 'name'), style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text('Party of ${e['party_size'] ?? 1} · ${e['minutes_waiting'] ?? 0}m ago',
+                    style: text.bodySmall!.copyWith(fontSize: 11),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
+              ]),
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        Container(
+          width: 8,
+          height: 8,
+          decoration: const BoxDecoration(color: AppColors.warning, shape: BoxShape.circle),
         ),
       ]),
     );
+  }
 
-    // Warning ring while the party is called — always paired with the
-    // labelled chip above (never colour alone).
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: AnimatedContainer(
-        duration: AppDurations.slow,
-        curve: Curves.easeOut,
-        decoration: BoxDecoration(
-          borderRadius: AppRadius.cardAll,
-          boxShadow: [
-            if (called)
-              BoxShadow(
-                color: AppColors.warning.withValues(alpha: 0.09),
-                blurRadius: 22,
-                spreadRadius: 1,
+  // ---- closing banner -------------------------------------------------------
+
+  Widget _closingBanner(double w) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        _roundBadge(Icons.emoji_emotions_outlined, size: 40),
+        const SizedBox(width: AppSpacing.lg),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Keep your guests happy while they wait', style: text.titleMedium),
+            const SizedBox(height: 6),
+            Text(
+                'From the queue page a party can browse your menu, hold a pre-order, and be notified the moment their table is ready.',
+                style: text.bodySmall),
+            const SizedBox(height: AppSpacing.md),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: ForkButton(
+                label: 'Preview guest experience',
+                icon: Icons.open_in_new,
+                dense: true,
+                onPressed: _previewGuest,
               ),
-          ],
+            ),
+          ]),
         ),
-        child: card,
-      ),
+        if (w >= 620) ...[
+          const SizedBox(width: AppSpacing.lg),
+          const _QueueMotif(width: 110, height: 78),
+        ],
+      ]),
+    );
+  }
+
+  // The owner app has no browser of its own, so the preview is the real thing on
+  // a real phone: scan, or copy the link across.
+  void _previewGuest() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final text = Theme.of(ctx).textTheme;
+        return AlertDialog(
+          title: const Text('Preview the guest experience'),
+          content: SizedBox(
+            width: 280,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Text('Scan this with a phone to see exactly what a guest sees when they join the queue.',
+                  style: text.bodySmall, textAlign: TextAlign.center),
+              const SizedBox(height: AppSpacing.lg),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+                child: QrImageView(data: _queueUrl, size: 170, backgroundColor: Colors.white),
+              ),
+              const SizedBox(height: AppSpacing.md),
+              SelectableText(_queueUrl,
+                  textAlign: TextAlign.center, style: text.bodySmall!.copyWith(fontSize: 11)),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _copyLink();
+              },
+              child: const Text('Copy link'),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -15332,6 +16077,68 @@ class _PreorderConfirmDialog extends StatelessWidget {
       ],
     );
   }
+}
+
+/// Ornament for the waitlist hero and closing banners: a line of people
+/// tapering away along an arc, drawn rather than shipped as an asset.
+///
+/// Fixed-size and hit-test transparent. It is dropped entirely at narrow widths
+/// by its callers — decoration never gets to bid for the width the copy needs.
+class _QueueMotif extends StatelessWidget {
+  const _QueueMotif({this.width = 132, this.height = 88});
+
+  final double width;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) => IgnorePointer(
+        child: SizedBox(
+          width: width,
+          height: height,
+          child: CustomPaint(painter: _QueueMotifPainter()),
+        ),
+      );
+}
+
+class _QueueMotifPainter extends CustomPainter {
+  // Head + body per figure, fading back along the queue.
+  static const List<double> _alphas = [0.32, 0.24, 0.16, 0.10];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final floor = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2
+      ..color = AppColors.copper.withValues(alpha: 0.20);
+    canvas.drawArc(
+      Rect.fromLTWH(size.width * 0.02, size.height * 0.20, size.width * 0.96, size.height * 1.05),
+      3.34,
+      2.60,
+      false,
+      floor,
+    );
+    for (var i = 0; i < _alphas.length; i++) {
+      final t = i / (_alphas.length - 1);
+      final cx = size.width * (0.17 + t * 0.66);
+      final cy = size.height * (0.60 + (t - 0.5).abs() * 0.20);
+      final r = size.height * (0.16 - t * 0.028);
+      canvas.drawCircle(
+        Offset(cx, cy - r * 1.45),
+        r * 0.52,
+        Paint()..color = AppColors.copperHi.withValues(alpha: _alphas[i]),
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(center: Offset(cx, cy + r * 0.45), width: r * 1.5, height: r * 1.7),
+          Radius.circular(r * 0.6),
+        ),
+        Paint()..color = AppColors.copper.withValues(alpha: _alphas[i] * 0.85),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
 // --- Subscription & billing -------------------------------------------------
@@ -18438,6 +19245,535 @@ void _employeeSheet(
   );
 }
 
+// ------------------------------------------------- employee scoring boards ---
+
+/// One roster row plus everything the Employees tab derives from it. Built once
+/// and shared by the team cards, the scoring band and the leave register, so a
+/// name, a score or a leave count cannot differ between the three surfaces.
+class _TeamMember {
+  const _TeamMember({
+    required this.user,
+    required this.empId,
+    required this.display,
+    required this.initials,
+    required this.roleLabels,
+    required this.isSuper,
+    required this.perfRow,
+    required this.leaves,
+  });
+
+  final Map user;
+  final String empId;
+  final String display;
+  final String initials;
+  final List<String> roleLabels;
+  final bool isSuper;
+
+  /// Null when the server returned no performance row for this person at all —
+  /// which is NOT the same as a row whose measures all came back empty.
+  final Map? perfRow;
+  final List<Map> leaves;
+
+  Map? component(String key) => ((perfRow?['components'] as Map?) ?? const {})[key] as Map?;
+}
+
+/// The scoring band, left to right: the composite first, then the measures it
+/// is built from in the order the detail sheet already lists them. The composite
+/// is keyed '' because it is the row itself rather than one of its components.
+final List<List<String>> _scoringBoxes = [
+  const ['', 'Overall score'],
+  ..._perfComponents,
+];
+
+/// This member's 0-100 figure for [key], or null when it could not be measured.
+///
+/// Availability is the SERVER's flag ([_perfMeasured]), never inferred from the
+/// number: a component with nothing behind it comes back `available:false` with
+/// a null score, and reading that as 0 would rank the person last on a measure
+/// nobody could take for them. Every ranking below hangs off this returning null.
+double? _memberScore(_TeamMember m, String key) {
+  if (key.isEmpty) {
+    final s = m.perfRow?['score'];
+    return s == null ? null : _numOf(s);
+  }
+  final c = m.component(key);
+  return _perfMeasured(c) ? _numOf(c!['score']) : null;
+}
+
+/// The raw reading behind that score, in the measure's own unit.
+dynamic _memberValue(_TeamMember m, String key) {
+  if (key.isEmpty) return m.perfRow?['score'];
+  return m.component(key)?['value'];
+}
+
+/// A reading in its own unit. The composite has no unit but a denominator, so
+/// it carries the "/ 100" the others must not.
+String _perfValueLabel(String key, dynamic value) {
+  if (value == null) return '—';
+  return switch (key) {
+    'apc' => _money(value),
+    'rating' => '${_score(value)} ★',
+    'attendance' => '${_score(value)}%',
+    'tat' => '${_score(value)} min',
+    _ => '${_score(value)} / 100',
+  };
+}
+
+/// What a measure is scored AGAINST, in the server's own figures. Two of the
+/// four are relative to the house and two are absolute scales; saying which is
+/// what stops "78 / 100" being read as a percentage of something it is not.
+String _perfBenchmarkLine(String key, Map benchmarks) {
+  final apc = benchmarks['apc'];
+  final tat = benchmarks['tat_minutes'];
+  return switch (key) {
+    'apc' => apc == null ? 'no house average to compare against' : 'house ${_money(apc)} per cover',
+    'rating' => 'absolute 1–5 star scale',
+    'attendance' => 'presence first, then punctuality',
+    'tat' => tat == null ? 'no house median to compare against' : 'house median ${_score(tat)} min',
+    _ => 'weighted over the measures each person had',
+  };
+}
+
+/// The one-line description of what a board actually measures.
+String _perfBasisLine(String key) => switch (key) {
+      'apc' => 'Pre-tax spend per cover, scored against the house average',
+      'rating' => 'Average guest rating, on an absolute 1–5 star scale',
+      'attendance' => 'Presence on open days, then punctuality once there is a baseline',
+      'tat' => 'Median seated-to-released time against the house median — faster scores higher',
+      _ => 'The weighted composite of every measure that could be taken for each person',
+    };
+
+/// Why this person is not on a board: the server's own sentence wherever it sent
+/// one, so the app never invents a reason it does not have.
+String _memberGapReason(_TeamMember m, String key, String perfNote) {
+  if (m.perfRow == null) {
+    return perfNote.isEmpty
+        ? 'No performance row was returned for them in this window.'
+        : perfNote;
+  }
+  if (key.isEmpty) {
+    return 'Not one of the ${_perfComponents.length} measures could be taken for them, '
+        'so there is no score — this is not a score of zero.';
+  }
+  final note = '${m.component(key)?['note'] ?? ''}'.trim();
+  return note.isEmpty ? 'Nothing measurable on this in the window.' : note;
+}
+
+/// Every employee ranked by ONE measure, which is the whole point of the band:
+/// who is strong and who is weak on it, with their own reading beside them.
+///
+/// The people the measure could not be taken for are listed BELOW the ranking
+/// rather than sorted into the bottom of it. A missing figure is not a bad one,
+/// and the position at the end of a ranked list means "worst" to every reader.
+void _metricBoard(
+  BuildContext context, {
+  required String metricKey,
+  required String title,
+  required List<_TeamMember> team,
+  required Map perf,
+  required String perfNote,
+  required void Function(_TeamMember) openMember,
+}) {
+  final text = Theme.of(context).textTheme;
+  final windowDays = _int(perf['window_days']);
+  final ranked = <_TeamMember>[for (final m in team) if (_memberScore(m, metricKey) != null) m]
+    ..sort((a, b) {
+      final byScore = _memberScore(b, metricKey)!.compareTo(_memberScore(a, metricKey)!);
+      return byScore != 0 ? byScore : a.display.compareTo(b.display);
+    });
+  final excluded = [for (final m in team) if (_memberScore(m, metricKey) == null) m];
+
+  void jumpToMember(_TeamMember m) {
+    Navigator.of(context).pop();
+    openMember(m);
+  }
+
+  _detailSheet(
+    context,
+    eyebrow: 'Scoring',
+    title: title,
+    children: [
+      Text(
+        '${_perfBasisLine(metricKey)}'
+        '${windowDays == null ? '' : ', over the last $windowDays days'}. '
+        '${_perfBenchmarkLine(metricKey, (perf['benchmarks'] as Map?) ?? const {})}.',
+        style: text.bodySmall,
+      ),
+      const SizedBox(height: AppSpacing.lg),
+      SectionHeader(title: 'Ranked', count: ranked.length),
+      if (ranked.isEmpty)
+        Text('Nobody could be measured on this in the window.', style: text.bodySmall)
+      else
+        for (var i = 0; i < ranked.length; i++)
+          Builder(builder: (_) {
+            final m = ranked[i];
+            final s = _memberScore(m, metricKey)!;
+            final own = _perfValueLabel(metricKey, _memberValue(m, metricKey));
+            return HBarRow(
+              label: '${i + 1}. ${m.display}',
+              // Against 100, not against the leader: the score already IS the
+              // scale, and re-basing it on the best person would make a strong
+              // team look weak the moment somebody excelled.
+              fraction: (s / 100).clamp(0.0, 1.0),
+              value: own,
+              sub: 'score ${s.round()}',
+              tooltip: '${m.display} — $own · score ${s.round()} / 100',
+              onTap: () => jumpToMember(m),
+            );
+          }),
+      if (excluded.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.lg),
+        SectionHeader(title: 'Not enough data', count: excluded.length),
+        for (final m in excluded)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: ForkCard(
+              inset: true,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              onTap: () => jumpToMember(m),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                // A Wrap, not a Row: the chip carries its own intrinsic width and
+                // "Not enough data" at a 1.3x text scale is most of a 234px sheet
+                // row on its own. Given a Row it overflowed; here it simply drops
+                // under the name, which is the reading that must survive.
+                Wrap(
+                  spacing: AppSpacing.sm,
+                  runSpacing: 6,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(m.display,
+                        style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(_memberGapReason(m, metricKey, perfNote),
+                    style: text.bodySmall?.copyWith(color: AppColors.textTertiary)),
+              ]),
+            ),
+          ),
+      ],
+    ],
+  );
+}
+
+/// The scoring band: one box per measure behind the score, plus the composite.
+/// Each carries the team's own figure, what that figure was measured against,
+/// and the shape of the spread across the roster — and opens the full ranking.
+///
+/// Empty when the scores could not be read at all: the reason is already stated
+/// once, in words, above the roster, and a band of five dashes underneath it
+/// would say the same thing five more times.
+List<Widget> _scoringBand(
+  BuildContext context, {
+  required List<_TeamMember> team,
+  required Map perf,
+  required String perfNote,
+  required int columns,
+  required void Function(_TeamMember) openMember,
+}) {
+  if (team.isEmpty || perfNote.isNotEmpty) return const [];
+  const micro = TextStyle(fontSize: 10.5, height: 1.3, color: AppColors.textTertiary);
+  final benchmarks = (perf['benchmarks'] as Map?) ?? const {};
+
+  final boxes = <Widget>[];
+  for (final spec in _scoringBoxes) {
+    final key = spec[0], label = spec[1];
+    final measured = <_TeamMember>[for (final m in team) if (_memberScore(m, key) != null) m]
+      ..sort((a, b) => _memberScore(b, key)!.compareTo(_memberScore(a, key)!));
+    final avg = measured.isEmpty
+        ? null
+        : measured.fold<double>(0, (s, m) => s + _memberScore(m, key)!) / measured.length;
+    // Seven bars is what the narrowest column in this grid can still label; the
+    // rest are one tap away on the board, which is where a long roster belongs.
+    final shown = measured.length > 7 ? measured.sublist(0, 7) : measured;
+
+    Widget? chart;
+    if (avg != null) {
+      // A ratio out of a whole (presence, and a composite already expressed as a
+      // percentage) reads as a gauge; the three that vary person to person are
+      // worth seeing as a spread, so those get the distribution instead.
+      chart = key.isEmpty || key == 'attendance'
+          // Boxed to the bar chart's own height so the captions underneath sit on
+          // one line across the band instead of stepping by 10px.
+          ? SizedBox(
+              height: 56,
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: DonutGauge(
+                  fraction: (avg / 100).clamp(0.0, 1.0),
+                  size: 46,
+                  tooltip: '${avg.round()} / 100 averaged over ${measured.length} '
+                      'of ${team.length} — best ${_memberScore(measured.first, key)!.round()}',
+                ),
+              ),
+            )
+          : WeekdayBars(
+              values: [for (final m in shown) _memberScore(m, key)!],
+              labels: [for (final m in shown) m.initials],
+              // Read-only inside a tappable box — see the tap note below.
+              tooltipBuilder: (i) => '${shown[i].display} — '
+                  '${_perfValueLabel(key, _memberValue(shown[i], key))} · '
+                  'score ${_memberScore(shown[i], key)!.round()} / 100',
+            );
+    }
+
+    boxes.add(_TappableStat(
+      // The BOX is the control and the chart inside it only reads. A per-bar tap
+      // would be the deeper hit target and would swallow the box's own tap, so
+      // one pixel would open a person and the pixel under it the whole board.
+      // Hover names the bar; every click opens the ranking, where the per-person
+      // rows are the things that lead anywhere.
+      onTap: () => _metricBoard(context,
+          metricKey: key,
+          title: label,
+          team: team,
+          perf: perf,
+          perfNote: perfNote,
+          openMember: openMember),
+      child: StatCard(
+        value: avg == null ? '—' : '${avg.round()}',
+        unit: avg == null ? null : '/ 100',
+        caption: '$label — team average',
+        chart: chart,
+        footer: Text(
+          avg == null
+              ? 'not measurable for anyone in this window'
+              : '${_perfBenchmarkLine(key, benchmarks)} · '
+                  '${measured.length} of ${team.length} measured',
+          style: micro,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+    ));
+  }
+
+  return [
+    // No trailing hint: SectionHeader lays its trailing out at intrinsic width,
+    // so a sentence there took the whole 390px header and pushed the title off.
+    // Each box carries the chevron this app uses everywhere else for "opens".
+    const SectionHeader(title: 'Scoring'),
+    _dashGrid(boxes, columns),
+    const SizedBox(height: 28),
+  ];
+}
+
+// --------------------------------------------------------- leave register ---
+
+/// One leave in the tab-level register. Unlike [_leaveRow] — which lives inside
+/// one person's sheet and so never needs to name them — this row leads with WHO,
+/// because the register is read across the roster.
+Widget _leaveTeamRow(
+  BuildContext context,
+  RestClient rest,
+  Map l, {
+  required bool canReview,
+  required VoidCallback reload,
+}) {
+  final text = Theme.of(context).textTheme;
+  final status = _s(l, 'status', 'requested');
+  final days = _int(l['days']) ?? 1;
+  final reason = _s(l, 'reason', '');
+  final filedBy = _s(l, 'requested_by_name', '');
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: ForkCard(
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Wrapped for the same reason as the scoring boards: a status chip and a
+        // long name do not share one narrow row at a raised text scale.
+        Wrap(
+          spacing: AppSpacing.sm,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(_s(l, 'employee_name', 'Employee'),
+                style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            StatusChip(label: status, color: _leaveStatusColor(status), dense: true),
+          ],
+        ),
+        const SizedBox(height: 3),
+        Text(
+          '${_leaveTypeLabel(_s(l, 'leave_type', ''))} · ${_leaveRange(l)} · '
+          '$days day${days == 1 ? '' : 's'}'
+          '${filedBy.isEmpty || filedBy == '—' ? '' : ' · filed by $filedBy'}',
+          style: text.bodySmall,
+        ),
+        if (reason.isNotEmpty && reason != '—') ...[
+          const SizedBox(height: 2),
+          Text(reason,
+              style: text.bodySmall?.copyWith(color: AppColors.textTertiary),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
+        ],
+        // Nothing to pop here: unlike the sheet's copy of these controls, this
+        // row is on the page itself, so the decision is taken in place.
+        if (canReview && status == 'requested') ...[
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            ForkButton(
+              label: 'Approve',
+              icon: Icons.check,
+              dense: true,
+              onPressed: () => _decideLeave(context, rest, l, true, reload),
+            ),
+            ForkButton.ghost(
+              label: 'Reject',
+              icon: Icons.close,
+              dense: true,
+              onPressed: () => _decideLeave(context, rest, l, false, reload),
+            ),
+          ]),
+        ],
+      ]),
+    ),
+  );
+}
+
+/// File a leave from the register: pick who it is for, then the shared dialog.
+/// Only reachable from a section that already required 'Review Attendance', so
+/// naming somebody else here can never come back a 403.
+Future<void> _requestLeaveForMember(
+  BuildContext context,
+  RestClient rest,
+  Profile p,
+  List<_TeamMember> team,
+  VoidCallback reload,
+) async {
+  final pickable = [for (final m in team) if (m.empId.isNotEmpty) m];
+  if (pickable.isEmpty) return;
+  final chosen = await showDialog<_TeamMember>(
+    context: context,
+    builder: (ctx) => SimpleDialog(
+      backgroundColor: AppColors.cardRaised,
+      title: const Text('Request leave for'),
+      children: [
+        for (final m in pickable)
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, m),
+            child: Text(m.display, style: Theme.of(ctx).textTheme.bodyMedium),
+          ),
+      ],
+    ),
+  );
+  if (chosen == null || !context.mounted) return;
+  await _requestLeave(context, rest, p,
+      empId: chosen.empId, empName: chosen.display, reload: reload);
+}
+
+/// The tab's leave register: who is off today, what is waiting on a decision,
+/// and what is booked ahead — over the same window the server paged.
+///
+/// Empty when leave could not be read at all. That reason is already stated once
+/// above the roster, and this section repeating it would print the same sentence
+/// twice on one page.
+List<Widget> _leaveSection(
+  BuildContext context,
+  RestClient rest,
+  Profile p, {
+  required Map leavePage,
+  required List<_TeamMember> team,
+  required String leaveNote,
+  required bool canReview,
+  required int metricColumns,
+  required VoidCallback reload,
+}) {
+  if (leaveNote.isNotEmpty) return const [];
+  final text = Theme.of(context).textTheme;
+  final today = RestaurantTime.todayIso();
+  final all = <Map>[for (final l in (leavePage['leaves'] as List?) ?? const []) if (l is Map) l];
+
+  String startOf(Map l) => _s(l, 'start_day', '');
+  String nameOf(Map l) => _s(l, 'employee_name', 'Employee');
+  bool approved(Map l) => _s(l, 'status', '') == 'approved';
+
+  final onLeave = [for (final l in all) if (approved(l) && _leaveCovers(l, today)) l]
+    ..sort((a, b) => nameOf(a).compareTo(nameOf(b)));
+  // Strictly after today, so a leave already running is counted once — under
+  // "on leave today" — instead of appearing in both registers.
+  final ahead = [for (final l in all) if (approved(l) && startOf(l).compareTo(today) > 0) l]
+    ..sort((a, b) => startOf(a).compareTo(startOf(b)));
+  final pending = [for (final l in all) if (_s(l, 'status', '') == 'requested') l]
+    ..sort((a, b) => startOf(a).compareTo(startOf(b)));
+
+  String names(List<Map> ls) {
+    if (ls.isEmpty) return '';
+    final first = ls.take(2).map(nameOf).join(', ');
+    return ls.length > 2 ? '$first +${ls.length - 2}' : first;
+  }
+
+  return [
+    // The filing control sits UNDER the counts rather than in the header's
+    // trailing slot: SectionHeader lays trailing out at its intrinsic width, so
+    // a labelled button there left the title 25px on a 390px phone at 1.3x.
+    SectionHeader(title: 'Leave', count: all.length),
+    _dashGrid([
+      _metricTile(context,
+          label: 'on leave today',
+          icon: Icons.beach_access_outlined,
+          accent: onLeave.isEmpty ? AppColors.copperHi : AppColors.info,
+          value: '${onLeave.length}',
+          sub: onLeave.isEmpty ? 'everyone is in' : names(onLeave)),
+      _metricTile(context,
+          label: 'awaiting decision',
+          icon: Icons.pending_actions,
+          accent: pending.isEmpty ? AppColors.copperHi : AppColors.warning,
+          value: '${pending.length}',
+          sub: pending.isEmpty ? 'nothing to review' : names(pending)),
+      _metricTile(context,
+          label: 'booked ahead',
+          icon: Icons.event_available,
+          value: '${ahead.length}',
+          sub: ahead.isEmpty ? 'nothing booked' : 'next ${_leaveRange(ahead.first)}'),
+    ], metricColumns),
+    const SizedBox(height: AppSpacing.lg),
+    if (canReview) ...[
+      Align(
+        alignment: Alignment.centerLeft,
+        child: ForkButton.ghost(
+          label: 'Request leave',
+          icon: Icons.event_busy,
+          dense: true,
+          onPressed: () => _requestLeaveForMember(context, rest, p, team, reload),
+        ),
+      ),
+      const SizedBox(height: AppSpacing.lg),
+    ],
+    if (all.isEmpty)
+      Text(
+        'No leave on record between ${_fmtDay(_s(leavePage, 'from', ''))} and '
+        '${_fmtDay(_s(leavePage, 'to', ''))}.',
+        style: text.bodySmall,
+      )
+    else ...[
+      if (pending.isNotEmpty) ...[
+        SectionHeader(
+            title: 'Awaiting decision', count: pending.length, padding: const EdgeInsets.only(bottom: 10)),
+        for (final l in pending) _leaveTeamRow(context, rest, l, canReview: canReview, reload: reload),
+        const SizedBox(height: AppSpacing.md),
+      ],
+      if (onLeave.isNotEmpty) ...[
+        SectionHeader(
+            title: 'On leave today', count: onLeave.length, padding: const EdgeInsets.only(bottom: 10)),
+        for (final l in onLeave) _leaveTeamRow(context, rest, l, canReview: canReview, reload: reload),
+        const SizedBox(height: AppSpacing.md),
+      ],
+      if (ahead.isNotEmpty) ...[
+        SectionHeader(
+            title: 'Booked ahead', count: ahead.length, padding: const EdgeInsets.only(bottom: 10)),
+        for (final l in ahead) _leaveTeamRow(context, rest, l, canReview: canReview, reload: reload),
+      ],
+      // Rows exist, but none of them is running, waiting or still to come —
+      // they are rejected, or approved and already behind us.
+      if (pending.isEmpty && onLeave.isEmpty && ahead.isEmpty)
+        Text('Nothing current — every leave in this window is decided and past.',
+            style: text.bodySmall),
+    ],
+  ];
+}
+
 /// The roster. One compact card per person carrying their performance score;
 /// everything behind that score — the four measures, their notes and their
 /// weights — plus the leave record and its decisions live in the tap.
@@ -18534,43 +19870,66 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         // each, which is what the one-row-per-person list spent on them.
         final width = MediaQuery.sizeOf(context).width;
         final cols = width >= 1500 ? 4 : (width >= 1120 ? 3 : (width >= 720 ? 2 : 1));
+        // The scoring boxes each carry a chart, so they need the roomier stat-card
+        // breakpoints rather than the dense one-figure tiling the leave counts use.
+        final scoreCols = width >= 1500 ? 5 : (width >= 1180 ? 4 : (width >= 900 ? 3 : (width >= 620 ? 2 : 1)));
 
-        final cards = <Widget>[];
+        // Derived once, then shared: the cards, the scoring boards and the leave
+        // register all read the same rows, so none of them can disagree.
+        final team = <_TeamMember>[];
         for (final r in rows) {
           final u = r as Map;
-          final isSuper = u['is_superadmin'] == true;
           final empId = '${u['employee_id'] ?? u['id'] ?? ''}';
           final roleAll = (u['role_all'] as List?)?.map((e) => '$e').where((s) => s.isNotEmpty).toList() ??
               [_s(u, 'role', 'staff')];
-          final roleLabels = [for (final role in roleAll) roleNameById[role] ?? _roleLabel(role)];
           final name = '${_s(u, 'emp_Fname')} ${_s(u, 'emp_Lname', '')}'.trim();
           final display = name.isEmpty ? _s(u, 'employee_Username') : name;
-          final initials =
-              display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join();
-          final perfRow = perfByEmp[empId];
-          final score = perfRow?['score'];
-          final myLeaves = leavesByEmp[empId] ?? const <Map>[];
+          team.add(_TeamMember(
+            user: u,
+            empId: empId,
+            display: display,
+            initials:
+                display.split(RegExp(r'\s+')).where((s) => s.isNotEmpty).take(2).map((s) => s[0]).join(),
+            roleLabels: [for (final role in roleAll) roleNameById[role] ?? _roleLabel(role)],
+            isSuper: u['is_superadmin'] == true,
+            perfRow: perfByEmp[empId],
+            leaves: leavesByEmp[empId] ?? const <Map>[],
+          ));
+        }
+
+        void openMember(_TeamMember m) => _employeeSheet(
+              context,
+              rest,
+              p,
+              employee: m.user,
+              display: m.display,
+              roleLabels: m.roleLabels,
+              perfRow: m.perfRow,
+              perfMeta: perf,
+              perfNote: perfNote,
+              leaves: m.leaves,
+              leaveNote: leaveNote,
+              canReview: canReview,
+              reload: reload,
+            );
+
+        final cards = <Widget>[];
+        for (final member in team) {
+          final u = member.user;
+          final isSuper = member.isSuper;
+          final empId = member.empId;
+          final roleLabels = member.roleLabels;
+          final display = member.display;
+          final initials = member.initials;
+          final score = member.perfRow?['score'];
+          final myLeaves = member.leaves;
           final pending = myLeaves.where((l) => _s(l, 'status', '') == 'requested').length;
           final onLeaveNow =
               myLeaves.any((l) => _s(l, 'status', '') == 'approved' && _leaveCovers(l, today));
 
           cards.add(ForkCard(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            onTap: () => _employeeSheet(
-              context,
-              rest,
-              p,
-              employee: u,
-              display: display,
-              roleLabels: roleLabels,
-              perfRow: perfRow,
-              perfMeta: perf,
-              perfNote: perfNote,
-              leaves: myLeaves,
-              leaveNote: leaveNote,
-              canReview: canReview,
-              reload: reload,
-            ),
+            onTap: () => openMember(member),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 InitialsAvatar(
@@ -18683,10 +20042,17 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                     SectionHeader(
                       title: 'Team',
                       count: rows.length,
+                      // Flexible, because SectionHeader lays its trailing out at
+                      // intrinsic width: on a 390px phone at a 1.3x text scale
+                      // this chip took the whole header and left the title 25px.
+                      // Bounding it is also what lets ChipLabel ellipsise — it
+                      // only shrinks when something above it sets a width.
                       trailing: perfNote.isEmpty && perf.isNotEmpty
-                          ? InfoChip(
-                              icon: Icons.speed,
-                              label: 'Scored over ${_int(perf['window_days']) ?? 30} days')
+                          ? Flexible(
+                              child: InfoChip(
+                                  icon: Icons.speed,
+                                  label: 'Scored over ${_int(perf['window_days']) ?? 30} days'),
+                            )
                           : null,
                     ),
                     // Said once, above the grid, rather than on every card.
@@ -18700,6 +20066,22 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       ),
                     ],
                     _dashGrid(cards, cols),
+                    const SizedBox(height: 28),
+                    // Added below the roster, not above it: the roster is what
+                    // this tab IS, and both sections summarise it.
+                    ..._scoringBand(context,
+                        team: team,
+                        perf: perf,
+                        perfNote: perfNote,
+                        columns: scoreCols,
+                        openMember: openMember),
+                    ..._leaveSection(context, rest, p,
+                        leavePage: leavePage,
+                        team: team,
+                        leaveNote: leaveNote,
+                        canReview: canReview,
+                        metricColumns: _metricCols(width),
+                        reload: reload),
                     const SizedBox(height: 76), // clears the FAB
                   ],
                 ),

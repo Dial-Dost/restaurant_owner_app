@@ -316,7 +316,9 @@ void main() {
     // Bala has no performance row at all: never a zero, and never a blank.
     expect(find.text('Not enough data'), findsOneWidget);
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
 
     expect(find.text('PERFORMANCE'), findsOneWidget);
@@ -335,7 +337,9 @@ void main() {
     _desktop(tester);
     await _mount(tester, m.employeesModule, _employeeRoutes());
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
 
     // Scoped to the open sheet — the roster behind it legitimately carries its
@@ -368,7 +372,9 @@ void main() {
     (perf['rows'] as List)[0].remove('effective_weights');
     await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
     final sheet = find.byType(Dialog);
     Finder inSheet(Finder f) => find.descendant(of: sheet, matching: f);
@@ -388,7 +394,9 @@ void main() {
     (((perf['rows'] as List)[0] as Map)['effective_weights'] as Map).remove('rating');
     await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
     final sheet = find.byType(Dialog);
     Finder inSheet(Finder f) => find.descendant(of: sheet, matching: f);
@@ -412,7 +420,9 @@ void main() {
       ..['score'] = 55;
     await _mount(tester, m.employeesModule, {..._employeeRoutes(), '/analytics/staff-performance': perf});
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
     final sheet = find.byType(Dialog);
     expect(find.descendant(of: sheet, matching: find.text('Counts for 0% of this score.')),
@@ -427,13 +437,19 @@ void main() {
     // The card flags that somebody is waiting on a decision.
     expect(find.text('1 to review'), findsOneWidget);
 
-    await tester.tap(find.text('Asha Rao'));
+    // .first is the ROSTER card: her name now also appears in the leave
+    // register below it, which is a different control entirely.
+    await tester.tap(find.text('Asha Rao').first);
     await tester.pumpAndSettle();
 
+    // Scoped to the SHEET: the tab's own leave register carries the same
+    // request, and deciding it there is a second, legitimate control.
+    final sheet = find.byType(Dialog);
+    Finder inSheet(Finder f) => find.descendant(of: sheet, matching: f);
     expect(find.text('LEAVE'), findsOneWidget);
-    expect(find.textContaining('Sick leave'), findsOneWidget);
-    expect(find.text('Approve'), findsOneWidget);
-    expect(find.text('Reject'), findsOneWidget);
+    expect(inSheet(find.textContaining('Sick leave')), findsOneWidget);
+    expect(inSheet(find.text('Approve')), findsOneWidget);
+    expect(inSheet(find.text('Reject')), findsOneWidget);
   });
 
   testWidgets('Employees: no analytics permission says so instead of showing an empty score',

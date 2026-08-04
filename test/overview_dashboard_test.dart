@@ -239,11 +239,10 @@ void main() {
     expect(opened, ['Menu:null']);
   });
 
-  // The revenue drill-down passes neither onTap nor tooltipBuilder, so
-  // _ChartHitBox must leave those bars a plain visual. Asserted at the widget
-  // boundary because a chart that silently grows a hover state is exactly how
-  // it starts promising a drill-down that does not exist (BUG 19).
-  testWidgets('the revenue drill-down chart stays inert', (tester) async {
+  // The revenue drill-down is where the charts DO lead somewhere: nothing else
+  // in that sheet is competing for the tap, so both the strip and the weekday
+  // bars name their day on hover and open it on tap.
+  testWidgets('the revenue drill-down charts name their day and open it', (tester) async {
     final api = _FakeApi(const {
       '/orders/daily-revenue?days=14': {
         'series': [
@@ -261,8 +260,191 @@ void main() {
     await tester.pumpAndSettle();
 
     final bars = tester.widget<WeekdayBars>(find.byType(WeekdayBars));
-    expect(bars.onTap, isNull);
-    expect(bars.tooltipBuilder, isNull);
+    expect(bars.onTap, isNotNull);
+    expect(bars.tooltipBuilder, isNotNull);
+    // 2026-07-31 is a Friday, and the weekday must be spelled out — "T" on the
+    // axis is either Tuesday or Thursday.
+    expect(bars.tooltipBuilder!(1), contains('Fri, Jul 31'));
+    expect(bars.tooltipBuilder!(1), contains('₹5100.00'));
+    expect(bars.tooltipBuilder!(1), contains('15 order(s)'));
+
+    // The strip inside the sheet is live too, indexed into the source series.
+    final strip = tester.widget<CopperBarcode>(find.byType(CopperBarcode).last);
+    expect(strip.onTap, isNotNull);
+    expect(strip.tooltipBuilder!(0), contains('Thu, Jul 30'));
+
+    // Tapping the last bar opens that day, not the whole window.
+    bars.onTap!(1);
+    await tester.pumpAndSettle();
+    expect(find.text('Fri, Jul 31'), findsOneWidget);
+    expect(find.text('REVENUE · ONE DAY'), findsOneWidget);
+    // ₹5100 over 15 orders, and the only day in the window with any takings.
+    expect(find.text('₹340.00'), findsOneWidget);
+  });
+
+  // The stat card is ALREADY a control. A per-bar tap on the chart inside it
+  // would be the deeper hit target and would swallow the card's own tap, so the
+  // inline strip reads on hover and every pixel of the card opens the same
+  // drill-down. This is the trap the wiring must not create.
+  testWidgets('the inline revenue strip reads but never steals the card tap', (tester) async {
+    final api = _FakeApi({'/orders/daily-revenue?days=14': _dailySeries()});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    final strip = tester.widget<CopperBarcode>(find.byType(CopperBarcode).first);
+    expect(strip.tooltipBuilder, isNotNull, reason: 'a chart you cannot read is decoration');
+    expect(strip.onTap, isNull, reason: 'a tap here would swallow the card it sits in');
+    expect(strip.tooltipBuilder!(0), contains('₹9000.00'));
+
+    // Tapping the chart itself opens the card's drill-down, not nothing.
+    await tester.tap(find.byType(CopperBarcode).first, warnIfMissed: false);
+    await tester.pumpAndSettle();
+    expect(find.text('REVENUE'), findsOneWidget);
+    expect(find.text('Last 14 days'), findsOneWidget);
+  });
+
+  // The occupancy gauge follows the same rule, and says the counts behind it.
+  testWidgets('the occupancy gauge reads on the card and acts in the sheet', (tester) async {
+    final api = _FakeApi(const {
+      '/get-tables': [
+        {'table_name': 'T1', 'occupied': true, 'covers': 4, 'table_total': 1200},
+        {'table_name': 'T2', 'occupied': true, 'covers': 2, 'table_total': 800},
+        {'table_name': 'T3', 'occupied': false},
+        {'table_name': 'T4', 'occupied': false},
+      ],
+    });
+    final rest = await _signIn(api);
+    final opened = <String>[];
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      openModule: (label, {Map<String, dynamic>? target}) => opened.add('$label:$target'),
+    ));
+    await tester.pumpAndSettle();
+
+    final onCard = tester.widget<DonutGauge>(find.byType(DonutGauge).first);
+    expect(onCard.onTap, isNull);
+    expect(onCard.tooltip, '2 of 4 tables occupied (50%) · 6 cover(s) seated');
+
+    await tester.tap(find.text('Tables occupied right now'));
+    await tester.pumpAndSettle();
+
+    final inSheet = tester.widget<DonutGauge>(
+      find.descendant(of: find.byType(Dialog), matching: find.byType(DonutGauge)),
+    );
+    expect(inSheet.onTap, isNotNull);
+    inSheet.onTap!();
+    await tester.pumpAndSettle();
+    // Closed the sheet and went to the floor plan, with no focus payload: an
+    // occupancy figure is not one table.
+    expect(opened, ['Tables:null']);
+    expect(find.byType(Dialog), findsNothing);
+  });
+
+  // The tooltip tests above call the builder directly; this one drives a real
+  // pointer, because the index a bar REPORTS is derived from its position and
+  // the painter's bar count. Get that mapping wrong and the hover card names one
+  // day while the tap opens another.
+  testWidgets('tapping the far-right bar opens the far-right day', (tester) async {
+    final api = _FakeApi(const {
+      '/orders/daily-revenue?days=14': {
+        'series': [
+          {'date': '2026-07-29', 'revenue': 1000, 'orders': 4},
+          {'date': '2026-07-30', 'revenue': 4200, 'orders': 12},
+          {'date': '2026-07-31', 'revenue': 5100, 'orders': 15},
+        ],
+      },
+    });
+    final rest = await _signIn(api);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Revenue this month — all channels'));
+    await tester.pumpAndSettle();
+
+    final strip = find.byType(CopperBarcode).last;
+    final box = tester.getRect(strip);
+    // Two pixels in from the right edge — the last slot the painter drew.
+    await tester.tapAt(Offset(box.right - 2, box.center.dy));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Fri, Jul 31'), findsOneWidget);
+    expect(find.text('Wed, Jul 29'), findsNothing);
+  });
+
+  // Overflow is the recurring failure on this page and 1.3x is an ordinary
+  // accessibility setting. The drill-downs are a fixed 460px card, so they are
+  // the ones a narrow window and a raised scale actually squeeze.
+  testWidgets('the charted cards and every drill-down survive each window and scale',
+      (tester) async {
+    for (final width in [390.0, 1100.0, 1200.0, 1700.0]) {
+      for (final scale in [1.0, 1.3]) {
+        final api = _FakeApi({
+          '/orders/daily-revenue?days=14': _dailySeries(),
+          '/orders/apc': const {
+            'total_revenue': 98765432.1,
+            'monthly_apc': 12345.67,
+            'total_covers': 4821,
+            'orders': [1, 2, 3],
+            'month': 'August 2026',
+          },
+          '/feedback/summary': const {
+            'averageRating': 4.35,
+            'totalResponses': 1284,
+            'last30DaysResponses': 96,
+            'categoryAverages': {
+              'food': {'label': 'Food quality and presentation', 'average': 4.6, 'count': 900},
+              'service': {'label': 'Service', 'average': 3.9, 'count': 384},
+            },
+          },
+          '/get-tables': [
+            for (var i = 0; i < 9; i++)
+              {'table_name': 'T$i', 'occupied': i.isEven, 'covers': 4, 'table_total': 999999.99},
+          ],
+        });
+        final rest = await _signIn(api);
+        tester.view.physicalSize = Size(width, 4000);
+        tester.view.devicePixelRatio = 1.0;
+        tester.platformDispatcher.textScaleFactorTestValue = scale;
+        addTearDown(tester.view.reset);
+        addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'Overview at ${width}px / ${scale}x');
+
+        for (final card in const [
+          'Revenue this month — all channels',
+          'Average per cover (APC), pre-tax',
+          'Tables occupied right now',
+          'Average guest rating',
+        ]) {
+          await tester.tap(find.text(card));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull,
+              reason: '"$card" drill-down at ${width}px / ${scale}x');
+          await tester.tap(find.text('Close'));
+          await tester.pumpAndSettle();
+        }
+
+        // And the day sheet the revenue charts open, which nests one sheet
+        // inside another.
+        await tester.tap(find.text('Revenue this month — all channels'));
+        await tester.pumpAndSettle();
+        tester.widget<WeekdayBars>(find.byType(WeekdayBars)).onTap!(0);
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'day sheet at ${width}px / ${scale}x');
+        await tester.tap(find.text('Close').last);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Close').last);
+        await tester.pumpAndSettle();
+      }
+    }
   });
 
   testWidgets('cross-tab metrics report real figures from their own endpoints', (tester) async {

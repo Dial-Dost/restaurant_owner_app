@@ -10,9 +10,24 @@ import '../theme/app_colors.dart';
 /// 1.5px rounded data-ends, 2px gaps, no gridlines louder than 5% white.
 /// Identity is carried by position + labels, never by extra hues.
 
+/// How many bars the barcode painter will draw across [width]. Hit-testing has
+/// to call this too: derive the count any other way and the hover card names a
+/// different day than the bar sitting under the pointer.
+int _barcodeCount(double width, double slot, double gap) =>
+    math.max(1, ((width + gap) / slot).floor());
+
+/// The point in the source series a resampled bar was drawn from — the inverse
+/// of the painter's `srcPos`, rounded to the nearest real reading so a drill-in
+/// lands on a day that exists rather than on an interpolated fiction.
+int _barcodeSource(int bar, int count, int length) {
+  if (length <= 1) return 0;
+  final t = count == 1 ? 0.0 : bar / (count - 1);
+  return (t * (length - 1)).round().clamp(0, length - 1);
+}
+
 /// Dense "barcode" strip — dozens of thin vertical bars, the most
 /// recognizable chart in the reference design.
-class CopperBarcode extends StatelessWidget {
+class CopperBarcode extends StatefulWidget {
   const CopperBarcode({
     super.key,
     required this.values,
@@ -20,6 +35,8 @@ class CopperBarcode extends StatelessWidget {
     this.barWidth = 2.6,
     this.gap = 2.4,
     this.dimmed = false,
+    this.onTap,
+    this.tooltipBuilder,
   });
 
   final List<double> values;
@@ -30,25 +47,89 @@ class CopperBarcode extends StatelessWidget {
   /// Muted variant for secondary cards.
   final bool dimmed;
 
+  /// Drill into the reading under the pointer. The index is into [values], not
+  /// into the resampled bars, so callers never have to know how many bars fit.
+  /// Null leaves the strip inert (and unhoverable).
+  final ValueChanged<int>? onTap;
+
+  /// What the hover card says, indexed the same way as [onTap]. Without it and
+  /// without [onTap] there is nothing to say and nowhere to go, so the strip
+  /// stays a plain visual.
+  final String Function(int index)? tooltipBuilder;
+
+  @override
+  State<CopperBarcode> createState() => _CopperBarcodeState();
+}
+
+class _CopperBarcodeState extends State<CopperBarcode> {
+  /// Resampled bar index, because that is what the painter highlights.
+  int? _hover;
+
   @override
   Widget build(BuildContext context) {
+    final live = widget.onTap != null || widget.tooltipBuilder != null;
     return SizedBox(
-      height: height,
+      height: widget.height,
       width: double.infinity,
-      child: CustomPaint(
-        painter: _BarcodePainter(values, barWidth, gap, dimmed),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final chart = CustomPaint(
+            painter: _BarcodePainter(
+                widget.values, widget.barWidth, widget.gap, widget.dimmed, _hover),
+          );
+          // Under an unbounded width the painter's bar count is unknowable here,
+          // so there is nothing honest to hit-test against.
+          if (!live ||
+              widget.values.isEmpty ||
+              !constraints.maxWidth.isFinite ||
+              constraints.maxWidth <= 0) {
+            return chart;
+          }
+          final slot = widget.barWidth + widget.gap;
+          final count = _barcodeCount(constraints.maxWidth, slot, widget.gap);
+          return Stack(
+            children: [
+              Positioned.fill(child: chart),
+              for (var i = 0; i < count; i++)
+                if (constraints.maxWidth - i * slot > 0)
+                  Positioned(
+                    left: i * slot,
+                    top: 0,
+                    bottom: 0,
+                    // The last slot can run past the edge; clamp it so the hit
+                    // area matches what is actually on screen.
+                    width: math.min(slot, constraints.maxWidth - i * slot),
+                    child: _ChartHitBox(
+                      onTap: widget.onTap == null
+                          ? null
+                          : () => widget.onTap!(
+                              _barcodeSource(i, count, widget.values.length)),
+                      tooltip: widget.tooltipBuilder
+                          ?.call(_barcodeSource(i, count, widget.values.length)),
+                      onHover: (h) => setState(
+                          () => _hover = h ? i : (_hover == i ? null : _hover)),
+                      child: const SizedBox.expand(),
+                    ),
+                  ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
 class _BarcodePainter extends CustomPainter {
-  _BarcodePainter(this.values, this.barWidth, this.gap, this.dimmed);
+  _BarcodePainter(
+      this.values, this.barWidth, this.gap, this.dimmed, this.hoveredBar);
 
   final List<double> values;
   final double barWidth;
   final double gap;
   final bool dimmed;
+
+  /// Resampled bar index under the pointer, or null when nothing is hovered.
+  final int? hoveredBar;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -57,7 +138,7 @@ class _BarcodePainter extends CustomPainter {
     if (maxV <= 0) return;
 
     final slot = barWidth + gap;
-    final count = math.max(1, ((size.width + gap) / slot).floor());
+    final count = _barcodeCount(size.width, slot, gap);
     // Resample values to the available bar count.
     final paint = Paint();
     for (var i = 0; i < count; i++) {
@@ -75,9 +156,22 @@ class _BarcodePainter extends CustomPainter {
         AppColors.copperHi,
         math.pow(frac, 1.3).toDouble(),
       )!;
-      paint.color = dimmed ? color.withValues(alpha: 0.45) : color;
+      final hot = i == hoveredBar;
+      paint.color =
+          hot ? AppColors.copperHi : (dimmed ? color.withValues(alpha: 0.45) : color);
 
       final x = i * slot;
+      if (hot) {
+        // A 2.6px bar cannot carry a hover state on colour alone, so the whole
+        // slot lights up behind it — a luminance change, not a second hue.
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(x - gap / 2, 0, slot, size.height),
+            const Radius.circular(2),
+          ),
+          Paint()..color = Colors.white.withValues(alpha: 0.07),
+        );
+      }
       canvas.drawRRect(
         RRect.fromRectAndRadius(
           Rect.fromLTWH(x, size.height - h, barWidth, h),
@@ -90,7 +184,9 @@ class _BarcodePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_BarcodePainter old) =>
-      old.values != values || old.dimmed != dimmed;
+      old.values != values ||
+      old.dimmed != dimmed ||
+      old.hoveredBar != hoveredBar;
 }
 
 /// Seven (or n) bars with single-letter labels underneath —
@@ -235,8 +331,8 @@ class _ChartHitBox extends StatelessWidget {
       onExit: (_) => onHover?.call(false),
       child: GestureDetector(
         onTap: onTap,
-        // Transparent (not opaque) so the whole column area answers the pointer
-        // even where the bar itself is short.
+        // Opaque so the whole slot answers the pointer, not just the pixels the
+        // mark happens to cover — a short bar is still easy to hit.
         behavior: HitTestBehavior.opaque,
         child: child,
       ),
@@ -254,7 +350,7 @@ class _ChartHitBox extends StatelessWidget {
 
 /// Thin ring gauge with the value in the center — the small circular
 /// meters on the reference venue cards.
-class DonutGauge extends StatelessWidget {
+class DonutGauge extends StatefulWidget {
   const DonutGauge({
     super.key,
     required this.fraction,
@@ -263,6 +359,8 @@ class DonutGauge extends StatelessWidget {
     this.color,
     this.center,
     this.label,
+    this.onTap,
+    this.tooltip,
   });
 
   final double fraction;
@@ -276,23 +374,41 @@ class DonutGauge extends StatelessWidget {
   /// Optional micro label under the gauge.
   final String? label;
 
+  /// Drill in from the gauge. One figure means one target, so there is no
+  /// per-mark index to report. Null keeps the gauge a plain readout.
+  final VoidCallback? onTap;
+  final String? tooltip;
+
+  @override
+  State<DonutGauge> createState() => _DonutGaugeState();
+}
+
+class _DonutGaugeState extends State<DonutGauge> {
+  bool _hover = false;
+
   @override
   Widget build(BuildContext context) {
+    final ring = widget.color ?? AppColors.copperHi;
     final gauge = SizedBox(
-      width: size,
-      height: size,
+      width: widget.size,
+      height: widget.size,
       child: TweenAnimationBuilder<double>(
-        tween: Tween(begin: 0, end: fraction.clamp(0.0, 1.0)),
+        tween: Tween(begin: 0, end: widget.fraction.clamp(0.0, 1.0)),
         duration: const Duration(milliseconds: 700),
         curve: Curves.easeOutCubic,
         builder: (context, t, _) => CustomPaint(
-          painter: _DonutPainter(t, stroke, color ?? AppColors.copperHi),
+          painter: _DonutPainter(
+            t,
+            widget.stroke,
+            _hover ? Color.lerp(ring, Colors.white, 0.28)! : ring,
+            _hover,
+          ),
           child: Center(
-            child: center ??
+            child: widget.center ??
                 Text(
-                  '${(fraction * 100).round()}%',
+                  '${(widget.fraction * 100).round()}%',
                   style: TextStyle(
-                    fontSize: size * 0.24,
+                    fontSize: widget.size * 0.24,
                     fontWeight: FontWeight.w500,
                     letterSpacing: -0.2,
                     color: AppColors.textPrimary,
@@ -302,28 +418,49 @@ class DonutGauge extends StatelessWidget {
         ),
       ),
     );
-    if (label == null) return gauge;
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        gauge,
-        const SizedBox(height: 6),
-        Text(
-          label!.toUpperCase(),
-          textAlign: TextAlign.center,
-          style: Theme.of(context).textTheme.labelSmall,
-        ),
-      ],
+    Widget content = gauge;
+    if (widget.label != null) {
+      content = Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          gauge,
+          const SizedBox(height: 6),
+          Text(
+            widget.label!.toUpperCase(),
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.labelSmall,
+          ),
+        ],
+      );
+    }
+    // An inert gauge keeps exactly the tree it had before interaction existed:
+    // no hit box, no transform, nothing to change how it looks or hit-tests.
+    final live = widget.onTap != null ||
+        (widget.tooltip != null && widget.tooltip!.isNotEmpty);
+    if (!live) return content;
+    return _ChartHitBox(
+      onTap: widget.onTap,
+      tooltip: widget.tooltip,
+      onHover: (h) => setState(() => _hover = h),
+      // Scale rather than a real size change: these gauges sit in fixed-height
+      // stat cards, where growing by 6% would shove the card's text around.
+      child: AnimatedScale(
+        scale: _hover ? 1.06 : 1.0,
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOutCubic,
+        child: content,
+      ),
     );
   }
 }
 
 class _DonutPainter extends CustomPainter {
-  _DonutPainter(this.fraction, this.stroke, this.color);
+  _DonutPainter(this.fraction, this.stroke, this.color, [this.hovered = false]);
 
   final double fraction;
   final double stroke;
   final Color color;
+  final bool hovered;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -333,7 +470,7 @@ class _DonutPainter extends CustomPainter {
     final track = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = stroke
-      ..color = Colors.white.withValues(alpha: 0.07);
+      ..color = Colors.white.withValues(alpha: hovered ? 0.14 : 0.07);
     canvas.drawArc(inner, 0, math.pi * 2, false, track);
 
     if (fraction <= 0) return;
@@ -352,7 +489,7 @@ class _DonutPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_DonutPainter old) =>
-      old.fraction != fraction || old.color != color;
+      old.fraction != fraction || old.color != color || old.hovered != hovered;
 }
 
 /// 2px copper line with a soft fade fill — compact trend spark.

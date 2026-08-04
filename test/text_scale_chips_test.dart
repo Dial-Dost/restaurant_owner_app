@@ -341,6 +341,11 @@ void main() {
   // 40px position box does not, crushing the Expanded to 35.8px against an
   // InfoChip's 37px of irreducible icon+padding+border. That trailing pair is a
   // Wrap now, so it drops to its own run instead of starving the name.
+  //
+  // The four buttons live in the row's "..." menu since the table redesign, so
+  // the sweep opens it. The guarantee is unchanged and now covers both states:
+  // no overflow with the menu shut, no overflow with it open, and all four
+  // actions still there and still on screen.
   testWidgets('Waitlist: the card fits a portrait phone at 1.0x and 1.3x', (tester) async {
     for (final width in _widths) {
       for (final scale in const [1.0, 1.3]) {
@@ -369,14 +374,32 @@ void main() {
 
       expect(tester.takeException(), isNull,
           reason: 'the waitlist card overflowed at ${width}px / ${scale}x');
+      // The party is readable without opening anything: the phone is mandatory
+      // at join, so it must never be the field the layout drops.
+      expect(find.text('Ramachandran'), findsOneWidget,
+          reason: 'the name was lost at ${width}px / ${scale}x');
+      expect(find.text('9876543210'), findsWidgets,
+          reason: 'the phone was lost at ${width}px / ${scale}x');
+
+      await tester.tap(find.byIcon(Icons.more_horiz).first);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull,
+          reason: 'the actions menu overflowed at ${width}px / ${scale}x');
       // Every action survives — degrading must not drop the destructive pair.
       for (final label in ['Call', 'Seat', 'No-show', 'Remove']) {
         expect(find.text(label), findsOneWidget, reason: '$label lost at ${width}px / ${scale}x');
       }
-      // The last button's right edge stays on screen. This is what a Row could
+      // The last item's right edge stays on screen. This is what a Row could
       // not promise: the overflowing children were laid out past the card.
       expect(tester.getBottomRight(find.text('Remove')).dx, lessThanOrEqualTo(width),
-          reason: 'the action row ran off the ${width}px screen at ${scale}x');
+          reason: 'the actions menu ran off the ${width}px screen at ${scale}x');
+      // A destructive item is never what the menu opens under: the harmless
+      // work is above the divider, the two ways out of the queue below it.
+      expect(tester.getTopLeft(find.text('Call')).dy,
+          lessThan(tester.getTopLeft(find.text('Remove')).dy),
+          reason: 'Remove climbed above Call at ${width}px / ${scale}x');
+      await tester.tapAt(const Offset(2, 2));
+      await tester.pumpAndSettle();
       }
     }
   });
