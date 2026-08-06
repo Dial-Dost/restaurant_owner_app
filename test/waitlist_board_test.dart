@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:restaurant_owner_app/models/profile.dart';
@@ -492,7 +493,12 @@ void main() {
     expect(find.text('Still waiting'), findsNothing);
   });
 
-  testWidgets('the join link can be copied, and the guest preview shows the same QR', (tester) async {
+  // The old assertion was the bug: "the guest preview shows the SAME QR" as the
+  // rail card. Two controls, one outcome, and neither actually showed the guest
+  // experience. They are distinct now — the card is the door artifact, the hero
+  // button opens the live page — so this asserts the split instead.
+  testWidgets('the join link copies, and the QR card opens the printable poster',
+      (tester) async {
     final copied = <String>[];
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
       if (call.method == 'Clipboard.setData') copied.add((call.arguments as Map)['text'] as String);
@@ -508,10 +514,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(copied.single, contains('/queue/csrorganics'));
 
-    await tester.tap(find.text('Preview guest experience'));
+    // The rail QR opens the poster view — bigger code, and a way to print it.
+    await tester.tap(find.byType(QrImageView).first);
     await tester.pumpAndSettle();
-    expect(find.text('Preview the guest experience'), findsOneWidget);
+    expect(find.text('Entrance QR'), findsOneWidget);
+    expect(find.text('Print'), findsOneWidget);
     expect(find.textContaining('/queue/csrorganics'), findsWidgets);
+    // And it is NOT the old preview dialog, which duplicated this card.
+    expect(find.text('Preview the guest experience'), findsNothing);
   });
 
   testWidgets('the Reservations tab points at Bookings instead of inventing rows', (tester) async {

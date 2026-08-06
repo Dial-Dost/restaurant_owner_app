@@ -12,6 +12,11 @@ import '../theme/app_colors.dart';
 ///   1. a near-black base                        (#08080A there, AppColors.bg here)
 ///   2. a hero wash                              linear-gradient(150deg, accDeep, #0b0b0d 78%)
 ///   3. a bloom off the top-right corner         radial accHi @ .30 -> transparent 62%
+///
+/// The copper runs a step DARKER than the web original (copperShadow for the
+/// wash, copperMid for the bloom rather than copperHi). The guest page is a
+/// phone held at arm's length for a few minutes; this is a desktop a manager
+/// stares at through a whole service, and the brighter mix read as glare.
 ///   4. a downward darkening pass                180deg, rgba(6,6,7,.15) -> .40 @45% -> .96
 ///   5. two ambient orbs, top-left / bottom-right, at .20 and .22
 ///
@@ -53,12 +58,12 @@ class GradientBackdrop extends StatelessWidget {
         Positioned(
           top: -120,
           left: -80,
-          child: _Orb(size: 360, color: AppColors.copper, opacity: 0.20),
+          child: _Orb(size: 360, color: AppColors.copperDeep, opacity: 0.20),
         ),
         Positioned(
           bottom: -140,
           right: -60,
-          child: _Orb(size: 340, color: AppColors.copperDeep, opacity: 0.22),
+          child: _Orb(size: 340, color: AppColors.copperShadow, opacity: 0.22),
         ),
 
         // 2 — the hero wash: copper at the top-left, gone by ~78% of its own height.
@@ -74,7 +79,7 @@ class GradientBackdrop extends StatelessWidget {
                 // are the same axis expressed the way Flutter wants it.
                 begin: Alignment(-0.7, -1),
                 end: Alignment(0.7, 1),
-                colors: [AppColors.copperDeep, Color(0xFF0B0B0D)],
+                colors: [AppColors.copperShadow, Color(0xFF0B0B0D)],
                 stops: [0.0, 0.78],
               ),
             ),
@@ -86,7 +91,7 @@ class GradientBackdrop extends StatelessWidget {
         Positioned(
           top: -120,
           right: -70,
-          child: _Orb(size: 340, color: AppColors.copperHi, opacity: 0.34, stop: 0.62),
+          child: _Orb(size: 340, color: AppColors.copperMid, opacity: 0.34, stop: 0.62),
         ),
 
         // 4 — the darkening pass that lands the wash back on the page colour.

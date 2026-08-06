@@ -11,6 +11,7 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
@@ -7554,6 +7555,30 @@ Future<void> _printTableQr(String tableName, String url) async {
         child: pw.Column(mainAxisAlignment: pw.MainAxisAlignment.center, children: [
           pw.Text('Scan to order — Table $tableName',
               style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 24),
+          pw.BarcodeWidget(barcode: pw.Barcode.qrCode(), data: url, width: 260, height: 260),
+          pw.SizedBox(height: 16),
+          pw.Text(url, style: const pw.TextStyle(fontSize: 9)),
+        ]),
+      ),
+    ),
+  );
+  await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+}
+
+/// The entrance poster. Same shape as [_printTableQr] deliberately: a host who
+/// has printed table QRs should recognise this sheet without being taught it.
+Future<void> _printQueueQr(String url) async {
+  final doc = pw.Document();
+  doc.addPage(
+    pw.Page(
+      build: (ctx) => pw.Center(
+        child: pw.Column(mainAxisAlignment: pw.MainAxisAlignment.center, children: [
+          pw.Text('Tables are full — scan to join the queue',
+              style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 8),
+          pw.Text('Browse the menu and pre-order while you wait',
+              style: const pw.TextStyle(fontSize: 12)),
           pw.SizedBox(height: 24),
           pw.BarcodeWidget(barcode: pw.Barcode.qrCode(), data: url, width: 260, height: 260),
           pw.SizedBox(height: 16),
@@ -17235,13 +17260,23 @@ class _WaitlistViewState extends State<_WaitlistView> {
         const SizedBox(height: AppSpacing.lg),
         // Paper exception: the QR keeps its white quiet zone so it stays
         // scannable — printed-output styling, black on white.
+        // Tapping the code enlarges it for the door. The card is the artifact;
+        // the hero's "Preview guest experience" button opens the live page. Two
+        // controls, two outcomes — they used to be the same dialog.
         Center(
-          child: Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
-            child: QrImageView(data: _queueUrl, size: 160, backgroundColor: Colors.white),
+          child: _TapRow(
+            onTap: _queuePoster,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+              child: QrImageView(data: _queueUrl, size: 160, backgroundColor: Colors.white),
+            ),
           ),
         ),
+        const SizedBox(height: 6),
+        Text('Tap the code to enlarge or print it',
+            textAlign: TextAlign.center,
+            style: text.bodySmall!.copyWith(fontSize: 10.5, color: AppColors.textTertiary)),
         const SizedBox(height: AppSpacing.md),
         Text('Scan to join waitlist', textAlign: TextAlign.center, style: text.titleSmall),
         const SizedBox(height: 2),
@@ -17425,23 +17460,48 @@ class _WaitlistViewState extends State<_WaitlistView> {
 
   // The owner app has no browser of its own, so the preview is the real thing on
   // a real phone: scan, or copy the link across.
-  void _previewGuest() {
+  /// Open the guest queue page for real.
+  ///
+  /// This used to pop a dialog containing the same QR, the same URL and the same
+  /// copy button as the rail card three inches to its right — two controls, one
+  /// outcome, and neither of them actually showed the guest experience. The rail
+  /// card is the artifact you put on the door; this is the "let me look at it"
+  /// button, so it opens the page.
+  Future<void> _previewGuest() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final ok = await launchUrl(Uri.parse(_queueUrl), mode: LaunchMode.externalApplication);
+      if (!ok) {throw Exception('no handler');}
+    } catch (_) {
+      // No browser, or the URL was refused. Falling back to the clipboard beats
+      // a button that silently does nothing on a till with a locked-down shell.
+      if (!mounted) {return;}
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Could not open a browser — the link has been copied instead.')));
+      await _copyLink();
+    }
+  }
+
+  /// The door-sign view: the QR at a size someone can actually scan across a
+  /// room, and a print button. This is what the rail card is FOR, and what the
+  /// old preview dialog should have been.
+  void _queuePoster() {
     showDialog<void>(
       context: context,
       builder: (ctx) {
         final text = Theme.of(ctx).textTheme;
         return AlertDialog(
-          title: const Text('Preview the guest experience'),
+          title: const Text('Entrance QR'),
           content: SizedBox(
-            width: 280,
+            width: 320,
             child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Text('Scan this with a phone to see exactly what a guest sees when they join the queue.',
+              Text('Display this at your door. Guests scan it to join the queue when every table is full.',
                   style: text.bodySmall, textAlign: TextAlign.center),
               const SizedBox(height: AppSpacing.lg),
               Container(
-                padding: const EdgeInsets.all(8),
+                padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
-                child: QrImageView(data: _queueUrl, size: 170, backgroundColor: Colors.white),
+                child: QrImageView(data: _queueUrl, size: 240, backgroundColor: Colors.white),
               ),
               const SizedBox(height: AppSpacing.md),
               SelectableText(_queueUrl,
@@ -17450,12 +17510,20 @@ class _WaitlistViewState extends State<_WaitlistView> {
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
-            FilledButton(
+            TextButton(
               onPressed: () {
                 Navigator.pop(ctx);
                 _copyLink();
               },
               child: const Text('Copy link'),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _printQueueQr(_queueUrl);
+              },
+              icon: const Icon(Icons.print, size: 16),
+              label: const Text('Print'),
             ),
           ],
         );

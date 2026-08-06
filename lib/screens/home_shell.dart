@@ -610,9 +610,13 @@ class _HomeShellState extends State<HomeShell> {
                   duration: AppDurations.base,
                   curve: Curves.easeInOut,
                   width: _sidebarCollapsed ? 68 : 224,
-                  decoration: const BoxDecoration(
-                    color: AppColors.bgDeep,
-                    border: Border(right: BorderSide(color: AppColors.divider)),
+                  decoration: BoxDecoration(
+                    // Translucent, not opaque: the backdrop's copper carries
+                    // through the rail so the wash is continuous across the top
+                    // of the window. Still dark enough that nav labels keep the
+                    // contrast they were measured at.
+                    color: AppColors.bgDeep.withValues(alpha: 0.82),
+                    border: const Border(right: BorderSide(color: AppColors.divider)),
                   ),
                   child: _navList(visible, p, inDrawer: false, collapsed: _sidebarCollapsed),
                 ),
