@@ -10,6 +10,7 @@ import '../services/restaurant_time.dart';
 import '../services/update_checker.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/gradient_backdrop.dart';
 import 'modules.dart' as m;
 import '../widgets/module_navigator.dart';
 import '../widgets/notifications_bell.dart';
@@ -538,11 +539,14 @@ class _HomeShellState extends State<HomeShell> {
 
   Widget _scaffold(Profile p, RestClient rest, _Module current, List<_Module> visible,
       Widget body, bool narrow) {
-    return Scaffold(
+    return GradientBackdrop(
+      child: Scaffold(
       key: _scaffoldKey,
-      backgroundColor: AppColors.bg,
+      // Transparent so the wash below shows through. The backdrop paints the
+      // base colour, so nothing is lost by not painting it twice.
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
-        backgroundColor: AppColors.bgDeep,
+        backgroundColor: Colors.transparent,
         surfaceTintColor: Colors.transparent,
         scrolledUnderElevation: 0,
         elevation: 0,
@@ -615,6 +619,7 @@ class _HomeShellState extends State<HomeShell> {
                 Expanded(child: body),
               ],
             ),
+    ),
     );
   }
 }
