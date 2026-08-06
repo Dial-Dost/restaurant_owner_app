@@ -748,6 +748,89 @@ class _TappableStatState extends State<_TappableStat> {
   }
 }
 
+/// Makes an existing ROW read as a control without changing its geometry:
+/// click cursor plus a faint hover wash, no padding, border or chevron of its
+/// own. Rows that gain a tap this way live inside grids and tables that already
+/// carry overflow tests, so the wrapper deliberately contributes no size.
+class _TapRow extends StatefulWidget {
+  const _TapRow({required this.child, required this.onTap});
+
+  final Widget child;
+  final VoidCallback onTap;
+
+  @override
+  State<_TapRow> createState() => _TapRowState();
+}
+
+class _TapRowState extends State<_TapRow> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          // A neutral wash, not the copper tint: that tint already means "this
+          // is the record your notification pointed at" on the waitlist row this
+          // wraps, and hover must not be able to impersonate it.
+          color: _hovered ? Colors.white.withValues(alpha: 0.04) : Colors.transparent,
+          child: widget.child,
+        ),
+      ),
+    );
+  }
+}
+
+/// Header row of a record card: a leading glyph, the identity column, and a
+/// trailing group of status chips and buttons.
+///
+/// Below [stackBelow] the trailing group drops onto its own line. It has to:
+/// the trailing widgets are non-flex, so they size to their own content and the
+/// identity column absorbs every pixel they take. On a 390px phone at 1.3x that
+/// left the column around 20px — narrower than a chip's own padding — and the
+/// overflow surfaced INSIDE the chip, where no call site would think to look
+/// for it. Stacking gives both halves the full width instead.
+///
+/// The trailing group is a Wrap, so it also breaks between its own items rather
+/// than overflowing once stacked.
+Widget _recordHeadRow(
+  BuildContext context, {
+  required Widget leading,
+  required Widget identity,
+  required List<Widget> trailing,
+  double stackBelow = 760,
+}) {
+  final tail = Wrap(
+    alignment: WrapAlignment.end,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    spacing: AppSpacing.sm,
+    runSpacing: AppSpacing.sm,
+    children: trailing,
+  );
+  if (MediaQuery.sizeOf(context).width >= stackBelow) {
+    // Wide: unchanged geometry. A non-flex Wrap is handed an unbounded main
+    // axis here, so it lays out on one line exactly as the old Row did.
+    return Row(children: [
+      leading,
+      const SizedBox(width: AppSpacing.md),
+      Expanded(child: identity),
+      const SizedBox(width: AppSpacing.md),
+      tail,
+    ]);
+  }
+  return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+    Row(children: [leading, const SizedBox(width: AppSpacing.md), Expanded(child: identity)]),
+    const SizedBox(height: AppSpacing.sm),
+    tail,
+  ]);
+}
+
 // Shared shell for the Overview drill-downs: a dark card dialog with a micro
 // eyebrow, title, scrolling body and an optional "View in <Module>" jump. The
 // jump is hidden outright when that module is not reachable for this user,
@@ -849,6 +932,53 @@ Widget _detailRow(BuildContext context, String label, String value, {String? tra
           ],
         ),
       ],
+    ),
+  );
+}
+
+/// One record inside a drill-down sheet: who/what it is, a qualifying line, and
+/// an optional figure.
+///
+/// A summary tile drills into a SET, and every member of that set has its own
+/// detail — so these rows lead somewhere too. Without [onTap] the row renders
+/// genuinely inert (the [ForkCard] adds no cursor or hover lift), which is the
+/// right reading when the sheet is already the deepest thing there is.
+///
+/// Title and badge share a [Wrap], not a Row: the sheet asks for 460px and gets
+/// 266 on a 390px phone, where a name and a status chip cannot hold one line —
+/// the scoring sheet's "Not enough data" row overflowed on exactly this.
+Widget _sheetRecordRow(
+  BuildContext context, {
+  required String title,
+  String? sub,
+  String? trailing,
+  Widget? badge,
+  VoidCallback? onTap,
+}) {
+  final text = Theme.of(context).textTheme;
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: ForkCard(
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      onTap: onTap,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        Wrap(
+          spacing: AppSpacing.sm,
+          runSpacing: 6,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(title, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ?badge,
+            if (trailing != null && trailing.isNotEmpty)
+              Text(trailing, style: text.titleSmall?.copyWith(color: AppColors.copperHi)),
+          ],
+        ),
+        if (sub != null && sub.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(sub, style: text.bodySmall, maxLines: 3, overflow: TextOverflow.ellipsis),
+        ],
+      ]),
     ),
   );
 }
@@ -4303,7 +4433,7 @@ String _concernBandTitle(String severity) => switch (severity) {
 /// not READ, which is why Attendance / Purchase Orders / Billing rows navigate
 /// with no focus payload at all rather than landing there and claiming the
 /// record "isn't in this list".
-Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav) {
+Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav, int windowDays) {
   final text = Theme.of(context).textTheme;
   final severity = '${m['severity'] ?? 'low'}';
   final colour = _concernColor(severity);
@@ -4325,6 +4455,12 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav) {
 
   return ForkCard(
     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    // The card caps the offenders at five and drops the server's prose the
+    // moment it has any of them; the sheet carries both in full. The "Open
+    // <dest>" button below stays exactly where it was — the card tap is the
+    // additional way in, never a replacement for it, and never the destructive
+    // one (nothing on this screen destroys anything).
+    onTap: () => _concernSheet(context, m, dest: dest, focus: focus, windowDays: windowDays),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(children: [
         StatusChip(label: severity.toUpperCase(), color: colour, dense: true),
@@ -4417,6 +4553,90 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav) {
   );
 }
 
+/// The whole concern, which the card can only ever show part of: EVERY
+/// offender (the card stops at five), the server's prose (the card drops it as
+/// soon as it has structured rows), and the window the count was measured over.
+///
+/// The jump is [_detailSheet]'s, so it carries the same filtered focus payload
+/// the card's button does — only keys the destination actually reads travel,
+/// and a concern with no reachable module simply has no jump.
+Future<void> _concernSheet(
+  BuildContext context,
+  Map m, {
+  required String? dest,
+  required Map<String, dynamic>? focus,
+  required int windowDays,
+}) {
+  final text = Theme.of(context).textTheme;
+  final severity = '${m['severity'] ?? 'low'}';
+  final count = _numOf(m['count']).round();
+  final advice = '${m['what_to_do'] ?? ''}'.trim();
+  final detail = '${m['detail'] ?? ''}'.trim();
+  final amount = m['amount'];
+  final items = <Map>[for (final it in (m['items'] as List?) ?? const []) if (it is Map) it];
+  // The server sends the worst offenders, not necessarily all of them, so a
+  // shortfall is stated rather than left as a silent disagreement with `count`.
+  final unlisted = count - items.length;
+
+  return _detailSheet(
+    context,
+    eyebrow: _concernBandTitle(severity),
+    title: '${m['title'] ?? m['label'] ?? ''}'.trim(),
+    jumpTo: dest,
+    jumpTarget: focus,
+    children: [
+      _detailRow(context, 'Affected', '$count'),
+      if (amount != null) _detailRow(context, 'At stake', _money(amount)),
+      _detailRow(context, 'Measured over', 'Last $windowDays days'),
+      if (detail.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.md),
+        Text(detail, style: text.bodySmall?.copyWith(color: AppColors.textSecondary)),
+      ],
+      if (items.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.lg),
+        Text('AFFECTED', style: text.labelSmall),
+        for (final it in items)
+          _detailRow(
+            context,
+            '${it['label'] ?? ''}',
+            '${it['sub'] ?? ''}'.trim().isNotEmpty
+                ? '${it['sub']}'
+                : (it['value'] == null ? '—' : _score(it['value'])),
+          ),
+        if (unlisted > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text('$unlisted more not listed by the server.',
+                style: text.bodySmall?.copyWith(color: AppColors.textTertiary)),
+          ),
+      ],
+      if (advice.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.lg),
+        Text('WHAT TO DO', style: text.labelSmall),
+        const SizedBox(height: 6),
+        Text(advice, style: text.bodySmall),
+      ],
+    ],
+  );
+}
+
+/// One severity's summary pill, which doubles as the filter for that band.
+///
+/// A band with nothing in it renders as a plain chip: no click cursor, no tap.
+/// Selection is spelled out in the label, so the state is never carried by the
+/// tint alone (same rule as every other chip here).
+Widget _concernBandChip(String severity, int count, {required bool selected, VoidCallback? onTap}) {
+  final chip = StatusChip(
+    label: selected ? '$count $severity · only' : '$count $severity',
+    color: _concernColor(severity),
+  );
+  if (onTap == null) return chip;
+  return MouseRegion(
+    cursor: SystemMouseCursors.click,
+    child: GestureDetector(onTap: onTap, child: chip),
+  );
+}
+
 /// Everything that needs a person, worst first.
 ///
 /// Reads GET /analytics/concerns, which EXTENDS the Overview strip's
@@ -4425,63 +4645,130 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav) {
 /// the rest of /analytics/*, which is what the module's keywords mirror.
 Widget concernsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () => rest.getMap('/analytics/concerns?days=30'),
-      builder: (context, data, reload) {
-        final nav = ModuleNavigator.of(context);
-        final text = Theme.of(context).textTheme;
-        final all = <Map>[for (final c in (data['concerns'] as List?) ?? const []) if (c is Map) c];
-        final totals = (data['totals'] as Map?) ?? const {};
-        final windowDays = _int(data['window_days']) ?? 30;
-
-        if (all.isEmpty) {
-          // Good news, not a failed load: an empty list is the state an owner is
-          // trying to reach, so it reads as an achievement rather than an error.
-          return EmptyState(
-            icon: Icons.verified_outlined,
-            title: 'Nothing needs your attention',
-            caption: 'No open concerns across stock, bills, approvals, staff, guest '
-                'feedback or suppliers in the last $windowDays days. Anything that '
-                'goes wrong shows up here on its own.',
-            action: ForkButton.ghost(
-                label: 'Check again', icon: Icons.refresh, dense: true, onPressed: reload),
-          );
-        }
-
-        final width = MediaQuery.sizeOf(context).width;
-        final cols = width >= 1500 ? 3 : (width >= 1000 ? 2 : 1);
-
-        final children = <Widget>[
-          SectionHeader(
-            title: 'Concerns',
-            count: all.length,
-            trailing: ForkButton.ghost(
-                label: 'Refresh', icon: Icons.refresh, dense: true, onPressed: reload),
-          ),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            for (final sev in _concernSeverities)
-              StatusChip(label: '${_int(totals[sev]) ?? 0} $sev', color: _concernColor(sev)),
-            InfoChip(icon: Icons.date_range, label: 'Last $windowDays days'),
-          ]),
-          const SizedBox(height: 16),
-        ];
-
-        for (final sev in _concernSeverities) {
-          final band = all.where((c) => '${c['severity'] ?? 'low'}' == sev).toList();
-          if (band.isEmpty) continue;
-          children.addAll([
-            SectionHeader(title: _concernBandTitle(sev), count: band.length),
-            _dashGrid([for (final c in band) _concernCard(context, c, nav)], cols),
-            const SizedBox(height: 20),
-          ]);
-        }
-
-        final generated = _s(data, 'generated_at', '');
-        if (generated.isNotEmpty) {
-          children.add(Text('Checked ${RestaurantTime.stamp(generated)}', style: text.labelSmall));
-        }
-
-        return ListView(padding: AppSpacing.pageNarrow, children: children);
-      },
+      builder: (context, data, reload) => _ConcernsBoard(data: data, reload: reload),
     );
+
+/// Stateful only for the severity filter. The summary pills and the band
+/// headings are the same control from two places — on a busy day this list runs
+/// well past a screen, and "show me only the ones I have to deal with today" is
+/// the question those two counts were already being asked.
+class _ConcernsBoard extends StatefulWidget {
+  const _ConcernsBoard({required this.data, required this.reload});
+
+  final Map<String, dynamic> data;
+  final VoidCallback reload;
+
+  @override
+  State<_ConcernsBoard> createState() => _ConcernsBoardState();
+}
+
+class _ConcernsBoardState extends State<_ConcernsBoard> {
+  /// Severity the list is narrowed to, or null for everything.
+  String? _band;
+
+  @override
+  Widget build(BuildContext context) {
+    final data = widget.data;
+    final reload = widget.reload;
+    final nav = ModuleNavigator.of(context);
+    final text = Theme.of(context).textTheme;
+    final all = <Map>[for (final c in (data['concerns'] as List?) ?? const []) if (c is Map) c];
+    final totals = (data['totals'] as Map?) ?? const {};
+    final windowDays = _int(data['window_days']) ?? 30;
+
+    if (all.isEmpty) {
+      // Good news, not a failed load: an empty list is the state an owner is
+      // trying to reach, so it reads as an achievement rather than an error.
+      return EmptyState(
+        icon: Icons.verified_outlined,
+        title: 'Nothing needs your attention',
+        caption: 'No open concerns across stock, bills, approvals, staff, guest '
+            'feedback or suppliers in the last $windowDays days. Anything that '
+            'goes wrong shows up here on its own.',
+        // Nothing to drill into, so the state offers the two things that are
+        // still true: ask the server again, or go back to the day's numbers.
+        action: Wrap(
+          alignment: WrapAlignment.center,
+          spacing: AppSpacing.sm,
+          runSpacing: AppSpacing.sm,
+          children: [
+            ForkButton.ghost(
+                label: 'Check again', icon: Icons.refresh, dense: true, onPressed: reload),
+            if (nav?.canOpen('Overview') ?? false)
+              ForkButton(
+                label: 'Back to Overview',
+                icon: Icons.arrow_forward,
+                dense: true,
+                onPressed: () => nav!.openModule('Overview'),
+              ),
+          ],
+        ),
+      );
+    }
+
+    int bandCount(String sev) => all.where((c) => '${c['severity'] ?? 'low'}' == sev).length;
+    // A refresh can empty the band that was selected; falling back to "all"
+    // beats showing a filtered screen with nothing on it and no explanation.
+    final band = _band != null && bandCount(_band!) > 0 ? _band : null;
+
+    final width = MediaQuery.sizeOf(context).width;
+    final cols = width >= 1500 ? 3 : (width >= 1000 ? 2 : 1);
+
+    final children = <Widget>[
+      SectionHeader(
+        title: 'Concerns',
+        count: all.length,
+        trailing: ForkButton.ghost(
+            label: 'Refresh', icon: Icons.refresh, dense: true, onPressed: reload),
+      ),
+      Wrap(spacing: 8, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        for (final sev in _concernSeverities)
+          _concernBandChip(
+            sev,
+            _int(totals[sev]) ?? bandCount(sev),
+            selected: band == sev,
+            onTap: bandCount(sev) == 0
+                ? null
+                : () => setState(() => _band = band == sev ? null : sev),
+          ),
+        InfoChip(icon: Icons.date_range, label: 'Last $windowDays days'),
+        if (band != null)
+          ForkButton.subtle(
+            label: 'Show every severity',
+            icon: Icons.close,
+            onPressed: () => setState(() => _band = null),
+          ),
+      ]),
+      const SizedBox(height: 16),
+    ];
+
+    for (final sev in _concernSeverities) {
+      if (band != null && sev != band) continue;
+      final rows = all.where((c) => '${c['severity'] ?? 'low'}' == sev).toList();
+      if (rows.isEmpty) continue;
+      children.addAll([
+        _TapRow(
+          onTap: () => setState(() => _band = band == sev ? null : sev),
+          child: SectionHeader(
+            title: _concernBandTitle(sev),
+            count: rows.length,
+            trailing: Text(band == sev ? 'Showing only this band' : 'Show only this band',
+                style: text.labelSmall),
+          ),
+        ),
+        _dashGrid([for (final c in rows) _concernCard(context, c, nav, windowDays)], cols),
+        const SizedBox(height: 20),
+      ]);
+    }
+
+    final generated = _s(data, 'generated_at', '');
+    if (generated.isNotEmpty) {
+      children.add(Text('Checked ${RestaurantTime.stamp(generated)}', style: text.labelSmall));
+    }
+
+    return ListView(padding: AppSpacing.pageNarrow, children: children);
+  }
+}
 
 // Tables are uniform, tappable boxes (not organised by seat count — any table
 // can seat a flexible number of people). Tap a free table to seat guests; tap
@@ -8967,7 +9254,226 @@ Future<void> _printKot(String table, List items) async {
   await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
 }
 
-// Customer receipt for the table's bill (items + total + APC).
+/// Stock tint, in the shared status voice: label + tint, never colour alone.
+/// Top-level so a drill-down sheet tints an item exactly as its row does.
+Color _inventoryStockColor(String status) {
+  final s = status.toLowerCase();
+  if (s.contains('out')) return AppColors.danger;
+  if (s.contains('low')) return AppColors.warning;
+  return AppColors.success;
+}
+
+/// The ledger movements for ONE item, asked for only when its sheet opens.
+///
+/// GET /inventory returns levels and no history, and putting a second call on
+/// the module's load would slow a screen that renders perfectly without it. So
+/// the history is fetched here, once, and a failure degrades to a sentence
+/// rather than taking the sheet down — the levels above it are still the answer
+/// to most of why the sheet was opened.
+class _ItemMovements extends StatefulWidget {
+  const _ItemMovements({required this.rest, required this.inventoryId, required this.unit});
+
+  final RestClient rest;
+  final String inventoryId;
+  final String unit;
+
+  @override
+  State<_ItemMovements> createState() => _ItemMovementsState();
+}
+
+class _ItemMovementsState extends State<_ItemMovements> {
+  static const int _max = 6;
+
+  List<Map> _rows = const [];
+  bool _loading = true;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      // The route's own default window is 30 days; stating it keeps the heading
+      // above this list honest if that default ever moves.
+      final from = RestaurantTime.isoDate(
+          RestaurantTime.nowWall().subtract(const Duration(days: 29)));
+      final r = await widget.rest.getMap('/inventory/movements?from=$from');
+      final mine = <Map>[
+        for (final m in (r['movements'] as List?) ?? const [])
+          if (m is Map && '${m['inventory_id']}' == widget.inventoryId) m,
+      ];
+      if (!mounted) return;
+      setState(() {
+        _rows = mine.length > _max ? mine.sublist(0, _max) : mine;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _failed = true;
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    if (_loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: AppSpacing.sm),
+        child: Column(children: [
+          SkeletonBox(height: 14, radius: 6),
+          SizedBox(height: AppSpacing.sm),
+          SkeletonBox(height: 14, radius: 6),
+        ]),
+      );
+    }
+    if (_failed) {
+      return Text('Movement history is unavailable right now.',
+          style: text.bodySmall?.copyWith(color: AppColors.textTertiary));
+    }
+    if (_rows.isEmpty) {
+      return Text('Nothing received, issued or wasted in this window.',
+          style: text.bodySmall?.copyWith(color: AppColors.textTertiary));
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      for (final r in _rows)
+        _detailRow(
+          context,
+          // The reason is the whole point of a wastage line, so it rides with
+          // the kind rather than being dropped for width.
+          [
+            _s(r, 'kind', 'movement'),
+            if (_s(r, 'reason', '').isNotEmpty) _s(r, 'reason', ''),
+          ].join(' · '),
+          '${_numOf(r['delta']) > 0 ? '+' : ''}${_score(r['delta'])}'
+          '${widget.unit.isEmpty ? '' : ' ${widget.unit}'}',
+          trailing: _s(r, 'created_at', '').isEmpty ? null : RestaurantTime.day(_s(r, 'created_at')),
+        ),
+    ]);
+  }
+}
+
+/// One stock item in full: what the row shows, plus the two things it has no
+/// column for — the expiry and the recent ledger — and the two stock actions
+/// the row's own menu already offers.
+///
+/// The jump is offered only for an item that is actually short: a purchase
+/// order is the next step for those and for nothing else, and an always-on jump
+/// would be an affordance pointing nowhere useful.
+Future<void> _inventoryItemSheet(
+    BuildContext context, RestClient rest, Map item, VoidCallback reload) {
+  final text = Theme.of(context).textTheme;
+  final status = _s(item, 'status', 'In Stock');
+  final colour = _inventoryStockColor(status);
+  final short = colour != AppColors.success;
+  final unit = _s(item, 'unit', '');
+  final category = _s(item, 'category', '').trim();
+  final expiry = _s(item, 'expiry_date', '').trim();
+
+  String? expiryNote;
+  final due = expiry.isEmpty ? null : DateTime.tryParse(expiry);
+  if (due != null) {
+    final now = RestaurantTime.nowWall();
+    final days = DateTime(due.year, due.month, due.day)
+        .difference(DateTime(now.year, now.month, now.day))
+        .inDays;
+    expiryNote = days < 0 ? '${-days}d ago' : (days == 0 ? 'today' : 'in ${days}d');
+  }
+
+  return _detailSheet(
+    context,
+    eyebrow: 'Inventory',
+    title: _s(item, 'name'),
+    jumpTo: short ? 'Purchase Orders' : null,
+    children: [
+      Align(alignment: Alignment.centerLeft, child: StatusChip(label: status, color: colour)),
+      const SizedBox(height: AppSpacing.md),
+      _detailRow(context, 'On hand', '${item['stock'] ?? 0}${unit.isEmpty ? '' : ' $unit'}'),
+      _detailRow(context, 'Category', category.isEmpty ? 'Uncategorised' : category),
+      _detailRow(context, 'Expiry', expiry.isEmpty ? 'Not set' : RestaurantTime.day(expiry),
+          trailing: expiryNote),
+      const SizedBox(height: AppSpacing.lg),
+      Text('MOVEMENTS · LAST 30 DAYS', style: text.labelSmall),
+      const SizedBox(height: 6),
+      _ItemMovements(rest: rest, inventoryId: '${item['id'] ?? ''}', unit: unit),
+      const SizedBox(height: AppSpacing.lg),
+      // Closed first: both of these open a dialog of their own, and stacking a
+      // second one over a sheet that is about to be stale reads as a bug.
+      Builder(
+        builder: (ctx) => Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+          ForkButton.ghost(
+            label: 'Receive stock',
+            icon: Icons.add,
+            dense: true,
+            onPressed: () {
+              Navigator.pop(ctx);
+              _receiveStock(context, rest, item, reload);
+            },
+          ),
+          ForkButton.ghost(
+            label: 'Record wastage',
+            icon: Icons.delete_outline,
+            dense: true,
+            onPressed: () {
+              Navigator.pop(ctx);
+              _recordWastage(context, rest, item, reload);
+            },
+          ),
+        ]),
+      ),
+    ],
+  );
+}
+
+/// A named set of stock items — a category, or everything at one status — with
+/// each line a way into that item's own sheet.
+Future<void> _inventoryListSheet(
+  BuildContext context,
+  RestClient rest,
+  VoidCallback reload, {
+  required String eyebrow,
+  required String title,
+  required List<Map> items,
+  List<Widget> lead = const [],
+  String? jumpTo,
+}) {
+  final text = Theme.of(context).textTheme;
+  return _detailSheet(
+    context,
+    eyebrow: eyebrow,
+    title: title,
+    jumpTo: jumpTo,
+    children: [
+      ...lead,
+      if (items.isEmpty)
+        Text('Nothing in this set.', style: text.bodySmall?.copyWith(color: AppColors.textTertiary))
+      else
+        Builder(
+          builder: (ctx) => Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            for (final it in items)
+              _TapRow(
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _inventoryItemSheet(context, rest, it, reload);
+                },
+                child: _detailRow(
+                  context,
+                  _s(it, 'name'),
+                  '${it['stock'] ?? 0} ${_s(it, 'unit', '')}'.trim(),
+                  trailing: _s(it, 'status', 'In Stock'),
+                ),
+              ),
+          ]),
+        ),
+    ],
+  );
+}
+
 Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () async {
         final items = await rest.getList('/inventory');
@@ -8989,21 +9495,14 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         final text = Theme.of(context).textTheme;
         final narrow = MediaQuery.sizeOf(context).width < 760;
 
-        // Stock tint follows the shared status voice: label + tint, never
-        // colour alone.
-        Color stockColor(String status) {
-          final s = status.toLowerCase();
-          if (s.contains('out')) return AppColors.danger;
-          if (s.contains('low')) return AppColors.warning;
-          return AppColors.success;
-        }
-
-        final lowCount = rows
-            .where((r) => stockColor(_s(r as Map, 'status', 'In Stock')) == AppColors.warning)
-            .length;
-        final outCount = rows
-            .where((r) => stockColor(_s(r as Map, 'status', 'In Stock')) == AppColors.danger)
-            .length;
+        List<Map> atStatus(Color want) => [
+              for (final r in rows)
+                if (_inventoryStockColor(_s(r as Map, 'status', 'In Stock')) == want) r,
+            ];
+        final low = atStatus(AppColors.warning);
+        final out = atStatus(AppColors.danger);
+        final lowCount = low.length;
+        final outCount = out.length;
 
         // --- Sections -------------------------------------------------------
         // Stock is segregated by CATEGORY, which is the tenant's own stored
@@ -9045,6 +9544,63 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             entries.add((key: key, item: m));
           }
         }
+
+        String labelOf(String key) =>
+            key.isEmpty ? 'Uncategorised' : (sectionLabel[key] ?? key);
+
+        int shortIn(String key) => [
+              for (final m in byKey[key] ?? const <Map>[])
+                if (_inventoryStockColor(_s(m, 'status', 'In Stock')) != AppColors.success) m,
+            ].length;
+
+        // One category, whole: every item in it with its level, each a way into
+        // that item's own sheet. This is what a section heading "opens".
+        Future<void> openSection(String key) {
+          final members = byKey[key] ?? const <Map>[];
+          final short = shortIn(key);
+          return _inventoryListSheet(
+            context,
+            rest,
+            reload,
+            eyebrow: 'Stock section',
+            title: labelOf(key),
+            items: members,
+            lead: [
+              _detailRow(context, 'Items', '${members.length}'),
+              _detailRow(context, 'Need restocking', '$short'),
+              const SizedBox(height: AppSpacing.md),
+            ],
+            jumpTo: short == 0 ? null : 'Purchase Orders',
+          );
+        }
+
+        // How the tracked total splits across the roster — the one figure the
+        // page holds but never states, because reading it means scrolling every
+        // heading. Each line opens that section.
+        Future<void> sectionBreakdown() => _detailSheet(
+              context,
+              eyebrow: 'Inventory',
+              title: '${rows.length} items tracked',
+              children: [
+                Builder(
+                  builder: (ctx) => Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    for (final key in orderedKeys)
+                      _TapRow(
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          openSection(key);
+                        },
+                        child: _detailRow(
+                          context,
+                          labelOf(key),
+                          '${(byKey[key] ?? const <Map>[]).length}',
+                          trailing: shortIn(key) == 0 ? null : '${shortIn(key)} short',
+                        ),
+                      ),
+                  ]),
+                ),
+              ],
+            );
 
         // Manage the tenant's inventory categories (add/rename/delete). Rename
         // cascades onto items server-side, so reload to refresh when changed.
@@ -9107,18 +9663,50 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                         // Low-stock summary from the rows already loaded.
                         return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                           _dashGrid([
-                            StatCard(value: '${rows.length}', caption: 'ITEMS TRACKED'),
+                            StatCard(
+                              value: '${rows.length}',
+                              caption: 'ITEMS TRACKED',
+                              // The page only answers "how is stock spread across
+                              // the categories?" by scrolling the whole list, so
+                              // the tile that states the total carries the split.
+                              onTap: sectionBreakdown,
+                            ),
                             StatCard(
                               value: '$lowCount',
                               caption: 'LOW STOCK',
                               tag: lowCount > 0 ? 'Lo' : null,
                               tagColor: AppColors.warning,
+                              // Zero low items has no list behind it. An inert
+                              // tile is honest; a tap onto "Nothing in this set"
+                              // is not.
+                              onTap: lowCount == 0
+                                  ? null
+                                  : () => _inventoryListSheet(
+                                        context,
+                                        rest,
+                                        reload,
+                                        eyebrow: 'Inventory',
+                                        title: 'Low stock',
+                                        items: low,
+                                        jumpTo: 'Purchase Orders',
+                                      ),
                             ),
                             StatCard(
                               value: '$outCount',
                               caption: 'OUT OF STOCK',
                               tag: outCount > 0 ? 'Out' : null,
                               tagColor: AppColors.danger,
+                              onTap: outCount == 0
+                                  ? null
+                                  : () => _inventoryListSheet(
+                                        context,
+                                        rest,
+                                        reload,
+                                        eyebrow: 'Inventory',
+                                        title: 'Out of stock',
+                                        items: out,
+                                        jumpTo: 'Purchase Orders',
+                                      ),
                             ),
                           ], narrow ? 1 : 3),
                           const SizedBox(height: AppSpacing.xxl),
@@ -9140,26 +9728,29 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       final it = entry.item;
                       if (it == null) {
                         final members = byKey[entry.key] ?? const <Map>[];
-                        final short = members
-                            .where((m) => stockColor(_s(m, 'status', 'In Stock')) != AppColors.success)
-                            .length;
+                        final short = shortIn(entry.key);
+                        final header = SectionHeader(
+                          title: labelOf(entry.key),
+                          count: members.length,
+                          padding: const EdgeInsets.only(bottom: 8),
+                          trailing: short == 0
+                              ? null
+                              : StatusChip(
+                                  label: '$short need${short == 1 ? 's' : ''} restocking',
+                                  color: AppColors.warning,
+                                  dense: true,
+                                ),
+                        );
                         return Padding(
                           padding: const EdgeInsets.only(top: AppSpacing.lg),
                           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            SectionHeader(
-                              title: entry.key.isEmpty
-                                  ? 'Uncategorised'
-                                  : (sectionLabel[entry.key] ?? entry.key),
-                              count: members.length,
-                              padding: const EdgeInsets.only(bottom: 8),
-                              trailing: short == 0
-                                  ? null
-                                  : StatusChip(
-                                      label: '$short need${short == 1 ? 's' : ''} restocking',
-                                      color: AppColors.warning,
-                                      dense: true,
-                                    ),
-                            ),
+                            // A saved-but-empty category has no section to open,
+                            // so its heading stays inert rather than offering a
+                            // tap onto an empty list.
+                            if (members.isEmpty)
+                              header
+                            else
+                              _TapRow(onTap: () => openSection(entry.key), child: header),
                             // A category on the roster with nothing in it is a
                             // real, saved category — say so rather than letting
                             // the empty heading read as a glitch.
@@ -9172,10 +9763,15 @@ Widget inventoryModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                         );
                       }
                       final status = _s(it, 'status', 'In Stock');
-                      final color = stockColor(status);
+                      final color = _inventoryStockColor(status);
                       final attention = color != AppColors.success;
                       final card = ForkCard(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        // The row states the level; the sheet adds the expiry and
+                        // the ledger it has no column for. The "..." menu keeps
+                        // both stock actions exactly where they were — a card tap
+                        // never moves stock.
+                        onTap: () => _inventoryItemSheet(context, rest, it, reload),
                         child: Row(children: [
                           AnimatedContainer(
                             duration: AppDurations.base,
@@ -10937,7 +11533,11 @@ Future<void> _resolveRecovery(BuildContext context, RestClient rest, String id, 
 // them. The link targets the dashboard-hosted /feedback page (orderBaseUrl) and
 // carries rid=<slug> + oid=<outletId> + eid=<employeeId>, matching the contract
 // the printed bill QR and post-payment redirect already use.
-Widget _employeeFeedbackQrSection(Profile p, List employees) {
+/// [feedback] is the loaded response list, used only to answer "is this waiter's
+/// QR actually being scanned, and what do they score?" behind a button on each
+/// row. The card itself stays untappable on purpose: it holds a selectable URL,
+/// and a gesture over the whole card would fight selecting it.
+Widget _employeeFeedbackQrSection(Profile p, List employees, List feedback) {
   final rows = employees.whereType<Map>().where((e) => '${e['id'] ?? e['employee_id'] ?? ''}'.isNotEmpty).toList();
   if (rows.isEmpty) return const SizedBox.shrink();
   String urlFor(String eid) =>
@@ -11003,9 +11603,10 @@ Widget _employeeFeedbackQrSection(Profile p, List employees) {
                           const SizedBox(height: 6),
                           SelectableText(url, style: text.bodySmall!.copyWith(fontSize: 11)),
                           const SizedBox(height: 6),
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: ForkButton.subtle(
+                          // Wrapped, not a Row: at 1.3x on a phone these two
+                          // buttons are wider than the column they sit in.
+                          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+                            ForkButton.subtle(
                               label: 'Copy link',
                               icon: Icons.copy,
                               onPressed: () async {
@@ -11016,7 +11617,12 @@ Widget _employeeFeedbackQrSection(Profile p, List employees) {
                                 }
                               },
                             ),
-                          ),
+                            ForkButton.subtle(
+                              label: 'Their feedback',
+                              icon: Icons.reviews_outlined,
+                              onPressed: () => _waiterFeedbackSheet(context, label, eid, feedback),
+                            ),
+                          ]),
                         ]),
                       ),
                     ]),
@@ -11027,6 +11633,279 @@ Widget _employeeFeedbackQrSection(Profile p, List employees) {
         ),
       ),
     ),
+  );
+}
+
+// --- Feedback drill-downs ----------------------------------------------------
+// Every figure on the Feedback tab opens what is behind it, computed from the
+// two payloads the module already holds — the `/feedback` rows and
+// `/feedback/summary`. Nothing here fetches again.
+//
+// One honesty constraint runs through all of them: `/feedback` returns the
+// newest 100 responses while the summary is computed over every response ever
+// recorded. Any figure derived from the rows says so, rather than quietly
+// presenting a sample as the whole history.
+
+/// How many responses landed on each whole star, 1..5. `overall_rating` is the
+/// mean of the per-question scores, so it is rounded to the star a guest would
+/// read off the page. Unrated rows are not counted at all.
+List<int> _ratingSpread(List items) {
+  final out = List<int>.filled(5, 0);
+  for (final m in items.whereType<Map>()) {
+    final raw = _numOf(m['overall_rating']);
+    if (raw <= 0) continue;
+    final star = raw.round();
+    out[(star < 1 ? 1 : (star > 5 ? 5 : star)) - 1]++;
+  }
+  return out;
+}
+
+String _pctOf(num part, num whole) => whole > 0 ? '${(part / whole * 100).toStringAsFixed(0)}%' : '—';
+
+/// Everything the "Responses" tile counts but cannot show: where the responses
+/// came in from, how many carried words rather than only stars, and the stretch
+/// of time the list actually covers.
+Future<void> _feedbackVolumeSheet(BuildContext context, Map sum, List items) {
+  final rows = items.whereType<Map>().toList();
+  final total = _int(sum['totalResponses']) ?? rows.length;
+  final withComment = rows.where((m) => _s(m, 'comments', '').isNotEmpty).length;
+  final withNps = rows.where((m) => m['nps'] != null).length;
+  final bySource = <String, int>{};
+  for (final m in rows) {
+    final src = _s(m, 'source', '').trim();
+    final key = src.isEmpty || src == '—' ? 'Not recorded' : src;
+    bySource[key] = (bySource[key] ?? 0) + 1;
+  }
+  final sources = bySource.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+  // The server sends the rows newest-first, so the ends of the list are the
+  // ends of the window.
+  final newest = rows.isEmpty ? '' : _s(rows.first, 'submitted_at', '');
+  final oldest = rows.isEmpty ? '' : _s(rows.last, 'submitted_at', '');
+
+  return _detailSheet(
+    context,
+    eyebrow: 'Responses',
+    title: '$total in total',
+    children: [
+      _detailRow(context, 'All time', '$total'),
+      _detailRow(context, 'Last 30 days', '${_int(sum['last30DaysResponses']) ?? 0}'),
+      _detailRow(context, 'Loaded below', '${rows.length}'),
+      if (newest.isNotEmpty) _detailRow(context, 'Newest', _fmtTime(newest)),
+      if (oldest.isNotEmpty && rows.length > 1) _detailRow(context, 'Oldest loaded', _fmtTime(oldest)),
+      Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 2),
+        child: Text('OF THE ${rows.length} LOADED', style: Theme.of(context).textTheme.labelSmall),
+      ),
+      _detailRow(context, 'Left a comment', '$withComment', trailing: _pctOf(withComment, rows.length)),
+      _detailRow(context, 'Answered "would recommend"', '$withNps', trailing: _pctOf(withNps, rows.length)),
+      if (sources.isNotEmpty) ...[
+        Padding(
+          padding: const EdgeInsets.only(top: 14, bottom: 2),
+          child: Text('WHERE THEY CAME IN', style: Theme.of(context).textTheme.labelSmall),
+        ),
+        for (final s in sources)
+          _detailRow(context, s.key, '${s.value}', trailing: _pctOf(s.value, rows.length)),
+      ],
+    ],
+  );
+}
+
+/// The spread and the per-question averages behind a single average score. The
+/// tile can only show the mean, and a 4.0 made of straight 4s is a different
+/// restaurant from a 4.0 made of 5s and 1s.
+Future<void> _feedbackRatingSheet(BuildContext context, Map sum, List items) {
+  final spread = _ratingSpread(items);
+  final rated = spread.fold<int>(0, (a, b) => a + b);
+  final cats = (sum['categoryAverages'] as Map?) ?? const {};
+  final catRows = cats.entries.map((e) {
+    final v = (e.value as Map?) ?? const {};
+    return (label: _s(v, 'label', '${e.key}'), avg: v['average']);
+  }).toList()
+    ..sort((a, b) => _numOf(a.avg).compareTo(_numOf(b.avg)));
+  final unhappy = spread[0] + spread[1];
+
+  return _detailSheet(
+    context,
+    eyebrow: 'Average rating',
+    title: '${sum['averageRating'] ?? '—'} / 5',
+    children: [
+      _detailRow(context, 'Responses scored', '$rated'),
+      _detailRow(context, 'At 2 stars or below', '$unhappy', trailing: _pctOf(unhappy, rated)),
+      Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 2),
+        child: Text('HOW THE SCORES FALL', style: Theme.of(context).textTheme.labelSmall),
+      ),
+      for (var star = 5; star >= 1; star--)
+        _detailRow(context, '$star star${star == 1 ? '' : 's'}', '${spread[star - 1]}',
+            trailing: _pctOf(spread[star - 1], rated)),
+      Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 2),
+        child: Text('BY QUESTION — WORST FIRST', style: Theme.of(context).textTheme.labelSmall),
+      ),
+      if (catRows.isEmpty)
+        Text('No per-question ratings have been recorded.', style: Theme.of(context).textTheme.bodySmall)
+      else
+        for (final c in catRows)
+          _detailRow(context, c.label, c.avg == null ? '—' : '${_score(c.avg)} / 5'),
+      Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Text(
+          'The spread is over the responses loaded below. The question averages come from '
+          'every response ever recorded, so the two need not add up.',
+          style: Theme.of(context).textTheme.bodySmall!.copyWith(color: AppColors.textTertiary, height: 1.35),
+        ),
+      ),
+    ],
+  );
+}
+
+/// Who is still waiting to be called back. Reached from the "Recovery" tile,
+/// which stays inert when the count is zero — an empty queue has nothing to
+/// open, and a sheet saying so would be an affordance that lied.
+Future<void> _recoveryQueueSheet(BuildContext context, List tickets) {
+  final rows = tickets.whereType<Map>().toList();
+  final worst = [...rows]..sort((a, b) => _numOf(a['overall_rating']).compareTo(_numOf(b['overall_rating'])));
+  return _detailSheet(
+    context,
+    eyebrow: 'Service recovery',
+    title: '${rows.length} open',
+    children: [
+      Text('Low-rating feedback that nobody has followed up yet, lowest score first.',
+          style: Theme.of(context).textTheme.bodySmall),
+      const SizedBox(height: AppSpacing.sm),
+      for (final t in worst)
+        _detailRow(
+          context,
+          _s(t, 'customer_name', 'Guest'),
+          '${_score(t['overall_rating'])} / 5',
+          trailing: _fmtTime(_s(t, 'submitted_at')),
+        ),
+    ],
+  );
+}
+
+/// The full record behind a recovery ticket.
+///
+/// Not a re-print of the card: the recovery reader returns only
+/// `{key,label,rating,follow_up_answer}` per question, so the card cannot show
+/// the QUESTION that was asked, the follow-up prompt, the recommend score or
+/// the source. Those live on the matching row in the main feedback list, which
+/// is joined here by id, and the ticket's own resolution fields are shown too.
+Future<void> _recoveryTicketSheet(BuildContext context, Map ticket, List items) {
+  final id = '${ticket['id'] ?? ''}';
+  final full = items.whereType<Map>().where((m) => '${m['id'] ?? ''}' == id).firstOrNull;
+  final cats = ((full ?? ticket)['category_ratings'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+  final comment = _s(ticket, 'comments', '');
+  final text = Theme.of(context).textTheme;
+
+  Widget head(String s) => Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 2),
+        child: Text(s, style: text.labelSmall),
+      );
+
+  return _detailSheet(
+    context,
+    eyebrow: 'Recovery ticket · ${_s(ticket, 'recovery_status', 'open')}',
+    title: _s(ticket, 'customer_name', 'Guest'),
+    children: [
+      _detailRow(context, 'Overall', '${_score(ticket['overall_rating'])} / 5'),
+      _detailRow(context, 'Submitted', _fmtTime(_s(ticket, 'submitted_at'))),
+      if (full != null && full['nps'] != null)
+        _detailRow(context, 'Would recommend', '${_numOf(full['nps']).toStringAsFixed(0)} / 10'),
+      if (full != null && _s(full, 'source').isNotEmpty) _detailRow(context, 'Came in via', _s(full, 'source')),
+      if (comment.isNotEmpty) ...[
+        head('IN THEIR WORDS'),
+        Text('"$comment"', style: text.bodyMedium!.copyWith(fontStyle: FontStyle.italic)),
+      ],
+      head('QUESTION BY QUESTION'),
+      if (cats.isEmpty)
+        Text('No per-question ratings were recorded.', style: text.bodySmall)
+      else
+        for (final c in cats) ...[
+          _detailRow(context, _s(c, 'label', _s(c, 'key')), '${_score(c['rating'])} / 5'),
+          if (_s(c, 'question').isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, bottom: 2),
+              child: Text(_s(c, 'question'), style: text.labelSmall),
+            ),
+          if (_s(c, 'follow_up').isNotEmpty || _s(c, 'follow_up_answer').isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 8, bottom: 6),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                if (_s(c, 'follow_up').isNotEmpty) Text(_s(c, 'follow_up'), style: text.labelSmall),
+                Text(_s(c, 'follow_up_answer', '').isEmpty ? '— not answered' : _s(c, 'follow_up_answer'),
+                    style: text.bodySmall),
+              ]),
+            ),
+        ],
+      if (full == null)
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(
+            'The original response is older than the list below, so the question wording and the '
+            'recommend score could not be attached.',
+            style: text.bodySmall!.copyWith(color: AppColors.textTertiary, height: 1.35),
+          ),
+        ),
+      head('FOLLOW-UP'),
+      _detailRow(context, 'Status', _s(ticket, 'recovery_status', 'open')),
+      if (_s(ticket, 'recovery_resolved_at', '').isNotEmpty)
+        _detailRow(context, 'Resolved', _fmtTime(_s(ticket, 'recovery_resolved_at'))),
+      if (_s(ticket, 'recovery_resolved_by', '').isNotEmpty)
+        _detailRow(context, 'Resolved by', _s(ticket, 'recovery_resolved_by')),
+      if (_s(ticket, 'recovery_note', '').isNotEmpty) Text(_s(ticket, 'recovery_note'), style: text.bodySmall),
+      // "Resolve" stays on the card. It closes a ticket, and closing one is not
+      // what tapping a row to read it should resolve to.
+    ],
+  );
+}
+
+/// How one waiter's own QR is actually performing. Reached from a button on the
+/// QR card rather than the card itself — that card holds a selectable URL, and
+/// a tap gesture over it would fight text selection.
+Future<void> _waiterFeedbackSheet(BuildContext context, String name, String eid, List items) {
+  final mine = items.whereType<Map>().where((m) => '${m['employee_id'] ?? ''}' == eid).toList();
+  final scored = mine.where((m) => _numOf(m['overall_rating']) > 0).toList();
+  final avg = scored.isEmpty
+      ? null
+      : scored.fold<double>(0, (a, m) => a + _numOf(m['overall_rating'])) / scored.length;
+  final spread = _ratingSpread(mine);
+  final text = Theme.of(context).textTheme;
+
+  return _detailSheet(
+    context,
+    eyebrow: 'Feedback tagged to this waiter',
+    title: name,
+    children: [
+      if (mine.isEmpty)
+        Text(
+          'No loaded response is tagged to them. Either their QR has not been scanned yet, or their '
+          'responses are older than the newest ${items.length} shown on this page.',
+          style: text.bodySmall,
+        )
+      else ...[
+        _detailRow(context, 'Responses', '${mine.length}'),
+        _detailRow(context, 'Average', avg == null ? '—' : '${avg.toStringAsFixed(2)} / 5'),
+        _detailRow(context, 'At 2 stars or below', '${spread[0] + spread[1]}',
+            trailing: _pctOf(spread[0] + spread[1], scored.length)),
+        Padding(
+          padding: const EdgeInsets.only(top: 14, bottom: 2),
+          child: Text('MOST RECENT', style: text.labelSmall),
+        ),
+        for (final m in mine.take(6))
+          _detailRow(
+            context,
+            _s(m, 'customer_name', 'Guest'),
+            '${_score(m['overall_rating'])} / 5',
+            trailing: _fmtTime(_s(m, 'submitted_at')),
+          ),
+        if (mine.length > 6)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text('and ${mine.length - 6} more in the list below.', style: text.bodySmall),
+          ),
+      ],
+    ],
   );
 }
 
@@ -11076,7 +11955,8 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                   : "That response isn't in this list — it may have been removed, or belong to another outlet.",
             ),
           Wrap(spacing: 12, runSpacing: 12, children: [
-            _statCard(context, 'Responses', '${sum['totalResponses'] ?? 0}', Icons.reviews),
+            _statCard(context, 'Responses', '${sum['totalResponses'] ?? 0}', Icons.reviews,
+                onTap: () => _feedbackVolumeSheet(context, sum, items)),
             SizedBox(
               width: 200,
               child: StatCard(
@@ -11087,6 +11967,7 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                   alignment: Alignment.centerLeft,
                   child: DonutGauge(fraction: (avgRating / 5).clamp(0.0, 1.0), size: 46),
                 ),
+                onTap: () => _feedbackRatingSheet(context, sum, items),
               ),
             ),
             SizedBox(
@@ -11096,11 +11977,15 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                 caption: 'RECOVERY',
                 tag: tickets.isNotEmpty ? 'Open' : null,
                 tagColor: AppColors.danger,
+                // Nothing open means nothing to open. Left genuinely inert —
+                // no cursor, no lift — rather than offering a sheet whose only
+                // content would be the zero already on the tile.
+                onTap: tickets.isEmpty ? null : () => _recoveryQueueSheet(context, tickets),
               ),
             ),
           ]),
           const SizedBox(height: AppSpacing.xxl),
-          _employeeFeedbackQrSection(p, employees),
+          _employeeFeedbackQrSection(p, employees, items),
           const SizedBox(height: AppSpacing.xxl),
           if (tickets.isNotEmpty) ...[
             SectionHeader(
@@ -11115,29 +12000,34 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                 padding: const EdgeInsets.only(bottom: 8),
                 child: ForkCard(
                   selected: isFocused(m),
+                  // Opens the full response — the question wording, the
+                  // follow-up prompts and the recommend score the recovery
+                  // reader does not return. "Resolve" keeps its own button so
+                  // reading a complaint can never close it.
+                  onTap: () => _recoveryTicketSheet(context, m, items),
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Row(children: [
-                      InitialsAvatar(initials: '${m['overall_rating'] ?? '-'}', color: AppColors.danger),
-                      const SizedBox(width: AppSpacing.md),
-                      Expanded(
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                          Text(_s(m, 'customer_name', 'Guest'), style: text.titleSmall),
-                          const SizedBox(height: 2),
-                          // Not the raw ISO date: submitted_at is a UTC instant,
-                          // so slicing at the "T" dates a 1am review to the
-                          // previous day in Asia/Kolkata.
-                          Text(_fmtTime(_s(m, 'submitted_at')), style: text.bodySmall),
-                        ]),
-                      ),
-                      const SizedBox(width: AppSpacing.md),
-                      const StatusChip(label: 'Low rating', color: AppColors.danger, dense: true),
-                      const SizedBox(width: AppSpacing.sm),
-                      ForkButton(
-                        label: 'Resolve',
-                        dense: true,
-                        onPressed: () => _resolveRecovery(context, rest, '${m['id']}', reload),
-                      ),
-                    ]),
+                    _recordHeadRow(
+                      context,
+                      leading: InitialsAvatar(
+                          initials: '${m['overall_rating'] ?? '-'}', color: AppColors.danger),
+                      identity: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(_s(m, 'customer_name', 'Guest'),
+                            style: text.titleSmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        // Not the raw ISO date: submitted_at is a UTC instant,
+                        // so slicing at the "T" dates a 1am review to the
+                        // previous day in Asia/Kolkata.
+                        Text(_fmtTime(_s(m, 'submitted_at')), style: text.bodySmall),
+                      ]),
+                      trailing: [
+                        const StatusChip(label: 'Low rating', color: AppColors.danger, dense: true),
+                        ForkButton(
+                          label: 'Resolve',
+                          dense: true,
+                          onPressed: () => _resolveRecovery(context, rest, '${m['id']}', reload),
+                        ),
+                      ],
+                    ),
                     if (_s(m, 'comments').isNotEmpty)
                       Padding(
                         padding: const EdgeInsets.only(top: 8),
@@ -13962,6 +14852,8 @@ class _AccountingViewState extends State<_AccountingView> {
   }
 
   Future<void> _exportPdf() async {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Preparing the PDF…')));
     final r = _range();
     final doc = pw.Document();
     String money(dynamic v) {
@@ -14006,6 +14898,304 @@ class _AccountingViewState extends State<_AccountingView> {
           kv('Net sales (after refunds)', _sales['net_sales'], bold: true),
         ]));
     await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+  }
+
+  // --- Drill-downs -----------------------------------------------------------
+  // Every headline figure on this page opens the arithmetic behind it. All of it
+  // is assembled from the four reports already loaded by [_load], so a
+  // drill-down costs no round-trip.
+  //
+  // One house rule runs through all of them: the SERVICE CHARGE IS NOT TAX. The
+  // server keeps `total_service_charge` out of `total_tax` and out of `by_rate`,
+  // and every sheet below keeps them on separate lines with separate wording —
+  // collapsing the two once booked ₹31,733.92 of owner income as GST.
+
+  Widget _sheetHead(String label) => Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 2),
+        child: Text(label.toUpperCase(), style: Theme.of(context).textTheme.labelSmall),
+      );
+
+  Widget _sheetNote(String body) => Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: Text(body,
+            style: Theme.of(context).textTheme.bodySmall!.copyWith(color: AppColors.textTertiary, height: 1.35)),
+      );
+
+  String _billsWord(int n) => '$n bill${n == 1 ? '' : 's'}';
+
+  /// "Last 30 days · 01/07 to 30/07" — every sheet says which window it is
+  /// describing, because the tab above it can be changed behind a sheet.
+  String get _windowLabel {
+    final r = _range();
+    return '$_days-day window · ${_ddmm(r.from)} to ${_ddmm(r.to)}';
+  }
+
+  Future<void> _netSalesSheet() {
+    final gross = _n(_sales['total_sales']);
+    final refunds = _n(_sales['total_refund']);
+    final bills = _n(_sales['bill_count']).round();
+    final methods = ((_sales['by_method'] as List?) ?? const []).whereType<Map>().toList();
+    return _detailSheet(
+      context,
+      eyebrow: 'Net sales · $_windowLabel',
+      title: _money(_sales['net_sales']),
+      children: [
+        _detailRow(context, 'Gross sales', _money(gross), trailing: _billsWord(bills)),
+        _detailRow(context, 'Refunds', refunds > 0 ? '− ${_money(refunds)}' : _money(0)),
+        _detailRow(context, 'Net sales', _money(_sales['net_sales'])),
+        _detailRow(context, 'Average bill', bills > 0 ? _money(gross / bills) : '—'),
+        _sheetHead('What sits inside gross sales'),
+        _detailRow(context, 'Tax collected', _money(_sales['total_tax'])),
+        _detailRow(context, 'Service charge', _money(_sales['total_service_charge'])),
+        _sheetNote('Gross sales is what guests actually paid, so it still carries both. The tax is '
+            'pass-through — it is owed onward to the government. The service charge is NOT tax: the '
+            'restaurant keeps it, and the reports count it as income.'),
+        if (methods.isNotEmpty) ...[
+          _sheetHead('By payment method'),
+          for (final m in methods)
+            _detailRow(context, _s(m, 'method', 'Other'), _money(m['sales']),
+                trailing: _billsWord(_int(m['bills']) ?? 0)),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _taxSheet() {
+    final byRate = ((_gst['by_rate'] as List?) ?? const []).whereType<Map>().toList();
+    final totalTax = _n(_gst['total_tax']);
+    final service = _n(_gst['total_service_charge']);
+    // Only the sales report carries the refunded share. Both reports are cut
+    // over the same settled bills in the same window, so the two figures are
+    // describing the same money.
+    final refundedTax = _n(_sales['total_refunded_tax']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Tax collected · $_windowLabel',
+      title: _money(totalTax),
+      children: [
+        if (byRate.isEmpty)
+          _sheetNote('No tax was charged on any settled bill in this window.')
+        else
+          for (final t in byRate)
+            _detailRow(
+              context,
+              '${_s(t, 'name', 'Tax')} · ${_numOf(t['percentage'])}%',
+              _money(t['tax']),
+              trailing: 'on ${_money(t['taxable'])}',
+            ),
+        _detailRow(context, 'Total tax', _money(totalTax)),
+        if (refundedTax > 0) ...[
+          _detailRow(context, 'Inside refunded bills', '− ${_money(refundedTax)}'),
+          _detailRow(context, 'Tax actually kept', _money(totalTax - refundedTax)),
+          _sheetNote('A refund reverses a tax-inclusive amount, so that share of the tax was never '
+              'the restaurant\'s to remit.'),
+        ],
+        _sheetHead('Not tax — shown separately'),
+        _detailRow(context, 'Service charge', _money(service)),
+        _sheetNote('The service charge is the restaurant\'s own income, not a levy collected for '
+            'anyone else. It is deliberately kept out of every figure above and out of the GST '
+            'breakdown on the page — booking it as tax would overstate what is owed and understate '
+            'what was earned.'),
+        _sheetHead('Turnover'),
+        _detailRow(context, 'Taxable turnover (ex-tax)', _money(_gst['total_taxable'])),
+      ],
+    );
+  }
+
+  Future<void> _expensesSheet() {
+    final byCat = ((_pnl['expenses_by_category'] as List?) ?? const []).whereType<Map>().toList();
+    final total = _n(_pnl['total_expenses']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Expenses · $_windowLabel',
+      title: _money(total),
+      children: [
+        if (byCat.isEmpty)
+          _sheetNote('Nothing was booked as an expense in this window.')
+        else
+          for (final c in byCat)
+            _detailRow(
+              context,
+              _s(c, 'category', 'General'),
+              _money(c['amount']),
+              trailing: total > 0 ? '${(_n(c['amount']) / total * 100).toStringAsFixed(1)}%' : null,
+            ),
+        _detailRow(context, 'Total expenses', _money(total),
+            trailing: '${_expenses.length} entr${_expenses.length == 1 ? 'y' : 'ies'}'),
+        _sheetNote('Salaries paid from the payroll section below are booked here automatically, '
+            'under "Payroll".'),
+      ],
+    );
+  }
+
+  Future<void> _netProfitSheet() {
+    final net = _n(_pnl['net_profit']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Net profit · $_windowLabel',
+      title: _money(net),
+      children: [
+        _detailRow(context, 'Gross sales', _money(_pnl['gross_sales'])),
+        _detailRow(context, 'Refunds', '− ${_money(_pnl['refunds'])}'),
+        _detailRow(context, 'Tax kept out', '− ${_money(_pnl['tax_collected'])}'),
+        _detailRow(context, 'Net revenue (ex-tax)', _money(_pnl['net_revenue'])),
+        _detailRow(context, 'Expenses', '− ${_money(_pnl['total_expenses'])}'),
+        _detailRow(context, 'Net profit', _money(net)),
+        _sheetHead('Read this carefully'),
+        _detailRow(context, 'Service charge earned', _money(_pnl['service_charge'])),
+        _sheetNote('Tax is subtracted because it is pass-through — collected for the government, '
+            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside net '
+            'revenue above, and the line here is only telling you how much of that revenue it was.'),
+      ],
+    );
+  }
+
+  Future<void> _methodSheet(Map m) {
+    final sales = _n(m['sales']);
+    final bills = _int(m['bills']) ?? 0;
+    final total = _n(_sales['total_sales']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Payment method · $_windowLabel',
+      title: _s(m, 'method', 'Other'),
+      children: [
+        _detailRow(context, 'Taken this way', _money(sales)),
+        _detailRow(context, 'Share of gross sales', total > 0 ? '${(sales / total * 100).toStringAsFixed(1)}%' : '—'),
+        _detailRow(context, 'Bills', '$bills'),
+        _detailRow(context, 'Average bill', bills > 0 ? _money(sales / bills) : '—'),
+        _sheetNote('The settled-bill list below can be filtered to this method to see the bills '
+            'themselves.'),
+      ],
+    );
+  }
+
+  Future<void> _taxRateSheet(Map t) {
+    final tax = _n(t['tax']);
+    final taxable = _n(t['taxable']);
+    final totalTax = _n(_gst['total_tax']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Tax rate · $_windowLabel',
+      title: '${_s(t, 'name', 'Tax')} · ${_numOf(t['percentage'])}%',
+      children: [
+        _detailRow(context, 'Taxable base', _money(taxable)),
+        _detailRow(context, 'Rate', '${_numOf(t['percentage'])}%'),
+        _detailRow(context, 'Tax charged', _money(tax)),
+        _detailRow(context, 'Share of all tax', totalTax > 0 ? '${(tax / totalTax * 100).toStringAsFixed(1)}%' : '—'),
+        _sheetNote('This base excludes the service charge. That charge is the restaurant\'s income, '
+            'not a taxable levy, and it is reported on its own line — never as a rate here.'),
+      ],
+    );
+  }
+
+  Future<void> _discountsSheet() {
+    final estimated = _n(_discounts['estimated_bills']);
+    final given = _n(_discounts['total_discount']);
+    final billCount = _int(_discounts['bill_count']) ?? 0;
+    final discounted = _int(_discounts['discounted_bills']) ?? 0;
+    final notes = ((_discounts['notes'] as List?) ?? const []).map((e) => '$e').where((s) => s.isNotEmpty);
+    return _detailSheet(
+      context,
+      eyebrow: 'Discounts given · $_windowLabel',
+      title: '${estimated > 0 ? '≈' : ''}${_money(given)}',
+      children: [
+        _detailRow(context, 'Manual discounts', _money(_discounts['manual_discount'])),
+        _detailRow(context, 'Coupons & vouchers', _money(_discounts['coupon_discount'])),
+        _detailRow(context, 'Total given', _money(given)),
+        _sheetHead('Reach'),
+        _detailRow(context, 'Bills discounted', '$discounted of $billCount'),
+        _detailRow(context, 'Share of bills',
+            billCount > 0 ? '${(discounted / billCount * 100).toStringAsFixed(1)}%' : '—'),
+        _detailRow(context, 'Sales in the same window', _money(_discounts['total_sales'])),
+        if (_n(_discounts['gift_redemption_total']) > 0)
+          _detailRow(context, 'Gift vouchers redeemed', _money(_discounts['gift_redemption_total'])),
+        if (estimated > 0)
+          _sheetNote('${estimated.round()} bill(s) stored the discount as a bare percentage, so the '
+              'money value is reconstructed and the totals above are approximate.'),
+        _sheetNote('Bill totals are already stored NET of discount, so every sales, tax and profit '
+            'figure on this page reflects these. Never subtract this again.'),
+        for (final n in notes) _sheetNote(n),
+      ],
+    );
+  }
+
+  Future<void> _couponSheet(Map c) {
+    final amount = _n(c['amount']);
+    final uses = _int(c['uses']) ?? 0;
+    final total = _n(_discounts['total_discount']);
+    return _detailSheet(
+      context,
+      eyebrow: '${'${c['kind']}' == 'gift' ? 'Gift voucher' : 'Coupon'} · $_windowLabel',
+      title: _s(c, 'code'),
+      children: [
+        _detailRow(context, 'Given away', _money(amount)),
+        _detailRow(context, 'Times redeemed', '$uses'),
+        _detailRow(context, 'Average per use', uses > 0 ? _money(amount / uses) : '—'),
+        _detailRow(context, 'Share of all discount', total > 0 ? '${(amount / total * 100).toStringAsFixed(1)}%' : '—'),
+      ],
+    );
+  }
+
+  Future<void> _expenseSheet(Map e) {
+    final vendor = _s(e, 'vendor', '');
+    final note = _s(e, 'note', '');
+    final total = _n(_pnl['total_expenses']);
+    final amount = _n(e['amount']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Expense · ${_s(e, 'category', 'General')}',
+      title: _money(amount),
+      children: [
+        _detailRow(context, 'Category', _s(e, 'category', 'General')),
+        _detailRow(context, 'Spent on', _s(e, 'spent_on')),
+        if (vendor.isNotEmpty) _detailRow(context, 'Vendor', vendor),
+        _detailRow(context, 'Share of expenses', total > 0 ? '${(amount / total * 100).toStringAsFixed(1)}%' : '—'),
+        if (_s(e, 'created_at', '').isNotEmpty) _detailRow(context, 'Booked', _fmtTime(_s(e, 'created_at'))),
+        if (_s(e, 'created_by', '').isNotEmpty) _detailRow(context, 'Booked by', _s(e, 'created_by')),
+        if (note.isNotEmpty) ...[_sheetHead('Note'), _sheetNote(note)],
+        // Deleting stays on the row's own button. A sheet reached by tapping a
+        // row must not put a destructive control under the reading finger.
+      ],
+    );
+  }
+
+  Future<void> _payrollSheet(Map r) {
+    final prof = (r['profile'] as Map?) ?? const {};
+    final hourly = '${prof['pay_type']}' == 'hourly';
+    final paid = r['paid'] == true;
+    final allowances = _n(prof['allowances']);
+    final deductions = _n(prof['deductions']);
+    return _detailSheet(
+      context,
+      eyebrow: 'Payroll · $_payrollMonth',
+      title: _s(r, 'name'),
+      children: [
+        _detailRow(context, 'Role', _s(r, 'role')),
+        if (prof.isEmpty)
+          _sheetNote('No salary is set for this employee, so nothing can be computed. Use "Set '
+              'salary" on the row to add one.')
+        else ...[
+          _detailRow(context, 'Pay type', hourly ? 'Hourly' : 'Monthly'),
+          if (hourly) ...[
+            _detailRow(context, 'Rate', '${_money(prof['hourly_rate'])} / hour'),
+            _detailRow(context, 'Hours worked', '${r['hours_worked'] ?? 0}'),
+            _detailRow(context, 'Earned', _money(_n(prof['hourly_rate']) * _n(r['hours_worked']))),
+          ] else
+            _detailRow(context, 'Base salary', _money(prof['base_salary'])),
+          if (allowances != 0) _detailRow(context, 'Allowances', '+ ${_money(allowances)}'),
+          if (deductions != 0) _detailRow(context, 'Deductions', '− ${_money(deductions)}'),
+          _detailRow(context, paid ? 'Was due' : 'Due now', r['computed_pay'] == null ? '—' : _money(r['computed_pay'])),
+        ],
+        _sheetHead('This month'),
+        _detailRow(context, 'Status', paid ? 'Paid' : 'Not paid yet'),
+        if (paid) ...[
+          _detailRow(context, 'Paid', _money(r['paid_amount'])),
+          if (_s(r, 'paid_at', '').isNotEmpty) _detailRow(context, 'Paid on', _fmtTime(_s(r, 'paid_at'))),
+        ],
+        _sheetNote('Recording a payment also books a "Payroll" expense, so it lands in the expense '
+            'total and in net profit above.'),
+      ],
+    );
   }
 
   // Download the Tally-compatible XML for the selected range and let the user
@@ -14062,23 +15252,51 @@ class _AccountingViewState extends State<_AccountingView> {
     const dayLabels = ['Day', 'Week', 'Month', 'Quarter', 'Half year', 'Year'];
 
     // Dense financial table row — label in the quiet voice, amount right.
-    Widget moneyRow(String label, String amount, {String? sub, Widget? trailing}) => Padding(
-          padding: const EdgeInsets.symmetric(vertical: 7),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(label, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
-                if (sub != null) ...[
-                  const SizedBox(height: 2),
-                  Text(sub, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
-                ],
-              ]),
-            ),
-            const SizedBox(width: AppSpacing.md),
-            Text(amount, style: text.titleSmall),
-            if (trailing != null) ...[const SizedBox(width: AppSpacing.sm), trailing],
-          ]),
+    //
+    // [onTap] opens the row's own breakdown. The affordance is _TapRow's cursor
+    // and hover wash rather than a chevron: these rows already carry an
+    // unbounded money string beside an ellipsised label, and every pixel a
+    // trailing glyph took would come out of the label at 1.3x on a phone.
+    Widget moneyRow(String label, String amount, {String? sub, Widget? trailing, VoidCallback? onTap}) {
+      final row = Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(label, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+              if (sub != null) ...[
+                const SizedBox(height: 2),
+                Text(sub, style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+              ],
+            ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Flexible(
+            child: Text(amount,
+                style: text.titleSmall, maxLines: 1, softWrap: false, overflow: TextOverflow.fade),
+          ),
+          if (trailing != null) ...[const SizedBox(width: AppSpacing.sm), trailing],
+        ]),
+      );
+      return onTap == null ? row : _TapRow(onTap: onTap, child: row);
+    }
+
+    // Rows in this section open their own detail — said once per card rather
+    // than decorating every row. Self-aligning, because the expense card's
+    // Column centres its children and this line belongs at the left margin
+    // with the labels it describes.
+    Widget tapHint() => Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 2, bottom: 2),
+            child: Text('Tap a row for its breakdown.', style: text.bodySmall),
+          ),
         );
+
+    Widget detailsFooter() => Row(mainAxisSize: MainAxisSize.min, children: [
+          Text('DETAILS', style: text.labelSmall!.copyWith(color: AppColors.copper)),
+          const Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
+        ]);
     Widget hairline() => Container(height: 1, color: AppColors.divider);
 
     String initialsOf(String name) {
@@ -14095,37 +15313,80 @@ class _AccountingViewState extends State<_AccountingView> {
     return RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
-        Row(children: [
-          Expanded(
-            child: ForkTabs(
-              tabs: dayLabels,
-              // Fall back to the Month tab by VALUE, not by a hardcoded index --
-              // an index literal silently points at a different period the next
-              // time this list changes.
-              selected: dayOptions.contains(_days)
-                  ? dayOptions.indexOf(_days)
-                  : dayOptions.indexOf(30),
-              onSelected: (i) {
-                setState(() => _days = dayOptions[i]);
-                _load();
-              },
-            ),
-          ),
-          const SizedBox(width: AppSpacing.sm),
-          ForkButton.ghost(label: 'Tally XML', icon: Icons.description_outlined, dense: true, onPressed: _exportTally),
-          const SizedBox(width: AppSpacing.sm),
-          ForkButton.ghost(label: 'Export PDF', icon: Icons.picture_as_pdf_outlined, dense: true, onPressed: _exportPdf),
-        ]),
+        // The two exports drop below the period tabs on a phone, and wrap again
+        // between themselves if they still do not fit. Side by side on one line
+        // with the tabs they wanted 410px of a 358px column at 1.3x, and
+        // ForkTabs — which scrolls, so it accepts any width it is handed — was
+        // the only child able to give, which it did all the way down to nothing
+        // while the buttons still overflowed by 52.
+        Builder(builder: (_) {
+          final tabs = ForkTabs(
+            tabs: dayLabels,
+            // Fall back to the Month tab by VALUE, not by a hardcoded index --
+            // an index literal silently points at a different period the next
+            // time this list changes.
+            selected: dayOptions.contains(_days)
+                ? dayOptions.indexOf(_days)
+                : dayOptions.indexOf(30),
+            onSelected: (i) {
+              setState(() => _days = dayOptions[i]);
+              _load();
+            },
+          );
+          final exports = Wrap(
+            alignment: WrapAlignment.end,
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.sm,
+            children: [
+              ForkButton.ghost(
+                  label: 'Tally XML', icon: Icons.description_outlined, dense: true, onPressed: _exportTally),
+              ForkButton.ghost(
+                  label: 'Export PDF', icon: Icons.picture_as_pdf_outlined, dense: true, onPressed: _exportPdf),
+            ],
+          );
+          if (!narrow) {
+            return Row(children: [
+              Expanded(child: tabs),
+              const SizedBox(width: AppSpacing.sm),
+              exports,
+            ]);
+          }
+          return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            tabs,
+            const SizedBox(height: AppSpacing.sm),
+            exports,
+          ]);
+        }),
         const SizedBox(height: AppSpacing.lg),
+        // Each headline opens the arithmetic under it. The captions say GST but
+        // the tax sheet is careful to name the service charge separately — it is
+        // income, not a levy, and the two must never read as one bucket.
         _dashGrid([
-          StatCard(value: money(_n(_sales['net_sales'])), caption: 'NET SALES'),
-          StatCard(value: money(_n(_gst['total_tax'])), caption: 'GST COLLECTED'),
-          StatCard(value: money(_n(_pnl['total_expenses'])), caption: 'EXPENSES'),
+          StatCard(
+            value: money(_n(_sales['net_sales'])),
+            caption: 'NET SALES',
+            footer: detailsFooter(),
+            onTap: _netSalesSheet,
+          ),
+          StatCard(
+            value: money(_n(_gst['total_tax'])),
+            caption: 'GST COLLECTED',
+            footer: detailsFooter(),
+            onTap: _taxSheet,
+          ),
+          StatCard(
+            value: money(_n(_pnl['total_expenses'])),
+            caption: 'EXPENSES',
+            footer: detailsFooter(),
+            onTap: _expensesSheet,
+          ),
           StatCard(
             value: money(_n(_pnl['net_profit'])),
             caption: 'NET PROFIT',
             tag: netProfitUp ? 'Up' : 'Dn',
             tagColor: netProfitUp ? AppColors.success : AppColors.danger,
+            footer: detailsFooter(),
+            onTap: _netProfitSheet,
           ),
         ], cols),
         const SizedBox(height: AppSpacing.xl),
@@ -14148,6 +15409,8 @@ class _AccountingViewState extends State<_AccountingView> {
                       sub: '${m['bills'] ?? 0} bills',
                       fraction: maxV > 0 ? (_n(m['sales']) / maxV).clamp(0.0, 1.0) : 0,
                       value: money(_n(m['sales'])),
+                      tooltip: '${_s(m, 'method', 'Other')} · ${_money(m['sales'])}',
+                      onTap: () => _methodSheet(m),
                     ),
                 ]);
               }),
@@ -14159,12 +15422,26 @@ class _AccountingViewState extends State<_AccountingView> {
           ForkCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               SectionHeader(title: 'GST breakdown', padding: const EdgeInsets.only(bottom: 6)),
+              tapHint(),
               for (var i = 0; i < byRate.length; i++) ...[
                 if (i > 0) hairline(),
                 moneyRow(
                   '${_s(byRate[i] as Map, 'name', 'Tax')} · ${(byRate[i] as Map)['percentage'] ?? 0}%',
                   _money((byRate[i] as Map)['tax']),
                   sub: 'Taxable ${_money((byRate[i] as Map)['taxable'])}',
+                  onTap: () => _taxRateSheet(byRate[i] as Map),
+                ),
+              ],
+              // Service charge is deliberately absent from the rates above: it
+              // is income, not tax. Named here so its absence reads as a
+              // decision rather than a missing row.
+              if (_n(_gst['total_service_charge']) > 0) ...[
+                hairline(),
+                moneyRow(
+                  'Service charge — not tax',
+                  _money(_gst['total_service_charge']),
+                  sub: 'Kept by the restaurant, excluded from every rate above',
+                  onTap: _taxSheet,
                 ),
               ],
             ]),
@@ -14183,6 +15460,7 @@ class _AccountingViewState extends State<_AccountingView> {
                 '${_n(_discounts['estimated_bills']) > 0 ? '≈' : ''}${_money(_discounts['total_discount'])}',
                 sub:
                     '${_discounts['discounted_bills'] ?? 0} of ${_discounts['bill_count'] ?? 0} bills · manual ${_money(_discounts['manual_discount'])} · coupons ${_money(_discounts['coupon_discount'])}',
+                onTap: _discountsSheet,
               ),
               for (final c in byCoupon) ...[
                 hairline(),
@@ -14190,6 +15468,7 @@ class _AccountingViewState extends State<_AccountingView> {
                   '${_s(c as Map, 'code')}${'${c['kind']}' == 'gift' ? ' · Gift voucher' : ''}',
                   _money(c['amount']),
                   sub: '${c['uses'] ?? 0} uses',
+                  onTap: () => _couponSheet(c),
                 ),
               ],
             ]),
@@ -14290,6 +15569,7 @@ class _AccountingViewState extends State<_AccountingView> {
         else
           ForkCard(
             child: Column(children: [
+              tapHint(),
               for (var i = 0; i < _expenses.length; i++) ...[
                 if (i > 0) hairline(),
                 moneyRow(
@@ -14297,6 +15577,9 @@ class _AccountingViewState extends State<_AccountingView> {
                   _money((_expenses[i] as Map)['amount']),
                   sub:
                       '${_s(_expenses[i] as Map, 'spent_on')}${_s(_expenses[i] as Map, 'note').isNotEmpty ? ' · ${_s(_expenses[i] as Map, 'note')}' : ''}',
+                  // Delete keeps its own button. The row tap opens the record;
+                  // a destructive action is never what a row tap resolves to.
+                  onTap: () => _expenseSheet(_expenses[i] as Map),
                   trailing: ForkIconButton(
                     icon: Icons.delete_outline,
                     tooltip: 'Delete expense',
@@ -14319,7 +15602,8 @@ class _AccountingViewState extends State<_AccountingView> {
           ]),
           padding: const EdgeInsets.only(bottom: 6),
         ),
-        Text('Due ${_money(_payroll['total_due'])} · Paid ${_money(_payroll['total_paid'])} — paying books a "Payroll" expense.',
+        Text('Due ${_money(_payroll['total_due'])} · Paid ${_money(_payroll['total_paid'])} — paying books a "Payroll" expense. '
+            'Tap anyone for how their pay was worked out.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.md),
         if (payrollRows.isNotEmpty)
@@ -14333,13 +15617,17 @@ class _AccountingViewState extends State<_AccountingView> {
                   final paid = r['paid'] == true;
                   final pay = r['computed_pay'];
                   final hourly = '${prof?['pay_type']}' == 'hourly';
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: Row(children: [
-                      InitialsAvatar(initials: initialsOf(_s(r, 'name', ''))),
-                      const SizedBox(width: AppSpacing.md),
-                      Expanded(
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  // Tapping opens how the figure was arrived at — rate, hours,
+                  // allowances, deductions. Editing and paying stay on their own
+                  // buttons.
+                  return _TapRow(
+                    onTap: () => _payrollSheet(r),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: _recordHeadRow(
+                        context,
+                        leading: InitialsAvatar(initials: initialsOf(_s(r, 'name', ''))),
+                        identity: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                           Text('${_s(r, 'name')} · ${_s(r, 'role')}',
                               style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
                           const SizedBox(height: 2),
@@ -14354,25 +15642,27 @@ class _AccountingViewState extends State<_AccountingView> {
                             overflow: TextOverflow.ellipsis,
                           ),
                         ]),
-                      ),
-                      const SizedBox(width: AppSpacing.md),
-                      if (paid)
-                        StatusChip(label: 'Paid ${_money(r['paid_amount'])}', color: AppColors.success, dense: narrow)
-                      else ...[
-                        Text(pay != null ? _money(pay) : '—', style: text.titleSmall),
-                        const SizedBox(width: AppSpacing.sm),
-                        ForkIconButton(icon: Icons.edit_outlined, tooltip: 'Set salary', onPressed: () => _editPayrollProfile(r)),
-                        if (pay != null && (pay as num) > 0) ...[
-                          const SizedBox(width: AppSpacing.sm),
-                          ForkButton(
-                            label: 'Pay',
-                            icon: Icons.payments_outlined,
-                            dense: true,
-                            onPressed: () => _payEmployee(r),
-                          ),
+                        trailing: [
+                          if (paid)
+                            StatusChip(
+                                label: 'Paid ${_money(r['paid_amount'])}', color: AppColors.success, dense: narrow)
+                          else ...[
+                            Text(pay != null ? _money(pay) : '—', style: text.titleSmall),
+                            ForkIconButton(
+                                icon: Icons.edit_outlined,
+                                tooltip: 'Set salary',
+                                onPressed: () => _editPayrollProfile(r)),
+                            if (pay != null && (pay as num) > 0)
+                              ForkButton(
+                                label: 'Pay',
+                                icon: Icons.payments_outlined,
+                                dense: true,
+                                onPressed: () => _payEmployee(r),
+                              ),
+                          ],
                         ],
-                      ],
-                    ]),
+                      ),
+                    ),
                   );
                 }),
               ],
@@ -15307,24 +16597,33 @@ class _WaitlistViewState extends State<_WaitlistView> {
         unit: 'Groups',
         caption: 'Current queue',
         icon: Icons.groups_outlined,
+        // The panel below caps the queue at eight rows, so the figure and the
+        // list disagree the moment a ninth party joins. The sheet is the whole of
+        // it, and unlike a tab switch it is observable however short the queue.
+        onTap: ordered.isEmpty ? null : () => _wholeQueue(ordered),
       ),
       _statTile(
         figure: mins.isEmpty ? '0' : (mins.first == mins.last ? '${mins.first}' : '${mins.first}–${mins.last}'),
         unit: 'Min',
         caption: 'Waited so far, shortest to longest',
         icon: Icons.schedule,
+        onTap: ordered.isEmpty ? null : () => _longestWaits(ordered),
       ),
       _statTile(
         figure: '${_freeTables.length}',
         unit: 'Free',
         caption: 'Tables ready to seat now',
         icon: Icons.table_restaurant_outlined,
+        // Tappable even at zero: "which tables" is the question either way, and
+        // the sheet carries the jump to the floor plan that answers it.
+        onTap: _freeTablesSheet,
       ),
       _statTile(
         figure: avg == 0 ? '0' : avg.toStringAsFixed(avg % 1 == 0 ? 0 : 1),
         unit: 'People',
         caption: 'Average party size',
         icon: Icons.person_outline,
+        onTap: ordered.isEmpty ? null : () => _partySizeSpread(ordered),
       ),
     ], cols);
   }
@@ -15334,10 +16633,12 @@ class _WaitlistViewState extends State<_WaitlistView> {
     required String unit,
     required String caption,
     required IconData icon,
+    VoidCallback? onTap,
   }) {
     final text = Theme.of(context).textTheme;
     return ForkCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      onTap: onTap,
       child: Row(children: [
         Expanded(
           child: Column(
@@ -15462,14 +16763,28 @@ class _WaitlistViewState extends State<_WaitlistView> {
         ],
       );
 
-  Widget _rowShell({required bool focused, required bool last, required Widget child}) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: BoxDecoration(
-          color: focused ? AppColors.tint(AppColors.copper) : null,
-          border: last ? null : const Border(bottom: BorderSide(color: AppColors.divider)),
-        ),
-        child: child,
-      );
+  /// The row's own box, plus the tap that opens the party.
+  ///
+  /// Opening a read-only sheet is the ONLY thing a row tap does. Every action —
+  /// call, seat, no-show, remove — stays in the "..." menu, whose button sits
+  /// inside this shell and wins the gesture arena as the deeper recognizer, so
+  /// reaching for the menu can never fire the row.
+  Widget _rowShell({
+    required bool focused,
+    required bool last,
+    required Widget child,
+    VoidCallback? onTap,
+  }) {
+    final shell = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: focused ? AppColors.tint(AppColors.copper) : null,
+        border: last ? null : const Border(bottom: BorderSide(color: AppColors.divider)),
+      ),
+      child: child,
+    );
+    return onTap == null ? shell : _TapRow(onTap: onTap, child: shell);
+  }
 
   Widget _entryRow(Map e, {required bool table, required double s, required bool focused, required bool last}) {
     final text = Theme.of(context).textTheme;
@@ -15493,6 +16808,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
       return _rowShell(
         focused: focused,
         last: last,
+        onTap: () => _partyDetails(e, preItems, members),
         child: _tableRow([
           Align(alignment: Alignment.centerLeft, child: _positionCell(e, called)),
           Align(alignment: Alignment.centerLeft, child: _partyCell(preItems, members)),
@@ -15528,6 +16844,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
     return _rowShell(
       focused: focused,
       last: last,
+      onTap: () => _partyDetails(e, preItems, members),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           _positionCell(e, called),
@@ -15714,6 +17031,155 @@ class _WaitlistViewState extends State<_WaitlistView> {
     );
   }
 
+  /// [_partyDetails] from anywhere holding a raw queue entry — a row, a rail
+  /// line, or a line inside one of the drill-down sheets below.
+  Future<void> _openParty(Map e) => _partyDetails(
+        e,
+        (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[],
+        (e['party_members'] as List?)?.whereType<Map>().toList() ?? const <Map>[],
+      );
+
+  /// A sheet whose lines each open a party. The pop comes first so the party
+  /// sheet replaces this one instead of stacking a second dialog over it.
+  Future<void> _partyListSheet({
+    required String eyebrow,
+    required String title,
+    required List<Map> parties,
+    required String Function(Map) valueOf,
+    String? Function(Map)? trailingOf,
+    List<Widget> lead = const [],
+  }) =>
+      _detailSheet(
+        context,
+        eyebrow: eyebrow,
+        title: title,
+        children: [
+          ...lead,
+          Builder(
+            builder: (ctx) => Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              for (final e in parties)
+                _TapRow(
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _openParty(e);
+                  },
+                  child: _detailRow(context, _s(e, 'name'), valueOf(e),
+                      trailing: trailingOf?.call(e)),
+                ),
+            ]),
+          ),
+        ],
+      );
+
+  /// Who has actually been standing longest. The panel is ordered by POSITION,
+  /// which is arrival order and not the same thing once parties are called and
+  /// seated out of turn — so the range on the tile has no ranking behind it
+  /// anywhere else on the page.
+  Future<void> _longestWaits(List ordered) {
+    final by = [...ordered.whereType<Map>()]
+      ..sort((a, b) => (_int(b['minutes_waiting']) ?? 0).compareTo(_int(a['minutes_waiting']) ?? 0));
+    return _partyListSheet(
+      eyebrow: 'Waiting longest first',
+      title: 'Who has waited how long',
+      parties: by,
+      valueOf: (e) => '${e['minutes_waiting'] ?? 0}m',
+      trailingOf: (e) => 'position ${e['position'] ?? '–'}',
+    );
+  }
+
+  /// Every party and its headcount — how the "guests waiting" total is made up.
+  /// The whole queue, in order. The tile and the summary row that count it used
+  /// to `setState(_tab = 0; _showAll = true)`, which is a no-op whenever the tab
+  /// is already Queue and the list already fits inside the eight-row preview —
+  /// i.e. for any restaurant with a short queue, tapping the headline figure did
+  /// nothing at all. Every other figure on this rail opens a sheet; so does this.
+  Future<void> _wholeQueue(List ordered) => _partyListSheet(
+        eyebrow: 'In the queue',
+        title: '${ordered.length} ${ordered.length == 1 ? 'group' : 'groups'} waiting',
+        parties: [...ordered.whereType<Map>()],
+        valueOf: (e) => '${e['minutes_waiting'] ?? 0}m',
+        trailingOf: (e) => 'waited',
+      );
+
+  Future<void> _guestsWaiting(List ordered) => _partyListSheet(
+        eyebrow: 'In the queue',
+        title: '${_guestCount(ordered)} guests waiting',
+        parties: [...ordered.whereType<Map>()],
+        valueOf: (e) => '${e['party_size'] ?? 1}',
+        trailingOf: (e) => 'people',
+      );
+
+  /// How many groups of each size are in the queue. An average of 3.4 says
+  /// nothing about whether that is a room full of pairs or one large booking,
+  /// which is the difference that decides which table to free next.
+  Future<void> _partySizeSpread(List ordered) {
+    final counts = <int, int>{};
+    for (final raw in ordered) {
+      final n = _int((raw as Map)['party_size']) ?? 1;
+      final size = n < 1 ? 1 : n;
+      counts[size] = (counts[size] ?? 0) + 1;
+    }
+    final sizes = counts.keys.toList()..sort();
+    return _detailSheet(
+      context,
+      eyebrow: 'In the queue',
+      title: 'Party sizes',
+      children: [
+        for (final size in sizes)
+          _detailRow(context, '$size ${size == 1 ? 'person' : 'people'}',
+              '${counts[size]}', trailing: counts[size] == 1 ? 'group' : 'groups'),
+      ],
+    );
+  }
+
+  /// WHICH tables are free, not just how many — and the way to the floor plan
+  /// when the answer is "none".
+  Future<void> _freeTablesSheet() {
+    final text = Theme.of(context).textTheme;
+    return _detailSheet(
+      context,
+      eyebrow: 'Right now',
+      title: _freeTables.isEmpty
+          ? 'No table is free'
+          : '${_freeTables.length} table${_freeTables.length == 1 ? '' : 's'} ready',
+      jumpTo: 'Tables',
+      children: [
+        if (_freeTables.isEmpty)
+          Text(
+              'Every table is occupied, booked or reserved. Free one on the floor '
+              'plan and the next party in the queue can be seated.',
+              style: text.bodySmall)
+        else
+          for (final t in _freeTables) _detailRow(context, t, 'Free'),
+      ],
+    );
+  }
+
+  /// The held lines behind the "pre-orders to confirm" count. The cards above
+  /// the queue show only how MANY items each party is holding; this is what
+  /// they actually picked, which is what the yes/no is about.
+  Future<void> _heldPreorders() {
+    final text = Theme.of(context).textTheme;
+    return _detailSheet(
+      context,
+      eyebrow: 'Waiting on a yes or no',
+      title: 'Held pre-orders',
+      children: [
+        for (final raw in _pendingPreorders.whereType<Map>()) ...[
+          Text(
+            [_s(raw, 'name'), if (_s(raw, 'table_name', '').isNotEmpty) _s(raw, 'table_name', '')]
+                .join(' · '),
+            style: text.titleSmall,
+          ),
+          for (final it in (raw['pre_order'] as List?)?.whereType<Map>() ?? const <Map>[])
+            _detailRow(context, '${_s(it, 'name')} ×${_int(it['quantity']) ?? 1}',
+                _numOf(it['price']) > 0 ? _money(it['price']) : '—'),
+          const SizedBox(height: AppSpacing.md),
+        ],
+      ],
+    );
+  }
+
   Widget _emptyPanel() => EmptyState(
         icon: Icons.hourglass_empty,
         title: _tab == 1 ? 'Nobody waiting for a table' : 'Queue is empty',
@@ -15801,8 +17267,15 @@ class _WaitlistViewState extends State<_WaitlistView> {
 
   Future<void> _copyLink() async {
     final messenger = ScaffoldMessenger.of(context);
-    await Clipboard.setData(ClipboardData(text: _queueUrl));
-    messenger.showSnackBar(const SnackBar(content: Text('Queue link copied')));
+    // Claiming "copied" before knowing it worked is a lie a host only discovers
+    // when they paste nothing into their WhatsApp. Report the failure instead.
+    try {
+      await Clipboard.setData(ClipboardData(text: _queueUrl));
+      messenger.showSnackBar(const SnackBar(content: Text('Queue link copied')));
+    } catch (_) {
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Could not copy the link — select it and copy manually.')));
+    }
   }
 
   /// Only figures GET /waitlist actually supports. "Served today" and "no-shows
@@ -15811,16 +17284,22 @@ class _WaitlistViewState extends State<_WaitlistView> {
   Widget _summaryCard(List ordered, List called) => ForkCard(
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           const SectionHeader(title: 'Queue summary', padding: EdgeInsets.only(bottom: 10)),
-          _summaryRow('Total in queue', '${ordered.length}', 'groups'),
-          _summaryRow('Guests waiting', '${_guestCount(ordered)}', 'people'),
-          _summaryRow('Notified', '${called.length}', 'groups'),
-          _summaryRow('Pre-orders to confirm', '${_pendingPreorders.length}', 'holds'),
+          // Each figure drills into the set it counts; a figure counting nothing
+          // stays inert rather than offering a tap onto an empty sheet.
+          _summaryRow('Total in queue', '${ordered.length}', 'groups',
+              onTap: ordered.isEmpty ? null : () => _wholeQueue(ordered)),
+          _summaryRow('Guests waiting', '${_guestCount(ordered)}', 'people',
+              onTap: ordered.isEmpty ? null : () => _guestsWaiting(ordered)),
+          _summaryRow('Notified', '${called.length}', 'groups',
+              onTap: called.isEmpty ? null : () => setState(() { _tab = 1; _showAll = false; })),
+          _summaryRow('Pre-orders to confirm', '${_pendingPreorders.length}', 'holds',
+              onTap: _pendingPreorders.isEmpty ? null : _heldPreorders),
         ]),
       );
 
-  Widget _summaryRow(String label, String figure, String unit) {
+  Widget _summaryRow(String label, String figure, String unit, {VoidCallback? onTap}) {
     final text = Theme.of(context).textTheme;
-    return Padding(
+    final row = Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Wrap(
         alignment: WrapAlignment.spaceBetween,
@@ -15839,6 +17318,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
         ],
       ),
     );
+    return onTap == null ? row : _TapRow(onTap: onTap, child: row);
   }
 
   Widget _toBeSeatedCard(List called) {
@@ -15875,7 +17355,12 @@ class _WaitlistViewState extends State<_WaitlistView> {
 
   Widget _seatSoonRow(Map e) {
     final text = Theme.of(context).textTheme;
-    return Padding(
+    // The rail line carries a name and a headcount; the party sheet carries the
+    // phone to call them back on and whatever they pre-ordered. Read-only, like
+    // the queue row — seating still happens from the row's "..." menu.
+    return _TapRow(
+      onTap: () => _openParty(e),
+      child: Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Row(children: [
         InitialsAvatar(initials: _guestInitials(_s(e, 'name', '')), size: 30),
@@ -15899,6 +17384,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
           decoration: const BoxDecoration(color: AppColors.warning, shape: BoxShape.circle),
         ),
       ]),
+      ),
     );
   }
 
@@ -16798,6 +18284,107 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
     }
   }
 
+  /// The whole PO: who it is with, what was asked for, what actually arrived,
+  /// what it cost and when each step happened.
+  ///
+  /// `GET /purchase-orders` already returns the same record `GET
+  /// /purchase-orders/:id` does — same `mapPurchaseOrder` on the server — so
+  /// this reads the row in hand rather than fetching it again.
+  ///
+  /// Only the two forward-moving actions are repeated here. Cancel and Delete
+  /// stay on the card alone: a sheet the owner opened to READ must not put a
+  /// destructive control under the next tap.
+  Future<void> _openPo(Map po) {
+    final text = Theme.of(context).textTheme;
+    final status = _s(po, 'status', 'draft');
+    final items = (po['items'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    final ordered = items.fold<double>(0, (s, it) => s + _numOf(it['qty_ordered']));
+    final received = items.fold<double>(0, (s, it) => s + _numOf(it['qty_received']));
+    final quality = _int(po['quality_rating']);
+    final notes = _s(po, 'notes', '');
+    final expected = _s(po, 'expected_date', '');
+    final canReceive = status == 'ordered' || status == 'draft';
+
+    String qty(double v) => v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(2);
+
+    // Built through a Builder so the button closes the SHEET's route: these
+    // children are handed to _detailSheet as widgets, so a captured page context
+    // would be popping from outside the dialog it lives in.
+    Widget action(Widget Function(BuildContext) build) => Padding(
+          padding: const EdgeInsets.only(top: AppSpacing.sm),
+          child: Builder(builder: build),
+        );
+
+    return _detailSheet(
+      context,
+      eyebrow: 'Purchase order · $status',
+      title: _s(po, 'vendor_name', 'Unassigned vendor'),
+      // Inventory reads no focus key, so nothing is forwarded — a target it
+      // cannot resolve would land the owner there under a "not in this list".
+      jumpTo: 'Inventory',
+      children: [
+        _detailRow(context, 'Status', status),
+        _detailRow(context, 'Total cost', _money(po['total_cost'])),
+        _detailRow(context, 'Received', '${qty(received)} of ${qty(ordered)}',
+            trailing: ordered > 0 ? '${(received / ordered * 100).toStringAsFixed(0)}%' : null),
+        if (quality != null && quality > 0) _detailRow(context, 'Delivery quality', '$quality of 5'),
+        Padding(
+          padding: const EdgeInsets.only(top: 14, bottom: 2),
+          child: Text('LINES (${items.length})', style: text.labelSmall),
+        ),
+        if (items.isEmpty)
+          Text('This order has no lines.', style: text.bodySmall)
+        else
+          for (final it in items)
+            _detailRow(
+              context,
+              _s(it, 'name', 'Item'),
+              _money(_numOf(it['qty_ordered']) * _numOf(it['unit_cost'])),
+              // What was asked for and what turned up, on the same line — a
+              // short delivery is the thing a PO is opened to check.
+              trailing: '${qty(_numOf(it['qty_ordered']))} × ${_money(it['unit_cost'])}'
+                  ' · ${qty(_numOf(it['qty_received']))} in',
+            ),
+        Padding(
+          padding: const EdgeInsets.only(top: 14, bottom: 2),
+          child: Text('DATES', style: text.labelSmall),
+        ),
+        if (_s(po, 'created_at', '').isNotEmpty) _detailRow(context, 'Raised', _fmtTime(_s(po, 'created_at'))),
+        if (_s(po, 'created_by', '').isNotEmpty) _detailRow(context, 'Raised by', _s(po, 'created_by')),
+        if (_s(po, 'ordered_at', '').isNotEmpty) _detailRow(context, 'Placed', _fmtTime(_s(po, 'ordered_at'))),
+        if (expected.isNotEmpty) _detailRow(context, 'Expected', expected),
+        if (_s(po, 'received_at', '').isNotEmpty) _detailRow(context, 'Received on', _fmtTime(_s(po, 'received_at'))),
+        if (notes.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.only(top: 14, bottom: 2),
+            child: Text('NOTES', style: text.labelSmall),
+          ),
+          Text(notes, style: text.bodySmall),
+        ],
+        if (status == 'draft')
+          action((ctx) => ForkButton.ghost(
+                label: 'Place this order',
+                icon: Icons.send_outlined,
+                dense: true,
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _setStatus(po, 'ordered');
+                },
+              )),
+        if (canReceive)
+          action((ctx) => ForkButton(
+                label: 'Receive stock',
+                icon: Icons.inventory_2_outlined,
+                dense: true,
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _receivePo(po);
+                },
+              )),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
@@ -16849,9 +18436,14 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
       padding: const EdgeInsets.only(bottom: 14),
       child: ForkCard(
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        // The card summarises; the sheet is where the lines, the short
+        // deliveries and the dates live. The action row below keeps its own
+        // buttons, so this tap never resolves to Cancel or Delete.
+        onTap: () => _openPo(po),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Container(
+          _recordHeadRow(
+            context,
+            leading: Container(
               width: 40,
               height: 40,
               decoration: BoxDecoration(
@@ -16861,36 +18453,33 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
               ),
               child: const Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.textTertiary),
             ),
-            const SizedBox(width: AppSpacing.md),
-            Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(_s(po, 'vendor_name', 'Unassigned vendor'),
-                    style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                const SizedBox(height: 6),
-                Wrap(spacing: 6, runSpacing: 6, children: [
-                  InfoChip(icon: Icons.inventory_2_outlined, label: '${items.length} item(s)'),
-                  InfoChip(
-                    icon: Icons.call_received,
-                    label: '${received.toStringAsFixed(0)}/${ordered.toStringAsFixed(0)} received',
-                  ),
-                ]),
+            identity: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(_s(po, 'vendor_name', 'Unassigned vendor'),
+                  style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 6),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                InfoChip(icon: Icons.inventory_2_outlined, label: '${items.length} item(s)'),
+                InfoChip(
+                  icon: Icons.call_received,
+                  label: '${received.toStringAsFixed(0)}/${ordered.toStringAsFixed(0)} received',
+                ),
               ]),
-            ),
-            const SizedBox(width: AppSpacing.md),
-            MicroStat(value: _money(po['total_cost']), label: 'total', alignEnd: true),
-            const SizedBox(width: 14),
-            AnimatedSwitcher(
-              duration: AppDurations.base,
-              switchInCurve: Curves.easeOut,
-              switchOutCurve: Curves.easeIn,
-              child: StatusChip(
-                key: ValueKey('po-${po['id']}-$status'),
-                label: status,
-                color: _statusColor(status),
-                dense: narrow,
+            ]),
+            trailing: [
+              MicroStat(value: _money(po['total_cost']), label: 'total', alignEnd: true),
+              AnimatedSwitcher(
+                duration: AppDurations.base,
+                switchInCurve: Curves.easeOut,
+                switchOutCurve: Curves.easeIn,
+                child: StatusChip(
+                  key: ValueKey('po-${po['id']}-$status'),
+                  label: status,
+                  color: _statusColor(status),
+                  dense: narrow,
+                ),
               ),
-            ),
-          ]),
+            ],
+          ),
           const SizedBox(height: AppSpacing.md),
           Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
             if (status == 'draft')
@@ -17091,6 +18680,40 @@ class _AttendanceViewState extends State<_AttendanceView> {
       widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin') ||
       widget.profile.role == 'manager' || widget.profile.roleAll.contains('manager');
 
+  /// Per-employee punctuality, keyed by employee id, resolved at most once per
+  /// screen and only when a sheet that shows it is actually opened.
+  ///
+  /// GET /attendance carries hours and shift counts but nothing to judge a START
+  /// TIME against — "late" needs a baseline, and the median first clock-in that
+  /// defines it is computed by /analytics/advanced. That is a second request, so
+  /// it is not paid on page load for a screen whose own data is already here.
+  Future<({Map<String, Map> byEmp, String? error})>? _punctualityOnce;
+
+  /// The advanced-analytics read is gated on the SAME action id the backend
+  /// guards it with, so a login without it is told plainly rather than sent to
+  /// collect a 403.
+  bool get _canReadPunctuality =>
+      _holdsAction(widget.profile, _analyticsPermissionId) && widget.profile.featureEnabled('analytics');
+
+  /// Resolves to a RESULT, never to an error. The future is created while a
+  /// sheet's children are being built and is only subscribed to a frame later,
+  /// when the dialog mounts — so a failure landing in that gap (offline, an
+  /// instant 403) would be an unhandled async error rather than the message the
+  /// builder is there to show.
+  Future<({Map<String, Map> byEmp, String? error})> _punctuality() =>
+      _punctualityOnce ??= widget.rest.getMap('/analytics/advanced?days=30').then(
+        (m) => (
+          byEmp: <String, Map>{
+            for (final r in (m['staff_attendance'] as List?) ?? const [])
+              // emp_id is what StaffAttendanceStat carries; employee_id is read
+              // too so a row from the other staff-analytics shape still keys.
+              if (r is Map) '${r['emp_id'] ?? r['employee_id'] ?? ''}': r,
+          }..remove(''),
+          error: null,
+        ),
+        onError: (Object e) => (byEmp: <String, Map>{}, error: '$e'),
+      );
+
   @override
   void initState() {
     super.initState();
@@ -17155,14 +18778,90 @@ class _AttendanceViewState extends State<_AttendanceView> {
     }
   }
 
+  /// Punctuality for one employee, filled in when the analytics read lands.
+  ///
+  /// A [FutureBuilder] INSIDE the sheet rather than an await before it opens:
+  /// everything else on these sheets is already in hand, and making the tap wait
+  /// on the network to show data the screen already holds is the worse trade.
+  ///
+  /// [baselineOnly] is the shift view — just the median start this person's
+  /// clock-ins are measured against, so a single shift can be read against it.
+  /// The full block is the roll-up view, and every verdict in it ("late", "absent")
+  /// is the SERVER's: none is recomputed here, because a threshold duplicated in
+  /// the client is a threshold that will one day disagree with the payslip.
+  Widget _punctualityBlock(String empId, {bool baselineOnly = false}) {
+    if (empId.isEmpty) return const SizedBox.shrink();
+    final text = Theme.of(context).textTheme;
+    if (!_canReadPunctuality) {
+      return Text('Punctuality needs the analytics permission, which this login does not hold.',
+          style: text.bodySmall);
+    }
+    return FutureBuilder<({Map<String, Map> byEmp, String? error})>(
+      future: _punctuality(),
+      builder: (context, snap) {
+        final small = Theme.of(context).textTheme.bodySmall;
+        final done = snap.data;
+        if (done == null) return Text('Reading punctuality…', style: small);
+        // Reported, never swallowed: an empty block here is indistinguishable
+        // from "this person is never late", which is the opposite claim.
+        if (done.error != null) {
+          return Text("Punctuality couldn't be loaded: ${done.error}", style: small);
+        }
+        final r = done.byEmp[empId];
+        final typical = r == null ? '' : _s(r, 'typical_start', '');
+        final hasBaseline = typical.isNotEmpty && typical != '—';
+        if (baselineOnly) {
+          return Text(
+            hasBaseline
+                ? 'This person usually starts around $typical — the median first clock-in '
+                    'over the last 30 days, in restaurant time.'
+                : 'No usual start time yet: too few worked days in the last 30 to set a '
+                    'baseline, so this clock-in cannot be called early or late.',
+            style: small,
+          );
+        }
+        if (r == null) {
+          return Text('No punctuality record in the last 30 days.', style: small);
+        }
+        final late = _int(r['late_shifts']) ?? 0;
+        final latePct = r['late_pct'];
+        final absent = _int(r['absent_days']) ?? 0;
+        final excused = _int(r['leave_days']) ?? 0;
+        final present = _int(r['days_present']) ?? 0;
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          _kv('Usual start', hasBaseline ? typical : 'No baseline yet'),
+          _kv('Late starts',
+              hasBaseline
+                  ? '$late${latePct == null ? '' : ' · ${_numOf(latePct).toStringAsFixed(0)}% of shifts'}'
+                  : '—'),
+          _kv('Days present', '$present'),
+          _kv('Excused by leave', '$excused'),
+          _kv('Absent, unexplained', '$absent'),
+          const SizedBox(height: 10),
+          Text(
+            'Late is measured against this person\'s own usual start, not a rota — '
+            'there is no scheduled start time in the system to compare against. '
+            'Approved leave is already taken out of the absent count.',
+            style: small,
+          ),
+        ]);
+      },
+    );
+  }
+
   /// The full record behind a pending-approval card: who, when they clocked in
   /// (restaurant time, spelled out with its offset), whether the shift is still
-  /// open, how long it has run — and the review actions themselves, so the
-  /// decision can be made from the detail rather than from the summary row.
+  /// open, how long it has run, the baseline it can be read against — and the
+  /// review actions themselves, so the decision can be made from the detail
+  /// rather than from the summary row.
   void _pendingSheet(Map m) {
     final clockIn = _s(m, 'clock_in', '');
     final clockOut = _s(m, 'clock_out', '');
     final mins = _shiftMinutes(clockIn, clockOut);
+    // 16h is the cap payroll and staff analytics both credit a single shift at,
+    // so past it this screen's length and every other figure for the same shift
+    // stop agreeing. Almost always a missed clock-out rather than a real shift.
+    final runaway = clockOut.isEmpty && mins != null && mins > 16 * 60;
     _detailSheet(
       context,
       eyebrow: 'Attendance · pending approval',
@@ -17172,6 +18871,17 @@ class _AttendanceViewState extends State<_AttendanceView> {
         _kv('Clocked out', clockOut.isEmpty ? 'Still on shift' : RestaurantTime.stamp(clockOut)),
         _kv('Length', mins == null ? '—' : '${_hm(mins)}${clockOut.isEmpty ? ' so far' : ''}'),
         _kv('Status', 'Awaiting approval'),
+        const SizedBox(height: 14),
+        _punctualityBlock(_s(m, 'emp_id', ''), baselineOnly: true),
+        if (runaway) ...[
+          const SizedBox(height: 10),
+          Text(
+            'Still open after more than 16 hours. Payroll and staff analytics both '
+            'credit a shift at 16 hours, so approving this as it stands records a '
+            'length nothing else will agree with — check for a missed clock-out first.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.warning),
+          ),
+        ],
         const SizedBox(height: 14),
         Text(
           'Approving keeps the clock-in time above exactly as recorded — the '
@@ -17207,6 +18917,11 @@ class _AttendanceViewState extends State<_AttendanceView> {
   /// minutes, shift count, whether one is open — so this states exactly that
   /// and the window it covers. There is no per-shift endpoint behind it and no
   /// action a manager can take on a total, so none is offered.
+  ///
+  /// The punctuality block is what stops this from being the row read twice:
+  /// hours and shifts are on the card, but whether those shifts started on time
+  /// and how many open days went unexplained are not, and cannot be — they come
+  /// from a different read (see [_punctualityBlock]).
   void _teamSheet(Map m) {
     final mins = (num.tryParse('${m['minutes'] ?? 0}') ?? 0).toInt();
     final shifts = (num.tryParse('${m['shifts'] ?? 0}') ?? 0).toInt();
@@ -17227,6 +18942,92 @@ class _AttendanceViewState extends State<_AttendanceView> {
           'Totals count approved shifts only — a pending or rejected clock-in '
           'adds nothing here. An open shift is counted up to this moment.',
           style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        SectionHeader(title: 'Punctuality — last 30 days', padding: const EdgeInsets.only(bottom: 8)),
+        _punctualityBlock(_s(m, 'emp_id', '')),
+      ],
+    );
+  }
+
+  /// The people behind a summary tile. Each row opens that person's own detail,
+  /// so the tile leads to the set AND the set leads on — a list that dead-ends
+  /// is the same complaint one level down.
+  void _peopleSheet({
+    required String eyebrow,
+    required String title,
+    required String note,
+    required List rows,
+    required String Function(Map) subOf,
+    required String Function(Map) trailingOf,
+    required void Function(Map) open,
+  }) {
+    _detailSheet(
+      context,
+      eyebrow: eyebrow,
+      title: title,
+      children: [
+        Text(note, style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        for (final x in rows)
+          if (x is Map)
+            _sheetRecordRow(
+              context,
+              title: _s(x, 'name', 'Employee'),
+              sub: subOf(x),
+              trailing: trailingOf(x),
+              onTap: () {
+                // Replace rather than stack: two dialogs deep, "Close" would
+                // drop the reader back onto a list they have finished with.
+                Navigator.of(context).pop();
+                open(x);
+              },
+            ),
+      ],
+    );
+  }
+
+  /// My own day. The card above states the total and the strip below states
+  /// "clocked in since 18:40"; what neither can hold is the FULL stamp with its
+  /// offset, what the total does and does not count, and my own punctuality.
+  void _mySheet() {
+    final clockedIn = _me['clocked_in'] == true;
+    final since = _s(_me, 'since', '');
+    final mins = (num.tryParse('${_me['today_minutes'] ?? 0}') ?? 0).toInt();
+    _detailSheet(
+      context,
+      eyebrow: 'Attendance · my day',
+      title: RestaurantTime.day(RestaurantTime.todayIso()),
+      children: [
+        _kv('Hours today', _hm(mins)),
+        _kv('Right now', clockedIn ? 'On shift' : 'Off shift'),
+        _kv('Since', since.isEmpty ? '—' : RestaurantTime.stamp(since)),
+        _kv('Timezone', RestaurantTime.zoneLabel()),
+        if (_me['pending_approval'] == true) _kv('Approval', 'One clock-in today is awaiting review'),
+        const SizedBox(height: 14),
+        Text(
+          'Every shift you started today is added together. A rejected clock-in is '
+          'left out; an open shift is counted up to this moment, so this figure '
+          'keeps rising while you are on it.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        SectionHeader(title: 'My punctuality — last 30 days', padding: const EdgeInsets.only(bottom: 8)),
+        _punctualityBlock(widget.profile.employeeId),
+        const SizedBox(height: 14),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton(
+            label: clockedIn ? 'Clock out' : 'Clock in',
+            icon: clockedIn ? Icons.logout : Icons.login,
+            dense: true,
+            onPressed: _busy
+                ? null
+                : () {
+                    Navigator.of(context).pop();
+                    _toggle(!clockedIn);
+                  },
+          ),
         ),
       ],
     );
@@ -17281,6 +19082,7 @@ class _AttendanceViewState extends State<_AttendanceView> {
             caption: 'HOURS TODAY',
             tag: clockedIn ? 'On shift' : null,
             tagColor: AppColors.copperHi,
+            onTap: _mySheet,
           ),
           if (_isManager)
             StatCard(
@@ -17288,12 +19090,54 @@ class _AttendanceViewState extends State<_AttendanceView> {
               caption: 'PENDING APPROVALS',
               tag: _pending.isNotEmpty ? 'Review' : null,
               tagColor: AppColors.warning,
+              // Nothing waiting is nothing to open. An empty list behind a tap
+              // is the dead end the tap was added to remove, so at zero this
+              // reads as the plain number it is — no cursor, no lift, no chevron.
+              onTap: _pending.isEmpty
+                  ? null
+                  : () => _peopleSheet(
+                        eyebrow: 'Attendance · pending approval',
+                        title: '${_pending.length} clock-in${_pending.length == 1 ? '' : 's'} awaiting review',
+                        note: 'Each one is already recorded — approving confirms the time as '
+                            'clocked, it does not set it. Open a name to review it.',
+                        rows: _pending,
+                        subOf: (x) {
+                          final t = _fmtTime(_s(x, 'clock_in', ''));
+                          return x['clock_out'] == null
+                              ? 'In $t · still on shift'
+                              : 'In $t · out ${_fmtTime(_s(x, 'clock_out', ''))}';
+                        },
+                        trailingOf: (x) {
+                          final mins = _shiftMinutes(_s(x, 'clock_in', ''), _s(x, 'clock_out', ''));
+                          return mins == null ? '' : _hm(mins);
+                        },
+                        open: _pendingSheet,
+                      ),
             ),
           if (_isManager)
-            StatCard(value: '$onShiftNow', caption: 'ON SHIFT NOW'),
+            StatCard(
+              value: '$onShiftNow',
+              caption: 'ON SHIFT NOW',
+              onTap: onShiftNow == 0
+                  ? null
+                  : () => _peopleSheet(
+                        eyebrow: 'Attendance · on shift',
+                        title: '$onShiftNow on shift now',
+                        note: 'Clocked in with no clock-out yet, over ${_from.isEmpty ? 'the summarised window' : '${_fmtDay(_from)} – ${_fmtDay(_to)}'}. '
+                            'Hours shown are this window\'s total, not the open shift alone.',
+                        rows: [for (final t in _team) if ((t as Map)['open'] == true) t],
+                        subOf: (x) => '${x['shifts'] ?? 0} shift${_int(x['shifts']) == 1 ? '' : 's'} in the window',
+                        trailingOf: (x) => _hm((num.tryParse('${x['minutes'] ?? 0}') ?? 0).toInt()),
+                        open: _teamSheet,
+                      ),
+            ),
         ], narrow ? 1 : (_isManager ? 3 : 1)),
         const SizedBox(height: 14),
         ForkCard(
+          // Same detail as the tile above it. The clock button keeps its own tap
+          // — a control inside a tappable card still wins its own gesture — so
+          // this adds a way to read the day without changing how to record it.
+          onTap: _mySheet,
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
               AnimatedContainer(
@@ -17370,40 +19214,41 @@ class _AttendanceViewState extends State<_AttendanceView> {
                 // full timestamps, how long it has run, and the same review
                 // actions — is one tap away.
                 onTap: () => _pendingSheet(m),
-                child: Row(children: [
-                  InitialsAvatar(initials: initialsOf(_s(m, 'name', '')), color: AppColors.warning),
-                  const SizedBox(width: AppSpacing.md),
-                  Expanded(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(_s(m, 'name', 'Employee'),
-                          style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      const SizedBox(height: 6),
-                      Wrap(spacing: 6, runSpacing: 6, children: [
-                        if (label.isNotEmpty) InfoChip(icon: Icons.login, label: 'In $label'),
-                        AnimatedSwitcher(
-                          duration: AppDurations.base,
-                          switchInCurve: Curves.easeOut,
-                          switchOutCurve: Curves.easeIn,
-                          child: m['clock_out'] == null
-                              ? StatusChip(
-                                  key: ValueKey('att-${m['id']}-on'),
-                                  label: 'On shift',
-                                  color: AppColors.copper,
-                                  dense: true)
-                              : StatusChip(
-                                  key: ValueKey('att-${m['id']}-ended'),
-                                  label: 'Shift ended',
-                                  color: AppColors.neutral,
-                                  dense: true),
-                        ),
-                      ]),
+                // The two review buttons are non-flex, so on a 390px phone at
+                // 1.3x they took 43px more than the row had and the name column
+                // could not give it back. Stacked, both halves get the width.
+                child: _recordHeadRow(
+                  context,
+                  leading: InitialsAvatar(initials: initialsOf(_s(m, 'name', '')), color: AppColors.warning),
+                  identity: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                    Text(_s(m, 'name', 'Employee'),
+                        style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const SizedBox(height: 6),
+                    Wrap(spacing: 6, runSpacing: 6, children: [
+                      if (label.isNotEmpty) InfoChip(icon: Icons.login, label: 'In $label'),
+                      AnimatedSwitcher(
+                        duration: AppDurations.base,
+                        switchInCurve: Curves.easeOut,
+                        switchOutCurve: Curves.easeIn,
+                        child: m['clock_out'] == null
+                            ? StatusChip(
+                                key: ValueKey('att-${m['id']}-on'),
+                                label: 'On shift',
+                                color: AppColors.copper,
+                                dense: true)
+                            : StatusChip(
+                                key: ValueKey('att-${m['id']}-ended'),
+                                label: 'Shift ended',
+                                color: AppColors.neutral,
+                                dense: true),
+                      ),
                     ]),
-                  ),
-                  const SizedBox(width: AppSpacing.md),
-                  ForkButton(label: 'Approve', icon: Icons.check, dense: true, onPressed: () => _review(m, true)),
-                  const SizedBox(width: AppSpacing.sm),
-                  ForkButton.ghost(label: 'Reject', icon: Icons.close, dense: true, onPressed: () => _review(m, false)),
-                ]),
+                  ]),
+                  trailing: [
+                    ForkButton(label: 'Approve', icon: Icons.check, dense: true, onPressed: () => _review(m, true)),
+                    ForkButton.ghost(label: 'Reject', icon: Icons.close, dense: true, onPressed: () => _review(m, false)),
+                  ],
+                ),
               ),
             );
           }),
@@ -17424,26 +19269,25 @@ class _AttendanceViewState extends State<_AttendanceView> {
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   // Tap for the roll-up behind the two figures on the row.
                   onTap: () => _teamSheet(m),
-                  child: Row(children: [
-                    InitialsAvatar(initials: initialsOf(_s(m, 'name', ''))),
-                    const SizedBox(width: AppSpacing.md),
-                    Expanded(
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text(_s(m, 'name', 'Employee'),
-                            style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                        const SizedBox(height: 6),
-                        Wrap(spacing: 6, runSpacing: 6, children: [
-                          InfoChip(icon: Icons.event_repeat, label: '${m['shifts'] ?? 0} shifts'),
-                        ]),
+                  // Same trap as the pending row: an hours total long enough to
+                  // matter ("16460h 54m") plus a chip is more than the trailing
+                  // slot has on a phone, and neither can shrink.
+                  child: _recordHeadRow(
+                    context,
+                    leading: InitialsAvatar(initials: initialsOf(_s(m, 'name', ''))),
+                    identity: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                      Text(_s(m, 'name', 'Employee'),
+                          style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 6),
+                      Wrap(spacing: 6, runSpacing: 6, children: [
+                        InfoChip(icon: Icons.event_repeat, label: '${m['shifts'] ?? 0} shifts'),
                       ]),
-                    ),
-                    const SizedBox(width: AppSpacing.md),
-                    MicroStat(value: _hm(mins), label: 'hours', alignEnd: true),
-                    if (open) ...[
-                      const SizedBox(width: 14),
-                      const StatusChip(label: 'On shift', color: AppColors.copper, dense: true),
+                    ]),
+                    trailing: [
+                      MicroStat(value: _hm(mins), label: 'hours', alignEnd: true),
+                      if (open) const StatusChip(label: 'On shift', color: AppColors.copper, dense: true),
                     ],
-                  ]),
+                  ),
                 ),
               );
             }),
@@ -17648,7 +19492,7 @@ class _OutletsViewState extends State<_OutletsView> {
   /// Nothing new is offered: switching keeps the admin/manager gate the app-bar
   /// switcher holds, and edit / activate / delete are the same calls the card's
   /// menu makes, which the backend gates on its own.
-  void _outletSheet(Map o, {double? revenue}) {
+  void _outletSheet(Map o, {double? revenue, int? orders}) {
     final isDefault = o['is_default'] == true;
     final active = o['is_active'] != false;
     final current = _isCurrentOutlet(o);
@@ -17663,6 +19507,10 @@ class _OutletsViewState extends State<_OutletsView> {
         _kv('Phone', _s(o, 'outlet_phone', '—')),
         _kv('Hours', _s(o, 'outlet_hours', '—')),
         _kv('Revenue (30d)', revenue == null ? 'Not in the roll-up' : '₹${revenue.toStringAsFixed(0)}'),
+        _kv('Orders (30d)', orders == null ? 'Not in the roll-up' : '$orders'),
+        _kv('Average order', (revenue == null || orders == null || orders == 0)
+            ? '—'
+            : '₹${(revenue / orders).toStringAsFixed(0)}'),
         const SizedBox(height: 14),
         Wrap(spacing: 8, runSpacing: 8, children: [
           if (_canSwitchOutlet && !current)
@@ -17711,6 +19559,61 @@ class _OutletsViewState extends State<_OutletsView> {
     );
   }
 
+  /// The 30-day roll-up keyed by outlet id — the join both the cards and the
+  /// stat drill-downs read, so a branch cannot be ranked on one figure here and
+  /// shown another there.
+  Map<String, Map> get _rollupById => <String, Map>{
+        for (final o in (_rollup['outlets'] as List?) ?? const [])
+          if (o is Map) _s(o, 'outlet_id', ''): o,
+      }..remove('');
+
+  /// Every branch behind one group figure, ranked by it, each row opening that
+  /// outlet's own detail — the tile leads to the set and the set leads on.
+  ///
+  /// A branch the roll-up did not return says so rather than reading as a zero
+  /// nobody reported, and it sorts last instead of claiming the bottom rank.
+  void _branchesSheet({
+    required String title,
+    required String note,
+    required double Function(Map roll) rankBy,
+    required String Function(Map? roll) trailingOf,
+    required String Function(Map? roll) subOf,
+  }) {
+    final roll = _rollupById;
+    final rows = [for (final o in _outlets) if (o is Map) o];
+    rows.sort((a, b) {
+      final ra = roll['${a['id']}'], rb = roll['${b['id']}'];
+      if (ra == null || rb == null) return ra == null ? (rb == null ? 0 : 1) : -1;
+      return rankBy(rb).compareTo(rankBy(ra));
+    });
+    _detailSheet(
+      context,
+      eyebrow: 'Multi-outlet · last 30 days',
+      title: title,
+      children: [
+        Text(note, style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        for (final o in rows)
+          _sheetRecordRow(
+            context,
+            title: _s(o, 'outlet_name', 'Outlet'),
+            badge: _isCurrentOutlet(o)
+                ? const StatusChip(label: 'Viewing', color: AppColors.copper, dense: true)
+                : (o['is_active'] == false
+                    ? const StatusChip(label: 'Inactive', color: AppColors.neutral, dense: true)
+                    : null),
+            sub: subOf(roll['${o['id']}']),
+            trailing: trailingOf(roll['${o['id']}']),
+            onTap: () {
+              Navigator.of(context).pop();
+              final r = roll['${o['id']}'];
+              _outletSheet(o, revenue: r == null ? null : _numOf(r['revenue']), orders: r == null ? null : _int(r['orders']));
+            },
+          ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
@@ -17727,6 +19630,8 @@ class _OutletsViewState extends State<_OutletsView> {
 
     final text = Theme.of(context).textTheme;
     final narrow = MediaQuery.sizeOf(context).width < 760;
+    final outletHint =
+        _canSwitchOutlet ? 'Tap an outlet for details and to switch' : 'Tap an outlet for details';
     final totals = (_rollup['totals'] as Map?) ?? {};
     final rollupOutlets = (_rollup['outlets'] as List?) ?? [];
     String money(double v) => '₹${v.toStringAsFixed(0)}';
@@ -17734,17 +19639,24 @@ class _OutletsViewState extends State<_OutletsView> {
     final compare = rollupOutlets
         .map((o) => (label: _s(o as Map, 'name', 'Outlet'), value: n(o['revenue'])))
         .toList();
-    // Per-outlet 30d revenue keyed by name (the rollup rows carry no id).
-    final revenueByName = <String, double>{
-      for (final o in rollupOutlets) _s(o as Map, 'name', ''): n(o['revenue']),
-    };
+    // Keyed on outlet_id, which the roll-up does carry. Keyed on NAME — as this
+    // was — two branches sharing a name collapse onto one entry and both cards
+    // show the second one's takings.
+    final rollupById = <String, Map>{
+      for (final o in rollupOutlets)
+        if (o is Map) _s(o, 'outlet_id', ''): o,
+    }..remove('');
 
     final outletCards = _outlets.map<Widget>((x) {
       final o = x as Map;
       final isDefault = o['is_default'] == true;
       final active = o['is_active'] != false;
       final current = _isCurrentOutlet(o);
-      final rev = revenueByName[_s(o, 'outlet_name', '')];
+      final roll = rollupById['${o['id']}'];
+      final rev = roll == null ? null : n(roll['revenue']);
+      // Already fetched with the revenue and never shown until now — a branch's
+      // order count is half of what "how is it doing" means.
+      final orders = roll == null ? null : (_int(roll['orders']) ?? 0);
       return ForkCard(
         // Copper selection ring marks the outlet the app is scoped to — always
         // paired with the labelled "Viewing" chip (never colour alone).
@@ -17752,7 +19664,7 @@ class _OutletsViewState extends State<_OutletsView> {
         // Every outlet opens its detail — including the one being viewed, which
         // had no tap at all before. Switching lives inside it, and on the card's
         // own "Open" button for whoever is allowed to switch.
-        onTap: () => _outletSheet(o, revenue: rev),
+        onTap: () => _outletSheet(o, revenue: rev, orders: orders),
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
           Row(children: [
@@ -17829,20 +19741,27 @@ class _OutletsViewState extends State<_OutletsView> {
             ),
           ]),
           const SizedBox(height: 12),
+          // A Wrap inside the flex, not a row of non-flex stats behind a Spacer.
+          // Phone and hours are free text with no length cap on the way in, and
+          // MicroStat's ChipLabel only ellipsises when something above it sets a
+          // width — which a Row full of intrinsic children never does. Four
+          // stats and a button did not fit 390px at 1.3x. Both free-text values
+          // are also cut to a glanceable length here; the sheet has them whole.
           Row(children: [
-            if (rev != null) ...[
-              MicroStat(value: money(rev), label: 'revenue (30d)'),
-              const SizedBox(width: AppSpacing.xl),
-            ],
-            if (_s(o, 'outlet_phone').isNotEmpty) ...[
-              MicroStat(value: _s(o, 'outlet_phone'), label: 'phone'),
-              const SizedBox(width: AppSpacing.xl),
-            ],
-            if (_s(o, 'outlet_hours').isNotEmpty)
-              MicroStat(value: _s(o, 'outlet_hours'), label: 'hours'),
-            const Spacer(),
-            if (_canSwitchOutlet && !current)
+            Expanded(
+              child: Wrap(spacing: AppSpacing.xl, runSpacing: AppSpacing.sm, children: [
+                if (rev != null) MicroStat(value: money(rev), label: 'revenue (30d)'),
+                if (orders != null) MicroStat(value: '$orders', label: 'orders (30d)'),
+                if (_s(o, 'outlet_phone').isNotEmpty)
+                  MicroStat(value: _capped(_s(o, 'outlet_phone'), 20), label: 'phone'),
+                if (_s(o, 'outlet_hours').isNotEmpty)
+                  MicroStat(value: _capped(_s(o, 'outlet_hours'), 20), label: 'hours'),
+              ]),
+            ),
+            if (_canSwitchOutlet && !current) ...[
+              const SizedBox(width: AppSpacing.sm),
               ForkButton.ghost(label: 'Open', icon: Icons.login, dense: true, onPressed: () => _switchToOutlet(o)),
+            ],
           ]),
         ]),
       );
@@ -17857,23 +19776,74 @@ class _OutletsViewState extends State<_OutletsView> {
           trailing: ForkButton(label: 'Add outlet', icon: Icons.add, dense: true, onPressed: () => _outletDialog()),
         ),
         _dashGrid([
+          // Deliberately inert. Its drill-down would be the list of branches —
+          // which is the grid at the bottom of this very page, already carrying
+          // each outlet's status and already opening each one's detail. A tap
+          // here would show the same set twice and teach nothing.
           StatCard(value: '${totals['outlets'] ?? _outlets.length}', caption: 'BRANCHES'),
-          StatCard(value: money(n(totals['revenue'])), caption: 'REVENUE (30D)'),
-          StatCard(value: '${totals['orders'] ?? 0}', caption: 'ORDERS (30D)'),
+          StatCard(
+            value: money(n(totals['revenue'])),
+            caption: 'REVENUE (30D)',
+            // Nothing in the roll-up is nothing to break down: the read is
+            // optional (it 403s without the outlet-admin permission) and a
+            // failed one must not leave a tap that opens an empty list.
+            onTap: rollupOutlets.isEmpty
+                ? null
+                : () => _branchesSheet(
+                      title: 'Revenue by branch',
+                      note: 'Every branch of this restaurant, best-earning first. Cancelled '
+                          'orders are already excluded. Share is of the group total.',
+                      rankBy: (r) => n(r['revenue']),
+                      trailingOf: (r) => r == null ? '' : money(n(r['revenue'])),
+                      subOf: (r) {
+                        if (r == null) return 'Not in the 30-day roll-up';
+                        final total = n(totals['revenue']);
+                        final share = total <= 0 ? '' : '${(n(r['revenue']) / total * 100).toStringAsFixed(0)}% of group · ';
+                        final ord = _int(r['orders']) ?? 0;
+                        return '$share$ord order${ord == 1 ? '' : 's'}';
+                      },
+                    ),
+          ),
+          StatCard(
+            value: '${totals['orders'] ?? 0}',
+            caption: 'ORDERS (30D)',
+            onTap: rollupOutlets.isEmpty
+                ? null
+                : () => _branchesSheet(
+                      title: 'Orders by branch',
+                      note: 'Every branch of this restaurant, busiest first. Cancelled orders '
+                          'are already excluded, so this is orders actually served.',
+                      rankBy: (r) => (_int(r['orders']) ?? 0).toDouble(),
+                      trailingOf: (r) => r == null ? '' : '${_int(r['orders']) ?? 0}',
+                      subOf: (r) {
+                        if (r == null) return 'Not in the 30-day roll-up';
+                        final ord = _int(r['orders']) ?? 0;
+                        final total = _int(totals['orders']) ?? 0;
+                        final share = total <= 0 ? '' : '${(ord / total * 100).toStringAsFixed(0)}% of group · ';
+                        return '${share}average ${ord == 0 ? '—' : money(n(r['revenue']) / ord)} per order';
+                      },
+                    ),
+          ),
         ], narrow ? 1 : 3),
         const SizedBox(height: AppSpacing.lg),
         if (compare.length > 1) ...[
           _chartCard(context, 'Revenue by outlet — last 30 days', _barChart(context, compare, money)),
           const SizedBox(height: AppSpacing.lg),
         ],
+        // The hint drops UNDER the title on a narrow window. SectionHeader lays
+        // its trailing slot out at intrinsic width, and this sentence wanted
+        // 146px more than a 390px phone has — pushing the header off the right
+        // edge. Below the title it has the whole width and needs no truncating.
         SectionHeader(
           title: 'Manage outlets',
-          padding: const EdgeInsets.only(top: 8, bottom: 10),
-          trailing: Text(
-            _canSwitchOutlet ? 'Tap an outlet for details and to switch' : 'Tap an outlet for details',
-            style: text.bodySmall,
-          ),
+          padding: EdgeInsets.only(top: 8, bottom: narrow ? 4 : 10),
+          trailing: narrow ? null : Text(outletHint, style: text.bodySmall),
         ),
+        if (narrow)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Text(outletHint, style: text.bodySmall),
+          ),
         _dashGrid(outletCards, narrow ? 1 : 2),
       ]),
     );
@@ -18918,6 +20888,22 @@ String _leaveRange(Map l) {
   return from == to ? _fmtDay(from) : '${_fmtDay(from)} – ${_fmtDay(to)}';
 }
 
+/// Longest span the server will accept in one request (LEAVE_MAX_DAYS). Mirrored
+/// here only to WARN before submitting — the server stays the authority, so a
+/// cap that moves there loosens on its own instead of leaving this screen
+/// refusing something the backend would have taken.
+const int _leaveMaxDays = 366;
+
+/// Whole days from [fromKey] to [toKey] inclusive — the same count the server
+/// stores as `days`. Both are zone-free "YYYY-MM-DD" keys, so this is plain UTC
+/// arithmetic and cannot land on a DST half-day.
+int _leaveDayCount(String fromKey, String toKey) {
+  final a = DateTime.tryParse('${fromKey}T00:00:00Z');
+  final b = DateTime.tryParse('${toKey}T00:00:00Z');
+  if (a == null || b == null || b.isBefore(a)) return 0;
+  return b.difference(a).inDays + 1;
+}
+
 /// Whether [dayKey] falls inside this leave's inclusive range. String compare is
 /// exact for "YYYY-MM-DD" and needs no zone of its own — both sides are already
 /// restaurant calendar days.
@@ -19013,6 +20999,22 @@ Future<void> _requestLeave(
                   ),
                 ),
               ]),
+              const SizedBox(height: 6),
+              // The pickers span a year either side, so a range longer than the
+              // server accepts is selectable — and a mistyped year used to be
+              // submitted only to come back a 400. Say the length up front.
+              Builder(builder: (_) {
+                final days = _leaveDayCount(from, to);
+                final over = days > _leaveMaxDays;
+                return Text(
+                  over
+                      ? '$days days — one request cannot span more than $_leaveMaxDays. '
+                          'Shorten the range, or file it in parts.'
+                      : '$days day${days == 1 ? '' : 's'}, both ends included.',
+                  style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                      color: over ? AppColors.danger : AppColors.textTertiary),
+                );
+              }),
               const SizedBox(height: AppSpacing.md),
               TextField(
                 controller: reason,
@@ -19073,6 +21075,95 @@ Future<void> _decideLeave(
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e'), backgroundColor: AppColors.danger));
   }
+}
+
+/// What a leave's status means for the person's ATTENDANCE record, in words.
+///
+/// Only an APPROVED leave is subtracted from absences (getStaffAttendanceStats
+/// does the subtracting, and it filters on `approved`). So a leave still waiting
+/// on a decision over days that have already gone by is, right now, reading as
+/// unexplained absence — and that is the one thing the register must not let a
+/// reader assume the other way.
+String _leaveAbsenceEffect(Map l, String todayKey) {
+  final status = _s(l, 'status', 'requested');
+  final started = _s(l, 'start_day', '').compareTo(todayKey) <= 0;
+  return switch (status) {
+    'approved' => 'Approved, so every day in this range is excluded from this '
+        'person\'s absence count — an excused day is not an absence.',
+    'rejected' => 'Rejected, so none of these days is excused. Any the person did '
+        'not clock in for counts as an unexplained absence.',
+    _ when started => 'Still awaiting a decision. Attendance only excuses APPROVED '
+        'leave, so the days in this range that have already passed are counting as '
+        'unexplained absences until somebody decides it.',
+    _ => 'Still awaiting a decision. Nothing is excused until it is approved.',
+  };
+}
+
+/// The whole record behind one leave, with the decisions the viewer is permitted.
+///
+/// The register row leads with who, what type and when; what it cannot hold is
+/// who filed it and who signed it off (with the stamp), the reason in full, and
+/// what the status currently means for the absence count.
+void _leaveSheet(
+  BuildContext context,
+  RestClient rest,
+  Map l, {
+  required bool canReview,
+  required VoidCallback reload,
+}) {
+  final status = _s(l, 'status', 'requested');
+  final days = _int(l['days']) ?? 1;
+  final reason = _s(l, 'reason', '');
+  final filedBy = _s(l, 'requested_by_name', '');
+  final decidedBy = _s(l, 'decided_by_name', '');
+  final decidedAt = _s(l, 'decided_at', '');
+  final createdAt = _s(l, 'created_at', '');
+  final text = Theme.of(context).textTheme;
+  _detailSheet(
+    context,
+    eyebrow: 'Leave · $status',
+    title: _s(l, 'employee_name', 'Employee'),
+    children: [
+      _kv('Type', _leaveTypeLabel(_s(l, 'leave_type', ''))),
+      _kv('Dates', _leaveRange(l)),
+      _kv('Days', '$days day${days == 1 ? '' : 's'}'),
+      _kv('Status', status),
+      _kv('Reason', reason.isEmpty || reason == '—' ? 'None given' : reason),
+      _kv('Filed by', filedBy.isEmpty || filedBy == '—' ? 'Not recorded' : filedBy),
+      _kv('Filed on', createdAt.isEmpty ? '—' : RestaurantTime.stamp(createdAt)),
+      _kv('Decided by', decidedBy.isEmpty || decidedBy == '—' ? 'Not decided yet' : decidedBy),
+      _kv('Decided on', decidedAt.isEmpty ? '—' : RestaurantTime.stamp(decidedAt)),
+      const SizedBox(height: 14),
+      Text(
+        _leaveAbsenceEffect(l, RestaurantTime.todayIso()),
+        style: text.bodySmall?.copyWith(
+            color: status == 'requested' ? AppColors.warning : AppColors.textSecondary),
+      ),
+      if (canReview && status == 'requested') ...[
+        const SizedBox(height: 14),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          ForkButton(
+            label: 'Approve',
+            icon: Icons.check,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _decideLeave(context, rest, l, true, reload);
+            },
+          ),
+          ForkButton.ghost(
+            label: 'Reject',
+            icon: Icons.close,
+            dense: true,
+            onPressed: () {
+              Navigator.of(context).pop();
+              _decideLeave(context, rest, l, false, reload);
+            },
+          ),
+        ]),
+      ],
+    ],
+  );
 }
 
 /// One leave in the detail sheet, with its decision controls when the viewer
@@ -19581,6 +21672,11 @@ Widget _leaveTeamRow(
     child: ForkCard(
       inset: true,
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      // The row summarises; the sheet carries who filed it, who signed it off
+      // and when, and what the status means for the absence count. Approve and
+      // reject stay on their own buttons below — a decision must never be what
+      // a stray tap on a list does.
+      onTap: () => _leaveSheet(context, rest, l, canReview: canReview, reload: reload),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         // Wrapped for the same reason as the scoring boards: a status chip and a
         // long name do not share one narrow row at a raised text scale.
@@ -19704,6 +21800,40 @@ List<Widget> _leaveSection(
     return ls.length > 2 ? '$first +${ls.length - 2}' : first;
   }
 
+  /// The leaves behind one count, each row opening its own record. Null when the
+  /// set is empty, which leaves that tile genuinely inert — [_metricTile] then
+  /// draws no chevron, no hover lift and no click cursor, because a tap onto
+  /// "nothing here" is the dead end these drill-downs exist to remove.
+  VoidCallback? openList(String title, String note, List<Map> ls) {
+    if (ls.isEmpty) return null;
+    return () => _detailSheet(
+          context,
+          eyebrow: 'Leave',
+          title: title,
+          children: [
+            Text(note, style: text.bodySmall),
+            const SizedBox(height: AppSpacing.lg),
+            for (final l in ls)
+              _sheetRecordRow(
+                context,
+                title: nameOf(l),
+                badge: StatusChip(
+                    label: _s(l, 'status', 'requested'),
+                    color: _leaveStatusColor(_s(l, 'status', '')),
+                    dense: true),
+                sub: '${_leaveTypeLabel(_s(l, 'leave_type', ''))} · ${_leaveRange(l)} · '
+                    '${_int(l['days']) ?? 1} day${(_int(l['days']) ?? 1) == 1 ? '' : 's'}',
+                onTap: () {
+                  // Replace rather than stack: from two dialogs deep, "Close"
+                  // would drop the reader back onto a list they are done with.
+                  Navigator.of(context).pop();
+                  _leaveSheet(context, rest, l, canReview: canReview, reload: reload);
+                },
+              ),
+          ],
+        );
+  }
+
   return [
     // The filing control sits UNDER the counts rather than in the header's
     // trailing slot: SectionHeader lays trailing out at its intrinsic width, so
@@ -19715,18 +21845,33 @@ List<Widget> _leaveSection(
           icon: Icons.beach_access_outlined,
           accent: onLeave.isEmpty ? AppColors.copperHi : AppColors.info,
           value: '${onLeave.length}',
-          sub: onLeave.isEmpty ? 'everyone is in' : names(onLeave)),
+          sub: onLeave.isEmpty ? 'everyone is in' : names(onLeave),
+          onTap: openList(
+              'On leave today',
+              'Approved leave covering ${_fmtDay(today)}. These days are already excluded '
+                  'from each person\'s absence count.',
+              onLeave)),
       _metricTile(context,
           label: 'awaiting decision',
           icon: Icons.pending_actions,
           accent: pending.isEmpty ? AppColors.copperHi : AppColors.warning,
           value: '${pending.length}',
-          sub: pending.isEmpty ? 'nothing to review' : names(pending)),
+          sub: pending.isEmpty ? 'nothing to review' : names(pending),
+          onTap: openList(
+              'Awaiting decision',
+              'Filed and not yet decided. Until one is approved its days are NOT excused — '
+                  'any that have already passed are counting as unexplained absences.',
+              pending)),
       _metricTile(context,
           label: 'booked ahead',
           icon: Icons.event_available,
           value: '${ahead.length}',
-          sub: ahead.isEmpty ? 'nothing booked' : 'next ${_leaveRange(ahead.first)}'),
+          sub: ahead.isEmpty ? 'nothing booked' : 'next ${_leaveRange(ahead.first)}',
+          onTap: openList(
+              'Booked ahead',
+              'Approved leave starting after ${_fmtDay(today)}, earliest first. Leave already '
+                  'running is counted under "on leave today" instead.',
+              ahead)),
     ], metricColumns),
     const SizedBox(height: AppSpacing.lg),
     if (canReview) ...[
