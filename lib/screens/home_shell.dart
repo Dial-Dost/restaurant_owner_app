@@ -610,15 +610,34 @@ class _HomeShellState extends State<HomeShell> {
                   duration: AppDurations.base,
                   curve: Curves.easeInOut,
                   width: _sidebarCollapsed ? 68 : 224,
-                  decoration: BoxDecoration(
-                    // A SCRIM, not a panel. bgDeep is 0xFF060607 — near black —
-                    // so even at 82% it swallowed the wash and the rail still
-                    // read as a separate dark slab. At 0.34 the glow carries
-                    // through the top of the rail the way it does the app bar,
-                    // and the gradient's own darkening pass keeps the lower rail
-                    // dark enough for the nav labels regardless.
-                    color: AppColors.bgDeep.withValues(alpha: 0.34),
-                    border: const Border(right: BorderSide(color: AppColors.divider)),
+                  decoration: const BoxDecoration(
+                    // The rail carries the glow down its WHOLE height, not just
+                    // the part the hero wash happens to reach. The backdrop's
+                    // wash stops at 42% of the window, so a flat scrim left the
+                    // lower rail plain black and the warmth looked like it had
+                    // been cut off mid-way rather than fading out.
+                    //
+                    // Its own gradient instead: a translucent scrim at the top so
+                    // the hero reads through, deepening to a warm — never neutral
+                    // — floor. The bottom stop is glowDeep at 10%, which is dark
+                    // enough for the nav labels and still visibly not grey.
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color(0x4D080605),
+                        // Carries a little glow of its own. Without it the rail
+                        // pinched cool in the middle — the hero wash has faded by
+                        // there and the floor glow has not started, so measured
+                        // warmth dropped to R-B +3 between two bands sitting at
+                        // +30 and +22. A gradient that cools in its own middle
+                        // reads as a seam.
+                        Color(0x94140D0A),
+                        Color(0x1A7C2D12),
+                      ],
+                      stops: [0.0, 0.52, 1.0],
+                    ),
+                    border: Border(right: BorderSide(color: AppColors.divider)),
                   ),
                   child: _navList(visible, p, inDrawer: false, collapsed: _sidebarCollapsed),
                 ),

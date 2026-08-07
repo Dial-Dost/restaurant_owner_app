@@ -10,14 +10,22 @@ import 'package:flutter/material.dart';
 ///    with a text label (and usually a dot).
 abstract final class AppColors {
   // ── Surfaces ────────────────────────────────────────────────────────
-  static const Color bg = Color(0xFF0A0A0B);
-  static const Color bgDeep = Color(0xFF060607);
-  static const Color surface = Color(0xFF121214);
-  static const Color card = Color(0xFF17171A);
-  static const Color cardTop = Color(0xFF1B1B1F);
-  static const Color cardBottom = Color(0xFF141416);
-  static const Color cardRaised = Color(0xFF1E1E23);
-  static const Color inset = Color(0xFF0E0E10);
+  // Warm-neutral, not grey. Every one of these used to lean COOL — B was higher
+  // than R in all eight (bg -1, cardRaised -5) — which is invisible on a black
+  // page and reads as grey the moment a warm backdrop sits behind it. They now
+  // lean warm by the same small amount, tilted toward the glow* orange.
+  //
+  // The tilt raises R and drops B while HOLDING G, which carries ~72% of
+  // relative luminance: every surface below moves by less than 0.0006, so no
+  // contrast ratio measured against these changes.
+  static const Color bg = Color(0xFF0C0A09);
+  static const Color bgDeep = Color(0xFF080605);
+  static const Color surface = Color(0xFF151211);
+  static const Color card = Color(0xFF1B1716);
+  static const Color cardTop = Color(0xFF201B1A);
+  static const Color cardBottom = Color(0xFF181412);
+  static const Color cardRaised = Color(0xFF231E1E);
+  static const Color inset = Color(0xFF110E0D);
 
   // ── Strokes ─────────────────────────────────────────────────────────
   static const Color border = Color(0x12FFFFFF); //  7% white
