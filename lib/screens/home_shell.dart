@@ -611,11 +611,13 @@ class _HomeShellState extends State<HomeShell> {
                   curve: Curves.easeInOut,
                   width: _sidebarCollapsed ? 68 : 224,
                   decoration: BoxDecoration(
-                    // Translucent, not opaque: the backdrop's copper carries
-                    // through the rail so the wash is continuous across the top
-                    // of the window. Still dark enough that nav labels keep the
-                    // contrast they were measured at.
-                    color: AppColors.bgDeep.withValues(alpha: 0.82),
+                    // A SCRIM, not a panel. bgDeep is 0xFF060607 — near black —
+                    // so even at 82% it swallowed the wash and the rail still
+                    // read as a separate dark slab. At 0.34 the glow carries
+                    // through the top of the rail the way it does the app bar,
+                    // and the gradient's own darkening pass keeps the lower rail
+                    // dark enough for the nav labels regardless.
+                    color: AppColors.bgDeep.withValues(alpha: 0.34),
                     border: const Border(right: BorderSide(color: AppColors.divider)),
                   ),
                   child: _navList(visible, p, inDrawer: false, collapsed: _sidebarCollapsed),

@@ -30,6 +30,17 @@ abstract final class AppColors {
   static const Color textTertiary = Color(0xFF615E57);
 
   // ── Copper accent ramp (sequential, light -> dark) ─────────────────
+  // --- Backdrop orange -------------------------------------------------------
+  // The copper ramp above is DESATURATED (~0.47) — it is an ink and metal
+  // palette, and washing a whole screen in it reads as brown, not as the warm
+  // orange the guest ordering page and the app icon (#ea580c) actually use.
+  // These three are the brand orange walked darker while KEEPING its saturation
+  // (~0.85-0.94), so the backdrop can be dimmed without turning to mud.
+  // Backdrop only: controls and text keep the copper ramp.
+  static const Color glowBright = Color(0xFFC2410C);
+  static const Color glowMid = Color(0xFF9A3412);
+  static const Color glowDeep = Color(0xFF7C2D12);
+
   static const Color copperHi = Color(0xFFE3B89B);
   static const Color copper = Color(0xFFC9997A);
   static const Color copperMid = Color(0xFFA9795C);

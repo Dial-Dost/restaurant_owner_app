@@ -13,10 +13,12 @@ import '../theme/app_colors.dart';
 ///   2. a hero wash                              linear-gradient(150deg, accDeep, #0b0b0d 78%)
 ///   3. a bloom off the top-right corner         radial accHi @ .30 -> transparent 62%
 ///
-/// The copper runs a step DARKER than the web original (copperShadow for the
-/// wash, copperMid for the bloom rather than copperHi). The guest page is a
-/// phone held at arm's length for a few minutes; this is a desktop a manager
-/// stares at through a whole service, and the brighter mix read as glare.
+/// The wash uses the glow* tokens, NOT the copper ramp. Copper is an ink and
+/// metal palette at ~0.47 saturation; spread across a whole screen it reads as
+/// brown rather than as the warm orange the guest page and the app icon use.
+/// glowDeep/glowBright are the brand orange (#ea580c) walked darker with its
+/// saturation intact, so dimming it does not turn it to mud — which is exactly
+/// what happened when this was first darkened down the copper ramp.
 ///   4. a downward darkening pass                180deg, rgba(6,6,7,.15) -> .40 @45% -> .96
 ///   5. two ambient orbs, top-left / bottom-right, at .20 and .22
 ///
@@ -58,12 +60,12 @@ class GradientBackdrop extends StatelessWidget {
         Positioned(
           top: -120,
           left: -80,
-          child: _Orb(size: 360, color: AppColors.copperDeep, opacity: 0.20),
+          child: _Orb(size: 360, color: AppColors.glowMid, opacity: 0.22),
         ),
         Positioned(
           bottom: -140,
           right: -60,
-          child: _Orb(size: 340, color: AppColors.copperShadow, opacity: 0.22),
+          child: _Orb(size: 340, color: AppColors.glowDeep, opacity: 0.22),
         ),
 
         // 2 — the hero wash: copper at the top-left, gone by ~78% of its own height.
@@ -79,7 +81,7 @@ class GradientBackdrop extends StatelessWidget {
                 // are the same axis expressed the way Flutter wants it.
                 begin: Alignment(-0.7, -1),
                 end: Alignment(0.7, 1),
-                colors: [AppColors.copperShadow, Color(0xFF0B0B0D)],
+                colors: [AppColors.glowDeep, Color(0xFF0B0B0D)],
                 stops: [0.0, 0.78],
               ),
             ),
@@ -91,7 +93,7 @@ class GradientBackdrop extends StatelessWidget {
         Positioned(
           top: -120,
           right: -70,
-          child: _Orb(size: 340, color: AppColors.copperMid, opacity: 0.34, stop: 0.62),
+          child: _Orb(size: 340, color: AppColors.glowBright, opacity: 0.34, stop: 0.62),
         ),
 
         // 4 — the darkening pass that lands the wash back on the page colour.
