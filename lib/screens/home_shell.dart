@@ -598,8 +598,32 @@ class _HomeShellState extends State<HomeShell> {
       ),
       drawer: narrow
           ? Drawer(
-              backgroundColor: AppColors.bgDeep,
-              child: SafeArea(child: _navList(visible, p, inDrawer: true)),
+              // The phone's nav is a DRAWER, not the wide layout's rail, so the
+              // rail's gradient never applied here and mobile stayed flat black
+              // while desktop glowed.
+              //
+              // It cannot reuse the rail's stops either: those are translucent
+              // and composite over the backdrop, but a drawer floats ABOVE the
+              // page — translucency there shows the module scrolling through the
+              // menu. So these are the OPAQUE equivalents, taken from sampling
+              // what the desktop rail actually composites to, which is what keeps
+              // the two form factors looking like the same product.
+              backgroundColor: Colors.transparent,
+              child: DecoratedBox(
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0xFF3A170C),
+                      Color(0xFF1A0E0A),
+                      Color(0xFF23120B),
+                    ],
+                    stops: [0.0, 0.52, 1.0],
+                  ),
+                ),
+                child: SafeArea(child: _navList(visible, p, inDrawer: true)),
+              ),
             )
           : null,
       body: narrow
@@ -625,7 +649,15 @@ class _HomeShellState extends State<HomeShell> {
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
                       colors: [
-                        Color(0x4D080605),
+                        // FULLY transparent at the top so the rail and the app
+                        // bar are literally the same pixels there. The app bar
+                        // carries no scrim, so any scrim here started as a hard
+                        // step directly under it — which is the seam that made
+                        // the top bar read as a separate strip rather than part
+                        // of the page. Costs 5.61:1 -> 4.86:1 on secondary text,
+                        // still above the 4.5 floor, and it is the brightest row
+                        // of the rail so everything below only improves.
+                        Color(0x00080605),
                         // Carries a little glow of its own. Without it the rail
                         // pinched cool in the middle — the hero wash has faded by
                         // there and the floor glow has not started, so measured
