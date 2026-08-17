@@ -15,6 +15,13 @@ import 'modules.dart' as m;
 import '../widgets/module_navigator.dart';
 import '../widgets/notifications_bell.dart';
 
+/// The app-wide phone/narrow breakpoint.
+///
+/// 760 is not a new number: it is the one every module in `modules.dart` already
+/// spells inline (`MediaQuery.sizeOf(context).width < 760`, eight call sites).
+/// The shell's chrome now shares that edge instead of adding a ninth literal.
+const double kNarrowWidth = 760;
+
 class _Module {
   final String label;
   final IconData icon;
@@ -209,6 +216,64 @@ class _HomeShellState extends State<HomeShell> {
             checked: '${o['id']}' == activeId,
             child: Text('${o['outlet_name'] ?? 'Outlet'}${o['is_active'] == false ? ' (inactive)' : ''}'),
           ),
+      ],
+    );
+  }
+
+  // Phone chrome: the outlet switcher, Refresh and Sign out fold into ONE 48dp
+  // button so the app bar has room for the module name.
+  //
+  // Nothing is dropped and nothing is duplicated — the outlet entries are the
+  // same entries `_outletSwitcher` lists, going through the same `_selectOutlet`,
+  // and the combined-view signal survives the fold: when 'all' is active this
+  // button turns copper exactly as the dedicated switcher's icon does, and says
+  // so in its tooltip. (Shrinking the title until it fits was the alternative,
+  // and a module name nobody can read is not a fix.)
+  Widget _chromeOverflow() {
+    final multi = _outlets.length > 1;
+    final activeId = widget.auth.selectedOutletId ?? (_outlets.isNotEmpty ? '${_outlets.first['id']}' : '');
+    final isAll = multi && activeId == 'all';
+    final text = Theme.of(context).textTheme;
+    Widget entry(IconData icon, String label) => Row(children: [
+          Icon(icon, size: 16, color: AppColors.textSecondary),
+          const SizedBox(width: 10),
+          Text(label),
+        ]);
+    return PopupMenuButton<String>(
+      tooltip: isAll ? 'Viewing all outlets (combined)' : 'More',
+      color: AppColors.cardRaised,
+      icon: Icon(Icons.more_vert, color: isAll ? AppColors.copperHi : AppColors.textSecondary),
+      onSelected: (value) {
+        if (value == 'refresh') {
+          setState(() => _refreshTick++);
+        } else if (value == 'logout') {
+          widget.auth.logout();
+        } else if (value.startsWith('outlet:')) {
+          _selectOutlet(value.substring('outlet:'.length));
+        }
+      },
+      itemBuilder: (_) => [
+        if (multi) ...[
+          PopupMenuItem<String>(
+            enabled: false,
+            height: 34,
+            child: Text('OUTLET', style: text.labelSmall),
+          ),
+          CheckedPopupMenuItem<String>(
+            value: 'outlet:all',
+            checked: isAll,
+            child: const Text('All outlets (combined)'),
+          ),
+          for (final o in _outlets)
+            CheckedPopupMenuItem<String>(
+              value: 'outlet:${o['id']}',
+              checked: '${o['id']}' == activeId,
+              child: Text('${o['outlet_name'] ?? 'Outlet'}${o['is_active'] == false ? ' (inactive)' : ''}'),
+            ),
+          const PopupMenuDivider(),
+        ],
+        PopupMenuItem<String>(value: 'refresh', child: entry(Icons.refresh, 'Refresh')),
+        PopupMenuItem<String>(value: 'logout', child: entry(Icons.logout, 'Sign out')),
       ],
     );
   }
@@ -495,6 +560,13 @@ class _HomeShellState extends State<HomeShell> {
 
     // Phones / narrow windows: nav lives in a drawer instead of a fixed sidebar.
     final narrow = MediaQuery.of(context).size.width < 700;
+    // The app bar collapses its chrome a little EARLIER than the nav rail becomes
+    // a drawer, and deliberately on a different measure: the rail branch is about
+    // where a 224px column stops paying for itself, while this is about the one
+    // row that has to fit a module name AND every action. Four actions plus the
+    // drawer button spend 248dp of a 360dp phone, which left "Cash register" 48dp
+    // and painted it through the outlet icon.
+    final compactChrome = MediaQuery.of(context).size.width < kNarrowWidth;
 
     // Every module builds under a ModuleNavigator, so any of them can jump the
     // shell to another module, focus a record a notification pointed at, or
@@ -530,7 +602,7 @@ class _HomeShellState extends State<HomeShell> {
           actions: {_ShellEscapeIntent: _dismissAction},
           child: Focus(
             autofocus: true,
-            child: _scaffold(p, rest, current, visible, body, narrow),
+            child: _scaffold(p, rest, current, visible, body, narrow, compactChrome),
           ),
         ),
       ),
@@ -538,7 +610,7 @@ class _HomeShellState extends State<HomeShell> {
   }
 
   Widget _scaffold(Profile p, RestClient rest, _Module current, List<_Module> visible,
-      Widget body, bool narrow) {
+      Widget body, bool narrow, bool compactChrome) {
     return GradientBackdrop(
       child: Scaffold(
       key: _scaffoldKey,
@@ -556,20 +628,34 @@ class _HomeShellState extends State<HomeShell> {
           const SizedBox(width: 2),
           const Icon(Icons.auto_awesome, size: 14, color: AppColors.copperHi),
           const SizedBox(width: 8),
-          Text(current.label,
-              style: const TextStyle(
-                fontSize: 17,
-                fontWeight: FontWeight.w600,
-                letterSpacing: -0.2,
-                color: AppColors.textPrimary,
-              )),
+          // Expanded + ellipsis, never a bare intrinsic Text. An AppBar hands its
+          // middle slot a maxWidth, but a Row lays a non-flex child out at its
+          // natural width and PAINTS it past its own box — Flex clips nothing — so
+          // a long module name printed straight into the actions on the right.
+          // Flexing the label makes that collision impossible at any width: the
+          // worst case is a truncated word instead of two overlapping ones. On
+          // desktop the label is nowhere near the budget, so nothing moves.
+          Expanded(
+            child: Text(current.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -0.2,
+                  color: AppColors.textPrimary,
+                )),
+          ),
         ]),
         bottom: const PreferredSize(
           preferredSize: Size.fromHeight(1),
           child: Divider(height: 1, thickness: 1, color: AppColors.divider),
         ),
         actions: [
-          if (_outlets.length > 1) _outletSwitcher(),
+          // Wide chrome, unchanged: outlet switcher, bell, refresh, "Sign out".
+          // Narrow keeps only the bell — the one action that is time-sensitive and
+          // carries a count — and folds the other three into `_chromeOverflow`.
+          if (!compactChrome && _outlets.length > 1) _outletSwitcher(),
           NotificationsBell(
             rest: rest,
             onOpenModule: _openModule,
@@ -578,12 +664,14 @@ class _HomeShellState extends State<HomeShell> {
             onSwitchOutlet: _outlets.length > 1 ? _selectOutlet : null,
             visibleLabels: _visibleLabels,
           ),
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: () => setState(() => _refreshTick++),
-            icon: const Icon(Icons.refresh),
-          ),
-          if (!narrow)
+          if (compactChrome)
+            _chromeOverflow()
+          else ...[
+            IconButton(
+              tooltip: 'Refresh',
+              onPressed: () => setState(() => _refreshTick++),
+              icon: const Icon(Icons.refresh),
+            ),
             Padding(
               padding: const EdgeInsets.only(right: 8),
               child: TextButton.icon(
@@ -591,9 +679,8 @@ class _HomeShellState extends State<HomeShell> {
                 icon: const Icon(Icons.logout, size: 16),
                 label: const Text('Sign out'),
               ),
-            )
-          else
-            IconButton(tooltip: 'Sign out', onPressed: widget.auth.logout, icon: const Icon(Icons.logout)),
+            ),
+          ],
         ],
       ),
       drawer: narrow

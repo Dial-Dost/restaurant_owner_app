@@ -416,8 +416,10 @@ Widget _loadingSkeleton() => ListView(
 //
 // With [onTap] the tile becomes a control: the ForkCard hover lift plus a
 // copper "DETAILS ›" affordance so it reads as expandable rather than flat.
-Widget _statCard(BuildContext c, String label, String value, IconData icon, {VoidCallback? onTap}) => SizedBox(
-      width: 200,
+Widget _statCard(BuildContext c, String label, String value, IconData icon,
+        {VoidCallback? onTap, double width = 200}) =>
+    SizedBox(
+      width: width,
       child: StatCard(
         value: value,
         caption: label.toUpperCase(),
@@ -430,6 +432,61 @@ Widget _statCard(BuildContext c, String label, String value, IconData icon, {Voi
                 const Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
               ]),
       ),
+    );
+
+/// Card width for one fixed-width tile inside a `Wrap` that is [available] px
+/// wide, measured rather than guessed.
+///
+/// Same idiom as [_tableTileWidth] on the floor plan, for the same reason. A
+/// 200px stat tile needs 412px to sit two across; a 360px phone leaves 328 inside
+/// the page padding, so Analytics dropped to ONE tile per row and threw away 39%
+/// of every row — while the KPI tiles beside them (170px) went two across, so the
+/// same screen disagreed with itself. Below the threshold the tile takes half the
+/// row instead, so a phone is never one-up, and a desktop column is untouched
+/// because it still clears `preferred * 2 + gap`.
+double _statTileWidth(double available, {double preferred = 200, double gap = 12}) {
+  if (!available.isFinite || available >= preferred * 2 + gap) return preferred;
+  // One pixel of slack, floored to whole pixels: a fractional layout width must
+  // not be what pushes the second card onto its own row.
+  final half = ((available - gap - 1) / 2).floorToDouble();
+  return half < 120 ? 120 : half;
+}
+
+/// A `Wrap` of fixed-width tiles that measures itself against the row it is
+/// actually laid out in and hands the tile width back to [tiles].
+///
+/// [scaleValue] also steps the stat number down one stop of the SAME type scale
+/// (`displayMedium` -> `displaySmall`) once the tile is narrower than its design
+/// width. That is not cosmetic: [StatCard] renders its value with
+/// `TextOverflow.clip` and no ellipsis, so a 32px `₹1,23,456` in a 137px tile
+/// loses its last digits with no visual cue — the owner would read a different,
+/// smaller number and have no way to know.
+///
+/// Stepping the token down buys roughly a fifth of the width back, which is
+/// enough for the figures this app actually shows at 360dp and up. It is NOT a
+/// guarantee: at 320dp a large enough rupee value still clips, because the
+/// clipping lives in [StatCard] (frozen, in lib/ui/) and only an ellipsis or a
+/// shorter money string can close it completely. Nothing is hardcoded here and
+/// nothing changes at the 200px design width.
+Widget _tileWrap(
+  List<Widget> Function(double tile) tiles, {
+  double preferred = 200,
+  double gap = 12,
+  bool scaleValue = false,
+}) =>
+    LayoutBuilder(
+      builder: (context, box) {
+        final tile = _statTileWidth(box.maxWidth, preferred: preferred, gap: gap);
+        final wrap = Wrap(spacing: gap, runSpacing: gap, children: tiles(tile));
+        if (!scaleValue || tile >= preferred) return wrap;
+        final theme = Theme.of(context);
+        return Theme(
+          data: theme.copyWith(
+            textTheme: theme.textTheme.copyWith(displayMedium: theme.textTheme.displaySmall),
+          ),
+          child: wrap,
+        );
+      },
     );
 
 // Token-styled key/value row: letter-spaced micro key, quiet value. The value
@@ -8552,25 +8609,10 @@ class _KdsHomeState extends State<_KdsHome> {
   // empty board can say "they're in the other branch" instead of just "none"
   // (the KDS reads the same outlet-scoped /orders as the Orders grid).
   Map<String, dynamic> _scope = const {};
-  // The KDS is a wall-mounted board nobody touches, so it must refresh itself —
-  // previously a new, barked or served order never appeared until staff left the
-  // module and came back. We hold the CURRENT view's AsyncView reload callback
-  // and tick it, which refetches in place (no spinner flash, unlike remounting).
-  Timer? _poll;
-  VoidCallback? _reloadCurrent;
-
-  @override
-  void dispose() {
-    _poll?.cancel();
-    super.dispose();
-  }
 
   @override
   void initState() {
     super.initState();
-    _poll = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (mounted) {_reloadCurrent?.call();}
-    });
     widget.rest.getMap('/restaurant/settings').then((s) {
       final list = ((s['kitchen_sections'] as List?) ?? const [])
           .map((e) => '$e'.trim())
@@ -8606,10 +8648,15 @@ class _KdsHomeState extends State<_KdsHome> {
 
   Widget _ticketsView() => AsyncView<List>(
         load: () => widget.rest.getList('/orders'),
+        // The KDS is a wall-mounted board nobody touches, so it must refresh
+        // itself — a new, barked or served order used to sit invisible until staff
+        // left the module and came back. There is no realtime push for the kitchen
+        // anywhere in the product, so polling is the only honest option; the fix
+        // was making the poll SILENT (AsyncView.pollEvery), because ticking a
+        // plain reload swapped the whole board for the loading skeleton every ten
+        // seconds and threw a scrolled-to cook back to ticket one.
+        pollEvery: const Duration(seconds: 10),
         builder: (context, rows, reload) {
-          // Latest wins: whichever view (Tickets/Expo) is on screen is the one the
-          // poll refreshes.
-          _reloadCurrent = reload;
           // Pending orders are NOT yet approved → they must not reach the kitchen.
           final active = rows.where((o) {
             final s = _s(o as Map, 'status', 'Preparing').toLowerCase();
@@ -8721,35 +8768,14 @@ class _KdsHomeState extends State<_KdsHome> {
 
 // Expo/pass screen: one card per active table with ready-vs-pending counts and
 // item chips coloured by state (green served / amber preparing / grey held).
-class _ExpoView extends StatefulWidget {
+// The pass refreshes itself on the same silent ten-second tick as the ticket
+// board (AsyncView.pollEvery) — it is the same wall-mounted screen on another
+// tab, and it had the identical skeleton flash. Stateless because the timer now
+// belongs to the view it refreshes, which is also what stops it from firing
+// against a disposed State once staff switch back to Tickets.
+class _ExpoView extends StatelessWidget {
   final RestClient rest;
   const _ExpoView({required this.rest});
-
-  @override
-  State<_ExpoView> createState() => _ExpoViewState();
-}
-
-// Stateful only so the pass can refresh itself: it is a wall-mounted board, and
-// previously a newly served/barked item never appeared until staff navigated away
-// and back. Ticks the AsyncView's own reload so there is no spinner flash.
-class _ExpoViewState extends State<_ExpoView> {
-  RestClient get rest => widget.rest;
-  Timer? _poll;
-  VoidCallback? _reload;
-
-  @override
-  void initState() {
-    super.initState();
-    _poll = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (mounted) {_reload?.call();}
-    });
-  }
-
-  @override
-  void dispose() {
-    _poll?.cancel();
-    super.dispose();
-  }
 
   // Per-item pass chip — tinted pill whose state always ships with a label
   // (· HOLD / · NOT BARKED), never colour alone.
@@ -8783,8 +8809,8 @@ class _ExpoViewState extends State<_ExpoView> {
   @override
   Widget build(BuildContext context) => AsyncView<Map<String, dynamic>>(
         load: () => rest.getMap('/kds/expo'),
+        pollEvery: const Duration(seconds: 10),
         builder: (context, data, reload) {
-          _reload = reload;
           final tables = (data['tables'] as List?) ?? [];
           if (tables.isEmpty) return _empty('No active tables on the pass.');
           final text = Theme.of(context).textTheme;
@@ -12186,6 +12212,90 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
       },
     );
 
+/// The narrowest one [CopperColumns] column can be — 48px of column plus the
+/// chart's own fixed 8px gap.
+///
+/// This is geometry, not taste. That chart lays its columns out with `Expanded`
+/// and a `SizedBox(width: 8)` between each pair, and gives the value + axis label
+/// no `maxLines`. So a column narrower than its own labels wraps them, and a
+/// wrapped label overflows the fixed 140px box and paints over the card below
+/// (Flex clips nothing, so a release build shows no stripes — just the mess the
+/// owner reported). Worse, once the gaps alone exceed the width — 38 columns on a
+/// 292px phone — every `Expanded` gets zero width and the whole Row overflows
+/// sideways: the "Sales — daily" chart at the Quarter/Year presets rendered as
+/// solid nothing. 48px carries the widest label these charts actually produce (a
+/// 9-glyph money figure at 10px ≈ 47px, `dd/mm` at 9.5px ≈ 26px) on one line.
+const double _kColumnMinSlot = 56;
+
+/// How many [CopperColumns] columns fit honestly across [width]. n columns cost
+/// `n * 48 + (n - 1) * 8`, so the count is `(width + 8) / 56` floored.
+int _columnsThatFit(double width) =>
+    !width.isFinite || width <= 0 ? 0 : ((width + 8) / _kColumnMinSlot).floor();
+
+/// A chronological series drawn as columns where they fit, and as a barcode where
+/// they do not.
+///
+/// Above the width its columns need this is EXACTLY the [CopperColumns] the
+/// desktop has always drawn — same values, same labels, same taps — so nothing
+/// moves on a wide window. Below it the series is redrawn as a [CopperBarcode],
+/// which is the one chart in the system that cannot overflow by construction: it
+/// derives its own mark count from the width it is handed and resamples the
+/// series into that many bars (365 readings render clean at 292px). The first and
+/// last labels are printed under the strip so the time axis is not lost, and
+/// hover/tap still report a real reading rather than an interpolated fiction.
+Widget _columnSeries(
+  BuildContext context,
+  List<({String label, double value})> data, {
+  required String Function(double) fmt,
+  ValueChanged<int>? onTap,
+  String Function(int index)? tooltipBuilder,
+}) =>
+    LayoutBuilder(
+      builder: (context, box) {
+        if (data.length <= _columnsThatFit(box.maxWidth)) {
+          return CopperColumns(
+            values: [for (final d in data) d.value],
+            labels: [for (final d in data) d.label],
+            valueFormatter: fmt,
+            tooltipBuilder: tooltipBuilder,
+            onTap: onTap,
+          );
+        }
+        final text = Theme.of(context).textTheme;
+        // 120 + 6 + the label line lands on the same ~140px the column chart
+        // occupies, so swapping between the two does not jump the page.
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          CopperBarcode(
+            values: [for (final d in data) d.value],
+            height: 120,
+            onTap: onTap,
+            tooltipBuilder: tooltipBuilder,
+          ),
+          const SizedBox(height: 6),
+          Row(children: [
+            Expanded(
+              child: Text(data.first.label,
+                  style: text.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ),
+            Expanded(
+              child: Text('${data.length} points',
+                  textAlign: TextAlign.center,
+                  style: text.labelSmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis),
+            ),
+            Expanded(
+              child: Text(data.last.label,
+                  textAlign: TextAlign.end,
+                  style: text.labelSmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis),
+            ),
+          ]),
+        ]);
+      },
+    );
+
 // Single-hue copper chart for (label, value) rows. Long chronological series
 // render as template CopperColumns; short/ranked data reads best as an HBarRow
 // list (label always beside value — nothing is colour-alone).
@@ -12223,13 +12333,7 @@ Widget _barChart(
   }
 
   if (data.length >= 10) {
-    return CopperColumns(
-      values: [for (final d in data) d.value],
-      labels: [for (final d in data) d.label],
-      valueFormatter: fmt,
-      tooltipBuilder: hint,
-      onTap: open,
-    );
+    return _columnSeries(context, data, fmt: fmt, tooltipBuilder: hint, onTap: open);
   }
   final maxV = data.map((d) => d.value).fold<double>(0, (a, b) => b > a ? b : a);
   return Column(children: [
@@ -12477,10 +12581,14 @@ class _KpiDrilldownSheet extends StatelessWidget {
   // the time axis readable where a ranked bar list would scramble it.
   Widget _columns(BuildContext context, List<({String label, double value})> data) {
     final fmt = valueFormat ?? _fmtNum;
-    return CopperColumns(
-      values: [for (final d in data) d.value],
-      labels: [for (final d in data) d.label],
-      valueFormatter: fmt,
+    // Through the shared chooser: this sheet is the NARROWEST surface a column
+    // chart is drawn on (a bottom sheet's own 18px padding takes it to 324px on a
+    // 360px phone), so it is the last place that can afford to assume 14 columns
+    // fit.
+    return _columnSeries(
+      context,
+      data,
+      fmt: fmt,
       tooltipBuilder: (i) => '${data[i].label} · ${fmt(data[i].value)}',
       // Already inside the KPI's own detail view, so a tap surfaces the reading
       // rather than opening a second sheet on top of this one.
@@ -13411,8 +13519,13 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
           _KpiChartKind kind = _KpiChartKind.bar,
           String Function(double)? fmt,
           String? jumpTo,
+          // Handed down by the enclosing _tileWrap so the tile fits the row it is
+          // actually in. Defaults to the design width, which is what every other
+          // _statCard caller in this file still gets.
+          double width = 200,
         }) =>
             _statCard(context, label, value, icon,
+                width: width,
                 onTap: () => openMetric(label, value,
                     explainerKey: explainerKey,
                     note: note,
@@ -13469,8 +13582,9 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                 InfoChip(icon: Icons.calendar_today_outlined, label: _s(apc, 'month')),
               ]),
             ),
-            Wrap(spacing: 12, runSpacing: 12, children: [
+            _tileWrap(scaleValue: true, (tile) => [
               metricCard('Monthly APC', _money(apc['monthly_apc']), Icons.trending_up,
+                  width: tile,
                   explainerKey: 'apc',
                   note: '${apc['total_covers'] ?? 0} covers this month',
                   series: apcByMonth.isNotEmpty ? apcByMonth : staffApc,
@@ -13478,6 +13592,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   fmt: money,
                   jumpTo: 'sales'),
               metricCard('Revenue', _money(apc['total_revenue']), Icons.payments,
+                  width: tile,
                   explainerKey: 'revenue',
                   note: 'Last 14 days below · ${_s(apc, 'month')} to date above',
                   series: dailySeries,
@@ -13485,6 +13600,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   fmt: money,
                   jumpTo: 'sales'),
               metricCard('Covers', '${apc['total_covers'] ?? 0}', Icons.groups,
+                  width: tile,
                   explainerKey: 'covers',
                   note: coversByMonth.isEmpty ? null : 'By month, last 12 months',
                   series: coversByMonth,
@@ -13492,12 +13608,14 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   fmt: (v) => v.toStringAsFixed(0),
                   jumpTo: 'sales'),
               metricCard('Avg prep', _fmtDur(((timing['avg_prep_ms'] ?? 0) as num).toInt()), Icons.timer,
+                  width: tile,
                   explainerKey: 'avg_prep_ms',
                   note: kOrdersTimed == 0 ? null : '$kOrdersTimed tickets timed in the last $kitchenDays days',
                   series: kSectionAvg,
                   fmt: dur,
                   jumpTo: 'kitchen'),
               metricCard('Avg rating', '${fb['averageRating'] ?? 0}', Icons.star,
+                  width: tile,
                   explainerKey: 'avg_rating',
                   note: '${fb['totalResponses'] ?? 0} responses',
                   series: staffRating,
@@ -13520,7 +13638,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                         ],
                     ])),
             const SizedBox(height: 12),
-            Wrap(spacing: 10, runSpacing: 10, children: [
+            _tileWrap(preferred: 170, gap: 10, (tile) => [
               for (final kk in _applySort('kpis', visibleKpis, _kpiSortOpts, defaultDesc: false))
                 Builder(builder: (context) {
                   final k = kk;
@@ -13532,7 +13650,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       : _analyticsViews.firstWhere((e) => e.$1 == home, orElse: () => (home, home)).$2;
                   final text = Theme.of(context).textTheme;
                   return SizedBox(
-                    width: 170,
+                    width: tile,
                     child: ForkCard(
                       padding: const EdgeInsets.all(12),
                       onTap: () => showModalBottomSheet(
@@ -13759,14 +13877,16 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             else ...[
               // Order-level prep summary — durations formatted as "Xm Ys". Each
               // tile expands into the explainer + a per-station breakdown.
-              Wrap(spacing: 12, runSpacing: 12, children: [
+              _tileWrap(scaleValue: true, (tile) => [
                 metricCard('Avg prep time', _fmtDur(num0(kSummary['avg_prep_ms']).toInt()), Icons.timer,
+                    width: tile,
                     explainerKey: 'avg_prep_ms',
                     note: '$kOrdersTimed tickets timed · median ${_fmtDur(num0(kSummary['median_prep_ms']).toInt())}',
                     series: kSectionAvg,
                     fmt: dur,
                     jumpTo: kitchenFull ? null : 'kitchen'),
                 metricCard('P90 prep', _fmtDur(num0(kSummary['p90_prep_ms']).toInt()), Icons.speed,
+                    width: tile,
                     explainerKey: 'p90_prep_ms',
                     note: 'Slowest ticket ${_fmtDur(num0(kSummary['max_prep_ms']).toInt())}',
                     series: kDishP90.isNotEmpty ? kDishP90.take(8).toList() : kSectionP90,
@@ -13774,6 +13894,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                     jumpTo: kitchenFull ? null : 'kitchen'),
                 metricCard('Avg bark → served', _fmtDur(num0(kSummary['avg_bark_to_served_ms']).toInt()),
                     Icons.room_service_outlined,
+                    width: tile,
                     explainerKey: 'bark_to_served',
                     note: '$kOrdersTimed tickets timed',
                     series: kSectionAvg,
@@ -14268,24 +14389,28 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             if (attendance.isEmpty)
               _empty('No attendance recorded yet — staff clock-ins will show up here.')
             else ...[
-              Wrap(spacing: 12, runSpacing: 12, children: [
+              _tileWrap(scaleValue: true, (tile) => [
                 metricCard('Hours worked', hrs(num0(attSummary['total_hours'])), Icons.schedule,
+                    width: tile,
                     note: '${attSummary['total_shifts'] ?? 0} shifts across '
                         '${attSummary['staff_tracked'] ?? attendance.length} staff',
                     series: attHours,
                     fmt: hrs),
                 metricCard('Avg hours / staff', hrs(num0(attSummary['avg_hours_per_staff'])), Icons.av_timer,
+                    width: tile,
                     note: '${attSummary['operating_days'] ?? 0} operating days in the window',
                     series: attHours,
                     fmt: hrs),
                 metricCard('Shifts', '${attSummary['total_shifts'] ?? 0}', Icons.badge_outlined,
-                    note: 'Approved clock-ins only', series: attShifts),
+                    width: tile, note: 'Approved clock-ins only', series: attShifts),
                 metricCard('Late shifts', '${attSummary['late_shifts'] ?? 0}', Icons.running_with_errors_outlined,
+                    width: tile,
                     note: 'More than 15 min after that person’s typical start', series: attLate),
                 metricCard('Absent days', '${attSummary['absent_days'] ?? 0}', Icons.event_busy_outlined,
+                    width: tile,
                     note: 'Open days with no clock-in, after their first shift', series: attAbsent),
                 metricCard('Awaiting approval', '${attSummary['pending_shifts'] ?? 0}', Icons.pending_actions_outlined,
-                    note: 'Pending shifts do not count toward hours'),
+                    width: tile, note: 'Pending shifts do not count toward hours'),
               ]),
               const SizedBox(height: AppSpacing.lg),
               _sortHeader('Attendance by staff', 'attendance', _attendanceSortOpts, setLocal,
@@ -14661,6 +14786,10 @@ class _AccountingViewState extends State<_AccountingView> {
   String _payrollMonth = RestaurantTime.thisMonthIso();
   Map<String, dynamic> _payroll = {};
   Map<String, dynamic> _discounts = {};
+  // Scheduled report delivery. Not scoped to the period tabs above: a schedule
+  // is a standing instruction, not a figure cut over the selected window.
+  List _schedules = [];
+  List _deliveries = [];
 
   // Settled-bill browser. The list is paged by _ClosedBillsList itself; this
   // state only holds what the user filters it by. The term is applied on a
@@ -14708,6 +14837,8 @@ class _AccountingViewState extends State<_AccountingView> {
         widget.rest.getMap('/expenses?$q'),
         widget.rest.getMap('/payroll?month=$_payrollMonth').catchError((_) => <String, dynamic>{}),
         widget.rest.getMap('/reports/discounts?$q').catchError((_) => <String, dynamic>{}),
+        widget.rest.getMap('/reports/schedules').catchError((_) => <String, dynamic>{}),
+        widget.rest.getMap('/reports/deliveries?limit=20').catchError((_) => <String, dynamic>{}),
       ]);
       if (!mounted) return;
       setState(() {
@@ -14717,6 +14848,8 @@ class _AccountingViewState extends State<_AccountingView> {
         _expenses = (res[3]['expenses'] as List?) ?? [];
         _payroll = res[4];
         _discounts = res[5];
+        _schedules = (res[6]['schedules'] as List?) ?? [];
+        _deliveries = (res[7]['deliveries'] as List?) ?? [];
         _loading = false;
       });
     } catch (e) {
@@ -15693,6 +15826,626 @@ class _AccountingViewState extends State<_AccountingView> {
               ],
             ]),
           ),
+        const SizedBox(height: AppSpacing.xxl),
+        _ScheduledReportsCard(
+          rest: widget.rest,
+          schedules: _schedules,
+          deliveries: _deliveries,
+          reload: _load,
+        ),
+      ]),
+    );
+  }
+}
+
+// --- Scheduled report delivery ----------------------------------------------
+// The server builds these on its own and files each run's CSV against a
+// delivery row; the notification bell only says one is ready and points here.
+// That split is the backend's: GET /notifications is readable by every
+// authenticated employee, so no figure travels in the bell — which is why the
+// file is downloaded from this card and nowhere else.
+//
+// Only sales, P&L and GST can be scheduled. Those are the three reports scoped
+// to the restaurant's own calendar day, so "yesterday" means the same thing
+// here as in the file; the backend admits nothing else.
+const Map<String, String> _reportKeyLabels = {
+  'sales': 'Sales',
+  'pnl': 'Profit & loss',
+  'gst': 'GST / tax',
+};
+
+const Map<String, String> _reportFrequencyLabels = {
+  'daily': 'Every day',
+  'weekly': 'Every week',
+  'monthly': 'Every month',
+};
+
+// What each frequency actually covers, spelled out in the editor: a report that
+// runs at 08:00 covers YESTERDAY, and that is the kind of thing an owner
+// otherwise discovers by reconciling a file against the wrong day.
+const Map<String, String> _reportPeriodNotes = {
+  'daily': 'Covers the previous day.',
+  'weekly': 'Covers the seven days ending the day before it runs.',
+  'monthly': 'Covers the whole previous calendar month.',
+};
+
+// 0 = Sunday, matching the backend's weekday column.
+const List<String> _weekdayNames = [
+  'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
+];
+
+/// A delivery's status as the owner should read it. `claimed` means the run has
+/// been taken and nothing else may take it; `abandoned` is an occurrence that
+/// came due while the server was down past its catch-up window — recorded as a
+/// row rather than silently skipped, which is the whole point of the history.
+({String label, Color color}) _deliveryStatus(String status) {
+  switch (status) {
+    case 'delivered':
+      return (label: 'Delivered', color: AppColors.success);
+    case 'rendered':
+      return (label: 'Building', color: AppColors.info);
+    case 'claimed':
+      return (label: 'Queued', color: AppColors.neutral);
+    case 'failed':
+      return (label: 'Failed', color: AppColors.danger);
+    case 'abandoned':
+      return (label: 'Missed', color: AppColors.warning);
+  }
+  return (label: status, color: AppColors.neutral);
+}
+
+class _ScheduledReportsCard extends StatefulWidget {
+  final RestClient rest;
+  final List schedules;
+  final List deliveries;
+  final VoidCallback reload;
+  const _ScheduledReportsCard({
+    required this.rest,
+    required this.schedules,
+    required this.deliveries,
+    required this.reload,
+  });
+
+  @override
+  State<_ScheduledReportsCard> createState() => _ScheduledReportsCardState();
+}
+
+class _ScheduledReportsCardState extends State<_ScheduledReportsCard> {
+  bool _busy = false;
+
+  // "All outlets (combined)" is a READ-ONLY view — the backend rejects every
+  // non-GET request while it is active. This list is one of the few that widens
+  // in that mode (it returns every outlet's schedules), so leaving the write
+  // controls up would offer a button whose only possible outcome is a 400.
+  bool get _allOutlets => widget.rest.auth.selectedOutletId == 'all';
+
+  // "Every day at 08:00 Asia/Kolkata" — the zone is named because the hour is
+  // the RESTAURANT's wall clock, not the clock on whichever machine is reading
+  // this. An owner in another state would otherwise read it as their own.
+  String _whenLabel(Map s) {
+    final at = '${_two(_int(s['hour_local']) ?? 0)}:${_two(_int(s['minute_local']) ?? 0)} ${RestaurantTime.zone}';
+    final frequency = _s(s, 'frequency', 'daily');
+    if (frequency == 'weekly') {
+      final wd = _int(s['weekday']) ?? 0;
+      final name = wd >= 0 && wd < _weekdayNames.length ? _weekdayNames[wd] : 'week';
+      return 'Every $name at $at';
+    }
+    if (frequency == 'monthly') {
+      return 'Day ${_int(s['day_of_month']) ?? 1} of every month at $at';
+    }
+    return 'Every day at $at';
+  }
+
+  static String _two(int n) => n.toString().padLeft(2, '0');
+
+  String _periodLabel(Map d) {
+    final from = _s(d, 'period_from', '');
+    final to = _s(d, 'period_to', '');
+    if (from.isEmpty || to.isEmpty) return '';
+    return from == to ? _fmtDay(from) : '${_fmtDay(from)} – ${_fmtDay(to)}';
+  }
+
+  /// Whether a delivery came from "Run now" rather than from its schedule.
+  bool _isManualRun(Object? occurrenceKey) {
+    if (occurrenceKey is! String || occurrenceKey.isEmpty) return true;
+    return occurrenceKey.startsWith('manual:');
+  }
+
+  // Create and edit share one form: the backend takes the same shape on POST
+  // and PATCH, and merges an omitted field onto the existing row.
+  Future<void> _scheduleDialog({Map? existing}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final name = TextEditingController(text: existing == null ? '' : _s(existing, 'name', ''));
+    String reportKey = _s(existing ?? const {}, 'report_key', 'sales');
+    if (!_reportKeyLabels.containsKey(reportKey)) reportKey = 'sales';
+    String frequency = _s(existing ?? const {}, 'frequency', 'daily');
+    if (!_reportFrequencyLabels.containsKey(frequency)) frequency = 'daily';
+    int weekday = _int(existing?['weekday']) ?? 1;
+    int dayOfMonth = _int(existing?['day_of_month']) ?? 1;
+    int hour = _int(existing?['hour_local']) ?? 8;
+    int minute = _int(existing?['minute_local']) ?? 0;
+    // The quarter-hours plus whatever this row already holds. A schedule saved
+    // from another client at, say, :07 must still open in the dropdown rather
+    // than crash it with a value no item carries.
+    final minuteOptions = (<int>{0, 15, 30, 45, minute}.toList()..sort());
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            width: 400,
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              gradient: AppColors.cardGradient,
+              borderRadius: AppRadius.cardAll,
+              border: Border.all(color: AppColors.borderStrong),
+            ),
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('SCHEDULED REPORT', style: Theme.of(ctx).textTheme.labelSmall),
+                const SizedBox(height: 6),
+                Text(existing == null ? 'New schedule' : 'Edit schedule', style: Theme.of(ctx).textTheme.titleMedium),
+                const SizedBox(height: AppSpacing.lg),
+                TextField(
+                  controller: name,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Name (e.g. Morning sales)', isDense: true),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                DropdownButtonFormField<String>(
+                  initialValue: reportKey,
+                  dropdownColor: AppColors.cardRaised,
+                  borderRadius: AppRadius.controlAll,
+                  decoration: const InputDecoration(labelText: 'Report', isDense: true),
+                  items: [
+                    for (final e in _reportKeyLabels.entries)
+                      DropdownMenuItem(value: e.key, child: Text(e.value)),
+                  ],
+                  onChanged: (v) => setDlg(() => reportKey = v ?? 'sales'),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                DropdownButtonFormField<String>(
+                  initialValue: frequency,
+                  dropdownColor: AppColors.cardRaised,
+                  borderRadius: AppRadius.controlAll,
+                  decoration: const InputDecoration(labelText: 'How often', isDense: true),
+                  items: [
+                    for (final e in _reportFrequencyLabels.entries)
+                      DropdownMenuItem(value: e.key, child: Text(e.value)),
+                  ],
+                  onChanged: (v) => setDlg(() => frequency = v ?? 'daily'),
+                ),
+                if (frequency == 'weekly') ...[
+                  const SizedBox(height: AppSpacing.sm),
+                  DropdownButtonFormField<int>(
+                    initialValue: weekday,
+                    dropdownColor: AppColors.cardRaised,
+                    borderRadius: AppRadius.controlAll,
+                    decoration: const InputDecoration(labelText: 'Day of the week', isDense: true),
+                    items: [
+                      for (var i = 0; i < _weekdayNames.length; i++)
+                        DropdownMenuItem(value: i, child: Text(_weekdayNames[i])),
+                    ],
+                    onChanged: (v) => setDlg(() => weekday = v ?? 1),
+                  ),
+                ],
+                if (frequency == 'monthly') ...[
+                  const SizedBox(height: AppSpacing.sm),
+                  DropdownButtonFormField<int>(
+                    initialValue: dayOfMonth,
+                    dropdownColor: AppColors.cardRaised,
+                    borderRadius: AppRadius.controlAll,
+                    // Capped at 28 by the backend so "the 31st" can never skip
+                    // February outright.
+                    decoration: const InputDecoration(labelText: 'Day of the month (1–28)', isDense: true),
+                    items: [
+                      for (var i = 1; i <= 28; i++) DropdownMenuItem(value: i, child: Text('$i')),
+                    ],
+                    onChanged: (v) => setDlg(() => dayOfMonth = v ?? 1),
+                  ),
+                ],
+                const SizedBox(height: AppSpacing.sm),
+                Row(children: [
+                  Expanded(
+                    child: DropdownButtonFormField<int>(
+                      initialValue: hour,
+                      dropdownColor: AppColors.cardRaised,
+                      borderRadius: AppRadius.controlAll,
+                      decoration: const InputDecoration(labelText: 'Hour', isDense: true),
+                      items: [
+                        for (var i = 0; i < 24; i++) DropdownMenuItem(value: i, child: Text(_two(i))),
+                      ],
+                      onChanged: (v) => setDlg(() => hour = v ?? 8),
+                    ),
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: DropdownButtonFormField<int>(
+                      initialValue: minute,
+                      dropdownColor: AppColors.cardRaised,
+                      borderRadius: AppRadius.controlAll,
+                      decoration: const InputDecoration(labelText: 'Minute', isDense: true),
+                      items: [
+                        for (final m in minuteOptions) DropdownMenuItem(value: m, child: Text(_two(m))),
+                      ],
+                      onChanged: (v) => setDlg(() => minute = v ?? 0),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  'Runs at ${_two(hour)}:${_two(minute)} on the restaurant\'s clock (${RestaurantTime.zone}). '
+                  '${_reportPeriodNotes[frequency] ?? ''}',
+                  style: Theme.of(ctx).textTheme.bodySmall,
+                ),
+                // The hour above is a wall clock and needs no offset table, but
+                // the run times listed on the card do — say so rather than let
+                // them quietly fall back to device time.
+                if (!RestaurantTime.zoneCovered) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'This build cannot resolve ${RestaurantTime.zone}\'s UTC offset, so past run times are shown in device time. The report itself still runs on the restaurant\'s clock.',
+                    style: Theme.of(ctx).textTheme.bodySmall,
+                  ),
+                ],
+                const SizedBox(height: AppSpacing.xl),
+                Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                  ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+                  const SizedBox(width: AppSpacing.sm),
+                  ForkButton(
+                    label: existing == null ? 'Create' : 'Save',
+                    icon: Icons.check,
+                    onPressed: () => Navigator.pop(ctx, true),
+                  ),
+                ]),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+    if (ok != true) return;
+    if (name.text.trim().isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Give the schedule a name.')));
+      return;
+    }
+    // weekday and day_of_month are sent only for the frequency that uses them;
+    // the backend nulls the other one so a schedule switched from monthly to
+    // weekly cannot keep a stale day behind it.
+    final body = <String, dynamic>{
+      'name': name.text.trim(),
+      'report_key': reportKey,
+      'frequency': frequency,
+      'hour_local': hour,
+      'minute_local': minute,
+      if (frequency == 'weekly') 'weekday': weekday,
+      if (frequency == 'monthly') 'day_of_month': dayOfMonth,
+    };
+    setState(() => _busy = true);
+    try {
+      if (existing == null) {
+        await widget.rest.post('/reports/schedules', body);
+      } else {
+        await widget.rest.patch('/reports/schedules/${existing['id']}', body);
+      }
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _setEnabled(Map s, bool enabled) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      await widget.rest.patch('/reports/schedules/${s['id']}', {'enabled': enabled});
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // Queues one extra run outside the schedule. It does NOT render here: the
+  // server picks it up on its next sweep, which is why the message points at
+  // the history rather than promising a file.
+  //
+  // 409 is not a failure. The server buckets a manual run to the restaurant's
+  // own minute and refuses a second one inside it, so the click that got there
+  // first IS queued — reporting that as an error would push the owner into
+  // clicking again, and claiming a second run was queued would be a lie.
+  Future<void> _runNow(Map s) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/reports/schedules/${s['id']}/run-now');
+      messenger.showSnackBar(
+          const SnackBar(content: Text('Queued — it appears under Recent deliveries once the server has built it.')));
+      widget.reload();
+    } catch (e) {
+      if (e is ApiException && e.status == 409) {
+        messenger.showSnackBar(const SnackBar(
+            content: Text('Already queued a moment ago — that run is still on its way, so nothing extra was queued. '
+                'Watch Recent deliveries.')));
+        // The earlier run is a delivery row that may have appeared since this
+        // page loaded, so refresh instead of leaving the owner with no sign of it.
+        widget.reload();
+      } else {
+        messenger.showSnackBar(SnackBar(content: Text('$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _delete(Map s) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this schedule?'),
+        // The server archives rather than destroys: the delivery rows are both
+        // the history and what stops an occurrence going out twice.
+        content: Text('"${_s(s, 'name')}" stops running. Reports it already produced stay in the history and can still be downloaded.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _busy = true);
+    try {
+      await widget.rest.delete('/reports/schedules/${s['id']}');
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // Same route as the Tally export: pull the stored file and hand it to the
+  // platform save dialog. The figures live only in this file — never in the
+  // notification that announced it.
+  Future<void> _download(Map d) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final fileName = _s(d, 'artifact_name', 'report.csv');
+    try {
+      final csv = await widget.rest.getText('/reports/deliveries/${d['id']}/download');
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save $fileName',
+        fileName: fileName,
+        type: FileType.custom,
+        allowedExtensions: const ['csv'],
+        bytes: Uint8List.fromList(utf8.encode(csv)),
+      );
+      messenger.showSnackBar(SnackBar(content: Text(path == null ? 'Download cancelled.' : 'Saved $fileName')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final schedules = [for (final s in widget.schedules) if (s is Map) s];
+    final deliveries = [for (final d in widget.deliveries) if (d is Map) d];
+    // Delivery rows outlive their schedule (they are the history), so a row
+    // whose schedule has since been deleted names the report instead of a
+    // schedule that is no longer there.
+    final nameById = <String, String>{
+      for (final s in schedules) _s(s, 'id', ''): _s(s, 'name', 'Report'),
+    }..remove('');
+    Widget hairline() => Container(height: 1, color: AppColors.divider);
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      SectionHeader(
+        title: 'Scheduled reports',
+        count: schedules.length,
+        trailing: _allOutlets
+            ? null
+            : ForkButton.ghost(
+                label: 'New schedule',
+                icon: Icons.add,
+                dense: true,
+                onPressed: _busy ? null : () => _scheduleDialog(),
+              ),
+        padding: const EdgeInsets.only(bottom: 6),
+      ),
+      Text(
+        'The server builds these on its own — nobody has to open the app. Each run files a CSV you download below, and the notification bell says when one is ready.',
+        style: text.bodySmall,
+      ),
+      // Said once, here, rather than left to each row's controls to discover a
+      // rejection at a time. The downloads below are reads and stay available.
+      if (_allOutlets) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              'All outlets (combined) is a read-only view: every outlet\'s schedules are listed here and none of them can be '
+              'changed from it. Switch to a single outlet to create, edit, pause, delete or run one.',
+              style: text.bodySmall,
+            ),
+          ),
+        ]),
+      ],
+      const SizedBox(height: AppSpacing.md),
+      if (schedules.isEmpty)
+        Text('No scheduled reports yet.', style: text.bodySmall)
+      else
+        for (final s in schedules)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _scheduleRow(context, s),
+          ),
+      if (deliveries.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.lg),
+        SectionHeader(
+          title: 'Recent deliveries',
+          count: deliveries.length,
+          padding: const EdgeInsets.only(bottom: 6),
+        ),
+        ForkCard(
+          child: Column(children: [
+            for (var i = 0; i < deliveries.length; i++) ...[
+              if (i > 0) hairline(),
+              _deliveryRow(context, deliveries[i], nameById),
+            ],
+          ]),
+        ),
+      ],
+    ]);
+  }
+
+  Widget _scheduleRow(BuildContext context, Map s) {
+    final text = Theme.of(context).textTheme;
+    final on = s['enabled'] != false;
+    final failures = _int(s['consecutive_failures']) ?? 0;
+    final lastStatus = _s(s, 'last_status', '');
+    final lastError = _s(s, 'last_error', '');
+    final lastRun = _s(s, 'last_run_at', '');
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        _recordHeadRow(
+          context,
+          leading: Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: AppColors.inset,
+              borderRadius: AppRadius.controlAll,
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Icon(Icons.event_repeat_outlined,
+                size: 16, color: on ? AppColors.textSecondary : AppColors.textTertiary),
+          ),
+          identity: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(_s(s, 'name', 'Scheduled report'),
+                style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+            const SizedBox(height: 3),
+            Text('${_reportKeyLabels[_s(s, 'report_key', '')] ?? _s(s, 'report_key')} · ${_whenLabel(s)}',
+                style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
+          ]),
+          trailing: [
+            StatusChip(
+              label: on ? 'On' : 'Paused',
+              color: on ? AppColors.success : AppColors.neutral,
+              dense: true,
+            ),
+            if (lastStatus.isNotEmpty)
+              StatusChip(
+                label: 'Last run ${_deliveryStatus(lastStatus).label.toLowerCase()}',
+                color: _deliveryStatus(lastStatus).color,
+                dense: true,
+              ),
+            // Run now and every item in the menu writes, so in the combined
+            // view they are dropped rather than shown against a row this mode
+            // cannot act on — the note under the section header says why.
+            if (!_allOutlets) ...[
+              ForkButton.ghost(
+                label: 'Run now',
+                icon: Icons.play_arrow_outlined,
+                dense: true,
+                onPressed: _busy ? null : () => _runNow(s),
+              ),
+              PopupMenuButton<String>(
+                iconColor: AppColors.textSecondary,
+                enabled: !_busy,
+                onSelected: (v) {
+                  if (v == 'edit') _scheduleDialog(existing: s);
+                  if (v == 'toggle') _setEnabled(s, !on);
+                  if (v == 'delete') _delete(s);
+                },
+                itemBuilder: (_) => [
+                  const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                  PopupMenuItem(value: 'toggle', child: Text(on ? 'Pause' : 'Resume')),
+                  const PopupMenuItem(value: 'delete', child: Text('Delete')),
+                ],
+              ),
+            ],
+          ],
+        ),
+        if (lastRun.isNotEmpty || failures > 0) ...[
+          const SizedBox(height: 12),
+          Wrap(spacing: AppSpacing.xl, runSpacing: AppSpacing.sm, children: [
+            if (lastRun.isNotEmpty) MicroStat(value: _fmtTime(lastRun), label: 'last run'),
+            if (failures > 0) MicroStat(value: '$failures', label: 'failures in a row'),
+          ]),
+        ],
+        if (lastError.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(_capped(lastError, 200), style: text.bodySmall!.copyWith(color: AppColors.danger)),
+        ],
+        // The server pauses a schedule that keeps failing rather than raising
+        // the same alarm every morning, so say that is what happened.
+        if (!on && failures > 0) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text('Paused automatically after repeated failures — fix the cause, then resume it.', style: text.bodySmall),
+        ],
+      ]),
+    );
+  }
+
+  Widget _deliveryRow(BuildContext context, Map d, Map<String, String> nameById) {
+    final text = Theme.of(context).textTheme;
+    final status = _deliveryStatus(_s(d, 'status', ''));
+    final title = nameById['${d['schedule_id']}'] ?? 'Deleted schedule';
+    final when = _s(d, 'delivered_at', '').isNotEmpty ? _s(d, 'delivered_at') : _s(d, 'created_at', '');
+    final error = _s(d, 'error', '');
+    final hasFile = _s(d, 'artifact_name', '').isNotEmpty;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(title, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+            const SizedBox(height: 2),
+            Text(
+              [
+                _periodLabel(d),
+                if (when.isNotEmpty) _fmtTime(when),
+                // A "Run now" carries a `manual:`-prefixed key bucketed to the
+                // minute, so repeated clicks collapse through the partial unique
+                // index; a scheduled occurrence carries a bare day key. Both are
+                // non-null, so presence alone does not tell them apart — reading
+                // it that way labelled every manual run as scheduled. Null still
+                // counts as manual: that is what one stored before the key existed.
+                if (_isManualRun(d['occurrence_key'])) 'run manually',
+                if (d['artifact_truncated'] == true) 'file truncated',
+              ].where((p) => p.isNotEmpty).join(' · '),
+              style: text.bodySmall,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            if (error.isNotEmpty) ...[
+              const SizedBox(height: 2),
+              Text(_capped(error, 160), style: text.bodySmall!.copyWith(color: AppColors.danger)),
+            ],
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        StatusChip(label: status.label, color: status.color, dense: true),
+        if (hasFile) ...[
+          const SizedBox(width: AppSpacing.sm),
+          ForkIconButton(
+            icon: Icons.download_outlined,
+            tooltip: 'Download ${_s(d, 'artifact_name')}',
+            onPressed: () => _download(d),
+          ),
+        ],
       ]),
     );
   }
@@ -18011,6 +18764,36 @@ class _CashViewState extends State<_CashView> {
   final _payoutCtl = TextEditingController();
   final _notesCtl = TextEditingController();
 
+  // ------------------------------------------------- denomination tally ---
+  //
+  // Indian denominations, notes then coins, biggest first. ₹2000 is still legal
+  // tender, so a drawer can genuinely hold one; ₹20 and ₹10 exist as BOTH a note
+  // and a coin, which is why this is a list of (value, isCoin) rather than a map
+  // keyed by value.
+  static const List<(int, bool)> _denominations = [
+    (2000, false), (500, false), (200, false), (100, false), (50, false), (20, false), (10, false),
+    (20, true), (10, true), (5, true), (2, true), (1, true),
+  ];
+
+  // One count field per denomination.
+  //
+  // READ THIS BEFORE "FIXING" IT: the per-denomination counts are a COUNTING AID
+  // and are NOT PERSISTED — deliberately, because there is nowhere to put them.
+  // `CashSessions` has no denomination column and no JSON column (base schema,
+  // and none of the migrations after it touch the table), and POST /cash/close
+  // reads only `counted_cash`, `cash_payouts` and `notes` — any other body key is
+  // silently dropped, so posting a breakdown would return 200 and lose it. What
+  // this tally does is compute the TOTAL and put it in the existing
+  // `counted_cash` field, which is the number the backend stores and computes the
+  // variance from. Storing the breakdown would need a new nullable jsonb column
+  // and a migration, which is a separate, scoped change.
+  late final List<TextEditingController> _denomCtls =
+      [for (var _ in _denominations) TextEditingController()];
+
+  /// Collapsible, because it is eleven fields; open by default because counting
+  /// the drawer IS closing the drawer.
+  bool _showDenoms = true;
+
   @override
   void initState() {
     super.initState();
@@ -18023,10 +18806,48 @@ class _CashViewState extends State<_CashView> {
     _countedCtl.dispose();
     _payoutCtl.dispose();
     _notesCtl.dispose();
+    for (final c in _denomCtls) {
+      c.dispose();
+    }
     super.dispose();
   }
 
   double _d(String s) => double.tryParse(s.trim()) ?? 0;
+
+  int _denomCount(int i) => int.tryParse(_denomCtls[i].text.trim()) ?? 0;
+
+  /// What the counts add up to — the figure that goes into `counted_cash`.
+  double get _denomTotal {
+    var total = 0.0;
+    for (var i = 0; i < _denominations.length; i++) {
+      final n = _denomCount(i);
+      if (n > 0) total += n * _denominations[i].$1;
+    }
+    return total;
+  }
+
+  bool get _denomEntered {
+    for (var i = 0; i < _denominations.length; i++) {
+      if (_denomCount(i) > 0) return true;
+    }
+    return false;
+  }
+
+  // The tally drives the Counted-cash field while it holds any counts, so the
+  // number submitted is the one the closer actually counted rather than a second,
+  // hand-typed figure that could disagree with it. Clearing every count leaves
+  // the field alone, so typing the total straight in still works.
+  void _denomChanged() {
+    setState(() {
+      if (_denomEntered) _countedCtl.text = _denomTotal.toStringAsFixed(0);
+    });
+  }
+
+  void _clearDenoms() {
+    for (final c in _denomCtls) {
+      c.clear();
+    }
+  }
 
   Future<void> _load() async {
     setState(() { _loading = true; _error = null; });
@@ -18075,6 +18896,7 @@ class _CashViewState extends State<_CashView> {
       _countedCtl.clear();
       _payoutCtl.clear();
       _notesCtl.clear();
+      _clearDenoms();
       final v = res is Map ? (num.tryParse('${res['variance'] ?? 0}') ?? 0) : 0;
       messenger.showSnackBar(SnackBar(
         content: Text(v == 0 ? 'Drawer balanced 🎯' : 'Variance ${_money(v)} (${v > 0 ? 'over' : 'short'})'),
@@ -18199,6 +19021,114 @@ class _CashViewState extends State<_CashView> {
     );
   }
 
+  // Count the drawer note by note and coin by coin, then check the tally against
+  // what the register expects. The counts themselves are NOT saved — see
+  // `_denomCtls` for why that is the honest ceiling here — so the section says so
+  // rather than implying a record it cannot keep.
+  Widget _denomTally(num expected) {
+    final text = Theme.of(context).textTheme;
+    final total = _denomTotal;
+    final diff = total - expected;
+    final diffColor = diff == 0
+        ? AppColors.success
+        : (diff > 0 ? AppColors.warning : AppColors.danger);
+    // Never colour alone: the chip always spells out which way it is out.
+    final diffLabel = diff == 0 ? 'Balanced' : (diff > 0 ? 'Over' : 'Short');
+
+    Widget line(int i) {
+      final (value, coin) = _denominations[i];
+      final n = _denomCount(i);
+      return Padding(
+        padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+        child: Row(children: [
+          SizedBox(
+            width: 66,
+            child: Text('₹$value',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: text.bodyMedium!.copyWith(color: AppColors.textPrimary)),
+          ),
+          Expanded(
+            child: TextField(
+              // ₹20 and ₹10 are each a note AND a coin, so the row's own label is
+              // not a unique handle for it — the kind that reads unique until the
+              // first ₹10-coin subtotal renders as "₹10" too.
+              key: ValueKey('denom-${coin ? 'coin' : 'note'}-$value'),
+              controller: _denomCtls[i],
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              onChanged: (_) => _denomChanged(),
+              style: text.bodyMedium!.copyWith(color: AppColors.textPrimary),
+              decoration: const InputDecoration(
+                isDense: true,
+                hintText: '0',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          SizedBox(
+            width: 84,
+            child: Text(n == 0 ? '—' : '₹${n * value}',
+                textAlign: TextAlign.end,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: text.bodySmall),
+          ),
+        ]),
+      );
+    }
+
+    Widget summaryRow(String label, Widget value) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Row(children: [
+            Expanded(child: Text(label, style: text.bodyMedium)),
+            const SizedBox(width: AppSpacing.sm),
+            value,
+          ]),
+        );
+
+    return ForkCard(
+      inset: true,
+      padding: const EdgeInsets.all(AppSpacing.md),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.calculate_outlined, size: 15, color: AppColors.copper),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(child: Text('COUNT THE DRAWER', style: text.labelSmall)),
+          ForkButton.subtle(
+            label: _showDenoms ? 'Hide' : 'Show',
+            onPressed: () => setState(() => _showDenoms = !_showDenoms),
+          ),
+        ]),
+        if (_showDenoms) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text('Enter how many of each — the total fills in Counted cash below. '
+              'The per-denomination counts are a counting aid and are not saved with the session.',
+              style: text.bodySmall),
+          const SizedBox(height: AppSpacing.md),
+          Text('NOTES', style: text.labelSmall),
+          const SizedBox(height: AppSpacing.sm),
+          for (var i = 0; i < _denominations.length; i++)
+            if (!_denominations[i].$2) line(i),
+          const SizedBox(height: AppSpacing.xs),
+          Text('COINS', style: text.labelSmall),
+          const SizedBox(height: AppSpacing.sm),
+          for (var i = 0; i < _denominations.length; i++)
+            if (_denominations[i].$2) line(i),
+        ],
+        Container(height: 1, margin: const EdgeInsets.symmetric(vertical: 6), color: AppColors.divider),
+        summaryRow('Counted from tally', Text(_money(total), style: text.titleMedium)),
+        summaryRow('Expected in drawer', Text(_money(expected), style: text.titleSmall)),
+        if (_denomEntered)
+          summaryRow(
+            'Difference',
+            StatusChip(label: '$diffLabel ${_money(diff.abs())}', color: diffColor, dense: true),
+          ),
+      ]),
+    );
+  }
+
   Widget _openSessionCard(Map<String, dynamic> cur) {
     final expected = num.tryParse('${cur['live_expected'] ?? 0}') ?? 0;
     final text = Theme.of(context).textTheme;
@@ -18257,9 +19187,19 @@ class _CashViewState extends State<_CashView> {
             Expanded(child: Text('Close & count down', style: text.titleMedium)),
           ]),
           const SizedBox(height: AppSpacing.md),
+          // Payouts are subtracted here because the server subtracts them when it
+          // computes the variance it STORES: expected = float + sales - refunds -
+          // payouts, variance = counted - expected (CloseCashSession). Comparing
+          // the tally against live_expected alone, which does not net payouts off,
+          // shows "Balanced" on a drawer the server then records as short by
+          // exactly the payout — the one reading a cash screen must never give.
+          _denomTally(expected - _d(_payoutCtl.text)),
+          const SizedBox(height: AppSpacing.md),
           TextField(controller: _countedCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Counted cash (₹)', border: OutlineInputBorder())),
           const SizedBox(height: 10),
-          TextField(controller: _payoutCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Cash paid out (₹)', border: OutlineInputBorder())),
+          // Rebuild on edit so the tally above re-nets against the new payout
+          // rather than sitting on a figure the closer has already superseded.
+          TextField(controller: _payoutCtl, onChanged: (_) => setState(() {}), keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Cash paid out (₹)', border: OutlineInputBorder())),
           const SizedBox(height: 10),
           TextField(controller: _notesCtl, decoration: const InputDecoration(labelText: 'Notes (optional)', border: OutlineInputBorder())),
           const SizedBox(height: AppSpacing.md),
