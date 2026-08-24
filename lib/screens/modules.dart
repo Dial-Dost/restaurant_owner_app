@@ -5988,15 +5988,34 @@ class _TableSheetState extends State<_TableSheet> {
   }
 
   Future<void> _assignWaiter(ScaffoldMessengerState messenger) async {
+    // The picker is fed from the server's ASSIGNABLE roster, not the full staff
+    // list: when the outlet uses attendance, only staff clocked in right now may
+    // be assigned (the backend enforces the same rule on the assign write). An
+    // outlet where nobody has ever clocked in gets everyone, as before.
     List users;
+    var attendanceInUse = false;
     try {
-      final m = await widget.rest.getMap('/restaurant/users');
-      users = (m['users'] as List?) ?? [];
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-      return;
+      final m = await widget.rest.getMap('/table-assignments/assignable');
+      users = (m['employees'] as List?) ?? [];
+      attendanceInUse = m['attendance_in_use'] == true;
+    } catch (_) {
+      // Older backend without the roster endpoint — fall back to the full staff
+      // list so assignment keeps working against it.
+      try {
+        final m = await widget.rest.getMap('/restaurant/users');
+        users = (m['users'] as List?) ?? [];
+      } catch (e) {
+        messenger.showSnackBar(SnackBar(content: Text('$e')));
+        return;
+      }
     }
     if (!mounted) return;
+    if (users.isEmpty && attendanceInUse) {
+      messenger.showSnackBar(const SnackBar(
+          content: Text(
+              'No staff are clocked in right now — staff must clock in before they can be assigned a table.')));
+      return;
+    }
     final chosen = await showDialog<Map>(
       context: context,
       builder: (ctx) => SimpleDialog(
@@ -10390,6 +10409,10 @@ class _CustomersViewState extends State<_CustomersView> {
       children: [
         _kv('Phone', _s(m, 'phone', '')),
         _kv('Email', _s(m, 'email', '')),
+        // Straight off the Bookings table on every read, so a booking made a
+        // second ago is already in the count — the guest book must never show
+        // a guest who just reserved as someone who has never interacted.
+        _kv('Bookings made', '${_int(m['bookings_made']) ?? 0}'),
         _kv('Visits', '$visits'),
         _kv('Bills', '${_int(m['bills']) ?? 0}'),
         _kv('Total spent', _money(m['total_spend'])),
@@ -10938,29 +10961,128 @@ class _BookingsViewState extends State<_BookingsView> {
       // (and switching feels instant) even while the chosen slice is loading.
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'upcoming', label: Text('Upcoming'), icon: Icon(Icons.event_available, size: 15)),
-              ButtonSegment(value: 'past', label: Text('Past'), icon: Icon(Icons.history, size: 15)),
-              ButtonSegment(value: 'all', label: Text('All'), icon: Icon(Icons.event_note, size: 15)),
-            ],
-            selected: {_window},
-            showSelectedIcon: false,
-            onSelectionChanged: (s) => setState(() => _window = s.first),
+        child: Row(children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(value: 'upcoming', label: Text('Upcoming'), icon: Icon(Icons.event_available, size: 15)),
+                  ButtonSegment(value: 'past', label: Text('Past'), icon: Icon(Icons.history, size: 15)),
+                  ButtonSegment(value: 'all', label: Text('All'), icon: Icon(Icons.event_note, size: 15)),
+                ],
+                selected: {_window},
+                showSelectedIcon: false,
+                onSelectionChanged: (s) => setState(() => _window = s.first),
+              ),
+            ),
           ),
-        ),
+          const SizedBox(width: 10),
+          // Until this button existed the app could only ASSIGN tables to
+          // bookings created elsewhere — walking in with a party of 8 and a
+          // phone in hand, there was simply no way to book at all, which a
+          // tester reported as "it does not let you book for 8". Creation
+          // rides the same seating suggester as assignment, so a party no
+          // single table fits gets offered a clubbed set (6 + 2) up front.
+          ForkButton(
+            label: 'New booking',
+            icon: Icons.add,
+            dense: true,
+            onPressed: () => _newBooking(context),
+          ),
+        ]),
       ),
       Expanded(
         child: AsyncView<List>(
-          // Re-keyed so switching the window remounts and refetches.
-          key: ValueKey('bookings-$_window'),
+          // Re-keyed so switching the window (or creating a booking) remounts
+          // and refetches.
+          key: ValueKey('bookings-$_window-$_createdTick'),
           load: () => widget.rest.getList('/get-bookings?window=$_window'),
           builder: _list,
         ),
       ),
     ]);
+  }
+
+  // Bumped after a successful create so the AsyncView refetches.
+  int _createdTick = 0;
+
+  /// Create a booking from the app. Party bigger than every single table gets
+  /// the seating suggester's clubbed combinations (same dialog the assign flow
+  /// uses); a fitting party picks from the suggested singles. Nothing is ever
+  /// clubbed without an explicit staff choice.
+  Future<void> _newBooking(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final form = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (_) => const _NewBookingDialog(),
+    );
+    if (form == null || !context.mounted) return;
+
+    final party = form['party'] as int;
+    final at = form['at'] as DateTime;
+    final iso = at.toIso8601String();
+    const durationMins = 120; // the backend's default booking window
+
+    // Ask the suggester what can hold this party at that time.
+    Map<String, dynamic>? suggestion;
+    try {
+      suggestion = await widget.rest.getMap(
+        '/tables/seating-suggestion?party=$party&at=${Uri.encodeQueryComponent(iso)}&duration=$durationMins');
+    } catch (_) {/* fall through — the picker below degrades to free tables */}
+    if (!context.mounted) return;
+
+    List<String>? names;
+    final singles = ((suggestion?['single'] as List?) ?? const []).cast<Map>();
+    if (singles.isNotEmpty) {
+      // A single table fits: a plain choice, least friction.
+      names = await showDialog<List<String>>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: Text('Table for $party'),
+          children: [
+            for (final t in singles)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, <String>[_s(t, 'table_name', '')]),
+                child: Row(children: [
+                  const Icon(Icons.table_restaurant_outlined, size: 16, color: AppColors.textSecondary),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(_s(t, 'table_name', ''))),
+                  Text(_seatsLabel(t),
+                      style: Theme.of(ctx).textTheme.bodySmall!.copyWith(fontSize: 11.5)),
+                ]),
+              ),
+          ],
+        ),
+      );
+    } else if (suggestion != null) {
+      // No single table fits — offer the clubbed combinations (or the manual
+      // override across every free table).
+      names = await showDialog<List<String>>(
+        context: context,
+        builder: (_) => _SeatingSuggestionDialog(suggestion: suggestion!, party: party),
+      );
+    }
+    if (names == null || names.isEmpty || !context.mounted) return;
+
+    try {
+      await widget.rest.post('/add-booking', {
+        'customer': {'name': form['name'], 'number': form['phone']},
+        'booking': {
+          'table_name': names.first,
+          if (names.length > 1) 'combined_table_names': names.sublist(1),
+          'date': iso,
+          'duration': '$durationMins',
+          'number_of_people': '$party',
+          if ((form['source'] as String).isNotEmpty) 'source': form['source'],
+        },
+      });
+      messenger.showSnackBar(SnackBar(
+          content: Text('Booked ${names.join(' + ')} for $party — ${form['name']}')));
+      if (mounted) setState(() => _createdTick++);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 
   Widget _list(BuildContext context, List rows, VoidCallback reload) {
@@ -11347,6 +11469,128 @@ class _BookingsViewState extends State<_BookingsView> {
 /// numbered) FREE tables, the runners-up, and a manual override built from every
 /// free table. Pops the chosen table names, primary first — or null. It decides
 /// nothing on its own: closing the dialog assigns nothing.
+/// The "New booking" form: who, how many, when. Table choice happens AFTER
+/// this dialog, driven by the seating suggester, so the form never offers a
+/// table the party cannot use.
+class _NewBookingDialog extends StatefulWidget {
+  const _NewBookingDialog();
+
+  @override
+  State<_NewBookingDialog> createState() => _NewBookingDialogState();
+}
+
+class _NewBookingDialogState extends State<_NewBookingDialog> {
+  final _name = TextEditingController();
+  final _phone = TextEditingController();
+  final _source = TextEditingController();
+  int _party = 2;
+  late DateTime _at;
+  String? _err;
+
+  @override
+  void initState() {
+    super.initState();
+    // Default to the next full hour — the common "they are on the phone now"
+    // case books for later today.
+    final now = DateTime.now();
+    _at = DateTime(now.year, now.month, now.day, now.hour + 1);
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _phone.dispose();
+    _source.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickDateTime() async {
+    final d = await showDatePicker(
+      context: context,
+      initialDate: _at,
+      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      lastDate: DateTime.now().add(const Duration(days: 90)),
+    );
+    if (d == null || !mounted) return;
+    final t = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(_at));
+    if (t == null || !mounted) return;
+    setState(() => _at = DateTime(d.year, d.month, d.day, t.hour, t.minute));
+  }
+
+  void _save() {
+    final name = _name.text.trim();
+    // Same rule POST /add-booking enforces server-side (normalizeMobile10):
+    // exactly 10 digits once formatting is stripped, so the dialog can never
+    // submit something the API will 400.
+    final digits = _phone.text.replaceAll(RegExp(r'[^0-9]'), '');
+    final phone = digits.length == 12 && digits.startsWith('91')
+        ? digits.substring(2)
+        : digits.length == 11 && digits.startsWith('0')
+            ? digits.substring(1)
+            : digits;
+    if (name.isEmpty) { setState(() => _err = 'Customer name is required'); return; }
+    if (phone.length != 10) { setState(() => _err = 'Enter a 10-digit mobile number'); return; }
+    if (_at.isBefore(DateTime.now().subtract(const Duration(minutes: 1)))) {
+      setState(() => _err = 'Pick a future date and time');
+      return;
+    }
+    Navigator.pop(context, <String, dynamic>{
+      'name': name,
+      'phone': phone,
+      'party': _party,
+      'at': _at,
+      'source': _source.text.trim(),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return AlertDialog(
+      title: const Text('New booking'),
+      content: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          TextField(controller: _name, decoration: const InputDecoration(labelText: 'Customer name'), textCapitalization: TextCapitalization.words),
+          const SizedBox(height: 10),
+          TextField(controller: _phone, decoration: const InputDecoration(labelText: 'Mobile (10 digits)'), keyboardType: TextInputType.phone),
+          const SizedBox(height: 10),
+          Row(children: [
+            Text('Party', style: text.titleSmall),
+            const Spacer(),
+            IconButton(onPressed: _party > 1 ? () => setState(() => _party--) : null, icon: const Icon(Icons.remove_circle_outline)),
+            Text('$_party', style: text.titleMedium),
+            IconButton(onPressed: _party < 30 ? () => setState(() => _party++) : null, icon: const Icon(Icons.add_circle_outline)),
+          ]),
+          InkWell(
+            onTap: _pickDateTime,
+            borderRadius: AppRadius.controlAll,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Row(children: [
+                const Icon(Icons.schedule, size: 16, color: AppColors.textSecondary),
+                const SizedBox(width: 8),
+                Text('${_fmtDmy(_at.toIso8601String())} · ${TimeOfDay.fromDateTime(_at).format(context)}', style: text.titleSmall),
+                const Spacer(),
+                Text('Change', style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
+              ]),
+            ),
+          ),
+          const SizedBox(height: 4),
+          TextField(controller: _source, decoration: const InputDecoration(labelText: 'Source (optional)', hintText: 'Phone, walk-in, EazyDiner…')),
+          if (_err != null) ...[
+            const SizedBox(height: 10),
+            Text(_err!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+          ],
+        ]),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: _save, child: const Text('Choose table')),
+      ],
+    );
+  }
+}
+
 class _SeatingSuggestionDialog extends StatefulWidget {
   final Map suggestion;
   final int party;
@@ -11811,26 +12055,45 @@ Future<void> _feedbackRatingSheet(BuildContext context, Map sum, List items) {
 }
 
 /// Who is still waiting to be called back. Reached from the "Recovery" tile,
-/// which stays inert when the count is zero — an empty queue has nothing to
-/// open, and a sheet saying so would be an affordance that lied.
+/// which is ALWAYS tappable: at zero this sheet explains what service recovery
+/// is and when a ticket lands here, because a tile whose caption names a
+/// concept the owner may not know yet cannot be the thing that explains it by
+/// staying silent. (It used to go inert at zero, and that read as a broken
+/// control, not a considered one.)
 Future<void> _recoveryQueueSheet(BuildContext context, List tickets) {
   final rows = tickets.whereType<Map>().toList();
   final worst = [...rows]..sort((a, b) => _numOf(a['overall_rating']).compareTo(_numOf(b['overall_rating'])));
+  final text = Theme.of(context).textTheme;
   return _detailSheet(
     context,
     eyebrow: 'Service recovery',
-    title: '${rows.length} open',
+    title: rows.isEmpty ? 'All clear' : '${rows.length} open',
     children: [
-      Text('Low-rating feedback that nobody has followed up yet, lowest score first.',
-          style: Theme.of(context).textTheme.bodySmall),
-      const SizedBox(height: AppSpacing.sm),
-      for (final t in worst)
-        _detailRow(
-          context,
-          _s(t, 'customer_name', 'Guest'),
-          '${_score(t['overall_rating'])} / 5',
-          trailing: _fmtTime(_s(t, 'submitted_at')),
+      if (rows.isEmpty) ...[
+        Text(
+          'No guest is waiting on a follow-up right now.',
+          style: text.bodyMedium,
         ),
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          'Any feedback scored 2 out of 5 or below opens a recovery ticket here '
+          'the moment it arrives, and the manager bell is pinged at the same '
+          'time. Tickets stay in this queue until someone follows the guest up '
+          'and marks them resolved with a note.',
+          style: text.bodySmall,
+        ),
+      ] else ...[
+        Text('Low-rating feedback that nobody has followed up yet, lowest score first.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        for (final t in worst)
+          _detailRow(
+            context,
+            _s(t, 'customer_name', 'Guest'),
+            '${_score(t['overall_rating'])} / 5',
+            trailing: _fmtTime(_s(t, 'submitted_at')),
+          ),
+      ],
     ],
   );
 }
@@ -12028,10 +12291,12 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                 caption: 'RECOVERY',
                 tag: tickets.isNotEmpty ? 'Open' : null,
                 tagColor: AppColors.danger,
-                // Nothing open means nothing to open. Left genuinely inert —
-                // no cursor, no lift — rather than offering a sheet whose only
-                // content would be the zero already on the tile.
-                onTap: tickets.isEmpty ? null : () => _recoveryQueueSheet(context, tickets),
+                // Always opens the queue. This tile used to go inert at zero,
+                // and a real owner read that as a broken control — "recovery
+                // is not clickable" — because nothing on the tile says what
+                // RECOVERY even is. The sheet now owns the empty case: it
+                // explains what lands here and when, instead of eating the tap.
+                onTap: () => _recoveryQueueSheet(context, tickets),
               ),
             ),
           ]),
@@ -19234,6 +19499,12 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
   List _vendors = const [];
   List _inventory = const [];
 
+  /// Why the inventory read came back empty-handed, when it FAILED rather than
+  /// genuinely holding nothing. "New PO" needs the difference: an empty stock
+  /// list means "add items first", a failed read means "retry / check access" —
+  /// and swallowing the error used to make both look identical.
+  String? _inventoryError;
+
   @override
   void initState() {
     super.initState();
@@ -19246,13 +19517,15 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
       final o = await widget.rest.getMap('/purchase-orders');
       List vend = const [];
       List inv = const [];
+      String? invError;
       try { final v = await widget.rest.getMap('/vendors'); vend = (v['vendors'] as List?) ?? const []; } catch (_) {}
-      try { inv = await widget.rest.getList('/inventory'); } catch (_) {}
+      try { inv = await widget.rest.getList('/inventory'); } catch (e) { invError = '$e'; }
       if (!mounted) return;
       setState(() {
         _orders = (o['orders'] as List?) ?? const [];
         _vendors = vend;
         _inventory = inv;
+        _inventoryError = invError;
         _loading = false;
       });
     } catch (e) {
@@ -19405,8 +19678,13 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
     }
     return Scaffold(
       backgroundColor: Colors.transparent,
+      // ALWAYS live. A FloatingActionButton with a null onPressed keeps its
+      // full colour (FABs have no disabled look), so gating it on inventory
+      // rendered a button that LOOKED tappable and silently ate the tap — a
+      // real owner reported exactly that. _createPo now owns the empty case
+      // and says out loud why a PO cannot be raised yet.
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _inventory.isEmpty ? null : _createPo,
+        onPressed: _createPo,
         icon: const Icon(Icons.add),
         label: const Text('New PO'),
       ),
@@ -19505,6 +19783,41 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
   }
 
   Future<void> _createPo() async {
+    // A PO line IS an inventory item, so with none loaded the form has nothing
+    // to offer. Say which of the two situations this is — nothing in stock yet,
+    // or a read that failed — instead of the dead-looking tap this used to be.
+    if (_inventory.isEmpty) {
+      final nav = ModuleNavigator.of(context);
+      final failed = _inventoryError != null;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('New purchase order'),
+          content: Text(
+            failed
+                ? 'Your inventory could not be loaded, and every purchase-order '
+                    'line must name an inventory item.\n\n$_inventoryError'
+                : 'Every purchase-order line names an inventory item, and this '
+                    'outlet has none yet. Add the ingredients you stock in '
+                    'Inventory first — then raise a PO to order them from a vendor.',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+            if (failed)
+              FilledButton(
+                onPressed: () { Navigator.pop(ctx); _load(); },
+                child: const Text('Retry'),
+              )
+            else if (nav?.canOpen('Inventory') ?? false)
+              FilledButton(
+                onPressed: () { Navigator.pop(ctx); nav!.openModule('Inventory'); },
+                child: const Text('Open Inventory'),
+              ),
+          ],
+        ),
+      );
+      return;
+    }
     final messenger = ScaffoldMessenger.of(context);
     String? vendorId;
     String? pickId;

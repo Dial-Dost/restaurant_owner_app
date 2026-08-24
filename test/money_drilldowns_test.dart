@@ -697,6 +697,66 @@ void main() {
       expect(find.text('Tomatoes'), findsOneWidget, reason: 'the sheet still opens');
       expect(find.text('View in Inventory'), findsNothing);
     });
+
+    // "New PO" was gated on inventory with `onPressed: null` — but a FAB with a
+    // null onPressed keeps its full colour (FABs have no disabled look), so on
+    // a fresh outlet it was a button that LOOKED tappable and silently ate the
+    // tap. A real owner reported exactly that. The FAB is now always live and
+    // the empty case says out loud why a PO cannot be raised yet.
+    testWidgets('New PO with an empty inventory explains itself instead of eating the tap',
+        (tester) async {
+      _size(tester, 1200);
+      final opened = <String>[];
+      await _mount(
+        tester,
+        m.purchaseOrdersModule,
+        {
+          '/purchase-orders': {'orders': <dynamic>[]},
+          '/vendors': {'vendors': <dynamic>[]},
+          '/inventory': <dynamic>[],
+        },
+        onOpen: (label, _) => opened.add(label),
+      );
+
+      await tester.tap(find.text('New PO'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('has none yet'), findsOneWidget,
+          reason: 'the tap must answer WHY, never land nowhere');
+      // The dead end names the way out — and takes the owner there.
+      await tester.tap(find.text('Open Inventory'));
+      await tester.pumpAndSettle();
+      expect(opened, contains('Inventory'));
+    });
+
+    testWidgets('New PO tells a failed inventory read apart from an empty one', (tester) async {
+      _size(tester, 1200);
+      await _mount(tester, m.purchaseOrdersModule, {
+        '/purchase-orders': {'orders': <dynamic>[]},
+        '/vendors': {'vendors': <dynamic>[]},
+        // No '/inventory' route: the read fails. "Add items first" would be a
+        // lie here — the outlet may hold plenty.
+      });
+
+      await tester.tap(find.text('New PO'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('could not be loaded'), findsOneWidget);
+      expect(find.text('Retry'), findsOneWidget);
+      expect(find.text('Open Inventory'), findsNothing,
+          reason: 'a failed read is not cured by adding items');
+    });
+
+    testWidgets('New PO opens the create dialog when inventory exists', (tester) async {
+      _size(tester, 1200);
+      await _mount(tester, m.purchaseOrdersModule, _poRoutes(const []));
+
+      await tester.tap(find.text('New PO'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('New purchase order'), findsOneWidget);
+      expect(find.text('Place order'), findsOneWidget);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -754,15 +814,24 @@ void main() {
       expect(find.text('2.9 / 5'), findsOneWidget);
     });
 
-    testWidgets('the recovery tile is inert at zero and opens the queue above it',
+    testWidgets('the recovery tile at zero opens the sheet that says what recovery IS',
         (tester) async {
       _size(tester, 1200);
       await _mount(tester, m.feedbackModule, _feedbackRoutes(items: [_entry('f1', rating: 5)]));
 
-      // Nothing open means nothing to open: the tile must carry no gesture, so
-      // it cannot offer a tap that lands on the zero already printed on it.
+      // The tile stays LIVE at zero. Its caption names a concept nothing on the
+      // page explains, so the tap must answer "what is this?" — a real owner
+      // read the old inert-at-zero tile as a broken control, and they were
+      // right to: nothing distinguished it from a dead handler.
       final tile = _tileCard('RECOVERY');
-      expect(tester.widget<ForkCard>(tile).onTap, isNull);
+      expect(tester.widget<ForkCard>(tile).onTap, isNotNull);
+
+      await _tap(tester, tile);
+      expect(find.text('All clear'), findsOneWidget);
+      expect(find.textContaining('2 out of 5 or below'), findsOneWidget,
+          reason: 'the empty sheet must say when a ticket lands here');
+      expect(find.textContaining('marks them resolved'), findsOneWidget,
+          reason: 'and how one leaves the queue');
     });
 
     testWidgets('the recovery tile opens the queue when tickets are waiting', (tester) async {

@@ -533,6 +533,48 @@ void main() {
     expect(find.text('High spend · 2'), findsOneWidget);
   });
 
+  // A tester who booked a table, settled its bill and left feedback watched the
+  // guest book stay at zero on all three counts. Bookings are the write the
+  // guest CAN make before ever settling a bill, so the sheet must carry the
+  // server's bookings_made — derived from the Bookings table on every read —
+  // and never render a guest who just reserved as someone who never interacted.
+  testWidgets('Guest book: the sheet shows bookings made, straight off the segments row',
+      (tester) async {
+    _desktop(tester);
+    await _mount(tester, m.customersModule, {
+      '/customers/segments': _segmentsRoute([
+        {..._guest(1), 'bookings_made': 4},
+      ]),
+    });
+
+    // The guest's name also sits in the ranking band, which is not a per-row
+    // control — the phone is printed on the tappable card alone.
+    await tester.tap(find.text('900000001').first);
+    await tester.pumpAndSettle();
+
+    // _kv renders its key uppercased — assert what the sheet SHOWS.
+    expect(find.text('BOOKINGS MADE'), findsOneWidget);
+    expect(find.text('4'), findsWidgets);
+    // The rest of the record still reads as before beside it.
+    expect(find.text('TOTAL SPENT'), findsOneWidget);
+    expect(find.text('BILLS'), findsOneWidget);
+  });
+
+  // An older backend row without the field must read as 0, not crash or vanish.
+  testWidgets('Guest book: a segments row without bookings_made reads as zero', (tester) async {
+    _desktop(tester);
+    await _mount(tester, m.customersModule, {
+      '/customers/segments': _segmentsRoute([_guest(1)]),
+    });
+
+    await tester.tap(find.text('900000001').first);
+    await tester.pumpAndSettle();
+
+    // _kv renders its key uppercased — assert what the sheet SHOWS.
+    expect(find.text('BOOKINGS MADE'), findsOneWidget);
+    expect(find.text('0'), findsWidgets);
+  });
+
   // ----------------------------------------------------------------- audit ---
 
   testWidgets('Audit: changing a filter resets paging to offset 0 and drops the loaded rows',
