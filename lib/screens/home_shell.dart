@@ -32,58 +32,89 @@ class _Module {
   const _Module(this.label, this.icon, this.keywords, this.build, {this.feature, this.adminOnly = false});
 }
 
-// Mirrors the web dashboard's modules and permission keywords. `feature` gates a
-// module behind a subscription-plan flag (additive — only hidden when the plan
-// explicitly sets it false).
-const _allModules = <_Module>[
-  _Module('Overview', Icons.dashboard, [], m.overviewModule),
-  // Sits directly under Overview because it is the same question asked harder:
-  // the strip says what needs attention, this says how bad and what to do.
-  //
-  // Keywords and feature MIRROR Analytics exactly, and deliberately so —
-  // GET /analytics/concerns is gated on the one analytics Action every other
-  // /analytics/* route uses, and the plan's `analytics` flag already covers the
-  // whole prefix. Anyone who can open Analytics can open this; nobody else can,
-  // and no gate is widened to make it visible.
-  _Module('Concerns', Icons.report_problem, ['analytics', 'apc', 'report'], m.concernsModule,
-      feature: 'analytics'),
-  _Module('Orders', Icons.receipt_long, ['order', 'bill', 'payment'], m.ordersModule),
-  _Module('Kitchen', Icons.soup_kitchen, ['order', 'kitchen', 'kot', 'kds'], m.kdsModule),
-  _Module('Menu', Icons.menu_book, ['menu'], m.menuModule),
-  _Module('Tables', Icons.table_restaurant, ['table'], m.tablesModule),
-  _Module('Waitlist', Icons.hourglass_top, ['table', 'order', 'waitlist'], m.waitlistModule),
-  _Module('Inventory', Icons.inventory_2, ['inventory', 'stock'], m.inventoryModule, feature: 'inventory'),
-  _Module('Purchase Orders', Icons.local_shipping, ['inventory', 'stock', 'purchase', 'vendor'], m.purchaseOrdersModule, feature: 'inventory'),
-  _Module('Bookings', Icons.event_seat, ['booking'], m.bookingsModule),
-  _Module('Customers', Icons.people, ['customer'], m.customersModule),
-  _Module('Feedback', Icons.reviews, ['feedback'], m.feedbackModule),
-  _Module('Analytics', Icons.insights, ['analytics', 'apc', 'report'], m.analyticsModule, feature: 'analytics'),
-  // What-if planning sits beside the analytics it is computed from: the
-  // /simulation/* routes are gated on the SAME analytics Action every
-  // /analytics/* route uses, and the plan's `analytics` flag covers the data
-  // it projects — so the gate here mirrors Analytics exactly and no role or
-  // plan needs remapping.
-  //
-  // The keyword list must be Analytics' list VERBATIM. Profile.can substring-
-  // matches permitted ACTION NAMES, and the action that authorizes /simulation/*
-  // server-side is named "View Order APC" — it contains 'apc', not 'simulation'.
-  // With ['analytics','simulation','what-if'] a non-admin granted exactly that
-  // action saw Simulation on the web but a hidden tile here; extra keywords that
-  // match no action name are not harmless padding, they are a silent lie.
-  _Module('Simulation', Icons.tune, ['analytics', 'apc', 'report'], m.simulationModule, feature: 'analytics'),
-  _Module('History', Icons.calendar_month, ['analytics', 'report'], m.historyModule, feature: 'analytics'),
-  _Module('Accounting', Icons.account_balance, ['report', 'accounting', 'finance', 'expense', 'analytics'], m.accountingModule, feature: 'accounting'),
-  _Module('Cash register', Icons.point_of_sale, ['report', 'accounting', 'finance', 'cash'], m.cashModule, feature: 'accounting'),
-  _Module('Valet', Icons.local_parking, ['valet', 'parking'], m.valetModule, feature: 'valet'),
-  _Module('Outlets', Icons.store_mall_directory, ['outlet', 'branch', 'setting', 'profile'], m.outletsModule, feature: 'multi_outlet'),
-  _Module('Employees', Icons.badge, ['employee', 'role', 'user'], m.employeesModule),
-  _Module('Roles', Icons.shield, ['role', 'permission'], m.rolesModule),
-  _Module('Audit Log', Icons.history, ['audit', 'log'], m.auditLogModule),
-  _Module('Attendance', Icons.schedule, [], m.attendanceModule),
-  _Module('Printer', Icons.print, [], m.printerModule),
-  _Module('Billing', Icons.card_membership, [], m.billingModule, adminOnly: true),
-  _Module('Settings', Icons.settings, [], m.settingsModule, adminOnly: true),
+/// A titled group of sidebar modules. The title renders as a small muted
+/// uppercase header in the expanded rail and the drawer; the collapsed
+/// (icon-only) rail draws a thin divider between groups instead.
+class _NavSection {
+  final String title; // stored uppercase — rendered verbatim
+  final List<_Module> modules;
+  const _NavSection(this.title, this.modules);
+}
+
+// Mirrors the web dashboard's modules, permission keywords AND its grouped
+// sidebar sections. `feature` gates a module behind a subscription-plan flag
+// (additive — only hidden when the plan explicitly sets it false).
+//
+// Grouping is presentation only: `_allModules` below flattens these sections
+// in order and stays the single source of module order for `visible`,
+// `_index` and `_visibleLabels` — every module appears in exactly one section.
+const _navSections = <_NavSection>[
+  _NavSection('OPERATIONS', [
+    _Module('Overview', Icons.dashboard, [], m.overviewModule),
+    // Sits directly under Overview because it is the same question asked harder:
+    // the strip says what needs attention, this says how bad and what to do.
+    //
+    // Keywords and feature MIRROR Analytics exactly, and deliberately so —
+    // GET /analytics/concerns is gated on the one analytics Action every other
+    // /analytics/* route uses, and the plan's `analytics` flag already covers the
+    // whole prefix. Anyone who can open Analytics can open this; nobody else can,
+    // and no gate is widened to make it visible.
+    _Module('Concerns', Icons.report_problem, ['analytics', 'apc', 'report'], m.concernsModule,
+        feature: 'analytics'),
+    _Module('Orders', Icons.receipt_long, ['order', 'bill', 'payment'], m.ordersModule),
+    _Module('Kitchen', Icons.soup_kitchen, ['order', 'kitchen', 'kot', 'kds'], m.kdsModule),
+    _Module('Tables', Icons.table_restaurant, ['table'], m.tablesModule),
+    _Module('Waitlist', Icons.hourglass_top, ['table', 'order', 'waitlist'], m.waitlistModule),
+    _Module('Bookings', Icons.event_seat, ['booking'], m.bookingsModule),
+    _Module('Menu', Icons.menu_book, ['menu'], m.menuModule),
+  ]),
+  _NavSection('INVENTORY', [
+    _Module('Inventory', Icons.inventory_2, ['inventory', 'stock'], m.inventoryModule, feature: 'inventory'),
+    _Module('Purchase Orders', Icons.local_shipping, ['inventory', 'stock', 'purchase', 'vendor'], m.purchaseOrdersModule, feature: 'inventory'),
+  ]),
+  _NavSection('GUESTS', [
+    _Module('Customers', Icons.people, ['customer'], m.customersModule),
+    _Module('Feedback', Icons.reviews, ['feedback'], m.feedbackModule),
+  ]),
+  _NavSection('TEAM', [
+    _Module('Attendance', Icons.schedule, [], m.attendanceModule),
+    _Module('Employees', Icons.badge, ['employee', 'role', 'user'], m.employeesModule),
+    _Module('Roles', Icons.shield, ['role', 'permission'], m.rolesModule),
+    _Module('Valet', Icons.local_parking, ['valet', 'parking'], m.valetModule, feature: 'valet'),
+  ]),
+  _NavSection('INSIGHTS', [
+    _Module('Analytics', Icons.insights, ['analytics', 'apc', 'report'], m.analyticsModule, feature: 'analytics'),
+    // What-if planning sits beside the analytics it is computed from: the
+    // /simulation/* routes are gated on the SAME analytics Action every
+    // /analytics/* route uses, and the plan's `analytics` flag covers the data
+    // it projects — so the gate here mirrors Analytics exactly and no role or
+    // plan needs remapping.
+    //
+    // The keyword list must be Analytics' list VERBATIM. Profile.can substring-
+    // matches permitted ACTION NAMES, and the action that authorizes /simulation/*
+    // server-side is named "View Order APC" — it contains 'apc', not 'simulation'.
+    // With ['analytics','simulation','what-if'] a non-admin granted exactly that
+    // action saw Simulation on the web but a hidden tile here; extra keywords that
+    // match no action name are not harmless padding, they are a silent lie.
+    _Module('Simulation', Icons.tune, ['analytics', 'apc', 'report'], m.simulationModule, feature: 'analytics'),
+    _Module('History', Icons.calendar_month, ['analytics', 'report'], m.historyModule, feature: 'analytics'),
+  ]),
+  _NavSection('MONEY', [
+    _Module('Accounting', Icons.account_balance, ['report', 'accounting', 'finance', 'expense', 'analytics'], m.accountingModule, feature: 'accounting'),
+    _Module('Cash register', Icons.point_of_sale, ['report', 'accounting', 'finance', 'cash'], m.cashModule, feature: 'accounting'),
+    _Module('Billing', Icons.card_membership, [], m.billingModule, adminOnly: true),
+  ]),
+  _NavSection('SETUP', [
+    _Module('Outlets', Icons.store_mall_directory, ['outlet', 'branch', 'setting', 'profile'], m.outletsModule, feature: 'multi_outlet'),
+    _Module('Printer', Icons.print, [], m.printerModule),
+    _Module('Audit Log', Icons.history, ['audit', 'log'], m.auditLogModule),
+    _Module('Settings', Icons.settings, [], m.settingsModule, adminOnly: true),
+  ]),
 ];
+
+// The flat list everything else keeps consuming — `visible` filtering, tab
+// indices, `_visibleLabels`, `_openModule` — in section order.
+final _allModules = <_Module>[for (final s in _navSections) ...s.modules];
 
 /// The signed-in shell: a permission-gated sidebar plus the selected module.
 class HomeShell extends StatefulWidget {
@@ -504,6 +535,65 @@ class _HomeShellState extends State<HomeShell> {
     ]);
   }
 
+  // The nav entries in section order: a section header (expanded rail and
+  // drawer) or a thin divider (collapsed, icon-only rail) introduces each
+  // group of visible modules. A section whose every module is hidden by
+  // permissions / plan features contributes NOTHING — no orphan headers, no
+  // stacked dividers. Indices are positions in `visible`, so selection and
+  // the active highlight keep addressing the same flat list as before.
+  List<Widget> _navEntries(List<_Module> visible,
+      {required bool inDrawer, required bool collapsed}) {
+    final entries = <Widget>[];
+    var firstShown = true;
+    for (final section in _navSections) {
+      final indices = <int>[];
+      for (final mod in section.modules) {
+        final i = visible.indexOf(mod);
+        if (i >= 0) indices.add(i);
+      }
+      if (indices.isEmpty) continue;
+      if (collapsed) {
+        // Icon-only rail: no room for words — a hairline marks the boundary.
+        // The first group opens the list and needs no separator.
+        if (!firstShown) {
+          entries.add(Padding(
+            padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 10),
+            child: Container(height: 1, color: AppColors.divider),
+          ));
+        }
+      } else {
+        // Same overline voice as the old single 'WORKSPACE' label these
+        // headers replace: 10px, w600, wide tracking, tertiary ink.
+        entries.add(Padding(
+          padding: EdgeInsets.fromLTRB(8, firstShown ? 0 : 16, 8, 6),
+          child: Text(section.title,
+              style: const TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.1,
+                color: AppColors.textTertiary,
+              )),
+        ));
+      }
+      firstShown = false;
+      for (final i in indices) {
+        entries.add(_NavItem(
+          label: visible[i].label,
+          icon: visible[i].icon,
+          active: i == _index,
+          collapsed: collapsed,
+          onTap: () {
+            _selectIndex(i);
+            // Close the drawer; it holds a LocalHistoryEntry on this route,
+            // so a pop dismisses the drawer, not the screen.
+            if (inDrawer) Navigator.of(context).pop();
+          },
+        ));
+      }
+    }
+    return entries;
+  }
+
   // The nav list, reused by the wide sidebar (optionally collapsed to an
   // icon-only rail) and the narrow drawer.
   Widget _navList(List<_Module> visible, Profile p,
@@ -522,34 +612,10 @@ class _HomeShellState extends State<HomeShell> {
                 )
               : _brandMark(p, inDrawer: inDrawer),
         ),
-        if (!collapsed)
-          const Padding(
-            padding: EdgeInsets.only(left: 20, bottom: 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text('WORKSPACE',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 1.1,
-                    color: AppColors.textTertiary,
-                  )),
-            ),
-          ),
         Expanded(
-          child: ListView.builder(
+          child: ListView(
             padding: EdgeInsets.symmetric(horizontal: collapsed ? 8 : 12),
-            itemCount: visible.length,
-            itemBuilder: (context, i) => _NavItem(
-              label: visible[i].label,
-              icon: visible[i].icon,
-              active: i == _index,
-              collapsed: collapsed,
-              onTap: () {
-                _selectIndex(i);
-                if (inDrawer) Navigator.of(context).pop(); // close the drawer
-              },
-            ),
+            children: _navEntries(visible, inDrawer: inDrawer, collapsed: collapsed),
           ),
         ),
       ],
