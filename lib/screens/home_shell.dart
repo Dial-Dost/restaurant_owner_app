@@ -58,6 +58,19 @@ const _allModules = <_Module>[
   _Module('Customers', Icons.people, ['customer'], m.customersModule),
   _Module('Feedback', Icons.reviews, ['feedback'], m.feedbackModule),
   _Module('Analytics', Icons.insights, ['analytics', 'apc', 'report'], m.analyticsModule, feature: 'analytics'),
+  // What-if planning sits beside the analytics it is computed from: the
+  // /simulation/* routes are gated on the SAME analytics Action every
+  // /analytics/* route uses, and the plan's `analytics` flag covers the data
+  // it projects — so the gate here mirrors Analytics exactly and no role or
+  // plan needs remapping.
+  //
+  // The keyword list must be Analytics' list VERBATIM. Profile.can substring-
+  // matches permitted ACTION NAMES, and the action that authorizes /simulation/*
+  // server-side is named "View Order APC" — it contains 'apc', not 'simulation'.
+  // With ['analytics','simulation','what-if'] a non-admin granted exactly that
+  // action saw Simulation on the web but a hidden tile here; extra keywords that
+  // match no action name are not harmless padding, they are a silent lie.
+  _Module('Simulation', Icons.tune, ['analytics', 'apc', 'report'], m.simulationModule, feature: 'analytics'),
   _Module('History', Icons.calendar_month, ['analytics', 'report'], m.historyModule, feature: 'analytics'),
   _Module('Accounting', Icons.account_balance, ['report', 'accounting', 'finance', 'expense', 'analytics'], m.accountingModule, feature: 'accounting'),
   _Module('Cash register', Icons.point_of_sale, ['report', 'accounting', 'finance', 'cash'], m.cashModule, feature: 'accounting'),
