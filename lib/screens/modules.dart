@@ -6184,6 +6184,34 @@ class _TableSheetState extends State<_TableSheet> {
   // Fetch the current bill and show a receipt-style preview before anything is
   // sent to the thermal printer. "Print" in the dialog fires the same
   // server-side /print/bill call as before; "Cancel" prints nothing.
+  // Legal entity, address lines, GSTIN — in the order the printed bill lays
+  // them out, and each included ONLY when the tenant actually has one. A
+  // restaurant with no GSTIN gets a clean header, never a stray "GSTN :".
+  // Mirrors the same rule in escpos.ts, which renders the real paper.
+  Future<List<String>> _billHeaderLines() async {
+    try {
+      final results = await Future.wait([
+        widget.rest.getMap('/restaurant/settings'),
+        widget.rest.getMap('/restaurant/profile'),
+      ]);
+      final settings = results[0];
+      final profile = results[1];
+      final lines = <String>[];
+      final legalName = _s(settings, 'bill_legal_name', '').trim();
+      if (legalName.isNotEmpty) lines.add(legalName);
+      // A stored address is one field owners fill in with real line breaks;
+      // honour those and drop blank ones so a trailing newline is not a gap.
+      for (final l in _s(profile, 'outlet_add', '').split(RegExp(r'\r?\n'))) {
+        if (l.trim().isNotEmpty) lines.add(l.trim());
+      }
+      final gstin = _s(settings, 'bill_gstin', '').trim();
+      if (gstin.isNotEmpty) lines.add('GSTN : $gstin');
+      return lines;
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
   Future<void> _previewBill(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
     Map? bill;
     try {
@@ -6197,12 +6225,19 @@ class _TableSheetState extends State<_TableSheet> {
       messenger.showSnackBar(const SnackBar(content: Text('No open bill to print for this table.')));
       return;
     }
+    // The identity block the paper carries — legal entity, address, GSTIN — so
+    // the preview shows the header the printer will actually produce instead of
+    // just the trading name. Best-effort on purpose: this is a PREVIEW of a bill
+    // the server renders, so a settings/profile hiccup must degrade to the old
+    // name-only header rather than block the print.
+    final headerLines = await _billHeaderLines();
     if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => _BillPreviewDialog(
         bill: bill!,
         restaurantName: widget.profile.restaurantName,
+        headerLines: headerLines,
         tableName: _name,
         noServiceCharge: noServiceCharge,
       ),
@@ -6942,11 +6977,16 @@ class _TableSheetState extends State<_TableSheet> {
 class _BillPreviewDialog extends StatelessWidget {
   final Map bill;
   final String restaurantName;
+  // Legal entity / address / GSTIN, already resolved and already filtered to the
+  // ones this tenant has. Empty for a tenant that has set none, in which case
+  // the header is just the trading name — same as before these fields existed.
+  final List<String> headerLines;
   final String tableName;
   final bool noServiceCharge;
   const _BillPreviewDialog({
     required this.bill,
     required this.restaurantName,
+    this.headerLines = const <String>[],
     required this.tableName,
     required this.noServiceCharge,
   });
@@ -7034,6 +7074,16 @@ class _BillPreviewDialog extends StatelessWidget {
                           textAlign: TextAlign.center,
                           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
                     ),
+                    // Registered entity, address, GSTIN — only the ones set.
+                    if (headerLines.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      for (final l in headerLines)
+                        Center(
+                          child: Text(l,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 11, color: inkFaint)),
+                        ),
+                    ],
                     const SizedBox(height: 2),
                     Center(
                       child: Text(
@@ -9302,22 +9352,71 @@ Future<void> _barkOrder(
 }
 
 // Print a Kitchen Order Ticket (KOT) for a table's items.
+/// A LOCAL PDF copy of one order's kitchen ticket, laid out like the thermal
+/// docket the backend renders (escpos.ts `buildReceiptBase64`, kind "kot") so a
+/// chef reads the same shape whichever came off the printer.
+///
+/// IT DELIBERATELY CARRIES NO "KOT - n" NUMBER, and says so on the paper.
+/// The day-scoped ticket number is allocated server-side, inside the same
+/// transaction that memoises it (migration 029 / AllocateKotNumber), because
+/// that is the only place it can be made unique per outlet-day, gapless under
+/// concurrent tills, and stable across a reprint. A number invented on this
+/// device would satisfy none of those and would collide with the real series the
+/// moment a second till printed. So this copy is honest about being unnumbered
+/// rather than quietly printing a number the kitchen cannot trust.
+///
+/// This ticket also covers ONE ORDER, whereas a thermal KOT covers the table's
+/// whole running order set — another reason not to stamp it with a series
+/// number that means "the nth ticket this outlet sent to the kitchen today".
 Future<void> _printKot(String table, List items) async {
+  int totalQty = 0;
+  for (final it in items) {
+    totalQty += ((it as Map)['quantity'] as num?)?.round() ?? 1;
+  }
   final doc = pw.Document();
   doc.addPage(
     pw.Page(
       build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Text('KOT — Table $table', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+        pw.Text('KOT', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
         // Printed tickets leave the screen, so they carry the zone explicitly.
         pw.Text(RestaurantTime.stampNow(), style: const pw.TextStyle(fontSize: 9)),
+        pw.Text('Local copy - no ticket number', style: const pw.TextStyle(fontSize: 8)),
+        pw.SizedBox(height: 6),
+        pw.Text('Table No: $table', style: const pw.TextStyle(fontSize: 12)),
         pw.Divider(),
-        ...items.map((it) {
-          final m = it as Map;
+        // Numbered lines with the quantity in its own right-hand column, matching
+        // the thermal docket's "No. / Item / Qty".
+        pw.Row(children: [
+          pw.SizedBox(width: 28, child: pw.Text('No.', style: const pw.TextStyle(fontSize: 9))),
+          pw.Expanded(child: pw.Text('Item', style: const pw.TextStyle(fontSize: 9))),
+          pw.SizedBox(width: 34, child: pw.Text('Qty', style: const pw.TextStyle(fontSize: 9), textAlign: pw.TextAlign.right)),
+        ]),
+        pw.Divider(),
+        ...items.asMap().entries.map((e) {
+          final m = e.value as Map;
+          final note = (m['note'] ?? '').toString().trim();
           return pw.Padding(
             padding: const pw.EdgeInsets.symmetric(vertical: 2),
-            child: pw.Text('${m['quantity'] ?? 1} x ${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14)),
+            child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+              pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+                pw.SizedBox(width: 28, child: pw.Text('${e.key + 1}', style: const pw.TextStyle(fontSize: 14))),
+                pw.Expanded(child: pw.Text('${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14))),
+                pw.SizedBox(
+                  width: 34,
+                  child: pw.Text('${m['quantity'] ?? 1}', style: const pw.TextStyle(fontSize: 14), textAlign: pw.TextAlign.right),
+                ),
+              ]),
+              // The one thing on a KOT more important than the dish name.
+              if (note.isNotEmpty)
+                pw.Padding(
+                  padding: const pw.EdgeInsets.only(left: 28, top: 1),
+                  child: pw.Text('* $note', style: const pw.TextStyle(fontSize: 11)),
+                ),
+            ]),
           );
         }),
+        pw.Divider(),
+        pw.Text('Total Qty: $totalQty', style: const pw.TextStyle(fontSize: 12)),
       ]),
     ),
   );
@@ -23996,6 +24095,16 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
               initialPaperWidth: _s(m, 'bill_paper_width', '80mm'),
               reload: reload,
             ),
+            const SizedBox(height: 14),
+            _BillIdentityCard(
+              rest: rest,
+              initialLegalName: _s(m, 'bill_legal_name', ''),
+              initialGstin: _s(m, 'bill_gstin', ''),
+              initialQrNote: _s(m, 'bill_qr_note', ''),
+              qrNoteDefault: _s(m, 'bill_qr_note_default', ''),
+              qrNoteMax: (m['bill_qr_note_max'] is num) ? (m['bill_qr_note_max'] as num).toInt() : 120,
+              reload: reload,
+            ),
             const SizedBox(height: AppSpacing.xxl),
             const SectionHeader(title: 'Branding'),
             _BrandingCard(
@@ -24233,6 +24342,153 @@ class _BillLogoCardState extends State<_BillLogoCard> {
               dense: true,
               onPressed: _busy ? null : () => _save(clear: true),
             ),
+        ]),
+      ]),
+    );
+  }
+}
+
+// What the printed bill says about the restaurant, and what it says above the
+// feedback/valet QR.
+//
+// ALL THREE FIELDS ARE OPTIONAL AND THAT IS THE POINT. An Indian bill normally
+// carries the registered entity behind the trading name ("… HOSPITALITY LLP")
+// and the GST registration, but plenty of tenants have neither — and they must
+// get a CLEAN receipt. An unset field prints nothing at all: no orphan "GSTN :"
+// label, no blank line standing in for the field that is missing.
+//
+// The QR sentence used to be a string literal inside the renderer, identical on
+// every tenant's paper. Clearing this box restores that built-in line rather
+// than printing nothing, so a restaurant that never opens this card sees its
+// receipt unchanged.
+class _BillIdentityCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialLegalName;
+  final String initialGstin;
+  final String initialQrNote;
+  // The line the printer falls back to when the note is blank, and the cap the
+  // backend enforces. Both come from the settings document rather than being
+  // written down again here, so this card can never disagree with escpos.ts.
+  final String qrNoteDefault;
+  final int qrNoteMax;
+  final VoidCallback reload;
+  const _BillIdentityCard({
+    required this.rest,
+    required this.initialLegalName,
+    required this.initialGstin,
+    required this.initialQrNote,
+    required this.qrNoteDefault,
+    required this.qrNoteMax,
+    required this.reload,
+  });
+  @override
+  State<_BillIdentityCard> createState() => _BillIdentityCardState();
+}
+
+class _BillIdentityCardState extends State<_BillIdentityCard> {
+  late final TextEditingController _legalName;
+  late final TextEditingController _gstin;
+  late final TextEditingController _qrNote;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _legalName = TextEditingController(text: widget.initialLegalName);
+    _gstin = TextEditingController(text: widget.initialGstin);
+    _qrNote = TextEditingController(text: widget.initialQrNote);
+  }
+
+  @override
+  void dispose() {
+    _legalName.dispose();
+    _gstin.dispose();
+    _qrNote.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      // Sent even when empty — '' is how a field is CLEARED, and clearing the
+      // note restores the built-in valet line. The backend presence-checks
+      // rather than truthiness-checks for exactly this reason.
+      await widget.rest.post('/restaurant/settings', {
+        'bill_legal_name': _legalName.text.trim(),
+        'bill_gstin': _gstin.text.trim(),
+        'bill_qr_note': _qrNote.text.trim(),
+      });
+      messenger.showSnackBar(const SnackBar(content: Text('Bill details saved.')));
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final noteLen = _qrNote.text.characters.length;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text('Bill details', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+            'Printed under your restaurant name on every bill, plus the message above the feedback QR code. Leave a field blank and it is left off the receipt entirely.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text('REGISTERED BUSINESS NAME', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _legalName,
+          decoration: const InputDecoration(
+            hintText: 'e.g. Navkrish Hospitality LLP',
+            helperText: 'The legal entity behind the trading name.',
+            isDense: true,
+          ),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Text('GSTIN', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _gstin,
+          textCapitalization: TextCapitalization.characters,
+          decoration: const InputDecoration(
+            hintText: 'e.g. 29AAXFN2701Q1ZF',
+            helperText: 'Printed as "GSTN : …". Leave blank if you are not GST registered.',
+            isDense: true,
+          ),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Text('MESSAGE ABOVE THE QR CODE', style: text.labelSmall),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _qrNote,
+          minLines: 2,
+          maxLines: 3,
+          maxLength: widget.qrNoteMax,
+          decoration: InputDecoration(
+            hintText: widget.qrNoteDefault.isNotEmpty ? widget.qrNoteDefault : 'Scan the QR code below',
+            helperText: widget.qrNoteDefault.isNotEmpty
+                ? 'Leave blank to use the default: "${widget.qrNoteDefault}"'
+                : 'Leave blank to use the built-in default.',
+            helperMaxLines: 3,
+            counterText: '$noteLen/${widget.qrNoteMax}',
+            isDense: true,
+          ),
+          onChanged: (_) => setState(() {}),
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          ForkButton(
+            label: _busy ? 'Saving…' : 'Save bill details',
+            icon: Icons.save_outlined,
+            dense: true,
+            onPressed: _busy ? null : _save,
+          ),
         ]),
       ]),
     );
