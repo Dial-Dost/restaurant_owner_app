@@ -10961,36 +10961,43 @@ class _BookingsViewState extends State<_BookingsView> {
       // (and switching feels instant) even while the chosen slice is loading.
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-        child: Row(children: [
-          Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: SegmentedButton<String>(
-                segments: const [
-                  ButtonSegment(value: 'upcoming', label: Text('Upcoming'), icon: Icon(Icons.event_available, size: 15)),
-                  ButtonSegment(value: 'past', label: Text('Past'), icon: Icon(Icons.history, size: 15)),
-                  ButtonSegment(value: 'all', label: Text('All'), icon: Icon(Icons.event_note, size: 15)),
-                ],
-                selected: {_window},
-                showSelectedIcon: false,
-                onSelectionChanged: (s) => setState(() => _window = s.first),
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          // Until this button existed the app could only ASSIGN tables to
-          // bookings created elsewhere — walking in with a party of 8 and a
-          // phone in hand, there was simply no way to book at all, which a
-          // tester reported as "it does not let you book for 8". Creation
-          // rides the same seating suggester as assignment, so a party no
-          // single table fits gets offered a clubbed set (6 + 2) up front.
-          ForkButton(
-            label: 'New booking',
-            icon: Icons.add,
-            dense: true,
-            onPressed: () => _newBooking(context),
-          ),
-        ]),
+        // Until the New-booking button existed the app could only ASSIGN
+        // tables to bookings created elsewhere — walking in with a party of 8
+        // and a phone in hand, there was simply no way to book at all, which a
+        // tester reported as "it does not let you book for 8". Creation rides
+        // the same seating suggester as assignment, so a party no single table
+        // fits gets offered a clubbed set (6 + 2) up front.
+        //
+        // Two layouts on purpose. Sharing one Row squeezed the SegmentedButton
+        // on phones until its labels wrapped LETTER BY LETTER ("U-pc-o-mi-ng")
+        // — the selector needs the full width there, so below the app's shared
+        // narrow breakpoint the button drops onto its own line instead.
+        // 760 = the app-wide narrow edge (kNarrowWidth in home_shell.dart —
+        // not importable here without a cycle; modules spell it inline).
+        child: MediaQuery.sizeOf(context).width < 760
+            ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Align(alignment: Alignment.centerLeft, child: _windowSelector()),
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: ForkButton(
+                    label: 'New booking',
+                    icon: Icons.add,
+                    dense: true,
+                    onPressed: () => _newBooking(context),
+                  ),
+                ),
+              ])
+            : Row(children: [
+                Expanded(child: Align(alignment: Alignment.centerLeft, child: _windowSelector())),
+                const SizedBox(width: 10),
+                ForkButton(
+                  label: 'New booking',
+                  icon: Icons.add,
+                  dense: true,
+                  onPressed: () => _newBooking(context),
+                ),
+              ]),
       ),
       Expanded(
         child: AsyncView<List>(
@@ -11006,6 +11013,17 @@ class _BookingsViewState extends State<_BookingsView> {
 
   // Bumped after a successful create so the AsyncView refetches.
   int _createdTick = 0;
+
+  Widget _windowSelector() => SegmentedButton<String>(
+        segments: const [
+          ButtonSegment(value: 'upcoming', label: Text('Upcoming'), icon: Icon(Icons.event_available, size: 15)),
+          ButtonSegment(value: 'past', label: Text('Past'), icon: Icon(Icons.history, size: 15)),
+          ButtonSegment(value: 'all', label: Text('All'), icon: Icon(Icons.event_note, size: 15)),
+        ],
+        selected: {_window},
+        showSelectedIcon: false,
+        onSelectionChanged: (s) => setState(() => _window = s.first),
+      );
 
   /// Create a booking from the app. Party bigger than every single table gets
   /// the seating suggester's clubbed combinations (same dialog the assign flow
