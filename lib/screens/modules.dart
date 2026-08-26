@@ -34,6 +34,7 @@ import '../ui/widgets/section_header.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/stat_card.dart';
 import '../ui/widgets/status_chip.dart';
+import '../widgets/appearance_card.dart';
 import '../widgets/async_view.dart';
 import '../widgets/module_navigator.dart';
 import '../widgets/table_bill.dart';
@@ -429,7 +430,7 @@ Widget _statCard(BuildContext c, String label, String value, IconData icon,
             : Row(mainAxisSize: MainAxisSize.min, children: [
                 Text('DETAILS',
                     style: Theme.of(c).textTheme.labelSmall!.copyWith(color: AppColors.copper)),
-                const Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
+                Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
               ]),
       ),
     );
@@ -579,9 +580,12 @@ Widget _metricTile(
   String? sub,
   Color subColor = AppColors.textSecondary,
   IconData? icon,
-  Color accent = AppColors.copperHi,
+  // Nullable because AppColors.copperHi is a getter now (the device accent),
+  // and a default must be const — null means "the active accent".
+  Color? accent,
   VoidCallback? onTap,
 }) {
+  accent ??= AppColors.copperHi;
   final text = Theme.of(context).textTheme;
   return ForkCard(
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -3327,7 +3331,7 @@ class _KitchenSectionsDialogState extends State<_KitchenSectionsDialog> {
                       inset: true,
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                       child: Row(children: [
-                        const Icon(Icons.tag, size: 14, color: AppColors.copperHi),
+                        Icon(Icons.tag, size: 14, color: AppColors.copperHi),
                         const SizedBox(width: AppSpacing.sm),
                         Expanded(child: Text(s, style: text.titleSmall, overflow: TextOverflow.ellipsis)),
                         ForkIconButton(
@@ -3532,7 +3536,7 @@ class _InventoryCategoriesDialogState extends State<_InventoryCategoriesDialog> 
                       inset: true,
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                       child: Row(children: [
-                        const Icon(Icons.category_outlined, size: 14, color: AppColors.copperHi),
+                        Icon(Icons.category_outlined, size: 14, color: AppColors.copperHi),
                         const SizedBox(width: AppSpacing.sm),
                         Expanded(child: Text(s, style: text.titleSmall, overflow: TextOverflow.ellipsis)),
                         ForkIconButton(
@@ -4356,7 +4360,7 @@ class _AuditLogViewState extends State<_AuditLogView> {
     final text = Theme.of(context).textTheme;
     final child = _loadingMore
         ? Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            const SizedBox(
+            SizedBox(
               width: 13,
               height: 13,
               child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.copper),
@@ -4409,7 +4413,7 @@ class _AuditLogViewState extends State<_AuditLogView> {
             borderRadius: AppRadius.controlAll,
             border: Border.all(color: AppColors.border),
           ),
-          child: const Icon(Icons.history, size: 14, color: AppColors.copper),
+          child: Icon(Icons.history, size: 14, color: AppColors.copper),
         ),
         const SizedBox(width: AppSpacing.md),
         Expanded(
@@ -5840,10 +5844,10 @@ class _TableBox extends StatelessWidget {
                   border: Border.all(color: AppColors.edge(AppColors.copper)),
                 ),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.lock_outline, size: 13, color: AppColors.copperHi),
+                  Icon(Icons.lock_outline, size: 13, color: AppColors.copperHi),
                   const SizedBox(width: 6),
                   Text('OTP $otp',
-                      style: const TextStyle(
+                      style: TextStyle(
                           fontSize: 13.5, fontWeight: FontWeight.w700, letterSpacing: 1.5, color: AppColors.copperHi)),
                 ]),
               ),
@@ -5863,13 +5867,13 @@ class _TableBox extends StatelessWidget {
                     border: Border.all(color: AppColors.edge(AppColors.copper)),
                   ),
                   child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    const Icon(Icons.link, size: 13, color: AppColors.copperHi),
+                    Icon(Icons.link, size: 13, color: AppColors.copperHi),
                     const SizedBox(width: 6),
                     Flexible(
                       child: Text('+ ${clubbedWith.join(' + ')}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                          style: TextStyle(
                               fontSize: 11.5, fontWeight: FontWeight.w700, color: AppColors.copperHi)),
                     ),
                   ]),
@@ -6635,10 +6639,10 @@ class _TableSheetState extends State<_TableSheet> {
                       border: Border.all(color: AppColors.edge(AppColors.copper)),
                     ),
                     child: Row(mainAxisSize: MainAxisSize.min, children: [
-                      const Icon(Icons.lock_outline, size: 14, color: AppColors.copperHi),
+                      Icon(Icons.lock_outline, size: 14, color: AppColors.copperHi),
                       const SizedBox(width: 7),
                       Text('OTP $_otp',
-                          style: const TextStyle(
+                          style: TextStyle(
                               fontSize: 15,
                               fontWeight: FontWeight.w700,
                               letterSpacing: 2,
@@ -8585,7 +8589,7 @@ Future<void> _changeOrderStatus(
                           AnimatedSwitcher(
                             duration: AppDurations.fast,
                             child: sel == s
-                                ? const Icon(Icons.check_circle,
+                                ? Icon(Icons.check_circle,
                                     key: ValueKey('on'), size: 16, color: AppColors.copperHi)
                                 : const Icon(Icons.circle_outlined,
                                     key: ValueKey('off'), size: 16, color: AppColors.textTertiary),
@@ -8766,7 +8770,7 @@ class _KdsHomeState extends State<_KdsHome> {
                   border: Border.all(color: AppColors.edge(AppColors.copper)),
                 ),
                 child: Row(children: [
-                  const Icon(Icons.lock, size: 16, color: AppColors.copperHi),
+                  Icon(Icons.lock, size: 16, color: AppColors.copperHi),
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
                     child: Text('LOCKED TO ${selected.toUpperCase()}',
@@ -9423,8 +9427,20 @@ Future<void> _printKot(String table, List items) async {
   await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
 }
 
+/// A quantity as a person writes it: 5 not 5.0, 2.5 stays 2.5.
+String _stockNum(double? v) {
+  if (v == null) return '';
+  return v == v.roundToDouble() ? '${v.round()}' : '$v';
+}
+
 /// Stock tint, in the shared status voice: label + tint, never colour alone.
 /// Top-level so a drill-down sheet tints an item exactly as its row does.
+///
+/// The STATUS ITSELF is never computed here. It comes from the server, which
+/// decides it from the quantity, the item's unit AND its reorder level (the
+/// backend's inventory_units module). This app deliberately holds no copy of
+/// that rule — a second copy is how the old one drifted, and it is why 5000 mg
+/// of potato used to read "In Stock" while 5 kg of it read "Low Stock".
 Color _inventoryStockColor(String status) {
   final s = status.toLowerCase();
   if (s.contains('out')) return AppColors.danger;
@@ -9543,6 +9559,7 @@ Future<void> _inventoryItemSheet(
   final unit = _s(item, 'unit', '');
   final category = _s(item, 'category', '').trim();
   final expiry = _s(item, 'expiry_date', '').trim();
+  final reorderApplied = double.tryParse('${item['reorder_applied'] ?? ''}');
 
   String? expiryNote;
   final due = expiry.isEmpty ? null : DateTime.tryParse(expiry);
@@ -9563,6 +9580,16 @@ Future<void> _inventoryItemSheet(
       Align(alignment: Alignment.centerLeft, child: StatusChip(label: status, color: colour)),
       const SizedBox(height: AppSpacing.md),
       _detailRow(context, 'On hand', '${item['stock'] ?? 0}${unit.isEmpty ? '' : ' $unit'}'),
+      // What the badge above was decided against, in this item's own unit, so
+      // "Low Stock" on 50 g is explicable instead of mysterious. Suppressed for
+      // a unit the server could not classify (basis 'legacy'), where there is no
+      // meaningful level to quote.
+      if (reorderApplied != null && _s(item, 'reorder_basis', '') != 'legacy')
+        _detailRow(
+          context,
+          _s(item, 'reorder_basis', '') == 'item' ? 'Reorder at' : 'Reorder at (default)',
+          '${_stockNum(reorderApplied)}${unit.isEmpty ? '' : ' $unit'}',
+        ),
       _detailRow(context, 'Category', category.isEmpty ? 'Uncategorised' : category),
       _detailRow(context, 'Expiry', expiry.isEmpty ? 'Not set' : RestaurantTime.day(expiry),
           trailing: expiryNote),
@@ -9591,6 +9618,19 @@ Future<void> _inventoryItemSheet(
             onPressed: () {
               Navigator.pop(ctx);
               _recordWastage(context, rest, item, reload);
+            },
+          ),
+          // Editing the threshold goes through its OWN endpoint, never through
+          // the add-item upsert: that one writes "Quantity" from the form, so it
+          // would stamp a stale stock figure over any movement recorded while
+          // this sheet was open. A threshold edit must not move stock.
+          ForkButton.ghost(
+            label: 'Reorder level',
+            icon: Icons.speed_outlined,
+            dense: true,
+            onPressed: () {
+              Navigator.pop(ctx);
+              _setReorderLevel(context, rest, item, reload);
             },
           ),
         ]),
@@ -10211,7 +10251,7 @@ class _VendorsSheetState extends State<_VendorsSheet> {
                           borderRadius: AppRadius.controlAll,
                           border: Border.all(color: AppColors.border),
                         ),
-                        child: const Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.copper),
+                        child: Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.copper),
                       ),
                       const SizedBox(width: AppSpacing.md),
                       Expanded(
@@ -10742,7 +10782,7 @@ class _CustomersViewState extends State<_CustomersView> {
   Widget _pagingFoot(BuildContext context, TextTheme text) {
     if (_loadingMore) {
       return Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        const SizedBox(
+        SizedBox(
           width: 13,
           height: 13,
           child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.copper),
@@ -11973,7 +12013,7 @@ Widget _employeeFeedbackQrSection(Profile p, List employees, List feedback) {
               borderRadius: AppRadius.controlAll,
               border: Border.all(color: AppColors.border),
             ),
-            child: const Icon(Icons.qr_code_2, size: 18, color: AppColors.copper),
+            child: Icon(Icons.qr_code_2, size: 18, color: AppColors.copper),
           ),
           title: Text('Per-waiter feedback QR', style: Theme.of(context).textTheme.titleSmall),
           subtitle: Padding(
@@ -13005,7 +13045,7 @@ class _KpiDrilldownSheet extends StatelessWidget {
       if (tip.isNotEmpty) ...[
         const SizedBox(height: 6),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Icon(Icons.lightbulb_outline, size: 13, color: AppColors.copper),
+          Icon(Icons.lightbulb_outline, size: 13, color: AppColors.copper),
           const SizedBox(width: 7),
           Expanded(
             child: Text(tip, style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
@@ -13228,7 +13268,7 @@ Widget _sortControl(String section, List<_SortOption> opts, void Function(void F
                     ),
                   ),
                 ),
-                if (i == fi) const Icon(Icons.check, size: 14, color: AppColors.copperHi),
+                if (i == fi) Icon(Icons.check, size: 14, color: AppColors.copperHi),
               ]),
             ),
         ],
@@ -13240,11 +13280,11 @@ Widget _sortControl(String section, List<_SortOption> opts, void Function(void F
             border: Border.all(color: AppColors.border),
           ),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.sort, size: 13, color: AppColors.copper),
+            Icon(Icons.sort, size: 13, color: AppColors.copper),
             const SizedBox(width: 6),
             Text(
               opts[fi].label,
-              style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.copperHi, letterSpacing: 0.2),
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.copperHi, letterSpacing: 0.2),
             ),
             const Icon(Icons.arrow_drop_down, size: 16, color: AppColors.textTertiary),
           ]),
@@ -14102,7 +14142,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                           ['Coupon redemptions', '${advDisc['redemptions'] ?? 0}'],
                         ])),
                     const SizedBox(width: 6),
-                    const Icon(Icons.chevron_right, size: 18, color: AppColors.copper),
+                    Icon(Icons.chevron_right, size: 18, color: AppColors.copper),
                   ]),
                 ),
                 _kv('Discount utilization', '${num0(advDisc['utilization_pct']).toStringAsFixed(0)}%'),
@@ -15835,7 +15875,7 @@ class _AccountingViewState extends State<_AccountingView> {
 
     Widget detailsFooter() => Row(mainAxisSize: MainAxisSize.min, children: [
           Text('DETAILS', style: text.labelSmall!.copyWith(color: AppColors.copper)),
-          const Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
+          Icon(Icons.chevron_right, size: 14, color: AppColors.copper),
         ]);
     Widget hairline() => Container(height: 1, color: AppColors.divider);
 
@@ -16919,7 +16959,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b) {
             borderRadius: AppRadius.controlAll,
             border: Border.all(color: AppColors.border),
           ),
-          child: const Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
+          child: Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
         ),
         const SizedBox(width: AppSpacing.md),
         Expanded(
@@ -17488,7 +17528,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
                 borderRadius: AppRadius.controlAll,
                 border: Border.all(color: AppColors.edge(AppColors.copper)),
               ),
-              child: const Icon(Icons.restaurant_menu, size: 18, color: AppColors.copperHi),
+              child: Icon(Icons.restaurant_menu, size: 18, color: AppColors.copperHi),
             ),
             const SizedBox(width: AppSpacing.md),
             Expanded(
@@ -17645,16 +17685,21 @@ class _WaitlistViewState extends State<_WaitlistView> {
     return total;
   }
 
-  Widget _roundBadge(IconData icon, {Color color = AppColors.copper, double size = 34}) => Container(
-        width: size,
-        height: size,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: AppColors.tint(color),
-          border: Border.all(color: AppColors.edge(color)),
-        ),
-        child: Icon(icon, size: size * 0.48, color: Color.lerp(color, Colors.white, 0.25)),
-      );
+  // color: null = the active accent (AppColors.copper is a getter now, so it
+  // cannot be a const default).
+  Widget _roundBadge(IconData icon, {Color? color, double size = 34}) {
+    final c = color ?? AppColors.copper;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: AppColors.tint(c),
+        border: Border.all(color: AppColors.edge(c)),
+      ),
+      child: Icon(icon, size: size * 0.48, color: Color.lerp(c, Colors.white, 0.25)),
+    );
+  }
 
   // The Party cell. It used to be the same groups icon on every row — 42px of a
   // desktop table carrying no information — while the phone layout showed
@@ -17694,7 +17739,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
                   border: Border.all(color: AppColors.edge(AppColors.copper)),
                 ),
                 child: Text('${members.length}',
-                    style: const TextStyle(
+                    style: TextStyle(
                         fontSize: 9, fontWeight: FontWeight.w700, color: AppColors.copperHi)),
               ),
             ),
@@ -17718,7 +17763,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
             borderRadius: AppRadius.tileAll,
             border: Border.all(color: AppColors.edge(AppColors.copper)),
           ),
-          child: const Icon(Icons.qr_code_2, size: 21, color: AppColors.copperHi),
+          child: Icon(Icons.qr_code_2, size: 21, color: AppColors.copperHi),
         ),
         const SizedBox(width: AppSpacing.lg),
         Expanded(
@@ -19069,7 +19114,7 @@ class _BillingViewState extends State<_BillingView> {
                 Align(
                   alignment: Alignment.centerRight,
                   child: isCurrent
-                      ? const StatusChip(label: 'Current plan', color: AppColors.copper)
+                      ? StatusChip(label: 'Current plan', color: AppColors.copper)
                       : ForkButton(
                           label: 'Choose',
                           icon: Icons.arrow_forward,
@@ -19100,7 +19145,7 @@ class _BillingViewState extends State<_BillingView> {
                       borderRadius: AppRadius.controlAll,
                       border: Border.all(color: AppColors.border),
                     ),
-                    child: const Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
+                    child: Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.copper),
                   ),
                   const SizedBox(width: AppSpacing.md),
                   Expanded(
@@ -19380,7 +19425,7 @@ class _CashViewState extends State<_CashView> {
               borderRadius: AppRadius.controlAll,
               border: Border.all(color: AppColors.border),
             ),
-            child: const Icon(Icons.lock_open, size: 16, color: AppColors.copper),
+            child: Icon(Icons.lock_open, size: 16, color: AppColors.copper),
           ),
           const SizedBox(width: AppSpacing.md),
           Expanded(child: Text('Open register', style: text.titleMedium)),
@@ -19475,7 +19520,7 @@ class _CashViewState extends State<_CashView> {
       padding: const EdgeInsets.all(AppSpacing.md),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Icon(Icons.calculate_outlined, size: 15, color: AppColors.copper),
+          Icon(Icons.calculate_outlined, size: 15, color: AppColors.copper),
           const SizedBox(width: AppSpacing.sm),
           Expanded(child: Text('COUNT THE DRAWER', style: text.labelSmall)),
           ForkButton.subtle(
@@ -19563,7 +19608,7 @@ class _CashViewState extends State<_CashView> {
                 borderRadius: AppRadius.controlAll,
                 border: Border.all(color: AppColors.border),
               ),
-              child: const Icon(Icons.lock_outline, size: 16, color: AppColors.copper),
+              child: Icon(Icons.lock_outline, size: 16, color: AppColors.copper),
             ),
             const SizedBox(width: AppSpacing.md),
             Expanded(child: Text('Close & count down', style: text.titleMedium)),
@@ -20723,7 +20768,7 @@ class _AttendanceViewState extends State<_AttendanceView> {
                     ]),
                     trailing: [
                       MicroStat(value: _hm(mins), label: 'hours', alignEnd: true),
-                      if (open) const StatusChip(label: 'On shift', color: AppColors.copper, dense: true),
+                      if (open) StatusChip(label: 'On shift', color: AppColors.copper, dense: true),
                     ],
                   ),
                 ),
@@ -21036,7 +21081,7 @@ class _OutletsViewState extends State<_OutletsView> {
             context,
             title: _s(o, 'outlet_name', 'Outlet'),
             badge: _isCurrentOutlet(o)
-                ? const StatusChip(label: 'Viewing', color: AppColors.copper, dense: true)
+                ? StatusChip(label: 'Viewing', color: AppColors.copper, dense: true)
                 : (o['is_active'] == false
                     ? const StatusChip(label: 'Inactive', color: AppColors.neutral, dense: true)
                     : null),
@@ -21132,7 +21177,7 @@ class _OutletsViewState extends State<_OutletsView> {
                   ),
                   if (isDefault) ...[
                     const SizedBox(width: 8),
-                    const TickTag('Main', color: AppColors.copper),
+                    TickTag('Main', color: AppColors.copper),
                   ],
                 ]),
                 if (_s(o, 'outlet_add').isNotEmpty) ...[
@@ -21796,7 +21841,7 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                               value: ratio,
                               minHeight: 4,
                               backgroundColor: AppColors.inset,
-                              valueColor: const AlwaysStoppedAnimation<Color>(AppColors.copper),
+                              valueColor: AlwaysStoppedAnimation<Color>(AppColors.copper),
                             ),
                           ),
                           const SizedBox(height: 10),
@@ -21930,7 +21975,7 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                               borderRadius: AppRadius.controlAll,
                               border: Border.all(color: AppColors.border),
                             ),
-                            child: const Icon(Icons.directions_car_outlined, size: 16, color: AppColors.copper),
+                            child: Icon(Icons.directions_car_outlined, size: 16, color: AppColors.copper),
                           ),
                           const SizedBox(width: 10),
                           Expanded(
@@ -23926,7 +23971,7 @@ Widget printerModule(RestClient rest, Profile p) {
                   inset: true,
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                   child: Row(children: [
-                    const Icon(Icons.receipt_long, size: 15, color: AppColors.copperHi),
+                    Icon(Icons.receipt_long, size: 15, color: AppColors.copperHi),
                     const SizedBox(width: AppSpacing.md),
                     Expanded(
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
@@ -24012,6 +24057,7 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           'brand_fonts': settings['brand_fonts'] ?? const [],
           'brand_fields': settings['brand_fields'] ?? const {},
           'brand_field_options': settings['brand_field_options'] ?? const {},
+          'brand_schemes': settings['brand_schemes'] ?? const [],
         };
       },
       // Landing: the template settings idiom — a single centered column of
@@ -24106,6 +24152,11 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
               reload: reload,
             ),
             const SizedBox(height: AppSpacing.xxl),
+            // Device-local chrome, deliberately outside the tenant's audited
+            // settings — see AppearanceController for why this is per-device.
+            const SectionHeader(title: 'Appearance — this device'),
+            const AppearanceCard(),
+            const SizedBox(height: AppSpacing.xxl),
             const SectionHeader(title: 'Branding'),
             _BrandingCard(
               rest: rest,
@@ -24126,6 +24177,7 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                 for (final f in (((m['brand_fields'] as Map?) ?? const {})['legacy'] as List?) ?? const []) f.toString(),
               ],
               fieldOptions: (m['brand_field_options'] as Map?) ?? const {},
+              schemes: (m['brand_schemes'] as List?) ?? const [],
               reload: reload,
             ),
             const SizedBox(height: 14),
@@ -26170,6 +26222,9 @@ class _CustomerBrandingCard extends StatefulWidget {
   final List<String> liveFields;
   final List<String> legacyFields;
   final Map fieldOptions;
+  // brand_schemes from GET /restaurant/settings: [{id,label,hint,preview:{...}}].
+  // Empty falls back to the shipped catalogue so an older backend still works.
+  final List schemes;
   final VoidCallback reload;
   const _CustomerBrandingCard({
     required this.rest,
@@ -26179,6 +26234,7 @@ class _CustomerBrandingCard extends StatefulWidget {
     required this.liveFields,
     required this.legacyFields,
     required this.fieldOptions,
+    required this.schemes,
     required this.reload,
   });
 
@@ -26200,13 +26256,26 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     'Inter', 'Poppins', 'Playfair Display', 'Montserrat', 'Lato',
     'Nunito', 'Oswald', 'Roboto Slab', 'DM Sans', 'Merriweather',
   ];
-  static const _fallbackLive = <String>['color_primary', 'font', 'header_style', 'button_shape', 'surface_style'];
+  static const _fallbackLive = <String>[
+    'scheme', 'color_primary', 'font', 'font_scale', 'header_style', 'button_shape', 'surface_style', 'card_shape',
+  ];
   static const _fallbackLegacy = <String>['color_secondary', 'color_bg', 'color_text', 'color_card'];
   static const _fallbackOptions = <String, List<String>>{
     'header_style': ['gradient', 'solid'],
     'button_shape': ['rounded', 'pill', 'square'],
     'surface_style': ['frosted', 'solid', 'tinted'],
+    'scheme': ['classic', 'copper', 'airy', 'contrast', 'custom'],
+    'font_scale': ['small', 'medium', 'large'],
+    'card_shape': ['rounded', 'sharp'],
   };
+  // Mirrors the server's BRAND_SCHEMES previews; the server list wins when sent.
+  static const _fallbackSchemes = <Map<String, dynamic>>[
+    {'id': 'classic', 'label': 'Classic dark', 'preview': {'background': '#08080A', 'surface': '#1A1A1F', 'text': '#ECEAE6'}},
+    {'id': 'copper', 'label': 'Warm copper', 'preview': {'background': '#0E0A08', 'surface': '#201812', 'text': '#F1E9DF'}},
+    {'id': 'airy', 'label': 'Light & airy', 'preview': {'background': '#F6F4EF', 'surface': '#FFFFFF', 'text': '#2B2723'}},
+    {'id': 'contrast', 'label': 'High contrast', 'preview': {'background': '#000000', 'surface': '#101010', 'text': '#FFFFFF'}},
+    {'id': 'custom', 'label': 'Custom', 'preview': {'background': '#08080A', 'surface': '#1A1A1F', 'text': '#ECEAE6'}},
+  ];
   // Human labels for the enum values + the retired keys.
   static const _optionLabels = <String, String>{
     'gradient': 'Gradient',
@@ -26216,6 +26285,10 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     'square': 'Square',
     'frosted': 'Frosted',
     'tinted': 'Accent glass',
+    'small': 'S',
+    'medium': 'M',
+    'large': 'L',
+    'sharp': 'Sharp',
   };
   static const _legacyLabels = <String, String>{
     'color_secondary': 'Secondary colour',
@@ -26233,6 +26306,13 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
   late String _headerStyle;
   late String _buttonShape;
   late String _surfaceStyle;
+  late String _scheme;
+  late String _fontScale;
+  late String _cardShape;
+  // Only a scheme the OWNER changed in this session clears the stored shell
+  // colour overrides on save — an untouched save must never wipe colours that
+  // were pinned from the web editor.
+  bool _schemeTouched = false;
   final TextEditingController _accent = TextEditingController();
   bool _busy = false;
   bool _showRetired = false;
@@ -26252,6 +26332,9 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     _headerStyle = _pick('header_style', '${c['header_style'] ?? ''}', 'gradient');
     _buttonShape = _pick('button_shape', '${c['button_shape'] ?? ''}', 'rounded');
     _surfaceStyle = _pick('surface_style', '${c['surface_style'] ?? ''}', 'frosted');
+    _scheme = _pick('scheme', '${c['scheme'] ?? ''}', 'classic');
+    _fontScale = _pick('font_scale', '${c['font_scale'] ?? ''}', 'medium');
+    _cardShape = _pick('card_shape', '${c['card_shape'] ?? ''}', 'rounded');
     final accent = '${c['color_primary'] ?? ''}'.trim();
     if (_hexRe.hasMatch(accent)) _accent.text = accent;
   }
@@ -26289,6 +26372,26 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
   // copper default rather than a lie.
   _BrandRamp get _ramp => _brandRamp(_accent.text);
 
+  List<Map> get _schemeList {
+    final fromServer = [for (final e in widget.schemes) if (e is Map) e];
+    return fromServer.isNotEmpty ? fromServer : _fallbackSchemes;
+  }
+
+  Map? _schemeMeta(String id) {
+    for (final m in _schemeList) {
+      if ('${m['id']}' == id) return m;
+    }
+    return null;
+  }
+
+  // A preview colour for the ACTIVE scheme's shell role, or null for
+  // classic/custom (whose shell is the shipped dark design).
+  Color? _schemeShell(String role) {
+    if (_scheme == 'classic' || _scheme == 'custom') return null;
+    final prev = _schemeMeta(_scheme)?['preview'];
+    return prev is Map ? _parse('${prev[role] ?? ''}') : null;
+  }
+
   Future<void> _save() async {
     final messenger = ScaffoldMessenger.of(context);
     // Only the LIVE keys travel. Retired colour keys are never re-sent, so they
@@ -26298,6 +26401,18 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     if (_live.contains('header_style')) cfg['header_style'] = _headerStyle;
     if (_live.contains('button_shape')) cfg['button_shape'] = _buttonShape;
     if (_live.contains('surface_style')) cfg['surface_style'] = _surfaceStyle;
+    if (_live.contains('scheme')) cfg['scheme'] = _scheme;
+    if (_live.contains('font_scale')) cfg['font_scale'] = _fontScale;
+    if (_live.contains('card_shape')) cfg['card_shape'] = _cardShape;
+    // Picking a preset here must actually LOOK like the preset: explicit shell
+    // colours (possibly pinned from the web editor) would override the scheme,
+    // so a deliberately chosen non-custom scheme clears them (null = clear on
+    // the server). Guarded by _schemeTouched: an untouched save changes nothing.
+    if (_schemeTouched && _scheme != 'custom') {
+      for (final k in ['color_bg', 'color_card', 'color_text', 'color_success', 'color_warning', 'color_error']) {
+        cfg[k] = null;
+      }
+    }
     if (_live.contains('color_primary')) {
       final t = _accent.text.trim();
       // Blank accent = keep whatever the page resolves today (merge-on-omit).
@@ -26466,18 +26581,72 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     ]);
   }
 
+  // One preset scheme as a tappable chip: a three-stop swatch strip (page /
+  // card / ink) with its name — the same previews the web editor renders,
+  // served by the backend so both stay in lockstep.
+  Widget _schemeChip(Map m) {
+    final id = '${m['id'] ?? ''}';
+    final active = id == _scheme;
+    final prev = (m['preview'] is Map) ? (m['preview'] as Map) : const {};
+    Color sw(String role, Color fallback) => _parse('${prev[role] ?? ''}') ?? fallback;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: _busy || active ? null : () => setState(() { _scheme = id; _schemeTouched = true; }),
+        child: AnimatedContainer(
+          duration: AppDurations.fast,
+          width: 108,
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: active ? Colors.white.withValues(alpha: 0.06) : Colors.transparent,
+            borderRadius: BorderRadius.circular(9),
+            border: Border.all(color: active ? AppColors.borderStrong : AppColors.border),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(5),
+              child: Row(children: [
+                Expanded(flex: 3, child: Container(height: 18, color: sw('background', const Color(0xFF08080A)))),
+                Expanded(flex: 2, child: Container(height: 18, color: sw('surface', const Color(0xFF1A1A1F)))),
+                Expanded(flex: 2, child: Container(height: 18, color: sw('text', const Color(0xFFECEAE6)))),
+              ]),
+            ),
+            const SizedBox(height: 5),
+            Text('${m['label'] ?? id}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                  color: active ? AppColors.textPrimary : AppColors.textSecondary,
+                )),
+          ]),
+        ),
+      ),
+    );
+  }
+
   // A miniature of the real guest page: near-black shell, floating accent orb,
   // hero wash, frosted panel, accent CTA. Every live control moves something here.
   Widget _preview() {
     final r = _ramp;
     final panel = _brandPanel(_surfaceStyle, r);
     final radius = _brandCtrlRadius(_buttonShape);
+    // Preset shell: page/card/ink from the selected scheme's preview (null for
+    // classic/custom = the shipped dark). Card radius + text scale mirror the
+    // card_shape / font_scale knobs so the miniature moves like the real page.
+    final shellBg = _schemeShell('background') ?? const Color(0xFF08080A);
+    final ink = _schemeShell('text') ?? Colors.white;
+    final schemeSurface = _schemeShell('surface');
+    final panelBg = schemeSurface?.withValues(alpha: _surfaceStyle == 'solid' ? 0.94 : 0.55) ?? panel.bg;
+    final cardR = _cardShape == 'sharp' ? 6.0 : 22.0;
+    final fsMul = _fontScale == 'small' ? 0.92 : (_fontScale == 'large' ? 1.1 : 1.0);
     final body = TextStyle(fontFamily: _font, fontFamilyFallback: const ['Inter', 'Roboto']);
     final serif = const TextStyle(fontFamily: 'Georgia', fontFamilyFallback: ['Times New Roman', 'serif']);
     return ClipRRect(
       borderRadius: BorderRadius.circular(22), // --rCard, a design constant
       child: Container(
-        color: const Color(0xFF08080A),
+        color: shellBg,
         height: 268,
         child: Stack(children: [
           // The animated accent orb, held still.
@@ -26522,26 +26691,26 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
               child: Padding(
                 padding: const EdgeInsets.all(14),
                 child: ClipRRect(
-                  borderRadius: BorderRadius.circular(22),
+                  borderRadius: BorderRadius.circular(cardR),
                   child: BackdropFilter(
                     filter: ImageFilter.blur(sigmaX: panel.blur, sigmaY: panel.blur),
                     child: Container(
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
-                        color: panel.bg,
-                        borderRadius: BorderRadius.circular(22),
-                        border: Border.all(color: Colors.white.withValues(alpha: panel.edge)),
+                        color: panelBg,
+                        borderRadius: BorderRadius.circular(cardR),
+                        border: Border.all(color: ink.withValues(alpha: panel.edge)),
                       ),
                       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                           Expanded(
                             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                              Text('Sample dish', style: serif.copyWith(fontSize: 17, color: Colors.white)),
+                              Text('Sample dish', style: serif.copyWith(fontSize: 17 * fsMul, color: ink)),
                               const SizedBox(height: 4),
                               Text('A few lines of description, exactly as a guest reads them.',
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
-                                  style: body.copyWith(fontSize: 11, height: 1.35, color: Colors.white.withValues(alpha: 0.58))),
+                                  style: body.copyWith(fontSize: 11 * fsMul, height: 1.35, color: ink.withValues(alpha: 0.58))),
                             ]),
                           ),
                           const SizedBox(width: 10),
@@ -26571,16 +26740,16 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
                             decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.06),
+                              color: ink.withValues(alpha: 0.06),
                               borderRadius: BorderRadius.circular(radius),
-                              border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+                              border: Border.all(color: ink.withValues(alpha: 0.12)),
                             ),
                             child: Text('Rate us',
-                                style: body.copyWith(fontSize: 11.5, fontWeight: FontWeight.w500, color: Colors.white)),
+                                style: body.copyWith(fontSize: 11.5 * fsMul, fontWeight: FontWeight.w500, color: ink)),
                           ),
                           const Spacer(),
                           Text(_font,
-                              style: body.copyWith(fontSize: 10, color: Colors.white.withValues(alpha: 0.45))),
+                              style: body.copyWith(fontSize: 10, color: ink.withValues(alpha: 0.45))),
                         ]),
                       ]),
                     ),
@@ -26670,6 +26839,16 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
             ]),
           ),
         const SizedBox(height: AppSpacing.lg),
+        if (_live.contains('scheme')) ...[
+          Text('COLOUR SCHEME', style: text.labelSmall),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, runSpacing: 8, children: [for (final m in _schemeList) _schemeChip(m)]),
+          const SizedBox(height: 5),
+          Text('A preset re-shells the guest pages — page, cards, ink, status colours — and keeps your accent. '
+              'Colours picked individually (here or on the web) stay in charge under "Custom".',
+              style: text.bodySmall!.copyWith(fontSize: 11)),
+          const SizedBox(height: AppSpacing.lg),
+        ],
         if (_live.contains('color_primary')) ...[
           _accentRow(),
           const SizedBox(height: AppSpacing.lg),
@@ -26707,6 +26886,18 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
           _toggle('Controls', 'Corner radius of buttons, chips and inputs.',
               [for (final v in _options('button_shape')) (v, _label(v))], _buttonShape,
               (v) => setState(() => _buttonShape = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_live.contains('card_shape')) ...[
+          _toggle('Cards', 'Rounded panels (the default) or squared-off corners.',
+              [for (final v in _options('card_shape')) (v, _label(v))], _cardShape,
+              (v) => setState(() => _cardShape = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_live.contains('font_scale')) ...[
+          _toggle('Text size', 'Scales every guest-page text size together (S 92% · M 100% · L 110%).',
+              [for (final v in _options('font_scale')) (v, _label(v))], _fontScale,
+              (v) => setState(() => _fontScale = v)),
           const SizedBox(height: AppSpacing.md),
         ],
         if (_unsupported.isNotEmpty) ...[
@@ -26755,6 +26946,7 @@ Future<void> _addInventory(
   final name = TextEditingController();
   final stock = TextEditingController();
   final unit = TextEditingController();
+  final reorder = TextEditingController();
   final messenger = ScaffoldMessenger.of(context);
   // Local mutable copy of the managed list so the inline "Manage categories"
   // affordance can refresh the picker without closing this dialog.
@@ -26831,7 +27023,25 @@ Future<void> _addInventory(
                   keyboardType: TextInputType.number,
                   decoration: const InputDecoration(labelText: 'Stock', isDense: true)),
               const SizedBox(height: AppSpacing.sm),
-              TextField(controller: unit, decoration: const InputDecoration(labelText: 'Unit (e.g. kg)', isDense: true)),
+              TextField(
+                controller: unit,
+                decoration: const InputDecoration(labelText: 'Unit (e.g. kg)', isDense: true),
+                // The reorder field below is labelled in whatever unit is typed
+                // here — a level means nothing without the unit it counts.
+                onChanged: (_) => setLocal(() {}),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                controller: reorder,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  labelText: unit.text.trim().isEmpty
+                      ? 'Reorder at (optional)'
+                      : 'Reorder at (${unit.text.trim()})',
+                  helperText: 'Blank = sensible default for this unit',
+                  isDense: true,
+                ),
+              ),
               const SizedBox(height: AppSpacing.xl),
               Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                 ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
@@ -26846,11 +27056,15 @@ Future<void> _addInventory(
   );
   if (ok == true) {
     try {
+      final level = num.tryParse(reorder.text.trim());
       await rest.post('/inventory', {
         'name': name.text.trim(),
         'category': (category ?? '').trim(),
         'stock': num.tryParse(stock.text.trim()) ?? 0,
         'unit': unit.text.trim(),
+        // Sent as an explicit null when blank so the server clears any stored
+        // level rather than being left to guess what "absent" meant.
+        'reorder_level': (level != null && level > 0) ? level : null,
       });
       reload();
       messenger.showSnackBar(const SnackBar(content: Text('Item added.')));
@@ -26861,6 +27075,87 @@ Future<void> _addInventory(
   name.dispose();
   stock.dispose();
   unit.dispose();
+  reorder.dispose();
+}
+
+/// Set (or clear) ONE item's reorder level, in that item's own unit.
+///
+/// POSTs /inventory/reorder-level, which touches only the threshold. The
+/// add-item route would have written "Quantity" too — see the note on the sheet
+/// button that opens this.
+Future<void> _setReorderLevel(
+    BuildContext context, RestClient rest, Map item, VoidCallback reload) async {
+  final unit = _s(item, 'unit', '');
+  final current = item['reorder_level'];
+  final applied = double.tryParse('${item['reorder_applied'] ?? ''}');
+  final field = TextEditingController(text: current == null ? '' : _stockNum(double.tryParse('$current')));
+  final messenger = ScaffoldMessenger.of(context);
+
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: 380,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('INVENTORY', style: Theme.of(ctx).textTheme.labelSmall),
+          const SizedBox(height: 6),
+          Text('Reorder level - ${_s(item, 'name')}', style: Theme.of(ctx).textTheme.titleMedium),
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            'Flag this item Low Stock at or below this level. Entered in the '
+            'item\'s own unit${unit.isEmpty ? '' : ' ($unit)'}.',
+            style: Theme.of(ctx).textTheme.bodySmall,
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          TextField(
+            controller: field,
+            keyboardType: TextInputType.number,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: unit.isEmpty ? 'Reorder at' : 'Reorder at ($unit)',
+              helperText: applied == null
+                  ? 'Blank = sensible default for this unit'
+                  : 'Blank = default (${_stockNum(applied)}${unit.isEmpty ? '' : ' $unit'})',
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: AppSpacing.xl),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
+            const SizedBox(width: AppSpacing.sm),
+            ForkButton(label: 'Save', icon: Icons.check, onPressed: () => Navigator.pop(ctx, true)),
+          ]),
+        ]),
+      ),
+    ),
+  );
+
+  if (ok == true) {
+    final raw = field.text.trim();
+    final level = raw.isEmpty ? null : num.tryParse(raw);
+    if (raw.isNotEmpty && (level == null || level <= 0)) {
+      messenger.showSnackBar(const SnackBar(content: Text('Enter a number greater than 0, or leave it blank.')));
+    } else {
+      try {
+        await rest.post('/inventory/reorder-level', {
+          'inventory_id': '${item['id'] ?? ''}',
+          'reorder_level': level,
+        });
+        reload();
+        messenger.showSnackBar(SnackBar(content: Text(level == null ? 'Using the default level.' : 'Reorder level saved.')));
+      } catch (e) {
+        messenger.showSnackBar(SnackBar(content: Text('$e')));
+      }
+    }
+  }
+  field.dispose();
 }
 
 Future<void> _addEmployee(BuildContext context, RestClient rest, VoidCallback reload) async {
