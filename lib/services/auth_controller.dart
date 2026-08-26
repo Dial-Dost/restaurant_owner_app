@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/profile.dart';
 import 'api_client.dart';
+import 'get_cache.dart';
 
 /// Owns the signed-in session: token persistence, profile, and login/logout.
 class AuthController extends ChangeNotifier {
@@ -113,6 +114,11 @@ class AuthController extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_tokenKey);
     await prefs.remove(_outletKey);
+    // A voluntary sign-out is the "handing the device over" gesture, so the
+    // saved GET cache goes with the token. An EXPIRED session keeps it: the
+    // same person is about to sign straight back in, and the warm cache is
+    // what makes that reopen instant.
+    if (!expired) await GetCache.instance.clearAll();
     if (t != null) await api.logout(t);
   }
 }
