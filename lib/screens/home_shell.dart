@@ -771,21 +771,23 @@ class _HomeShellState extends State<HomeShell> {
               // It cannot reuse the rail's stops either: those are translucent
               // and composite over the backdrop, but a drawer floats ABOVE the
               // page — translucency there shows the module scrolling through the
-              // menu. So these are the OPAQUE equivalents, taken from sampling
-              // what the desktop rail actually composites to, which is what keeps
-              // the two form factors looking like the same product.
+              // menu. So these are the OPAQUE equivalents of what the desktop
+              // rail composites to — DERIVED live in AppColors.drawer*, never
+              // frozen hexes: sampled copper stand-ins here are exactly how the
+              // phone sidebar came to ignore the accent setting while the rest
+              // of the app recoloured.
               backgroundColor: Colors.transparent,
               child: DecoratedBox(
-                decoration: const BoxDecoration(
+                decoration: BoxDecoration(
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
                     colors: [
-                      Color(0xFF3A170C),
-                      Color(0xFF1A0E0A),
-                      Color(0xFF23120B),
+                      AppColors.drawerTop,
+                      AppColors.drawerMid,
+                      AppColors.drawerBottom,
                     ],
-                    stops: [0.0, 0.52, 1.0],
+                    stops: const [0.0, 0.52, 1.0],
                   ),
                 ),
                 child: SafeArea(child: _navList(visible, p, inDrawer: true)),
@@ -800,7 +802,7 @@ class _HomeShellState extends State<HomeShell> {
                   duration: AppDurations.base,
                   curve: Curves.easeInOut,
                   width: _sidebarCollapsed ? 68 : 224,
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     // The rail carries the glow down its WHOLE height, not just
                     // the part the hero wash happens to reach. The backdrop's
                     // wash stops at 42% of the window, so a flat scrim left the
@@ -823,17 +825,19 @@ class _HomeShellState extends State<HomeShell> {
                         // of the page. Costs 5.61:1 -> 4.86:1 on secondary text,
                         // still above the 4.5 floor, and it is the brightest row
                         // of the rail so everything below only improves.
-                        Color(0x00080605),
+                        AppColors.bgDeep.withValues(alpha: 0),
                         // Carries a little glow of its own. Without it the rail
                         // pinched cool in the middle — the hero wash has faded by
                         // there and the floor glow has not started, so measured
                         // warmth dropped to R-B +3 between two bands sitting at
                         // +30 and +22. A gradient that cools in its own middle
-                        // reads as a seam.
-                        Color(0x94140D0A),
-                        Color(0x1A7C2D12),
+                        // reads as a seam. Derived (AppColors.railScrim*), not
+                        // frozen: a hardcoded warm scrim is the same defect that
+                        // kept the phone drawer copper under every accent.
+                        AppColors.railScrimMid,
+                        AppColors.railGlowFloor,
                       ],
-                      stops: [0.0, 0.52, 1.0],
+                      stops: const [0.0, 0.52, 1.0],
                     ),
                     border: Border(right: BorderSide(color: AppColors.divider)),
                   ),
