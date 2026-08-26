@@ -186,7 +186,7 @@ class _UpdateDialogState extends State<_UpdateDialog> {
                 LinearProgressIndicator(value: v),
                 const SizedBox(height: 6),
                 Text('${(v * 100).toStringAsFixed(0)}%',
-                    style: const TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+                    style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
               ],
             ),
           ),
@@ -206,7 +206,7 @@ class _UpdateDialogState extends State<_UpdateDialog> {
           if (info.notes.isNotEmpty) ...[const SizedBox(height: 8), Text(info.notes)],
           if (info.downloadUrl == null) ...[
             const SizedBox(height: 8),
-            const Text('Please update from where you got the app.',
+            Text('Please update from where you got the app.',
                 style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
           ],
         ];

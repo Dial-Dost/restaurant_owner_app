@@ -210,7 +210,7 @@ Widget _focusBanner(
         ),
         for (final a in actions) ...[const SizedBox(width: AppSpacing.sm), a],
         IconButton(
-          icon: const Icon(Icons.close, size: 16, color: AppColors.textTertiary),
+          icon: Icon(Icons.close, size: 16, color: AppColors.textTertiary),
           tooltip: 'Dismiss',
           visualDensity: VisualDensity.compact,
           onPressed: () => ModuleNavigator.of(context)?.clearFocus(),
@@ -588,6 +588,7 @@ Widget _metricTile(
   accent ??= AppColors.copperHi;
   final text = Theme.of(context).textTheme;
   return ForkCard(
+  subColor ??= AppColors.textSecondary;
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
     onTap: onTap,
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
@@ -599,7 +600,7 @@ Widget _metricTile(
         Expanded(
           child: Text(label.toUpperCase(), maxLines: 1, overflow: TextOverflow.ellipsis, style: text.labelSmall),
         ),
-        if (onTap != null) const Icon(Icons.chevron_right, size: 14, color: AppColors.textTertiary),
+        if (onTap != null) Icon(Icons.chevron_right, size: 14, color: AppColors.textTertiary),
       ]),
       const SizedBox(height: 6),
       Text(value,
@@ -713,7 +714,7 @@ Widget _attentionCard(BuildContext context, Map m, ModuleNavigator? nav) {
         if (trailing.isNotEmpty) ...[
           const SizedBox(width: AppSpacing.sm),
           Text(trailing,
-              style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+              style: TextStyle(fontSize: 11, color: AppColors.textSecondary)),
         ],
       ]),
     );
@@ -737,7 +738,7 @@ Widget _attentionCard(BuildContext context, Map m, ModuleNavigator? nav) {
         ],
         if (tap != null) ...[
           const SizedBox(width: AppSpacing.xs),
-          const Icon(Icons.chevron_right, size: 16, color: AppColors.textSecondary),
+          Icon(Icons.chevron_right, size: 16, color: AppColors.textSecondary),
         ],
       ]),
       if (shown.isNotEmpty) ...[
@@ -747,7 +748,7 @@ Widget _attentionCard(BuildContext context, Map m, ModuleNavigator? nav) {
           Padding(
             padding: const EdgeInsets.only(top: 2),
             child: Text('and $more more',
-                style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
+                style: TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
           ),
       ] else if (detail.isNotEmpty) ...[
         const SizedBox(height: 5),
@@ -1160,7 +1161,7 @@ List<Widget> _overviewInsights(BuildContext context, Map ins, ModuleNavigator? n
 
   if (head.isNotEmpty) {
     out.addAll([
-      const SectionHeader(
+      SectionHeader(
         title: 'Last 30 days',
         trailing: Text('incl. tax',
             style: TextStyle(fontSize: 10.5, color: AppColors.textSecondary)),
@@ -1441,7 +1442,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           if (prev > 0) weekDeltaPct = (last7 - prev) / prev * 100;
         }
 
-        const micro = TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: AppColors.textTertiary);
+        final micro = TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: AppColors.textTertiary);
 
         // --- drill-downs -----------------------------------------------------
         // Every popup below reads only what load() already fetched — no extra
@@ -1999,7 +2000,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
               const SizedBox(height: AppSpacing.sm),
               Row(children: [
                 Text(accountJumps ? 'Open Settings' : 'View profile', style: micro),
-                const Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
+                Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
               ]),
             ]),
           ),
@@ -2143,7 +2144,7 @@ Widget _ordersHiddenNote(BuildContext context, int hidden, ModuleNavigator? nav)
   // reassurance that nothing was deleted still holds either way.
   final canOpenHistory = nav != null && nav.canOpen('History');
   return Row(children: [
-    const Icon(Icons.history, size: 14, color: AppColors.textTertiary),
+    Icon(Icons.history, size: 14, color: AppColors.textTertiary),
     const SizedBox(width: 7),
     Expanded(
       child: Text(
@@ -4545,7 +4546,7 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav, int windo
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 2),
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Padding(
+              Padding(
                 padding: EdgeInsets.only(top: 5, right: 7),
                 child: Icon(Icons.circle, size: 4, color: AppColors.textTertiary),
               ),
@@ -4558,7 +4559,7 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav, int windo
                 Flexible(
                   child: Text('${it['sub']}',
                       textAlign: TextAlign.right,
-                      style: const TextStyle(fontSize: 11, color: AppColors.textSecondary),
+                      style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
                 ),
@@ -4569,7 +4570,7 @@ Widget _concernCard(BuildContext context, Map m, ModuleNavigator? nav, int windo
           Padding(
             padding: const EdgeInsets.only(top: 3),
             child: Text('and $more more',
-                style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
+                style: TextStyle(fontSize: 10.5, color: AppColors.textTertiary)),
           ),
       ] else if (detail.isNotEmpty)
         Text(detail, style: text.bodySmall?.copyWith(color: AppColors.textSecondary)),
@@ -5972,7 +5973,7 @@ class _TableSheetState extends State<_TableSheet> {
       inset: true,
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       child: Row(children: [
-        const Icon(Icons.badge_outlined, size: 16, color: AppColors.textSecondary),
+        Icon(Icons.badge_outlined, size: 16, color: AppColors.textSecondary),
         const SizedBox(width: 10),
         Expanded(
           child: Text(assigned ? 'Waiter: $waiter' : 'No waiter assigned',
@@ -6692,7 +6693,7 @@ class _TableSheetState extends State<_TableSheet> {
                               Padding(
                                 padding: const EdgeInsets.only(top: 3),
                                 child: Row(children: [
-                                  const Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
+                                  Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
                                   const SizedBox(width: 5),
                                   Expanded(
                                     child: Text(note,
@@ -7544,7 +7545,7 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
             child: _uploading
                 ? const Center(child: CircularProgressIndicator())
                 : (_imageUrl == null || _imageUrl!.isEmpty)
-                    ? const Center(
+                    ? Center(
                         child: Column(mainAxisSize: MainAxisSize.min, children: [
                           Icon(Icons.add_a_photo, color: AppColors.textSecondary),
                           SizedBox(height: 4),
@@ -8591,7 +8592,7 @@ Future<void> _changeOrderStatus(
                             child: sel == s
                                 ? Icon(Icons.check_circle,
                                     key: ValueKey('on'), size: 16, color: AppColors.copperHi)
-                                : const Icon(Icons.circle_outlined,
+                                : Icon(Icons.circle_outlined,
                                     key: ValueKey('off'), size: 16, color: AppColors.textTertiary),
                           ),
                         ]),
@@ -10193,7 +10194,7 @@ class _VendorsSheetState extends State<_VendorsSheet> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     return Container(
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.card)),
         border: Border(top: BorderSide(color: AppColors.borderStrong)),
@@ -10728,7 +10729,7 @@ class _CustomersViewState extends State<_CustomersView> {
                   ),
                   const SizedBox(width: AppSpacing.sm),
                   Text(_customerRankValue(rows[i], sort),
-                      style: const TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+                      style: TextStyle(fontSize: 11, color: AppColors.textSecondary)),
                 ]),
               ),
             ),
@@ -10980,7 +10981,7 @@ Widget historyModule(RestClient rest, Profile p) => AsyncView<Map<String, dynami
                     ),
                     const SizedBox(width: AppSpacing.md),
                     Text(money(num0(m['revenue'])), style: text.displaySmall!.copyWith(fontSize: 20)),
-                    const Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
+                    Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
                   ]),
                 ),
               );
@@ -11202,7 +11203,7 @@ class _BookingsViewState extends State<_BookingsView> {
               SimpleDialogOption(
                 onPressed: () => Navigator.pop(ctx, <String>[_s(t, 'table_name', '')]),
                 child: Row(children: [
-                  const Icon(Icons.table_restaurant_outlined, size: 16, color: AppColors.textSecondary),
+                  Icon(Icons.table_restaurant_outlined, size: 16, color: AppColors.textSecondary),
                   const SizedBox(width: 10),
                   Expanded(child: Text(_s(t, 'table_name', ''))),
                   Text(_seatsLabel(t),
@@ -11264,7 +11265,7 @@ class _BookingsViewState extends State<_BookingsView> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text('Share so guests can book a table online',
+                  Text('Share so guests can book a table online',
                       textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
                   const SizedBox(height: 6),
                   SelectableText(reservationUrl, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11)),
@@ -11554,7 +11555,7 @@ class _BookingsViewState extends State<_BookingsView> {
                 if (notes.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    const Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
+                    Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
                     const SizedBox(width: 5),
                     Expanded(
                       child: Text(notes,
@@ -11724,7 +11725,7 @@ class _NewBookingDialogState extends State<_NewBookingDialog> {
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 8),
               child: Row(children: [
-                const Icon(Icons.schedule, size: 16, color: AppColors.textSecondary),
+                Icon(Icons.schedule, size: 16, color: AppColors.textSecondary),
                 const SizedBox(width: 8),
                 Text('${_fmtDmy(_at.toIso8601String())} · ${TimeOfDay.fromDateTime(_at).format(context)}', style: text.titleSmall),
                 const Spacer(),
@@ -13037,7 +13038,7 @@ class _KpiDrilldownSheet extends StatelessWidget {
       if (how.isNotEmpty) ...[
         const SizedBox(height: 6),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Icon(Icons.functions, size: 13, color: AppColors.textTertiary),
+          Icon(Icons.functions, size: 13, color: AppColors.textTertiary),
           const SizedBox(width: 7),
           Expanded(child: Text(how, style: text.bodySmall)),
         ]),
@@ -13286,7 +13287,7 @@ Widget _sortControl(String section, List<_SortOption> opts, void Function(void F
               opts[fi].label,
               style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.copperHi, letterSpacing: 0.2),
             ),
-            const Icon(Icons.arrow_drop_down, size: 16, color: AppColors.textTertiary),
+            Icon(Icons.arrow_drop_down, size: 16, color: AppColors.textTertiary),
           ]),
         ),
       ),
@@ -13487,7 +13488,7 @@ Widget _priceSuggestionExplainer(BuildContext context, Map m) {
     if (marginNote.isNotEmpty) ...[
       const SizedBox(height: 7),
       Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Icon(Icons.receipt_long_outlined, size: 13, color: AppColors.textTertiary),
+        Icon(Icons.receipt_long_outlined, size: 13, color: AppColors.textTertiary),
         const SizedBox(width: 7),
         Expanded(child: Text(marginNote, style: text.bodySmall!.copyWith(fontSize: 11.5))),
       ]),
@@ -13539,7 +13540,7 @@ Widget _suppressedRow(BuildContext context, Map row) {
   return Padding(
     padding: const EdgeInsets.symmetric(vertical: 5),
     child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const Icon(Icons.pause_circle_outline, size: 14, color: AppColors.textTertiary),
+      Icon(Icons.pause_circle_outline, size: 14, color: AppColors.textTertiary),
       const SizedBox(width: 8),
       Expanded(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -14461,7 +14462,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                             borderRadius: AppRadius.controlAll,
                             border: Border.all(color: AppColors.border),
                           ),
-                          child: const Icon(Icons.soup_kitchen_outlined, size: 16, color: AppColors.textSecondary),
+                          child: Icon(Icons.soup_kitchen_outlined, size: 16, color: AppColors.textSecondary),
                         ),
                         const SizedBox(width: AppSpacing.md),
                         Expanded(
@@ -16075,7 +16076,7 @@ class _AccountingViewState extends State<_AccountingView> {
               decoration: InputDecoration(
                 isDense: true,
                 hintText: 'Search bill no, table, customer…',
-                prefixIcon: const Icon(Icons.search, size: 18, color: AppColors.textTertiary),
+                prefixIcon: Icon(Icons.search, size: 18, color: AppColors.textTertiary),
                 suffixIcon: _billTerm.isEmpty
                     ? null
                     : IconButton(
@@ -16692,7 +16693,7 @@ class _ScheduledReportsCardState extends State<_ScheduledReportsCard> {
       if (_allOutlets) ...[
         const SizedBox(height: AppSpacing.sm),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
+          Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
@@ -16977,7 +16978,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b) {
         const SizedBox(width: AppSpacing.md),
         Text(_money(b['grand_total']), style: text.titleSmall),
         const SizedBox(width: 4),
-        const Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
+        Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
       ]),
     ),
   );
@@ -17932,7 +17933,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
 
   Widget _headerRow(double s) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           color: AppColors.inset,
           border: Border(bottom: BorderSide(color: AppColors.divider)),
         ),
@@ -17943,7 +17944,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
               textAlign: i == _cols.length - 1 ? TextAlign.right : TextAlign.left,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
                 letterSpacing: 0.3,
@@ -18168,7 +18169,10 @@ class _WaitlistViewState extends State<_WaitlistView> {
   }
 
   PopupMenuItem<String> _menuItem(String value, IconData icon, String label,
-      {Color color = AppColors.textSecondary}) {
+      // Nullable because AppColors.textSecondary is a getter now (the device
+      // scheme), and a default must be const â€” null means "secondary ink".
+      {Color? color}) {
+    color ??= AppColors.textSecondary;
     final fg = color == AppColors.textSecondary
         ? AppColors.textPrimary
         : Color.lerp(color, Colors.white, 0.25)!;
@@ -19384,7 +19388,7 @@ class _CashViewState extends State<_CashView> {
                       borderRadius: AppRadius.controlAll,
                       border: Border.all(color: AppColors.border),
                     ),
-                    child: const Icon(Icons.point_of_sale, size: 16, color: AppColors.textTertiary),
+                    child: Icon(Icons.point_of_sale, size: 16, color: AppColors.textTertiary),
                   ),
                   const SizedBox(width: AppSpacing.md),
                   Expanded(
@@ -19899,7 +19903,7 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
                 borderRadius: AppRadius.controlAll,
                 border: Border.all(color: AppColors.border),
               ),
-              child: const Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.textTertiary),
+              child: Icon(Icons.local_shipping_outlined, size: 16, color: AppColors.textTertiary),
             ),
             identity: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(_s(po, 'vendor_name', 'Unassigned vendor'),
@@ -20107,7 +20111,7 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
               onChanged: (v) => setDlg(() => qualityRating = v ?? 0),
             ),
           ]),
-          const Align(alignment: Alignment.centerLeft, child: Text('Feeds the supplier score in Analytics.', style: TextStyle(fontSize: 11, color: AppColors.textSecondary))),
+          Align(alignment: Alignment.centerLeft, child: Text('Feeds the supplier score in Analytics.', style: TextStyle(fontSize: 11, color: AppColors.textSecondary))),
         ]))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -21855,7 +21859,7 @@ Widget valetModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                                 maxLines: 2,
                               ),
                             ),
-                            const Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
+                            Icon(Icons.chevron_right, size: 16, color: AppColors.textTertiary),
                           ]),
                         ]),
                       ),
@@ -22171,7 +22175,7 @@ class _ValetCheckInDialogState extends State<_ValetCheckInDialog> {
             controller: _plate,
             autofocus: true,
             textCapitalization: TextCapitalization.characters,
-            style: const TextStyle(
+            style: TextStyle(
               fontFamily: 'monospace',
               fontSize: 15,
               fontWeight: FontWeight.w600,
@@ -22340,7 +22344,7 @@ Widget _perfComponentRow(BuildContext context, String label, Map? c, double? eff
             : pct == null
                 ? 'It counted towards this score, but the server did not say by how much.'
                 : 'Counts for $pct% of this score.',
-        style: const TextStyle(fontSize: 10.5, color: AppColors.textTertiary),
+        style: TextStyle(fontSize: 10.5, color: AppColors.textTertiary),
       ),
     ]),
   );
@@ -23047,7 +23051,7 @@ List<Widget> _scoringBand(
   required void Function(_TeamMember) openMember,
 }) {
   if (team.isEmpty || perfNote.isNotEmpty) return const [];
-  const micro = TextStyle(fontSize: 10.5, height: 1.3, color: AppColors.textTertiary);
+  final micro = TextStyle(fontSize: 10.5, height: 1.3, color: AppColors.textTertiary);
   final benchmarks = (perf['benchmarks'] as Map?) ?? const {};
 
   final boxes = <Widget>[];
@@ -23586,7 +23590,7 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                   ]),
                 ),
                 PopupMenuButton<String>(
-                  icon: const Icon(Icons.more_vert, size: 18, color: AppColors.textSecondary),
+                  icon: Icon(Icons.more_vert, size: 18, color: AppColors.textSecondary),
                   onSelected: (v) async {
                     if (v == 'roles') {
                       final changed = await showModalBottomSheet<bool>(
@@ -23998,7 +24002,7 @@ Widget printerModule(RestClient rest, Profile p) {
                     children: [
                       for (final l in svc.logs)
                         Text(l,
-                            style: const TextStyle(
+                            style: TextStyle(
                                 fontFamily: 'monospace', fontSize: 11, color: AppColors.textSecondary)),
                     ],
                   ),
@@ -25752,7 +25756,7 @@ class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
             border: Border.all(color: AppColors.border),
           ),
           child: SelectableText('/webhooks/whatsapp/${widget.slug}',
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
+              style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
         ),
         if (widget.webhookSecret.isNotEmpty) ...[
           const SizedBox(height: AppSpacing.sm),
@@ -25766,7 +25770,7 @@ class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
               border: Border.all(color: AppColors.border),
             ),
             child: SelectableText(widget.webhookSecret,
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
+                style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: AppColors.textPrimary)),
           ),
         ] else ...[
           const SizedBox(height: AppSpacing.sm),
@@ -26068,7 +26072,7 @@ class _BrandingCardState extends State<_BrandingCard> {
               border: Border.all(color: AppColors.border),
               image: _logo.isNotEmpty ? DecorationImage(image: NetworkImage(_logo), fit: BoxFit.contain) : null,
             ),
-            child: _logo.isEmpty ? const Icon(Icons.storefront, color: AppColors.textSecondary) : null,
+            child: _logo.isEmpty ? Icon(Icons.storefront, color: AppColors.textSecondary) : null,
           ),
           const SizedBox(width: AppSpacing.md),
           ForkButton.ghost(
@@ -26567,7 +26571,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                 Text(lbl.toUpperCase(),
                     style: Theme.of(context).textTheme.labelSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
                 Text(_hexOfColor(c),
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 8.5, color: AppColors.textTertiary),
+                    style: TextStyle(fontFamily: 'monospace', fontSize: 8.5, color: AppColors.textTertiary),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis),
               ]),
@@ -26772,7 +26776,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Icon(Icons.history, size: 14, color: AppColors.textTertiary),
+          Icon(Icons.history, size: 14, color: AppColors.textTertiary),
           const SizedBox(width: 6),
           Expanded(
             child: Text('${_legacyStored.length} retired colour${_legacyStored.length == 1 ? '' : 's'} still stored',
@@ -26809,7 +26813,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                       style: text.bodySmall!.copyWith(fontSize: 11.5), maxLines: 1, overflow: TextOverflow.ellipsis),
                 ),
                 Text('${widget.initialConfig[k]}',
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 10, color: AppColors.textTertiary)),
+                    style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: AppColors.textTertiary)),
                 const SizedBox(width: 8),
                 const StatusChip(label: 'Not used', color: AppColors.neutral, dense: true),
               ]),
@@ -26833,7 +26837,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
           Padding(
             padding: const EdgeInsets.only(top: 10),
             child: Row(children: [
-              const Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
+              Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
               const SizedBox(width: 6),
               Expanded(child: Text('Only an admin can change branding.', style: text.bodySmall!.copyWith(fontSize: 11))),
             ]),
@@ -26903,7 +26907,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
         if (_unsupported.isNotEmpty) ...[
           const SizedBox(height: 4),
           Row(children: [
-            const Icon(Icons.info_outline, size: 14, color: AppColors.textTertiary),
+            Icon(Icons.info_outline, size: 14, color: AppColors.textTertiary),
             const SizedBox(width: 6),
             Expanded(
               child: Text('Your server also offers ${_unsupported.join(', ')} — update the app to edit ${_unsupported.length == 1 ? 'it' : 'them'} here.',
@@ -27539,7 +27543,7 @@ class _CreateRoleDialogState extends State<_CreateRoleDialog> {
           TextField(
             controller: _name,
             readOnly: _isEdit, // the name is the role's key — locked while editing
-            style: _isEdit ? const TextStyle(fontSize: 14, color: AppColors.textSecondary) : null,
+            style: _isEdit ? TextStyle(fontSize: 14, color: AppColors.textSecondary) : null,
             decoration: const InputDecoration(
               labelText: 'Role name (e.g. Floor Supervisor)',
               isDense: true,
@@ -28097,7 +28101,7 @@ class _SimulationViewState extends State<_SimulationView> {
               const SizedBox(width: AppSpacing.sm),
             ],
             Text(value,
-                style: const TextStyle(
+                style: TextStyle(
                     fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
           ]),
         );
@@ -28191,7 +28195,7 @@ class _SimulationViewState extends State<_SimulationView> {
               softWrap: false,
               overflow: TextOverflow.fade,
               style: style ??
-                  const TextStyle(
+                  TextStyle(
                       fontSize: 12.5, fontWeight: FontWeight.w500, color: AppColors.textPrimary)),
         );
 

@@ -506,7 +506,7 @@ class _HomeShellState extends State<HomeShell> {
           children: [
             Text(p.restaurantName,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0.3,
@@ -528,7 +528,7 @@ class _HomeShellState extends State<HomeShell> {
       if (!inDrawer)
         IconButton(
           tooltip: 'Collapse sidebar',
-          icon: const Icon(Icons.chevron_left, color: AppColors.textTertiary),
+          icon: Icon(Icons.chevron_left, color: AppColors.textTertiary),
           visualDensity: VisualDensity.compact,
           onPressed: _toggleSidebar,
         ),
@@ -567,7 +567,7 @@ class _HomeShellState extends State<HomeShell> {
         entries.add(Padding(
           padding: EdgeInsets.fromLTRB(8, firstShown ? 0 : 16, 8, 6),
           child: Text(section.title,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
                 letterSpacing: 1.1,
@@ -606,7 +606,7 @@ class _HomeShellState extends State<HomeShell> {
               ? Center(
                   child: IconButton(
                     tooltip: 'Expand sidebar',
-                    icon: const Icon(Icons.chevron_right, color: AppColors.textTertiary),
+                    icon: Icon(Icons.chevron_right, color: AppColors.textTertiary),
                     onPressed: _toggleSidebar,
                   ),
                 )
@@ -718,7 +718,7 @@ class _HomeShellState extends State<HomeShell> {
             child: Text(current.label,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 17,
                   fontWeight: FontWeight.w600,
                   letterSpacing: -0.2,

@@ -53,7 +53,7 @@ class GradientBackdrop extends StatelessWidget {
     return Stack(
       children: [
         // 1 — the base every other layer sits on.
-        const Positioned.fill(child: ColoredBox(color: AppColors.bg)),
+        Positioned.fill(child: ColoredBox(color: AppColors.bg)),
 
         // 5 — ambient orbs. Painted before the hero so the hero reads as the
         // brighter event and these stay atmosphere.

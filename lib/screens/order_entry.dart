@@ -413,11 +413,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text('${m['name']}',
-                      style: const TextStyle(
+                      style: TextStyle(
                           fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
                   const SizedBox(height: 2),
                   Text('₹${_price(id).toStringAsFixed(2)}',
-                      style: const TextStyle(fontSize: 12.5, color: AppColors.textSecondary)),
+                      style: TextStyle(fontSize: 12.5, color: AppColors.textSecondary)),
                 ],
               ),
             ),
@@ -438,10 +438,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                       onPressed: () => _editItemNote(id, '${m['name']}'),
                     ),
                     IconButton(
-                        icon: const Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
+                        icon: Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
                         onPressed: () => _setQty(id, -1)),
                     Text('$qty',
-                        style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
+                        style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
                     IconButton(
                         icon: Icon(Icons.add_circle_outline, color: AppColors.copperHi),
                         onPressed: () => _setQty(id, 1)),
@@ -457,11 +457,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                   const SizedBox(width: 8),
                 ],
                 if (note.isNotEmpty) ...[
-                  const Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.textTertiary),
+                  Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.textTertiary),
                   const SizedBox(width: 6),
                   Expanded(
                       child: Text(note,
-                          style: const TextStyle(
+                          style: TextStyle(
                               fontSize: 12, fontStyle: FontStyle.italic, color: AppColors.textSecondary))),
                 ],
               ]),

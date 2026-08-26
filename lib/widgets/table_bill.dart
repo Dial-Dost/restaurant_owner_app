@@ -217,7 +217,7 @@ class _TableBillSheetState extends State<_TableBillSheet> {
                   ForkCard(
                     inset: true,
                     child: Row(children: [
-                      const Icon(Icons.info_outline, size: 16, color: AppColors.textSecondary),
+                      Icon(Icons.info_outline, size: 16, color: AppColors.textSecondary),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text('No open bill on this table yet — nothing has been ordered.',

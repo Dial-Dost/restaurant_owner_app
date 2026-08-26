@@ -9,6 +9,7 @@ import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/gradient_backdrop.dart';
 
 /// The owner's report: "changing the accent does not recolour the sidebar on my
 /// phone." The mechanism was CAPTURED colour, not a broken rebuild boundary —
@@ -126,6 +127,27 @@ void main() {
 
     // And the derivation really tracks the ramp: teal glow in, copper glow out.
     expect(AppColors.glowDeep, AppAccents.teal.glowDeep);
+  });
+
+  testWidgets('scheme change repaints the shell ground live', (tester) async {
+    final auth = await _signIn();
+    await tester.pumpWidget(_appRoot(() => HomeShell(auth: auth, startPrinterAgent: false)));
+    await tester.pump();
+    await tester.pump();
+
+    // The backdrop's base layer is the page every other layer sits on — if it
+    // tracks the scheme, the shell ground genuinely moved.
+    Color ground() => tester
+        .widget<ColoredBox>(find
+            .descendant(of: find.byType(GradientBackdrop), matching: find.byType(ColoredBox))
+            .first)
+        .color;
+    expect(ground(), AppSchemes.rustic.bg);
+
+    await AppearanceController.instance.setScheme('graphite');
+    await tester.pump();
+    expect(ground(), AppSchemes.graphite.bg);
+    expect(AppColors.textPrimary, AppSchemes.graphite.textPrimary);
   });
 
   testWidgets('an OPEN dialog recolours with the accent', (tester) async {

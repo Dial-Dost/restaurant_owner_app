@@ -69,6 +69,72 @@ abstract final class AppAccents {
       all.firstWhere((a) => a.id == id, orElse: () => copper);
 }
 
+/// The curated shell-scheme set: five complete dark shells, each the full
+/// ground/surface/ink ladder re-tilted to a different temperature. Scheme and
+/// accent compose FREELY — appearance_matrix_test.dart pre-checks the whole
+/// 5x8 matrix (both body inks on every surface, both readable accent stops on
+/// the grounds they sit on) at WCAG AA 4.5:1, so no combination an owner can
+/// pick is allowed to exist unreadable. Rustic is the shipped Rustic Fork
+/// shell, byte-identical by aliasing.
+abstract final class AppSchemes {
+  static const String defaultId = 'rustic';
+
+  // The shipped Rustic Fork shell — aliased from AppColors so the default is
+  // byte-identical by construction, not by copy.
+  static const rustic = AppColors.rusticShell;
+
+  // Deeper and cool: the rustic ladder pushed toward slate blue-grey.
+  static const slate = AppShellScheme(
+    id: 'slate', label: 'Slate',
+    bg: Color(0xFF090B0E), bgDeep: Color(0xFF050708),
+    surface: Color(0xFF10141A), card: Color(0xFF141A21),
+    cardTop: Color(0xFF182028), cardBottom: Color(0xFF11161C),
+    cardRaised: Color(0xFF1D2530), inset: Color(0xFF0C1015),
+    textPrimary: Color(0xFFE8ECF1), textSecondary: Color(0xFF97A1AE),
+    textTertiary: Color(0xFF5C6570),
+  );
+
+  // A touch lighter than rustic and warmer than graphite: charcoal with the
+  // same R>B tilt the rustic surfaces carry.
+  static const charcoal = AppShellScheme(
+    id: 'charcoal', label: 'Charcoal',
+    bg: Color(0xFF121110), bgDeep: Color(0xFF0C0B0A),
+    surface: Color(0xFF1A1817), card: Color(0xFF201D1B),
+    cardTop: Color(0xFF252220), cardBottom: Color(0xFF1B1917),
+    cardRaised: Color(0xFF2A2624), inset: Color(0xFF161413),
+    textPrimary: Color(0xFFEFEDEA), textSecondary: Color(0xFFA5A19A),
+    textTertiary: Color(0xFF6A665F),
+  );
+
+  // The darkest ground of the set, blue-black — night-service chrome.
+  static const midnight = AppShellScheme(
+    id: 'midnight', label: 'Midnight',
+    bg: Color(0xFF070A14), bgDeep: Color(0xFF04060D),
+    surface: Color(0xFF0D1220), card: Color(0xFF101728),
+    cardTop: Color(0xFF131B2E), cardBottom: Color(0xFF0E1421),
+    cardRaised: Color(0xFF16203A), inset: Color(0xFF0A0E1A),
+    textPrimary: Color(0xFFE7EBF4), textSecondary: Color(0xFF93A0B8),
+    textTertiary: Color(0xFF57627A),
+  );
+
+  // Dead-neutral grey: for the owner who wants the accent to be the ONLY hue
+  // the chrome speaks.
+  static const graphite = AppShellScheme(
+    id: 'graphite', label: 'Graphite',
+    bg: Color(0xFF0B0B0C), bgDeep: Color(0xFF070708),
+    surface: Color(0xFF131315), card: Color(0xFF19191B),
+    cardTop: Color(0xFF1E1E20), cardBottom: Color(0xFF161618),
+    cardRaised: Color(0xFF232326), inset: Color(0xFF0F0F10),
+    textPrimary: Color(0xFFEBEBEC), textSecondary: Color(0xFF9B9B9E),
+    textTertiary: Color(0xFF616163),
+  );
+
+  static const List<AppShellScheme> all = [rustic, slate, charcoal, midnight, graphite];
+
+  static AppShellScheme byId(String? id) =>
+      all.firstWhere((s) => s.id == id, orElse: () => rustic);
+}
+
 /// Per-DEVICE appearance for the owner app: which accent the Rustic Fork shell
 /// wears. Persisted in SharedPreferences, NOT on the server, on purpose:
 ///
@@ -94,21 +160,30 @@ class AppearanceController extends ChangeNotifier {
   static final AppearanceController instance = AppearanceController._();
 
   static const String _prefsKey = 'appearance.accent';
+  static const String _schemePrefsKey = 'appearance.scheme';
 
   String _accentId = AppAccents.defaultId;
   String get accentId => _accentId;
   AppAccent get accent => AppAccents.byId(_accentId);
 
-  /// Restore the device's accent before the first frame (called from main()).
-  /// Any failure (fresh install, corrupt prefs) lands on the copper default.
+  String _schemeId = AppSchemes.defaultId;
+  String get schemeId => _schemeId;
+  AppShellScheme get scheme => AppSchemes.byId(_schemeId);
+
+  /// Restore the device's appearance before the first frame (called from
+  /// main()). Any failure (fresh install, corrupt prefs) lands on the shipped
+  /// copper-on-rustic default.
   Future<void> load() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       _accentId = AppAccents.byId(prefs.getString(_prefsKey)).id;
+      _schemeId = AppSchemes.byId(prefs.getString(_schemePrefsKey)).id;
     } catch (_) {
       _accentId = AppAccents.defaultId;
+      _schemeId = AppSchemes.defaultId;
     }
     AppColors.applyAccent(AppAccents.byId(_accentId));
+    AppColors.applyShell(AppSchemes.byId(_schemeId));
     notifyListeners();
   }
 
@@ -120,9 +195,22 @@ class AppearanceController extends ChangeNotifier {
     // Notify FIRST so the UI recolours instantly; persistence is best-effort
     // (a failed write only means the choice doesn't survive a restart).
     notifyListeners();
+    await _persist(_prefsKey, resolved.id);
+  }
+
+  Future<void> setScheme(String id) async {
+    final resolved = AppSchemes.byId(id);
+    if (resolved.id == _schemeId) return;
+    _schemeId = resolved.id;
+    AppColors.applyShell(resolved);
+    notifyListeners();
+    await _persist(_schemePrefsKey, resolved.id);
+  }
+
+  Future<void> _persist(String key, String value) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_prefsKey, resolved.id);
+      await prefs.setString(key, value);
     } catch (_) {/* keep the in-memory choice */}
   }
 
@@ -130,7 +218,9 @@ class AppearanceController extends ChangeNotifier {
   @visibleForTesting
   void debugReset() {
     _accentId = AppAccents.defaultId;
+    _schemeId = AppSchemes.defaultId;
     AppColors.applyAccent(AppAccents.copper);
+    AppColors.applyShell(AppSchemes.rustic);
     notifyListeners();
   }
 }

@@ -32,82 +32,82 @@ abstract final class AppTheme {
 
     final text = base.textTheme.copyWith(
       // Oversized stat numbers — light weight, tight tracking.
-      displayLarge: const TextStyle(
+      displayLarge: TextStyle(
         fontSize: 40,
         fontWeight: FontWeight.w300,
         letterSpacing: -1.2,
         color: AppColors.textPrimary,
         height: 1.0,
       ),
-      displayMedium: const TextStyle(
+      displayMedium: TextStyle(
         fontSize: 32,
         fontWeight: FontWeight.w300,
         letterSpacing: -0.8,
         color: AppColors.textPrimary,
         height: 1.0,
       ),
-      displaySmall: const TextStyle(
+      displaySmall: TextStyle(
         fontSize: 24,
         fontWeight: FontWeight.w400,
         letterSpacing: -0.5,
         color: AppColors.textPrimary,
         height: 1.05,
       ),
-      headlineMedium: const TextStyle(
+      headlineMedium: TextStyle(
         fontSize: 22,
         fontWeight: FontWeight.w600,
         letterSpacing: -0.4,
         color: AppColors.textPrimary,
       ),
-      titleLarge: const TextStyle(
+      titleLarge: TextStyle(
         fontSize: 17,
         fontWeight: FontWeight.w600,
         letterSpacing: -0.2,
         color: AppColors.textPrimary,
       ),
-      titleMedium: const TextStyle(
+      titleMedium: TextStyle(
         fontSize: 15,
         fontWeight: FontWeight.w600,
         letterSpacing: -0.1,
         color: AppColors.textPrimary,
       ),
-      titleSmall: const TextStyle(
+      titleSmall: TextStyle(
         fontSize: 13,
         fontWeight: FontWeight.w600,
         color: AppColors.textPrimary,
       ),
-      bodyLarge: const TextStyle(
+      bodyLarge: TextStyle(
         fontSize: 14,
         fontWeight: FontWeight.w400,
         color: AppColors.textPrimary,
         height: 1.45,
       ),
-      bodyMedium: const TextStyle(
+      bodyMedium: TextStyle(
         fontSize: 13,
         fontWeight: FontWeight.w400,
         color: AppColors.textSecondary,
         height: 1.45,
       ),
-      bodySmall: const TextStyle(
+      bodySmall: TextStyle(
         fontSize: 12,
         fontWeight: FontWeight.w400,
         color: AppColors.textSecondary,
         height: 1.4,
       ),
       // Letter-spaced uppercase micro label ("CROWD SIZE" style).
-      labelSmall: const TextStyle(
+      labelSmall: TextStyle(
         fontSize: 10,
         fontWeight: FontWeight.w600,
         letterSpacing: 1.1,
         color: AppColors.textTertiary,
       ),
-      labelMedium: const TextStyle(
+      labelMedium: TextStyle(
         fontSize: 12,
         fontWeight: FontWeight.w500,
         letterSpacing: 0.2,
         color: AppColors.textSecondary,
       ),
-      labelLarge: const TextStyle(
+      labelLarge: TextStyle(
         fontSize: 13,
         fontWeight: FontWeight.w600,
         letterSpacing: 0.2,
@@ -123,7 +123,7 @@ abstract final class AppTheme {
         thickness: 1,
         space: 1,
       ),
-      iconTheme: const IconThemeData(color: AppColors.textSecondary, size: 18),
+      iconTheme: IconThemeData(color: AppColors.textSecondary, size: 18),
       // Same colour an M3 IconButton already resolves to (colorScheme
       // .onSurfaceVariant), so nothing moves — but it must be spelled out.
       // AppBar hands its iconTheme/actionsIconTheme down as

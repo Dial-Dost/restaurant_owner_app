@@ -92,6 +92,40 @@ void main() {
       await AppearanceController.instance.load();
       expect(AppearanceController.instance.accentId, 'copper');
     });
+
+    test('setScheme persists and load restores it (device round-trip)', () async {
+      await AppearanceController.instance.setScheme('midnight');
+      expect(AppearanceController.instance.schemeId, 'midnight');
+      expect(AppColors.bg, AppSchemes.midnight.bg);
+      expect(AppColors.textPrimary, AppSchemes.midnight.textPrimary);
+
+      // Simulate a cold start: reset in-memory state, then load from prefs.
+      AppearanceController.instance.debugReset();
+      expect(AppColors.bg, AppSchemes.rustic.bg);
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'midnight');
+      expect(AppColors.bg, AppSchemes.midnight.bg);
+      expect(AppColors.cardRaised, AppSchemes.midnight.cardRaised);
+      expect(AppColors.textSecondary, AppSchemes.midnight.textSecondary);
+    });
+
+    test('scheme and accent persist independently (they compose, not compete)', () async {
+      await AppearanceController.instance.setScheme('slate');
+      await AppearanceController.instance.setAccent('rose');
+      AppearanceController.instance.debugReset();
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'slate');
+      expect(AppearanceController.instance.accentId, 'rose');
+      expect(AppColors.bg, AppSchemes.slate.bg);
+      expect(AppColors.copper, AppAccents.rose.base);
+    });
+
+    test('a corrupt stored scheme id loads as the rustic default', () async {
+      SharedPreferences.setMockInitialValues({'appearance.scheme': 'hot-dog-stand'});
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'rustic');
+      expect(AppColors.bg, AppSchemes.rustic.bg);
+    });
   });
 
   group('accent recolours the widgets', () {
