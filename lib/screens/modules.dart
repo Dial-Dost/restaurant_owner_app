@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
@@ -578,17 +579,19 @@ Widget _metricTile(
   required String label,
   required String value,
   String? sub,
-  Color subColor = AppColors.textSecondary,
+  // Nullable because AppColors.textSecondary is a getter now (the device
+  // scheme), and a default must be const — null means "secondary ink".
+  Color? subColor,
   IconData? icon,
   // Nullable because AppColors.copperHi is a getter now (the device accent),
   // and a default must be const — null means "the active accent".
   Color? accent,
   VoidCallback? onTap,
 }) {
+  subColor ??= AppColors.textSecondary;
   accent ??= AppColors.copperHi;
   final text = Theme.of(context).textTheme;
   return ForkCard(
-  subColor ??= AppColors.textSecondary;
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
     onTap: onTap,
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
@@ -3893,7 +3896,7 @@ class _AuditLogView extends StatefulWidget {
   State<_AuditLogView> createState() => _AuditLogViewState();
 }
 
-class _AuditLogViewState extends State<_AuditLogView> {
+class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
   // Rows per fetch. The trail runs to thousands of entries, so it is pulled one
   // batch at a time and appended as the list nears its end — the old single
   // `?limit=300` shot both stalled the open and made the count chip read "300"
@@ -3945,15 +3948,20 @@ class _AuditLogViewState extends State<_AuditLogView> {
   String _from = '';
   String _to = '';
   String _category = 'All';
-  // Bumped per request; a response whose serial is stale lost a race with a
-  // newer filter and must not be merged into the list.
-  int _serial = 0;
+  // Request racing is guarded by CachePrimedScreen's generation counter: a
+  // response whose generation is stale lost a race with a newer filter and
+  // must not be merged into the list.
 
   @override
   void initState() {
     super.initState();
     _scroll.addListener(_onScroll);
-    _load();
+    unawaited(primeFromCache(
+      fetch: () => _fetchPage(offset: 0),
+      apply: (res) { _applyPage(res, append: false); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
   @override
@@ -3970,56 +3978,80 @@ class _AuditLogViewState extends State<_AuditLogView> {
     return p.isAdmin || p.actions.contains('*') || p.actions.contains(_undoAuditPermissionId);
   }
 
-  /// One page. [append] adds the next window; otherwise the list is replaced
-  /// from offset 0 — which is also what a filter change must do, so a filtered
-  /// view can never keep rows that no longer match.
-  Future<void> _load({bool append = false, int? limit}) async {
-    if (append && (_loadingMore || !_hasMore)) return;
-    final serial = ++_serial;
-    setState(() {
-      if (append) {
-        _loadingMore = true;
-      } else {
-        _loading = true;
-        _error = null;
-      }
-    });
-    final offset = append ? _rows.length : 0;
+  /// One page's GET under the CURRENT filters, side-effect free — replayable
+  /// against the persisted cache at boot and the network path of every [_load].
+  Future<Map<String, dynamic>> _fetchPage({required int offset, int? limit}) {
     final q = _query.trim();
     final fromIso = _from.isEmpty ? '' : _restaurantDayBoundIso(_from);
     final toIso = _to.isEmpty ? '' : _restaurantDayBoundIso(_to, end: true);
+    // ?meta=1 returns { logs, total, has_more } — the true row count, which is
+    // what the header chip reports, instead of "however many are loaded".
     final path = '/audit-logs?meta=1&limit=${limit ?? _pageSize}&offset=$offset'
         '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}'
         '${_category == 'All' ? '' : '&category=${Uri.encodeQueryComponent(_category)}'}'
         '${fromIso.isEmpty ? '' : '&from=${Uri.encodeQueryComponent(fromIso)}'}'
         '${toIso.isEmpty ? '' : '&to=${Uri.encodeQueryComponent(toIso)}'}';
-    try {
-      // ?meta=1 returns { logs, total, has_more } — the true row count, which is
-      // what the header chip reports, instead of "however many are loaded".
-      final res = await widget.rest.getMap(path);
-      if (!mounted || serial != _serial) return;
-      final page = <Map>[for (final r in (res['logs'] as List?) ?? const []) if (r is Map) r];
+    return widget.rest.getMap(path);
+  }
+
+  /// Merge one page into the list — field assignment only, shared by the cache
+  /// prime and the network load so the two paths cannot drift.
+  void _applyPage(Map<String, dynamic> res, {required bool append}) {
+    final page = <Map>[for (final r in (res['logs'] as List?) ?? const []) if (r is Map) r];
+    if (!append) {
+      _rows.clear();
+      _ids.clear();
+    }
+    var added = 0;
+    for (final r in page) {
+      final id = _s(r, 'id', '');
+      if (id.isNotEmpty && !_ids.add(id)) continue;
+      _rows.add(r);
+      added++;
+    }
+    _total = _int(res['total']) ?? _rows.length;
+    // A page that brought nothing new can never advance the offset — stop
+    // instead of asking for the same window forever.
+    _hasMore = res['has_more'] == true && (!append || added > 0);
+  }
+
+  /// One page. [append] adds the next window; otherwise the list is replaced
+  /// from offset 0 — which is also what a filter change must do, so a filtered
+  /// view can never keep rows that no longer match. [silent] keeps whatever is
+  /// on screen up while the refetch is in flight (the cache prime's follow-up).
+  Future<void> _load({bool append = false, int? limit, bool silent = false}) async {
+    if (append && (_loadingMore || !_hasMore)) return;
+    final gen = bumpCacheGen();
+    if (!silent) {
       setState(() {
-        if (!append) {
-          _rows.clear();
-          _ids.clear();
+        if (append) {
+          _loadingMore = true;
+        } else {
+          _loading = true;
+          _error = null;
         }
-        var added = 0;
-        for (final r in page) {
-          final id = _s(r, 'id', '');
-          if (id.isNotEmpty && !_ids.add(id)) continue;
-          _rows.add(r);
-          added++;
-        }
-        _total = _int(res['total']) ?? _rows.length;
-        // A page that brought nothing new can never advance the offset — stop
-        // instead of asking for the same window forever.
-        _hasMore = res['has_more'] == true && (!append || added > 0);
+      });
+    }
+    final offset = append ? _rows.length : 0;
+    try {
+      final res = await _fetchPage(offset: offset, limit: limit);
+      if (!mounted || !cacheGenIs(gen)) return;
+      setState(() {
+        _applyPage(res, append: append);
         _loading = false;
         _loadingMore = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted || serial != _serial) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // Only a SILENT refresh keeps the trail up behind the offline pill: a
+      // loud non-append failure means a filter just changed, and old rows under
+      // a new filter would describe neither.
+      if (silent && _rows.isNotEmpty) {
+        setState(() { _loading = false; _loadingMore = false; markCacheOffline(); });
+        return;
+      }
       setState(() {
         _error = '$e';
         _loading = false;
@@ -4054,8 +4086,8 @@ class _AuditLogViewState extends State<_AuditLogView> {
   /// rule: the request restarts at offset 0 AND everything already scrolled in
   /// is discarded. Appending to a list built under different filters would mix
   /// two result sets and make the count chip describe neither. `_load()` with
-  /// append:false already clears `_rows`/`_ids`; the bumped `_serial` inside it
-  /// also strands any page still in flight for the previous filter.
+  /// append:false already clears `_rows`/`_ids`; the bumped generation inside
+  /// it also strands any page still in flight for the previous filter.
   void _applyFilters(VoidCallback change) {
     setState(() {
       change();
@@ -4248,7 +4280,7 @@ class _AuditLogViewState extends State<_AuditLogView> {
   @override
   Widget build(BuildContext context) {
     final loaded = _rows.length;
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    return cacheStaleOverlay(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
         child: SectionHeader(
@@ -4277,7 +4309,7 @@ class _AuditLogViewState extends State<_AuditLogView> {
         child: _filterBar(context),
       ),
       Expanded(child: _body(context)),
-    ]);
+    ]));
   }
 
   /// Date presets, the category filter, and what the two of them currently mean.
@@ -10340,7 +10372,7 @@ class _CustomersView extends StatefulWidget {
   State<_CustomersView> createState() => _CustomersViewState();
 }
 
-class _CustomersViewState extends State<_CustomersView> {
+class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
   static const int _pageSize = 50;
   // How many names a leaderboard card shows.
   static const int _leaderSize = 5;
@@ -10379,13 +10411,27 @@ class _CustomersViewState extends State<_CustomersView> {
   String _segment = 'all';
   String _query = '';
   Timer? _debounce;
-  int _serial = 0;
 
   @override
   void initState() {
     super.initState();
     _scroll.addListener(_onScroll);
-    _load();
+    unawaited(primeFromCache(
+      // The list AND the three leaderboards: painting the band as loading
+      // skeletons next to an instant list would read as half a screen.
+      fetch: () async {
+        final page = await _fetchPage(offset: 0);
+        final leaders = await _fetchLeaders();
+        return (page: page, leaders: leaders);
+      },
+      apply: (d) {
+        _applyPage(d.page, append: false);
+        _applyLeaders(d.leaders);
+        _loading = false;
+      },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
   @override
@@ -10404,53 +10450,75 @@ class _CustomersViewState extends State<_CustomersView> {
         '${q.isEmpty ? '' : '&search=${Uri.encodeQueryComponent(q)}'}';
   }
 
+  /// One page's GET under the CURRENT filters, side-effect free — replayable
+  /// against the persisted cache at boot and the network path of every [_load].
+  Future<Map<String, dynamic>> _fetchPage({required int offset}) =>
+      widget.rest.getMap(_query4(_sort, limit: _pageSize, offset: offset, meta: true));
+
+  /// Merge one page — field assignment only, shared by the cache prime and the
+  /// network load so the two paths cannot drift.
+  void _applyPage(Map<String, dynamic> res, {required bool append}) {
+    final page = <Map>[for (final r in (res['customers'] as List?) ?? const []) if (r is Map) r];
+    if (!append) {
+      _rows.clear();
+      _ids.clear();
+    }
+    var added = 0;
+    for (final r in page) {
+      final id = _s(r, 'customer_id', '');
+      if (id.isNotEmpty && !_ids.add(id)) continue;
+      _rows.add(r);
+      added++;
+    }
+    _total = _int(res['total']) ?? _rows.length;
+    _hasMore = res['has_more'] == true && (!append || added > 0);
+    if (_s(res, 'segment', 'all') == 'all') {
+      _counts = <String, int>{
+        for (final e in ((res['segment_counts'] as Map?) ?? const {}).entries)
+          '${e.key}': _int(e.value) ?? 0,
+      };
+      _countsQuery = _query;
+    }
+    _spendBasis = _s(res, 'spend_basis', '');
+  }
+
   /// One page of the list. [append] extends it; otherwise the list restarts at
   /// offset 0 and the three leaderboards are re-ranked under the new filters.
-  Future<void> _load({bool append = false}) async {
+  /// [silent] keeps what is on screen up while the refetch is in flight.
+  Future<void> _load({bool append = false, bool silent = false}) async {
     if (append && (_loadingMore || !_hasMore)) return;
-    final serial = ++_serial;
-    setState(() {
-      if (append) {
-        _loadingMore = true;
-      } else {
-        _loading = true;
-        _error = null;
-      }
-    });
+    final gen = bumpCacheGen();
+    if (!silent) {
+      setState(() {
+        if (append) {
+          _loadingMore = true;
+        } else {
+          _loading = true;
+          _error = null;
+        }
+      });
+    }
     final offset = append ? _rows.length : 0;
     try {
-      final res = await widget.rest
-          .getMap(_query4(_sort, limit: _pageSize, offset: offset, meta: true));
-      if (!mounted || serial != _serial) return;
-      final page = <Map>[for (final r in (res['customers'] as List?) ?? const []) if (r is Map) r];
+      final res = await _fetchPage(offset: offset);
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        if (!append) {
-          _rows.clear();
-          _ids.clear();
-        }
-        var added = 0;
-        for (final r in page) {
-          final id = _s(r, 'customer_id', '');
-          if (id.isNotEmpty && !_ids.add(id)) continue;
-          _rows.add(r);
-          added++;
-        }
-        _total = _int(res['total']) ?? _rows.length;
-        _hasMore = res['has_more'] == true && (!append || added > 0);
-        if (_s(res, 'segment', 'all') == 'all') {
-          _counts = <String, int>{
-            for (final e in ((res['segment_counts'] as Map?) ?? const {}).entries)
-              '${e.key}': _int(e.value) ?? 0,
-          };
-          _countsQuery = _query;
-        }
-        _spendBasis = _s(res, 'spend_basis', '');
+        _applyPage(res, append: append);
         _loading = false;
         _loadingMore = false;
+        _error = null;
+        markCacheLive();
       });
-      if (!append) await _loadLeaders(serial);
+      if (!append) await _loadLeaders(gen);
     } catch (e) {
-      if (!mounted || serial != _serial) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // Only a SILENT refresh keeps the list up behind the offline pill: a
+      // loud non-append failure means a filter just changed, and old rows
+      // under a new filter would describe neither.
+      if (silent && _rows.isNotEmpty) {
+        setState(() { _loading = false; _loadingMore = false; markCacheOffline(); });
+        return;
+      }
       setState(() {
         _error = '$e';
         _loading = false;
@@ -10460,13 +10528,11 @@ class _CustomersViewState extends State<_CustomersView> {
     }
   }
 
-  /// The overview band. Three small server-ranked reads, not a re-sort of what
-  /// is already on screen.
-  ///
-  /// Each ranking is awaited on its own so one failure costs one card. A failed
-  /// card SAYS it failed — it must not fall back to an empty list, which reads
-  /// identically to "no guests match" and would hide a broken endpoint.
-  Future<void> _loadLeaders(int serial) async {
+  /// The three server-ranked reads, side-effect free. Each ranking is awaited
+  /// on its own so one failure costs one card. A failed card SAYS it failed —
+  /// it must not fall back to an empty list, which reads identically to "no
+  /// guests match" and would hide a broken endpoint.
+  Future<({Map<String, List<Map>> out, Map<String, String> failed})> _fetchLeaders() async {
     final out = <String, List<Map>>{};
     final failed = <String, String>{};
     Future<void> rank(List<String> s) async {
@@ -10478,18 +10544,26 @@ class _CustomersViewState extends State<_CustomersView> {
       }
     }
 
-    setState(() => _leadersLoading = true);
     await Future.wait([for (final s in _customerSorts) rank(s)]);
-    if (!mounted || serial != _serial) return;
-    setState(() {
-      _leaders
-        ..clear()
-        ..addAll(out);
-      _leaderErrors
-        ..clear()
-        ..addAll(failed);
-      _leadersLoading = false;
-    });
+    return (out: out, failed: failed);
+  }
+
+  void _applyLeaders(({Map<String, List<Map>> out, Map<String, String> failed}) d) {
+    _leaders
+      ..clear()
+      ..addAll(d.out);
+    _leaderErrors
+      ..clear()
+      ..addAll(d.failed);
+    _leadersLoading = false;
+  }
+
+  /// The overview band. Re-ranked whenever the page-one list is (re)loaded.
+  Future<void> _loadLeaders(int gen) async {
+    setState(() => _leadersLoading = true);
+    final d = await _fetchLeaders();
+    if (!mounted || !cacheGenIs(gen)) return;
+    setState(() => _applyLeaders(d));
   }
 
   void _onScroll() {
@@ -10577,7 +10651,7 @@ class _CustomersViewState extends State<_CustomersView> {
   @override
   Widget build(BuildContext context) {
     final loaded = _rows.length;
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    return cacheStaleOverlay(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
         child: SectionHeader(
@@ -10631,7 +10705,7 @@ class _CustomersViewState extends State<_CustomersView> {
         ]),
       ),
       Expanded(child: _body(context)),
-    ]);
+    ]));
   }
 
   Widget _body(BuildContext context) {
@@ -15198,9 +15272,10 @@ class _AccountingView extends StatefulWidget {
   State<_AccountingView> createState() => _AccountingViewState();
 }
 
-class _AccountingViewState extends State<_AccountingView> {
+class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen {
   int _days = 30;
   bool _loading = true;
+  bool _hasData = false;
   String? _error;
   Map<String, dynamic> _sales = {};
   Map<String, dynamic> _gst = {};
@@ -15225,7 +15300,12 @@ class _AccountingViewState extends State<_AccountingView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
   @override
@@ -15245,38 +15325,62 @@ class _AccountingViewState extends State<_AccountingView> {
     return (from: RestaurantTime.isoDate(from), to: RestaurantTime.isoDate(to));
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  /// Side-effect-free GET composition over the CURRENT window/month — replayable
+  /// against the persisted cache at boot and the network path of every [_load].
+  Future<List<Map<String, dynamic>>> _fetch() {
     final r = _range();
     final q = 'from=${r.from}&to=${r.to}';
-    try {
-      final res = await Future.wait([
-        widget.rest.getMap('/reports/sales?$q'),
-        widget.rest.getMap('/reports/gst?$q'),
-        widget.rest.getMap('/reports/pnl?$q'),
-        widget.rest.getMap('/expenses?$q'),
-        widget.rest.getMap('/payroll?month=$_payrollMonth').catchError((_) => <String, dynamic>{}),
-        widget.rest.getMap('/reports/discounts?$q').catchError((_) => <String, dynamic>{}),
-        widget.rest.getMap('/reports/schedules').catchError((_) => <String, dynamic>{}),
-        widget.rest.getMap('/reports/deliveries?limit=20').catchError((_) => <String, dynamic>{}),
-      ]);
-      if (!mounted) return;
+    return Future.wait([
+      widget.rest.getMap('/reports/sales?$q'),
+      widget.rest.getMap('/reports/gst?$q'),
+      widget.rest.getMap('/reports/pnl?$q'),
+      widget.rest.getMap('/expenses?$q'),
+      widget.rest.getMap('/payroll?month=$_payrollMonth').catchError((_) => <String, dynamic>{}),
+      widget.rest.getMap('/reports/discounts?$q').catchError((_) => <String, dynamic>{}),
+      widget.rest.getMap('/reports/schedules').catchError((_) => <String, dynamic>{}),
+      widget.rest.getMap('/reports/deliveries?limit=20').catchError((_) => <String, dynamic>{}),
+    ]);
+  }
+
+  void _apply(List<Map<String, dynamic>> res) {
+    _sales = res[0];
+    _gst = res[1];
+    _pnl = res[2];
+    _expenses = (res[3]['expenses'] as List?) ?? [];
+    _payroll = res[4];
+    _discounts = res[5];
+    _schedules = (res[6]['schedules'] as List?) ?? [];
+    _deliveries = (res[7]['deliveries'] as List?) ?? [];
+    _hasData = true;
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) {
       setState(() {
-        _sales = res[0];
-        _gst = res[1];
-        _pnl = res[2];
-        _expenses = (res[3]['expenses'] as List?) ?? [];
-        _payroll = res[4];
-        _discounts = res[5];
-        _schedules = (res[6]['schedules'] as List?) ?? [];
-        _deliveries = (res[7]['deliveries'] as List?) ?? [];
+        _loading = true;
+        _error = null;
+      });
+    }
+    try {
+      final res = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
+      setState(() {
+        _apply(res);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // Only a SILENT refresh keeps the figures up behind the offline pill: a
+      // loud load here means the window or payroll month just changed, and old
+      // figures under a new window label would be a silent tally mismatch —
+      // the error screen is the honest outcome for that.
+      if (silent && _hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() {
         _error = '$e';
         _loading = false;
@@ -15891,7 +15995,7 @@ class _AccountingViewState extends State<_AccountingView> {
     final payrollRows = (_payroll['rows'] as List?) ?? [];
     final netProfitUp = _n(_pnl['net_profit']) >= 0;
 
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
         // The two exports drop below the period tabs on a phone, and wrap again
@@ -16257,7 +16361,7 @@ class _AccountingViewState extends State<_AccountingView> {
           reload: _load,
         ),
       ]),
-    );
+    ));
   }
 }
 
@@ -17003,7 +17107,10 @@ class _ClosedBillsList extends StatefulWidget {
   State<_ClosedBillsList> createState() => _ClosedBillsListState();
 }
 
-class _ClosedBillsListState extends State<_ClosedBillsList> {
+// CachePrimedScreen here is for the boot-time prime and the request-generation
+// guard; the staleness pill stays with the parent Accounting screen (this list
+// is embedded mid-scroll, and it primes from the same store in the same boot).
+class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScreen {
   final List<Map> _rows = [];
   bool _loading = true;
   bool _hasMore = false;
@@ -17013,7 +17120,12 @@ class _ClosedBillsListState extends State<_ClosedBillsList> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: () => _fetchPage(offset: 0),
+      apply: (res) { _applyPage(res, append: false); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
   @override
@@ -17021,31 +17133,50 @@ class _ClosedBillsListState extends State<_ClosedBillsList> {
     super.didUpdateWidget(old);
     final was = old.filter.query(limit: old.pageSize, offset: 0);
     final now = widget.filter.query(limit: widget.pageSize, offset: 0);
+    // _load bumps the generation, which also strands a boot prime or an older
+    // filter's page still in flight — the guard that keeps a slow stale
+    // response from painting over the newer filter's rows.
     if (was != now) _load();
   }
 
-  Future<void> _load({bool append = false}) async {
-    setState(() {
-      _loading = true;
-      if (!append) _error = null;
-    });
+  Future<Map<String, dynamic>> _fetchPage({required int offset}) =>
+      widget.rest.getMap('/bills/closed?${widget.filter.query(limit: widget.pageSize, offset: offset)}');
+
+  void _applyPage(Map<String, dynamic> res, {required bool append}) {
+    final page = ((res['bills'] as List?) ?? const []).map((e) => e as Map).toList();
+    if (!append) _rows.clear();
+    _rows.addAll(page);
+    _total = _int(res['total']) ?? _rows.length;
+    _hasMore = res['has_more'] == true;
+  }
+
+  Future<void> _load({bool append = false, bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) {
+      setState(() {
+        _loading = true;
+        if (!append) _error = null;
+      });
+    }
     final offset = append ? _rows.length : 0;
     try {
-      final path = '/bills/closed?${widget.filter.query(limit: widget.pageSize, offset: offset)}';
-      final res = await widget.rest.getMap(path);
-      if (!mounted) return;
-      final page = ((res['bills'] as List?) ?? const []).map((e) => e as Map).toList();
+      final res = await _fetchPage(offset: offset);
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        if (!append) _rows.clear();
-        _rows.addAll(page);
-        _total = _int(res['total']) ?? _rows.length;
-        _hasMore = res['has_more'] == true;
+        _applyPage(res, append: append);
         _loading = false;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // A failed silent refresh with rows on screen keeps them (the build
+      // already prefers rows over the error state when both exist).
       setState(() {
-        _error = '$e';
+        if (silent && _rows.isNotEmpty) {
+          markCacheOffline();
+        } else {
+          _error = '$e';
+        }
         _loading = false;
       });
     }
@@ -17324,8 +17455,11 @@ class _WaitlistView extends StatefulWidget {
   State<_WaitlistView> createState() => _WaitlistViewState();
 }
 
-class _WaitlistViewState extends State<_WaitlistView> {
+class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
   bool _loading = true;
+  // Set by the first payload to land (cached or live). Tracked separately from
+  // _entries because an empty queue is a legitimate payload, not "no data".
+  bool _hasData = false;
   String? _error;
   List _entries = const [];
   // Parties already SEATED whose held pre-order still needs a yes/no. Seating no
@@ -17364,7 +17498,12 @@ class _WaitlistViewState extends State<_WaitlistView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
     _poll = Timer.periodic(const Duration(seconds: 10), (_) => _load(silent: true));
   }
 
@@ -17374,27 +17513,56 @@ class _WaitlistViewState extends State<_WaitlistView> {
     super.dispose();
   }
 
+  /// The GETs this board is made of, with no side effects — replayable against
+  /// the persisted cache at boot (see [CachePrimedScreen]) and the network path
+  /// of every [_load].
+  Future<({List entries, List pending, List tables})> _fetch() async {
+    final w = await widget.rest.getMap('/waitlist');
+    List tables = const [];
+    try { tables = await widget.rest.getList('/get-tables'); } catch (_) {}
+    // Best-effort: an older backend without the route must not blank the queue.
+    Map<String, dynamic> pending = const <String, dynamic>{};
+    try { pending = await widget.rest.getMap('/waitlist/pending-preorders'); } catch (_) {}
+    return (
+      entries: (w['entries'] as List?) ?? const [],
+      pending: (pending['entries'] as List?) ?? const [],
+      tables: tables,
+    );
+  }
+
+  /// Field assignment only — called inside setState by both the cache prime
+  /// and the network load, so the two paths cannot drift.
+  void _apply(({List entries, List pending, List tables}) d) {
+    _entries = d.entries;
+    _pendingPreorders = d.pending;
+    _freeTables = [
+      for (final t in d.tables)
+        if (!((t as Map)['occupied'] == true || t['booked'] == true || t['reserved'] == true)) _s(t, 'table_name'),
+    ].where((s) => s.isNotEmpty && s != '—').toList();
+    _hasData = true;
+  }
+
   Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
     if (!silent) setState(() { _loading = true; _error = null; });
     try {
-      final w = await widget.rest.getMap('/waitlist');
-      List tables = const [];
-      try { tables = await widget.rest.getList('/get-tables'); } catch (_) {}
-      // Best-effort: an older backend without the route must not blank the queue.
-      Map<String, dynamic> pending = const <String, dynamic>{};
-      try { pending = await widget.rest.getMap('/waitlist/pending-preorders'); } catch (_) {}
-      if (!mounted) return;
+      final d = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        _entries = (w['entries'] as List?) ?? const [];
-        _pendingPreorders = (pending['entries'] as List?) ?? const [];
-        _freeTables = [
-          for (final t in tables)
-            if (!((t as Map)['occupied'] == true || t['booked'] == true || t['reserved'] == true)) _s(t, 'table_name'),
-        ].where((s) => s.isNotEmpty && s != '—').toList();
+        _apply(d);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // With a queue already on screen (saved or live), a failed refresh keeps
+      // it up behind the offline pill — a 10s-poll board that swapped itself
+      // for an error page on one dropped request would be unusable at the door.
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() { _error = '$e'; _loading = false; });
     }
   }
@@ -17624,7 +17792,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
     // endpoint supports: GET /waitlist returns waiting + called and nothing else.
     final called = [for (final e in ordered) if (_s(e as Map, 'status', 'waiting') == 'called') e];
 
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: LayoutBuilder(builder: (context, c) {
         final wide = c.maxWidth >= _twoColumnMin;
@@ -17664,7 +17832,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
           _closingBanner(c.maxWidth),
         ]);
       }),
-    );
+    ));
   }
 
   String get _queueUrl => '${AppConfig.orderBaseUrl}/queue/${widget.profile.restaurantUsername}';
@@ -18170,7 +18338,7 @@ class _WaitlistViewState extends State<_WaitlistView> {
 
   PopupMenuItem<String> _menuItem(String value, IconData icon, String label,
       // Nullable because AppColors.textSecondary is a getter now (the device
-      // scheme), and a default must be const â€” null means "secondary ink".
+      // scheme), and a default must be const — null means "secondary ink".
       {Color? color}) {
     color ??= AppColors.textSecondary;
     final fg = color == AppColors.textSecondary
@@ -18889,8 +19057,9 @@ class _BillingView extends StatefulWidget {
   State<_BillingView> createState() => _BillingViewState();
 }
 
-class _BillingViewState extends State<_BillingView> {
+class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
   bool _loading = true;
+  bool _hasData = false;
   bool _busy = false;
   String? _error;
   Map<String, dynamic> _info = {};
@@ -18898,17 +19067,27 @@ class _BillingViewState extends State<_BillingView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: () => widget.rest.getMap('/billing'),
+      apply: (info) { _info = info; _hasData = true; _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
-  Future<void> _load() async {
-    setState(() { _loading = true; _error = null; });
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) setState(() { _loading = true; _error = null; });
     try {
       final info = await widget.rest.getMap('/billing');
-      if (!mounted) return;
-      setState(() { _info = info; _loading = false; });
+      if (!mounted || !cacheGenIs(gen)) return;
+      setState(() { _info = info; _hasData = true; _loading = false; _error = null; markCacheLive(); });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() { _error = '$e'; _loading = false; });
     }
   }
@@ -19036,7 +19215,7 @@ class _BillingViewState extends State<_BillingView> {
       if (sub == null) 'Unlimited starter (no plan assigned).',
     ].where((s) => s.isNotEmpty).join(' · ');
 
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
         StatCard(
@@ -19169,7 +19348,7 @@ class _BillingViewState extends State<_BillingView> {
           }),
         ],
       ]),
-    );
+    ));
   }
 }
 
@@ -19183,8 +19362,10 @@ class _CashView extends StatefulWidget {
   State<_CashView> createState() => _CashViewState();
 }
 
-class _CashViewState extends State<_CashView> {
+class _CashViewState extends State<_CashView> with CachePrimedScreen {
   bool _loading = true;
+  // First payload landed — _current may legitimately be null (no open session).
+  bool _hasData = false;
   bool _busy = false;
   String? _error;
   Map<String, dynamic>? _current;
@@ -19228,7 +19409,12 @@ class _CashViewState extends State<_CashView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
   @override
@@ -19280,19 +19466,41 @@ class _CashViewState extends State<_CashView> {
     }
   }
 
-  Future<void> _load() async {
-    setState(() { _loading = true; _error = null; });
+  /// Side-effect-free GET composition — replayable against the persisted cache
+  /// at boot and the network path of every [_load].
+  Future<({Map<String, dynamic>? current, List history})> _fetch() async {
+    final cur = await widget.rest.getMap('/cash/current');
+    final hist = await widget.rest.getMap('/cash/sessions').catchError((_) => <String, dynamic>{});
+    return (
+      current: cur['session'] is Map ? Map<String, dynamic>.from(cur['session'] as Map) : null,
+      history: (hist['sessions'] as List?) ?? const [],
+    );
+  }
+
+  void _apply(({Map<String, dynamic>? current, List history}) d) {
+    _current = d.current;
+    _history = d.history;
+    _hasData = true;
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) setState(() { _loading = true; _error = null; });
     try {
-      final cur = await widget.rest.getMap('/cash/current');
-      final hist = await widget.rest.getMap('/cash/sessions').catchError((_) => <String, dynamic>{});
-      if (!mounted) return;
+      final d = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        _current = cur['session'] is Map ? Map<String, dynamic>.from(cur['session'] as Map) : null;
-        _history = (hist['sessions'] as List?) ?? const [];
+        _apply(d);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() { _error = '$e'; _loading = false; });
     }
   }
@@ -19354,7 +19562,7 @@ class _CashViewState extends State<_CashView> {
     final closed = _history.where((s) => (s as Map)['status'] == 'closed').toList();
     final text = Theme.of(context).textTheme;
     final narrow = MediaQuery.sizeOf(context).width < 760;
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
         AnimatedSwitcher(
@@ -19413,7 +19621,7 @@ class _CashViewState extends State<_CashView> {
             );
           }),
       ]),
-    );
+    ));
   }
 
   Widget _openCard() {
@@ -19658,8 +19866,10 @@ class _PurchaseOrdersView extends StatefulWidget {
   State<_PurchaseOrdersView> createState() => _PurchaseOrdersViewState();
 }
 
-class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
+class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> with CachePrimedScreen {
   bool _loading = true;
+  // First payload landed (cached or live) — an empty PO list is data too.
+  bool _hasData = false;
   String? _error;
   List _orders = const [];
   List _vendors = const [];
@@ -19674,28 +19884,59 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
-  Future<void> _load() async {
-    setState(() { _loading = true; _error = null; });
+  /// The screen's GET composition, side-effect free — replayable against the
+  /// persisted cache at boot and the network path of every [_load].
+  Future<({List orders, List vendors, List inventory, String? inventoryError})> _fetch() async {
+    final o = await widget.rest.getMap('/purchase-orders');
+    List vend = const [];
+    List inv = const [];
+    String? invError;
+    try { final v = await widget.rest.getMap('/vendors'); vend = (v['vendors'] as List?) ?? const []; } catch (_) {}
+    try { inv = await widget.rest.getList('/inventory'); } catch (e) { invError = '$e'; }
+    return (
+      orders: (o['orders'] as List?) ?? const [],
+      vendors: vend,
+      inventory: inv,
+      inventoryError: invError,
+    );
+  }
+
+  void _apply(({List orders, List vendors, List inventory, String? inventoryError}) d) {
+    _orders = d.orders;
+    _vendors = d.vendors;
+    _inventory = d.inventory;
+    _inventoryError = d.inventoryError;
+    _hasData = true;
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) setState(() { _loading = true; _error = null; });
     try {
-      final o = await widget.rest.getMap('/purchase-orders');
-      List vend = const [];
-      List inv = const [];
-      String? invError;
-      try { final v = await widget.rest.getMap('/vendors'); vend = (v['vendors'] as List?) ?? const []; } catch (_) {}
-      try { inv = await widget.rest.getList('/inventory'); } catch (e) { invError = '$e'; }
-      if (!mounted) return;
+      final d = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        _orders = (o['orders'] as List?) ?? const [];
-        _vendors = vend;
-        _inventory = inv;
-        _inventoryError = invError;
+        _apply(d);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      // Data already on screen (saved or live): keep it behind the offline
+      // pill rather than trading the list for an error page.
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() { _error = '$e'; _loading = false; });
     }
   }
@@ -19842,7 +20083,7 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
         ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
       ]));
     }
-    return Scaffold(
+    return cacheStaleOverlay(Scaffold(
       backgroundColor: Colors.transparent,
       // ALWAYS live. A FloatingActionButton with a null onPressed keeps its
       // full colour (FABs have no disabled look), so gating it on inventory
@@ -19873,7 +20114,7 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> {
                     : _poCard(_orders[i - 1] as Map),
               ),
       ),
-    );
+    ));
   }
 
   Widget _poCard(Map po) {
@@ -20149,8 +20390,9 @@ class _AttendanceView extends StatefulWidget {
   State<_AttendanceView> createState() => _AttendanceViewState();
 }
 
-class _AttendanceViewState extends State<_AttendanceView> {
+class _AttendanceViewState extends State<_AttendanceView> with CachePrimedScreen {
   bool _loading = true;
+  bool _hasData = false;
   bool _busy = false;
   String? _error;
   Map<String, dynamic> _me = {};
@@ -20204,35 +20446,59 @@ class _AttendanceViewState extends State<_AttendanceView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
-  Future<void> _load() async {
-    setState(() { _loading = true; _error = null; });
+  /// Side-effect-free GET composition — replayable against the persisted cache
+  /// at boot and the network path of every [_load].
+  Future<({Map<String, dynamic> me, List team, List pending, String from, String to})> _fetch() async {
+    final me = await widget.rest.getMap('/attendance/me');
+    List team = const [];
+    List pending = const [];
+    var from = '';
+    var to = '';
+    if (_isManager) {
+      final t = await widget.rest.getMap('/attendance').catchError((_) => <String, dynamic>{});
+      team = (t['rows'] as List?) ?? const [];
+      pending = (t['pending'] as List?) ?? const [];
+      from = _s(t, 'from', '');
+      to = _s(t, 'to', '');
+    }
+    return (me: me, team: team, pending: pending, from: from, to: to);
+  }
+
+  void _apply(({Map<String, dynamic> me, List team, List pending, String from, String to}) d) {
+    _me = d.me;
+    _team = d.team;
+    _pending = d.pending;
+    _from = d.from;
+    _to = d.to;
+    _hasData = true;
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) setState(() { _loading = true; _error = null; });
     try {
-      final me = await widget.rest.getMap('/attendance/me');
-      List team = const [];
-      List pending = const [];
-      var from = '';
-      var to = '';
-      if (_isManager) {
-        final t = await widget.rest.getMap('/attendance').catchError((_) => <String, dynamic>{});
-        team = (t['rows'] as List?) ?? const [];
-        pending = (t['pending'] as List?) ?? const [];
-        from = _s(t, 'from', '');
-        to = _s(t, 'to', '');
-      }
-      if (!mounted) return;
+      final d = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
       setState(() {
-        _me = me;
-        _team = team;
-        _pending = pending;
-        _from = from;
-        _to = to;
+        _apply(d);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() { _error = '$e'; _loading = false; });
     }
   }
@@ -20560,7 +20826,7 @@ class _AttendanceViewState extends State<_AttendanceView> {
           : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
     }
 
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
         _dashGrid([
@@ -20780,7 +21046,7 @@ class _AttendanceViewState extends State<_AttendanceView> {
             }),
         ],
       ]),
-    );
+    ));
   }
 }
 
@@ -20795,8 +21061,9 @@ class _OutletsView extends StatefulWidget {
   State<_OutletsView> createState() => _OutletsViewState();
 }
 
-class _OutletsViewState extends State<_OutletsView> {
+class _OutletsViewState extends State<_OutletsView> with CachePrimedScreen {
   bool _loading = true;
+  bool _hasData = false;
   String? _error;
   List _outlets = [];
   Map<String, dynamic> _rollup = {};
@@ -20804,25 +21071,51 @@ class _OutletsViewState extends State<_OutletsView> {
   @override
   void initState() {
     super.initState();
-    _load();
+    unawaited(primeFromCache(
+      fetch: _fetch,
+      apply: (d) { _apply(d); _loading = false; },
+      refresh: () => _load(silent: true),
+      fallback: _load,
+    ));
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final outlets = await widget.rest.getMap('/outlets');
-      final rollup = await widget.rest.getMap('/outlets/rollup?days=30').catchError((_) => <String, dynamic>{});
-      if (!mounted) return;
+  /// Side-effect-free GET composition — replayable against the persisted cache
+  /// at boot and the network path of every [_load].
+  Future<({List outlets, Map<String, dynamic> rollup})> _fetch() async {
+    final outlets = await widget.rest.getMap('/outlets');
+    final rollup = await widget.rest.getMap('/outlets/rollup?days=30').catchError((_) => <String, dynamic>{});
+    return (outlets: (outlets['outlets'] as List?) ?? [], rollup: rollup);
+  }
+
+  void _apply(({List outlets, Map<String, dynamic> rollup}) d) {
+    _outlets = d.outlets;
+    _rollup = d.rollup;
+    _hasData = true;
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    final gen = bumpCacheGen();
+    if (!silent) {
       setState(() {
-        _outlets = (outlets['outlets'] as List?) ?? [];
-        _rollup = rollup;
+        _loading = true;
+        _error = null;
+      });
+    }
+    try {
+      final d = await _fetch();
+      if (!mounted || !cacheGenIs(gen)) return;
+      setState(() {
+        _apply(d);
         _loading = false;
+        _error = null;
+        markCacheLive();
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || !cacheGenIs(gen)) return;
+      if (_hasData) {
+        setState(() { _loading = false; markCacheOffline(); });
+        return;
+      }
       setState(() {
         _error = '$e';
         _loading = false;
@@ -21254,7 +21547,7 @@ class _OutletsViewState extends State<_OutletsView> {
       );
     }).toList();
 
-    return RefreshIndicator(
+    return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
         SectionHeader(
@@ -21333,7 +21626,7 @@ class _OutletsViewState extends State<_OutletsView> {
           ),
         _dashGrid(outletCards, narrow ? 1 : 2),
       ]),
-    );
+    ));
   }
 }
 
@@ -26187,6 +26480,15 @@ _BrandRamp _brandRamp(String hex) {
 
 String _hexOfColor(Color c) => '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
 
+// A LinearGradient matching a CSS `linear-gradient(<deg>deg, …)`: 0° points up,
+// 90° right, clockwise — so the Flutter preview's washes rotate exactly like the
+// guest pages' CSS ones.
+LinearGradient _brandAngleGradient(double deg, List<Color> colors) {
+  final rad = deg * math.pi / 180;
+  final dx = math.sin(rad), dy = -math.cos(rad);
+  return LinearGradient(begin: Alignment(-dx, -dy), end: Alignment(dx, dy), colors: colors);
+}
+
 // The panel material behind `surface_style` — exactly the --panelBg/--blur/--pbA
 // triples the guest pages use.
 ({Color bg, double blur, double edge}) _brandPanel(String style, _BrandRamp r) {
@@ -26260,10 +26562,52 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     'Inter', 'Poppins', 'Playfair Display', 'Montserrat', 'Lato',
     'Nunito', 'Oswald', 'Roboto Slab', 'DM Sans', 'Merriweather',
   ];
-  static const _fallbackLive = <String>[
+  // THE editable-contract tables. Every control the card renders is BUILT from
+  // these (the colour-role groups, the gradient groups and the base knobs), and
+  // _unsupported = the server's live list minus exactly these keys — so adding a
+  // key here grows its editor and empties the "server also offers" banner in the
+  // same commit, by construction. The banner only returns for a genuinely
+  // unknown future key the server starts advertising.
+  static const _knobKeys = <String>[
     'scheme', 'color_primary', 'font', 'font_scale', 'header_style', 'button_shape', 'surface_style', 'card_shape',
   ];
-  static const _fallbackLegacy = <String>['color_secondary', 'color_bg', 'color_text', 'color_card'];
+  // Colour ROLES, grouped the way the web editor groups them (brand / shell /
+  // status). Each entry: key, label, one-line hint.
+  static const _colorRoleGroups = <(String, List<(String, String, String)>)>[
+    ('Brand colours', [
+      ('color_secondary', 'Secondary', 'Chips and secondary buttons.'),
+      ('color_accent', 'Highlight', 'Badges and price emphasis.'),
+    ]),
+    ('Shell', [
+      ('color_bg', 'Page background', 'The shell behind everything.'),
+      ('color_card', 'Card surface', 'Panel base colour.'),
+      ('color_text', 'Body text', 'Main ink colour — the server keeps it readable.'),
+    ]),
+    ('Status colours', [
+      ('color_success', 'Success', 'Confirmations, ready / seated states.'),
+      ('color_warning', 'Warning', 'Waiting and caution states.'),
+      ('color_error', 'Error', 'Failures and destructive actions.'),
+    ]),
+  ];
+  // Gradient surfaces: id (the `<id>_grad_from/_to/_angle` key prefix), label,
+  // hint, and the angle the shipped derived wash uses (mirrors the backend's
+  // BRAND_GRADIENT_ANGLE_DEFAULTS).
+  static const _gradientGroups = <(String, String, String, double)>[
+    ('header', 'Header wash gradient', 'Your own two-stop wash behind the restaurant name.', 150),
+    ('button', 'Button gradient', 'The fill of accent buttons — same colour twice = solid.', 180),
+    ('bg', 'Page background gradient', 'A wash painted over the page shell.', 180),
+  ];
+  static final List<String> _editableKeys = [
+    ..._knobKeys,
+    for (final (_, roles) in _colorRoleGroups)
+      for (final (key, _, _) in roles) key,
+    for (final (id, _, _, _) in _gradientGroups) ...['${id}_grad_from', '${id}_grad_to', '${id}_grad_angle'],
+  ];
+  // The shipped backend advertises every colour role + gradient key as live and
+  // retires nothing; these fallbacks (used only when /settings didn't answer)
+  // mirror that so a transient error doesn't hide working controls.
+  static List<String> get _fallbackLive => _editableKeys;
+  static const _fallbackLegacy = <String>[];
   static const _fallbackOptions = <String, List<String>>{
     'header_style': ['gradient', 'solid'],
     'button_shape': ['rounded', 'pill', 'square'],
@@ -26313,11 +26657,17 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
   late String _scheme;
   late String _fontScale;
   late String _cardShape;
-  // Only a scheme the OWNER changed in this session clears the stored shell
-  // colour overrides on save — an untouched save must never wipe colours that
-  // were pinned from the web editor.
-  bool _schemeTouched = false;
   final TextEditingController _accent = TextEditingController();
+  // One controller per colour ROLE (the 8 non-primary keys). Empty text = "auto":
+  // the save sends null, which DELETES the stored override server-side.
+  final Map<String, TextEditingController> _roles = {};
+  // Gradient state per surface id (header/button/bg): two stop controllers +
+  // the angle. A gradient is ON only while BOTH stops parse — mirroring the
+  // server's activation rule, so the preview can never show a wash a guest
+  // wouldn't get.
+  final Map<String, TextEditingController> _gradFrom = {};
+  final Map<String, TextEditingController> _gradTo = {};
+  final Map<String, double> _gradAngle = {};
   bool _busy = false;
   bool _showRetired = false;
 
@@ -26330,7 +26680,9 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     final legacy = widget.legacyFields.isNotEmpty ? widget.legacyFields : _fallbackLegacy;
     // Only surface retired keys the tenant really stored — a clean tenant sees none.
     _legacyStored = legacy.where((k) => '${c[k] ?? ''}'.trim().isNotEmpty).toList();
-    _unsupported = _live.where((k) => !_fallbackLive.contains(k)).toList();
+    // Derived from the SAME table the editors are built from (_editableKeys), so
+    // this list — and the banner it feeds — empties by construction.
+    _unsupported = _live.where((k) => !_editableKeys.contains(k)).toList();
     final f = _s(c, 'font', 'Inter');
     _font = _fonts.contains(f) ? f : _fonts.first;
     _headerStyle = _pick('header_style', '${c['header_style'] ?? ''}', 'gradient');
@@ -26341,11 +26693,39 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     _cardShape = _pick('card_shape', '${c['card_shape'] ?? ''}', 'rounded');
     final accent = '${c['color_primary'] ?? ''}'.trim();
     if (_hexRe.hasMatch(accent)) _accent.text = accent;
+    // Roles prefill with the RESOLVED value the server returned (never blank for
+    // an existing tenant) — same as the web editor, so saving what you loaded
+    // pins exactly what guests already see.
+    for (final (_, roles) in _colorRoleGroups) {
+      for (final (key, _, _) in roles) {
+        final v = '${c[key] ?? ''}'.trim();
+        _roles[key] = TextEditingController(text: _hexRe.hasMatch(v) ? v : '');
+      }
+    }
+    // Gradients prefill only from EXPLICIT stored keys (the server passes them
+    // through rather than resolving defaults in), so blank = off = derived wash.
+    for (final (id, _, _, angleDefault) in _gradientGroups) {
+      final from = '${c['${id}_grad_from'] ?? ''}'.trim();
+      final to = '${c['${id}_grad_to'] ?? ''}'.trim();
+      _gradFrom[id] = TextEditingController(text: _hexRe.hasMatch(from) ? from : '');
+      _gradTo[id] = TextEditingController(text: _hexRe.hasMatch(to) ? to : '');
+      final rawAngle = c['${id}_grad_angle'];
+      _gradAngle[id] = (rawAngle is num) ? (rawAngle.toDouble() % 360 + 360) % 360 : angleDefault;
+    }
   }
 
   @override
   void dispose() {
     _accent.dispose();
+    for (final c in _roles.values) {
+      c.dispose();
+    }
+    for (final c in _gradFrom.values) {
+      c.dispose();
+    }
+    for (final c in _gradTo.values) {
+      c.dispose();
+    }
     super.dispose();
   }
 
@@ -26396,10 +26776,46 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     return prev is Map ? _parse('${prev[role] ?? ''}') : null;
   }
 
+  // brand_config key → the scheme preview's role name for the six shell/status
+  // colours a preset pins (the accent trio is brand identity and never touched).
+  static const _schemeRoleOf = <String, String>{
+    'color_bg': 'background',
+    'color_card': 'surface',
+    'color_text': 'text',
+    'color_success': 'success',
+    'color_warning': 'warning',
+    'color_error': 'error',
+  };
+
+  // Picking a preset fills the shell/status role fields with the scheme's own
+  // values (blank for "classic" = re-derive the shipped defaults), so what is
+  // saved is exactly what the picker showed — the same rule as the web editor.
+  // "custom" only flips the marker and leaves every field alone.
+  void _applyScheme(String id) {
+    setState(() {
+      _scheme = id;
+      if (id == 'custom') return;
+      final prev = id == 'classic' ? null : _schemeMeta(id)?['preview'];
+      _schemeRoleOf.forEach((key, role) {
+        final ctrl = _roles[key];
+        if (ctrl == null) return;
+        final v = prev is Map ? '${prev[role] ?? ''}'.trim() : '';
+        ctrl.text = _hexRe.hasMatch(v) ? v : '';
+      });
+    });
+  }
+
+  // A manual tweak of a shell/status role while a NAMED preset is active flips
+  // the marker to "custom", so the picker never claims a look that's been edited.
+  void _touchRole() {
+    if (_scheme != 'classic' && _scheme != 'custom') _scheme = 'custom';
+    setState(() {});
+  }
+
   Future<void> _save() async {
     final messenger = ScaffoldMessenger.of(context);
-    // Only the LIVE keys travel. Retired colour keys are never re-sent, so they
-    // stay exactly as stored server-side (the backend keeps them on merge).
+    // Only the LIVE keys travel. Anything the server doesn't advertise is never
+    // re-sent, so it stays exactly as stored server-side (merge-on-omit).
     final cfg = <String, dynamic>{};
     if (_live.contains('font')) cfg['font'] = _font;
     if (_live.contains('header_style')) cfg['header_style'] = _headerStyle;
@@ -26408,13 +26824,15 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     if (_live.contains('scheme')) cfg['scheme'] = _scheme;
     if (_live.contains('font_scale')) cfg['font_scale'] = _fontScale;
     if (_live.contains('card_shape')) cfg['card_shape'] = _cardShape;
-    // Picking a preset here must actually LOOK like the preset: explicit shell
-    // colours (possibly pinned from the web editor) would override the scheme,
-    // so a deliberately chosen non-custom scheme clears them (null = clear on
-    // the server). Guarded by _schemeTouched: an untouched save changes nothing.
-    if (_schemeTouched && _scheme != 'custom') {
-      for (final k in ['color_bg', 'color_card', 'color_text', 'color_success', 'color_warning', 'color_error']) {
-        cfg[k] = null;
+    // Colour roles: what a field says is what the tenant gets — a valid hex pins
+    // the role, a blank sends null, which DELETES the stored override so the
+    // role re-derives (and follows any future evolution of the scheme/derived
+    // defaults). Mirrors the web editor exactly.
+    for (final (_, roles) in _colorRoleGroups) {
+      for (final (key, _, _) in roles) {
+        if (!_live.contains(key)) continue;
+        final t = _roles[key]!.text.trim();
+        cfg[key] = _hexRe.hasMatch(t) ? t : null;
       }
     }
     if (_live.contains('color_primary')) {
@@ -26422,10 +26840,32 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
       // Blank accent = keep whatever the page resolves today (merge-on-omit).
       if (_hexRe.hasMatch(t)) cfg['color_primary'] = t;
     }
+    // Gradients: both stops valid → the full triple; anything else → null for
+    // ALL THREE keys, which deletes them (absent must stay absent, so a cleared
+    // gradient renders the shipped derived wash again).
+    for (final (id, _, _, _) in _gradientGroups) {
+      if (!_live.contains('${id}_grad_from')) continue;
+      final from = _gradFrom[id]!.text.trim(), to = _gradTo[id]!.text.trim();
+      final on = _hexRe.hasMatch(from) && _hexRe.hasMatch(to);
+      cfg['${id}_grad_from'] = on ? from : null;
+      cfg['${id}_grad_to'] = on ? to : null;
+      cfg['${id}_grad_angle'] = on ? _gradAngle[id]!.round() : null;
+    }
     setState(() => _busy = true);
     try {
-      await widget.rest.post('/restaurant/branding', {'brand_config': cfg});
-      messenger.showSnackBar(const SnackBar(content: Text('Guest page theme saved.')));
+      final resp = await widget.rest.post('/restaurant/branding', {'brand_config': cfg});
+      // The server may have adjusted a colour to keep guest text readable
+      // (brand_contrast). Repeat that in plain words rather than leaving the
+      // owner wondering why the live page differs from what they picked.
+      final contrast = (resp is Map && resp['brand_contrast'] is List) ? (resp['brand_contrast'] as List) : const [];
+      var msg = 'Guest page theme saved.';
+      final note = contrast.isNotEmpty && contrast.first is Map ? contrast.first as Map : null;
+      if (note != null) {
+        msg = 'Saved — but your ${note['role']} colour ${note['requested']} is too close to the ${note['against']} '
+            '(${note['ratio']}:1 contrast; ${note['minimum']}:1 needed), so guests see ${note['applied']} instead. '
+            'Pick a stronger colour to clear the guard.';
+      }
+      messenger.showSnackBar(SnackBar(content: Text(msg), duration: Duration(seconds: note == null ? 4 : 9)));
       widget.reload();
     } on ApiException catch (e) {
       messenger.showSnackBar(SnackBar(content: Text(e.status == 403 ? 'Only an admin can change branding.' : '$e')));
@@ -26585,6 +27025,145 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     ]);
   }
 
+  // One colour ROLE: swatch (explicit value or the derived one), label + hint,
+  // hex field, and Auto — which clears the field so the save DELETES the
+  // override and the role re-derives server-side.
+  Widget _roleRow(String key, String label, String hint) {
+    final text = Theme.of(context).textTheme;
+    final ctrl = _roles[key]!;
+    final explicit = _parse(ctrl.text);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(children: [
+        Container(
+          width: 22,
+          height: 22,
+          decoration: BoxDecoration(
+            color: explicit ?? _derivedRole(key),
+            borderRadius: BorderRadius.circular(5),
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label, style: text.bodySmall!.copyWith(fontSize: 12, color: AppColors.textPrimary)),
+            Text(hint, style: text.bodySmall!.copyWith(fontSize: 10.5), maxLines: 1, overflow: TextOverflow.ellipsis),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 96,
+          child: TextField(
+            controller: ctrl,
+            enabled: !_busy,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: explicit == null ? 'auto ${_hexOfColor(_derivedRole(key))}' : '#RRGGBB',
+            ),
+            onChanged: (_) => _touchRole(),
+          ),
+        ),
+        // Fixed-width slot so rows don't jiggle as Auto appears/disappears.
+        SizedBox(
+          width: 58,
+          child: ctrl.text.trim().isEmpty
+              ? null
+              : ForkButton.subtle(
+                  label: 'Auto',
+                  onPressed: _busy
+                      ? null
+                      : () {
+                          ctrl.clear();
+                          _touchRole();
+                        },
+                ),
+        ),
+      ]),
+    );
+  }
+
+  // One gradient surface: an on/off affordance ("Customise" prefills the stops
+  // the derived wash uses today; "Auto" clears both, deleting the keys on save),
+  // two hex stop fields, an angle slider and a live wash strip.
+  Widget _gradientEditor(String id, String label, String hint) {
+    final text = Theme.of(context).textTheme;
+    final active = _activeGradient(id);
+    final derived = _derivedGradient(id);
+    final angle = _gradAngle[id] ?? 180;
+    Widget stopField(TextEditingController ctrl, String hintText) => Expanded(
+          child: TextField(
+            controller: ctrl,
+            enabled: !_busy,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            decoration: InputDecoration(isDense: true, hintText: hintText),
+            onChanged: (_) => setState(() {}),
+          ),
+        );
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Expanded(child: Text(label.toUpperCase(), style: text.labelSmall)),
+        ForkButton.subtle(
+          label: active != null ? 'Auto' : 'Customise',
+          icon: active != null ? Icons.close : Icons.gradient,
+          onPressed: _busy
+              ? null
+              : () => setState(() {
+                    if (active != null) {
+                      _gradFrom[id]!.clear();
+                      _gradTo[id]!.clear();
+                    } else {
+                      _gradFrom[id]!.text = _hexOfColor(derived.$1);
+                      _gradTo[id]!.text = _hexOfColor(derived.$2);
+                    }
+                  }),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      // The wash as guests would see it — the custom stops, or the derived wash
+      // this control would replace.
+      Container(
+        height: 20,
+        decoration: BoxDecoration(
+          gradient: _brandAngleGradient(angle, [active?.$1 ?? derived.$1, active?.$2 ?? derived.$2]),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: AppColors.border),
+        ),
+      ),
+      if (active != null) ...[
+        const SizedBox(height: 6),
+        Row(children: [
+          stopField(_gradFrom[id]!, '#RRGGBB'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            child: Icon(Icons.arrow_forward, size: 13, color: AppColors.textTertiary),
+          ),
+          stopField(_gradTo[id]!, '#RRGGBB'),
+        ]),
+        Row(children: [
+          Expanded(
+            child: Slider(
+              value: angle.clamp(0.0, 359.0).toDouble(),
+              min: 0,
+              max: 359,
+              onChanged: _busy ? null : (v) => setState(() => _gradAngle[id] = v),
+            ),
+          ),
+          SizedBox(
+            width: 38,
+            child: Text('${angle.round()}°',
+                textAlign: TextAlign.right,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+          ),
+        ]),
+      ],
+      const SizedBox(height: 4),
+      Text(active != null ? hint : '$hint Off — guests see the built-in wash above.',
+          style: text.bodySmall!.copyWith(fontSize: 11)),
+    ]);
+  }
+
   // One preset scheme as a tappable chip: a three-stop swatch strip (page /
   // card / ink) with its name — the same previews the web editor renders,
   // served by the backend so both stay in lockstep.
@@ -26596,7 +27175,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
-        onTap: _busy || active ? null : () => setState(() { _scheme = id; _schemeTouched = true; }),
+        onTap: _busy || active ? null : () => _applyScheme(id),
         child: AnimatedContainer(
           duration: AppDurations.fast,
           width: 108,
@@ -26630,19 +27209,77 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     );
   }
 
-  // A miniature of the real guest page: near-black shell, floating accent orb,
-  // hero wash, frosted panel, accent CTA. Every live control moves something here.
+  // The colour a role RESOLVES to right now: the explicit field value, else the
+  // scheme's shell value, else the derived/shipped default — the same precedence
+  // the server applies, so the preview and the live page cannot disagree.
+  Color _derivedRole(String key) {
+    final r = _ramp;
+    switch (key) {
+      case 'color_secondary':
+        return r.mid;
+      case 'color_accent':
+        return r.hi;
+      case 'color_bg':
+        return _schemeShell('background') ?? const Color(0xFF08080A);
+      case 'color_card':
+        return _schemeShell('surface') ?? const Color(0xFF1A1A1F);
+      case 'color_text':
+        return _schemeShell('text') ?? const Color(0xFFECEAE6);
+      case 'color_success':
+        return _schemeShell('success') ?? const Color(0xFF8FB27C);
+      case 'color_warning':
+        return _schemeShell('warning') ?? const Color(0xFFE4C48C);
+      case 'color_error':
+        return _schemeShell('error') ?? const Color(0xFFE0A79B);
+    }
+    return r.acc;
+  }
+
+  Color _roleColor(String key) => _parse(_roles[key]?.text ?? '') ?? _derivedRole(key);
+
+  // The stops a surface's DERIVED wash uses today, so "Customise" starts from
+  // exactly what guests currently see and the off-state strip previews it.
+  (Color, Color) _derivedGradient(String id) {
+    final r = _ramp;
+    switch (id) {
+      case 'header':
+        final bg = _roleColor('color_bg');
+        // Mirrors the guest pages' tail rule: the default shell keeps the
+        // shipped #0B0B0D tail; any other shell fades into its own background.
+        final tail = bg.toARGB32() == 0xFF08080A ? const Color(0xFF0B0B0D) : bg;
+        return (r.deep, tail);
+      case 'button':
+        return (r.hi, r.mid);
+      default: // bg
+        return (_roleColor('color_bg'), _roleColor('color_card'));
+    }
+  }
+
+  // The active gradient for a surface, or null while either stop is invalid.
+  (Color, Color)? _activeGradient(String id) {
+    final from = _parse(_gradFrom[id]?.text ?? '');
+    final to = _parse(_gradTo[id]?.text ?? '');
+    return (from != null && to != null) ? (from, to) : null;
+  }
+
+  // A miniature of the real guest page: shell, floating accent orb, hero wash,
+  // frosted panel, accent CTA, status dots. Every live control moves something
+  // here — colour roles retint it and the gradient editors re-wash it.
   Widget _preview() {
     final r = _ramp;
     final panel = _brandPanel(_surfaceStyle, r);
     final radius = _brandCtrlRadius(_buttonShape);
-    // Preset shell: page/card/ink from the selected scheme's preview (null for
-    // classic/custom = the shipped dark). Card radius + text scale mirror the
-    // card_shape / font_scale knobs so the miniature moves like the real page.
-    final shellBg = _schemeShell('background') ?? const Color(0xFF08080A);
-    final ink = _schemeShell('text') ?? Colors.white;
-    final schemeSurface = _schemeShell('surface');
-    final panelBg = schemeSurface?.withValues(alpha: _surfaceStyle == 'solid' ? 0.94 : 0.55) ?? panel.bg;
+    // Shell roles resolved with the same precedence as the server: explicit
+    // field → scheme preview → shipped default.
+    final shellBg = _roleColor('color_bg');
+    final ink = _roleColor('color_text');
+    final surface = _roleColor('color_card');
+    final panelBg = surface.toARGB32() == 0xFF1A1A1F && _scheme != 'custom'
+        ? panel.bg
+        : surface.withValues(alpha: _surfaceStyle == 'solid' ? 0.94 : 0.55);
+    final bgGrad = _activeGradient('bg');
+    final headerGrad = _activeGradient('header');
+    final buttonGrad = _activeGradient('button');
     final cardR = _cardShape == 'sharp' ? 6.0 : 22.0;
     final fsMul = _fontScale == 'small' ? 0.92 : (_fontScale == 'large' ? 1.1 : 1.0);
     final body = TextStyle(fontFamily: _font, fontFamilyFallback: const ['Inter', 'Roboto']);
@@ -26650,7 +27287,11 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     return ClipRRect(
       borderRadius: BorderRadius.circular(22), // --rCard, a design constant
       child: Container(
-        color: shellBg,
+        decoration: BoxDecoration(
+          color: shellBg,
+          // The page-background wash paints over the shell, like --bgWash.
+          gradient: bgGrad == null ? null : _brandAngleGradient(_gradAngle['bg'] ?? 180, [bgGrad.$1, bgGrad.$2]),
+        ),
         height: 268,
         child: Stack(children: [
           // The animated accent orb, held still.
@@ -26667,21 +27308,27 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
             ),
           ),
           Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            // Hero wash — `header_style`.
+            // Hero wash — the tenant's explicit header gradient wins (the same
+            // precedence as the guest pages), else `header_style` picks between
+            // the derived wash and a flat accent block.
             Container(
               height: 74,
               padding: const EdgeInsets.symmetric(horizontal: 16),
               alignment: Alignment.centerLeft,
-              decoration: _headerStyle == 'solid'
-                  ? BoxDecoration(color: r.deep)
-                  : BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [r.deep, const Color(0xFF0B0B0D)],
-                        stops: const [0, 0.78],
-                      ),
-                    ),
+              decoration: headerGrad != null
+                  ? BoxDecoration(
+                      gradient: _brandAngleGradient(_gradAngle['header'] ?? 150, [headerGrad.$1, headerGrad.$2]),
+                    )
+                  : _headerStyle == 'solid'
+                      ? BoxDecoration(color: r.deep)
+                      : BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [r.deep, const Color(0xFF0B0B0D)],
+                            stops: const [0, 0.78],
+                          ),
+                        ),
               child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text('TABLE 4 · DINE-IN',
                     style: body.copyWith(fontSize: 8.5, letterSpacing: 1.4, color: Colors.white.withValues(alpha: 0.62))),
@@ -26718,23 +27365,48 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                             ]),
                           ),
                           const SizedBox(width: 10),
-                          // Roboto thin numerals — a design constant, tinted by the ramp.
+                          // Roboto thin numerals — a design constant, tinted by
+                          // the HIGHLIGHT role (accHi when not overridden).
                           Text('₹429',
                               style: TextStyle(
                                 fontFamily: 'Roboto',
                                 fontWeight: FontWeight.w300,
                                 fontSize: 22,
                                 letterSpacing: -0.5,
-                                color: r.hi,
+                                color: _roleColor('color_accent'),
                               )),
                         ]),
                         const Spacer(),
-                        // CTA — `button_shape` drives --rCtrl.
+                        // Status roles, so the semantic pickers visibly retint.
+                        Row(children: [
+                          for (final (key, lbl) in const <(String, String)>[
+                            ('color_success', 'Ready'),
+                            ('color_warning', 'Waiting'),
+                            ('color_error', 'Failed'),
+                          ]) ...[
+                            Container(
+                              width: 7,
+                              height: 7,
+                              margin: const EdgeInsets.only(right: 4),
+                              decoration: BoxDecoration(color: _roleColor(key), shape: BoxShape.circle),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.only(right: 10),
+                              child: Text(lbl,
+                                  style: body.copyWith(fontSize: 9 * fsMul, color: _roleColor(key))),
+                            ),
+                          ],
+                        ]),
+                        const SizedBox(height: 8),
+                        // CTA — `button_shape` drives --rCtrl; the fill is the
+                        // tenant's button gradient when set.
                         Row(children: [
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
                             decoration: BoxDecoration(
-                              gradient: LinearGradient(colors: [r.acc, r.mid]),
+                              gradient: buttonGrad != null
+                                  ? _brandAngleGradient(_gradAngle['button'] ?? 180, [buttonGrad.$1, buttonGrad.$2])
+                                  : LinearGradient(colors: [r.acc, r.mid]),
                               borderRadius: BorderRadius.circular(radius),
                             ),
                             child: Text('Add to cart',
@@ -26857,6 +27529,21 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
           _accentRow(),
           const SizedBox(height: AppSpacing.lg),
         ],
+        // Every other colour ROLE, grouped like the web editor. A blank field =
+        // "derive it" (the swatch shows what that derives to right now).
+        for (final (group, roles) in _colorRoleGroups)
+          if (roles.any((r) => _live.contains(r.$1))) ...[
+            Text(group.toUpperCase(), style: text.labelSmall),
+            const SizedBox(height: 2),
+            for (final (key, label, hint) in roles)
+              if (_live.contains(key)) _roleRow(key, label, hint),
+            const SizedBox(height: AppSpacing.md),
+          ],
+        // The page-background wash lives with the shell colours it paints over.
+        if (_live.contains('bg_grad_from')) ...[
+          _gradientEditor('bg', 'Page background gradient', 'A two-stop wash painted over the page shell.'),
+          const SizedBox(height: AppSpacing.lg),
+        ],
         if (_live.contains('font')) ...[
           Text('BODY FONT', style: text.labelSmall),
           const SizedBox(height: 6),
@@ -26880,6 +27567,12 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
               (v) => setState(() => _headerStyle = v)),
           const SizedBox(height: AppSpacing.md),
         ],
+        // Custom gradients sit with their solid counterparts: the hero wash
+        // above, the button controls below.
+        if (_live.contains('header_grad_from')) ...[
+          _gradientEditor('header', 'Header wash gradient', 'Your own two-stop wash behind the restaurant name — overrides the derived accent wash.'),
+          const SizedBox(height: AppSpacing.md),
+        ],
         if (_live.contains('surface_style')) ...[
           _toggle('Panels', 'Card material: frosted glass, an opaque slab, or glass tinted with your accent.',
               [for (final v in _options('surface_style')) (v, _label(v))], _surfaceStyle,
@@ -26890,6 +27583,10 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
           _toggle('Controls', 'Corner radius of buttons, chips and inputs.',
               [for (final v in _options('button_shape')) (v, _label(v))], _buttonShape,
               (v) => setState(() => _buttonShape = v)),
+          const SizedBox(height: AppSpacing.md),
+        ],
+        if (_live.contains('button_grad_from')) ...[
+          _gradientEditor('button', 'Button gradient', 'The fill of every accent button — pick the same colour twice for solid buttons.'),
           const SizedBox(height: AppSpacing.md),
         ],
         if (_live.contains('card_shape')) ...[
