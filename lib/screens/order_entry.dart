@@ -268,7 +268,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                   Padding(
                     padding: const EdgeInsets.fromLTRB(2, 12, 2, 6),
                     child: Text(cat.toUpperCase(),
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
                           letterSpacing: 1.1,
@@ -443,7 +443,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                     Text('$qty',
                         style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
                     IconButton(
-                        icon: const Icon(Icons.add_circle_outline, color: AppColors.copperHi),
+                        icon: Icon(Icons.add_circle_outline, color: AppColors.copperHi),
                         onPressed: () => _setQty(id, 1)),
                   ])
                 : FilledButton.tonal(onPressed: () => _setQty(id, 1), child: const Text('Add')),

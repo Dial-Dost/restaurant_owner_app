@@ -6,13 +6,17 @@ import 'status_chip.dart';
 /// The reference design's "| Hig" / "| Lo" corner tag — a short copper tick
 /// followed by a tiny label.
 class TickTag extends StatelessWidget {
-  const TickTag(this.label, {super.key, this.color = AppColors.copperHi});
+  const TickTag(this.label, {super.key, this.color});
 
   final String label;
-  final Color color;
+
+  /// null = the active accent (AppColors.copperHi is a getter now — the
+  /// device's appearance accent — so it cannot be a const default).
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
+    final color = this.color ?? AppColors.copperHi;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [

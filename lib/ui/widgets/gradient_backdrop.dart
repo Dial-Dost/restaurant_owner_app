@@ -74,7 +74,7 @@ class GradientBackdrop extends StatelessWidget {
           right: 0,
           top: 0,
           height: h,
-          child: const DecoratedBox(
+          child: DecoratedBox(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 // 150deg in CSS runs top-left -> bottom-right; these alignments

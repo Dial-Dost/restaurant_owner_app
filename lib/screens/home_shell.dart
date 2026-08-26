@@ -483,7 +483,7 @@ class _HomeShellState extends State<HomeShell> {
         height: 30,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(8),
-          gradient: const LinearGradient(
+          gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: [AppColors.copperHi, AppColors.copperDeep],
@@ -496,7 +496,7 @@ class _HomeShellState extends State<HomeShell> {
             ),
           ],
         ),
-        child: const Icon(Icons.restaurant_menu, size: 16, color: AppColors.onCopper),
+        child: Icon(Icons.restaurant_menu, size: 16, color: AppColors.onCopper),
       ),
       const SizedBox(width: 10),
       Expanded(
@@ -705,7 +705,7 @@ class _HomeShellState extends State<HomeShell> {
         title: Row(children: [
           _backButton(),
           const SizedBox(width: 2),
-          const Icon(Icons.auto_awesome, size: 14, color: AppColors.copperHi),
+          Icon(Icons.auto_awesome, size: 14, color: AppColors.copperHi),
           const SizedBox(width: 8),
           // Expanded + ellipsis, never a bare intrinsic Text. An AppBar hands its
           // middle slot a maxWidth, but a Row lays a non-flex child out at its

@@ -210,8 +210,8 @@ void main() {
         home: Scaffold(
           body: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
-            child: Row(children: const [
-              InfoChip(icon: Icons.badge_outlined, label: 'Ramachandran'),
+            child: Row(children: [
+              const InfoChip(icon: Icons.badge_outlined, label: 'Ramachandran'),
               StatusChip(label: 'Occupied', color: AppColors.copper, dense: true),
               TickTag('APC close', color: AppColors.warning),
             ]),
@@ -230,7 +230,7 @@ void main() {
         _size(tester, 800, 600, scale);
         await tester.pumpWidget(MaterialApp(
           theme: AppTheme.dark(),
-          home: const Scaffold(
+          home: Scaffold(
             body: Center(
               child: SizedBox(
                 width: 60,

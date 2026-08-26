@@ -14,7 +14,7 @@ class StatCard extends StatelessWidget {
     this.unit,
     required this.caption,
     this.tag,
-    this.tagColor = AppColors.copperHi,
+    this.tagColor,
     this.chart,
     this.footer,
     this.onTap,
@@ -31,7 +31,9 @@ class StatCard extends StatelessWidget {
 
   /// Corner tick-tag text ("Hig", "Lo", "Live").
   final String? tag;
-  final Color tagColor;
+  /// null = the active accent (AppColors.copperHi is a getter now — the
+  /// device's appearance accent — so it cannot be a const default).
+  final Color? tagColor;
 
   /// Chart slot — typically [CopperBarcode] or [WeekdayBars].
   final Widget? chart;
@@ -75,7 +77,7 @@ class StatCard extends StatelessWidget {
                   ),
                 ),
               ),
-              if (tag != null) TickTag(tag!, color: tagColor),
+              if (tag != null) TickTag(tag!, color: tagColor ?? AppColors.copperHi),
             ],
           ),
           if (chart != null) ...[

@@ -218,7 +218,7 @@ class _LoginScreenState extends State<LoginScreen> {
       });
     }
     if (_loadingPrefs) {
-      return const Scaffold(
+      return Scaffold(
         backgroundColor: AppColors.bg,
         body: Center(child: CircularProgressIndicator(color: AppColors.copper)),
       );
@@ -283,7 +283,7 @@ class _LoginScreenState extends State<LoginScreen> {
           height: 44,
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(12),
-            gradient: const LinearGradient(
+            gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
               colors: [AppColors.copperHi, AppColors.copperDeep],
@@ -296,7 +296,7 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
             ],
           ),
-          child: const Icon(Icons.restaurant_menu, size: 22, color: AppColors.onCopper),
+          child: Icon(Icons.restaurant_menu, size: 22, color: AppColors.onCopper),
         ),
         const SizedBox(width: 14),
         Column(
@@ -382,7 +382,7 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.storefront, size: 16, color: AppColors.copperHi),
+                  Icon(Icons.storefront, size: 16, color: AppColors.copperHi),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(_savedRestaurant!,
@@ -420,7 +420,7 @@ class _LoginScreenState extends State<LoginScreen> {
             ],
             if (_loadingOutlets) ...[
               Row(
-                children: const [
+                children: [
                   SizedBox(
                     height: 16,
                     width: 16,
@@ -477,7 +477,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   child: auth.busy
-                      ? const SizedBox(
+                      ? SizedBox(
                           height: 18,
                           width: 18,
                           child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.onCopper))

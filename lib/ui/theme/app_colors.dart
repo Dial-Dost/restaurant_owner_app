@@ -1,5 +1,44 @@
 import 'package:flutter/material.dart';
 
+/// One owner-app accent voice: the six-stop ramp every control/text accent is
+/// drawn from, plus the three saturated "glow" tones the gradient backdrop
+/// dims down. Same tonal recipe as the shipped Rustic Fork copper (a
+/// desaturated ink-and-metal ramp with a high-saturation backdrop trio), so
+/// every preset sits inside the design system instead of fighting it. The
+/// curated catalogue + the per-device controller live in appearance.dart; this
+/// type sits here so AppColors can hold one without an import cycle.
+@immutable
+class AppAccent {
+  const AppAccent({
+    required this.id,
+    required this.label,
+    required this.hi,
+    required this.base,
+    required this.mid,
+    required this.deep,
+    required this.shadow,
+    required this.on,
+    required this.glowBright,
+    required this.glowMid,
+    required this.glowDeep,
+  });
+
+  final String id;
+  final String label;
+  final Color hi;
+  final Color base;
+  final Color mid;
+  final Color deep;
+  final Color shadow;
+
+  /// Ink dark enough to sit on an accent-filled control.
+  final Color on;
+
+  final Color glowBright;
+  final Color glowMid;
+  final Color glowDeep;
+}
+
 /// The Rustic Fork palette — a near-black workspace with a single warm
 /// copper accent, sampled from the reference design.
 ///
@@ -37,39 +76,64 @@ abstract final class AppColors {
   static const Color textSecondary = Color(0xFF9A978F);
   static const Color textTertiary = Color(0xFF615E57);
 
-  // ── Copper accent ramp (sequential, light -> dark) ─────────────────
-  // --- Backdrop orange -------------------------------------------------------
-  // The copper ramp above is DESATURATED (~0.47) — it is an ink and metal
-  // palette, and washing a whole screen in it reads as brown, not as the warm
-  // orange the guest ordering page and the app icon (#ea580c) actually use.
-  // These three are the brand orange walked darker while KEEPING its saturation
-  // (~0.85-0.94), so the backdrop can be dimmed without turning to mud.
-  // Backdrop only: controls and text keep the copper ramp.
-  static const Color glowBright = Color(0xFFC2410C);
-  static const Color glowMid = Color(0xFF9A3412);
-  static const Color glowDeep = Color(0xFF7C2D12);
-
-  static const Color copperHi = Color(0xFFE3B89B);
-  static const Color copper = Color(0xFFC9997A);
-  static const Color copperMid = Color(0xFFA9795C);
-  static const Color copperDeep = Color(0xFF7D5B47);
-  static const Color copperShadow = Color(0xFF4E3928);
-  /// Ink dark enough to sit on a copper-filled control.
-  static const Color onCopper = Color(0xFF221510);
-
-  static const List<Color> copperRamp = [
-    copperHi,
-    copper,
-    copperMid,
-    copperDeep,
-    copperShadow,
-  ];
-
-  static const LinearGradient copperGradient = LinearGradient(
-    begin: Alignment.topCenter,
-    end: Alignment.bottomCenter,
-    colors: [copperHi, copperMid],
+  // ── Accent ramp (sequential, light -> dark) ────────────────────────
+  // Historically a const copper ramp; now backed by a swappable AppAccent so
+  // the device's appearance setting can recolour the whole app WITHOUT a
+  // single per-module edit — every call site keeps reading AppColors.copper*
+  // (the names stay, whatever hue is active; renaming them would touch every
+  // module for zero behaviour). The default IS the original Rustic Fork
+  // copper, byte-identical, applied before anything can read these.
+  //
+  // The backdrop "glow" trio rides along: it is the accent walked darker while
+  // KEEPING high saturation (~0.74-0.88), because the ramp itself is
+  // DESATURATED (~0.47) ink-and-metal and washing a whole screen in it reads
+  // as mud. Backdrop only: controls and text keep the ramp.
+  static const AppAccent rusticCopper = AppAccent(
+    id: 'copper',
+    label: 'Copper',
+    hi: Color(0xFFE3B89B),
+    base: Color(0xFFC9997A),
+    mid: Color(0xFFA9795C),
+    deep: Color(0xFF7D5B47),
+    shadow: Color(0xFF4E3928),
+    on: Color(0xFF221510),
+    glowBright: Color(0xFFC2410C),
+    glowMid: Color(0xFF9A3412),
+    glowDeep: Color(0xFF7C2D12),
   );
+
+  static AppAccent _accent = rusticCopper;
+
+  /// The active accent. Set ONLY by AppearanceController (which persists the
+  /// per-device choice and notifies the app root to rebuild).
+  static AppAccent get accent => _accent;
+  static void applyAccent(AppAccent a) => _accent = a;
+
+  static Color get glowBright => _accent.glowBright;
+  static Color get glowMid => _accent.glowMid;
+  static Color get glowDeep => _accent.glowDeep;
+
+  static Color get copperHi => _accent.hi;
+  static Color get copper => _accent.base;
+  static Color get copperMid => _accent.mid;
+  static Color get copperDeep => _accent.deep;
+  static Color get copperShadow => _accent.shadow;
+  /// Ink dark enough to sit on an accent-filled control.
+  static Color get onCopper => _accent.on;
+
+  static List<Color> get copperRamp => [
+        copperHi,
+        copper,
+        copperMid,
+        copperDeep,
+        copperShadow,
+      ];
+
+  static LinearGradient get copperGradient => LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [copperHi, copperMid],
+      );
 
   static const LinearGradient cardGradient = LinearGradient(
     begin: Alignment.topCenter,

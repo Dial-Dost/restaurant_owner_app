@@ -95,7 +95,7 @@ class TableApcStrip extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Icon(Icons.receipt_long_outlined, size: 15, color: AppColors.copper),
+          Icon(Icons.receipt_long_outlined, size: 15, color: AppColors.copper),
           const SizedBox(width: 8),
           Expanded(
             child: Text(

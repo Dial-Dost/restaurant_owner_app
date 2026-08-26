@@ -15,7 +15,7 @@ abstract final class AppTheme {
     final base = ThemeData(
       brightness: Brightness.dark,
       useMaterial3: true,
-      colorScheme: const ColorScheme.dark(
+      colorScheme: ColorScheme.dark(
         primary: AppColors.copper,
         onPrimary: AppColors.onCopper,
         secondary: AppColors.copperHi,

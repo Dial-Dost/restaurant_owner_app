@@ -231,7 +231,7 @@ class _NotificationsBellState extends State<NotificationsBell> {
         ];
         return AlertDialog(
           backgroundColor: AppColors.cardRaised,
-          icon: const Icon(Icons.info_outline, color: AppColors.copperHi),
+          icon: Icon(Icons.info_outline, color: AppColors.copperHi),
           title: const Text("Can't open that yet"),
           content: Text(message, style: const TextStyle(color: AppColors.textSecondary)),
           actions: actions,

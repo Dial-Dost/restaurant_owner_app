@@ -6,6 +6,7 @@ import 'screens/login_screen.dart';
 import 'services/auth_controller.dart';
 import 'ui/theme/app_colors.dart';
 import 'ui/theme/app_theme.dart';
+import 'ui/theme/appearance.dart';
 
 // Desktop mice can't drag-scroll a horizontal ScrollView by default (only the
 // wheel/trackpad do). Add mouse (and stylus) to the accepted drag devices so
@@ -45,7 +46,12 @@ class _OwnerAppState extends State<OwnerApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    // Rebuild the whole tree when the device accent changes: AppTheme.dark()
+    // and every module read the accent through AppColors getters, so one
+    // rebuild here recolours the app with no per-module wiring.
+    return AnimatedBuilder(
+      animation: AppearanceController.instance,
+      builder: (context, _) => MaterialApp(
       title: 'Restaurant Dash — Owner',
       debugShowCheckedModeBanner: false,
       scrollBehavior: _DragScrollBehavior(),
@@ -54,7 +60,7 @@ class _OwnerAppState extends State<OwnerApp> {
         animation: auth,
         builder: (context, _) {
           if (!auth.initialized) {
-            return const Scaffold(
+            return Scaffold(
               backgroundColor: AppColors.bg,
               body: Center(
                 child: CircularProgressIndicator(color: AppColors.copper),
@@ -63,6 +69,7 @@ class _OwnerAppState extends State<OwnerApp> {
           }
           return auth.isAuthenticated ? HomeShell(auth: auth) : LoginScreen(auth: auth);
         },
+      ),
       ),
     );
   }

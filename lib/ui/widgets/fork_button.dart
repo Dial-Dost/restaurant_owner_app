@@ -183,7 +183,7 @@ class _ForkIconButtonState extends State<ForkIconButton> {
                   child: Container(
                     width: 6,
                     height: 6,
-                    decoration: const BoxDecoration(
+                    decoration: BoxDecoration(
                       color: AppColors.copperHi,
                       shape: BoxShape.circle,
                     ),
