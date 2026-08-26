@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/phone_validation.dart';
@@ -6,6 +8,7 @@ import '../ui/theme/app_colors.dart';
 import '../ui/widgets/fork_card.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/status_chip.dart';
+import '../widgets/async_view.dart';
 import '../widgets/table_bill.dart';
 
 /// Staff POS order entry for a table: pick menu items into a cart and send the
@@ -31,8 +34,12 @@ class OrderEntryScreen extends StatefulWidget {
   State<OrderEntryScreen> createState() => _OrderEntryScreenState();
 }
 
-class _OrderEntryScreenState extends State<OrderEntryScreen> {
-  late Future<List<dynamic>> _menu;
+class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScreen {
+  // The menu, held as plain state (not a FutureBuilder) so the boot-time cache
+  // prime can paint a saved copy instantly and the network refresh can land in
+  // place without ever swapping the list for the skeleton.
+  List<dynamic>? _menuItems;
+  String? _menuError;
   final Map<String, int> _cart = {};
   final Map<String, String> _itemNotes = {}; // per-item kitchen note (by menu id)
   final Set<String> _itemHold = {}; // held courses (fired later from the KDS)
@@ -52,7 +59,16 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
   @override
   void initState() {
     super.initState();
-    _menu = _load();
+    // _loadMenu is naturally silent while items are on screen (the skeleton is
+    // simply "_menuItems == null"), so refresh and fallback are the same call.
+    unawaited(primeFromCache(
+      fetch: () => widget.rest.getList('/menu'),
+      apply: _applyMenu,
+      refresh: _loadMenu,
+      fallback: _loadMenu,
+    ));
+    // The running bill is live money — deliberately never primed from a saved
+    // copy: a stale APC strip could steer the waiter's upsell the wrong way.
     _loadTableBill();
   }
 
@@ -76,14 +92,36 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
     super.dispose();
   }
 
-  Future<List<dynamic>> _load() async {
-    final items = await widget.rest.getList('/menu');
+  /// Field assignment only — shared by the cache prime and the network load.
+  void _applyMenu(List<dynamic> items) {
     _itemsById.clear();
     for (final it in items) {
       final m = it as Map;
       _itemsById['${m['id']}'] = m;
     }
-    return items;
+    _menuItems = items;
+    _menuError = null;
+  }
+
+  Future<void> _loadMenu() async {
+    final gen = bumpCacheGen();
+    try {
+      final items = await widget.rest.getList('/menu');
+      if (!mounted || !cacheGenIs(gen)) return;
+      setState(() {
+        _applyMenu(items);
+        markCacheLive();
+      });
+    } catch (e) {
+      if (!mounted || !cacheGenIs(gen)) return;
+      // A saved menu already on screen survives a failed refresh — the waiter
+      // keeps taking the order behind the offline pill.
+      if (_menuItems != null) {
+        setState(markCacheOffline);
+        return;
+      }
+      setState(() => _menuError = '$e');
+    }
   }
 
   // Takeaway/delivery contact number. Optional, but anything typed must be a
@@ -177,7 +215,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                 ? 'New delivery'
                 : 'New takeaway'),
       ),
-      body: Column(children: [
+      body: cacheStaleOverlay(Column(children: [
         // What the table is already running at — visible while the order is
         // being built, so the waiter can see the per-head gap in time to close
         // it. Tapping opens the full item-by-item bill.
@@ -210,10 +248,13 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
           ),
         ),
         Expanded(
-          child: FutureBuilder<List<dynamic>>(
-            future: _menu,
-            builder: (context, snap) {
-              if (snap.connectionState != ConnectionState.done) {
+          child: Builder(
+            builder: (context) {
+              if (_menuError != null) {
+                return Center(child: Text('Failed to load menu: $_menuError'));
+              }
+              final items = _menuItems;
+              if (items == null) {
                 return ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
@@ -229,10 +270,6 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                   ],
                 );
               }
-              if (snap.hasError) {
-                return Center(child: Text('Failed to load menu: ${snap.error}'));
-              }
-              final items = snap.data ?? [];
               final q = _query.trim().toLowerCase();
               if (q.isNotEmpty) {
                 // Flat, filtered list across all categories while searching.
@@ -282,7 +319,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
             },
           ),
         ),
-      ]),
+      ])),
       bottomNavigationBar: _count == 0
           ? null
           : Padding(
@@ -413,11 +450,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text('${m['name']}',
-                      style: const TextStyle(
+                      style: TextStyle(
                           fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
                   const SizedBox(height: 2),
                   Text('₹${_price(id).toStringAsFixed(2)}',
-                      style: const TextStyle(fontSize: 12.5, color: AppColors.textSecondary)),
+                      style: TextStyle(fontSize: 12.5, color: AppColors.textSecondary)),
                 ],
               ),
             ),
@@ -438,10 +475,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                       onPressed: () => _editItemNote(id, '${m['name']}'),
                     ),
                     IconButton(
-                        icon: const Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
+                        icon: Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
                         onPressed: () => _setQty(id, -1)),
                     Text('$qty',
-                        style: const TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
+                        style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
                     IconButton(
                         icon: Icon(Icons.add_circle_outline, color: AppColors.copperHi),
                         onPressed: () => _setQty(id, 1)),
@@ -457,11 +494,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> {
                   const SizedBox(width: 8),
                 ],
                 if (note.isNotEmpty) ...[
-                  const Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.textTertiary),
+                  Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.textTertiary),
                   const SizedBox(width: 6),
                   Expanded(
                       child: Text(note,
-                          style: const TextStyle(
+                          style: TextStyle(
                               fontSize: 12, fontStyle: FontStyle.italic, color: AppColors.textSecondary))),
                 ],
               ]),

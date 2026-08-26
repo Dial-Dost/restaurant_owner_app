@@ -56,7 +56,7 @@ class SectionHeader extends StatelessWidget {
                     ),
                     child: Text(
                       '$count',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 10.5,
                         fontWeight: FontWeight.w600,
                         color: AppColors.textSecondary,

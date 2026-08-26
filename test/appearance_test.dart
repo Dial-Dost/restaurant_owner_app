@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/theme/backdrop_style.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 
 void main() {
@@ -91,6 +92,82 @@ void main() {
     test('load with no stored value keeps the copper default', () async {
       await AppearanceController.instance.load();
       expect(AppearanceController.instance.accentId, 'copper');
+    });
+
+    test('setScheme persists and load restores it (device round-trip)', () async {
+      await AppearanceController.instance.setScheme('midnight');
+      expect(AppearanceController.instance.schemeId, 'midnight');
+      expect(AppColors.bg, AppSchemes.midnight.bg);
+      expect(AppColors.textPrimary, AppSchemes.midnight.textPrimary);
+
+      // Simulate a cold start: reset in-memory state, then load from prefs.
+      AppearanceController.instance.debugReset();
+      expect(AppColors.bg, AppSchemes.rustic.bg);
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'midnight');
+      expect(AppColors.bg, AppSchemes.midnight.bg);
+      expect(AppColors.cardRaised, AppSchemes.midnight.cardRaised);
+      expect(AppColors.textSecondary, AppSchemes.midnight.textSecondary);
+    });
+
+    test('scheme and accent persist independently (they compose, not compete)', () async {
+      await AppearanceController.instance.setScheme('slate');
+      await AppearanceController.instance.setAccent('rose');
+      AppearanceController.instance.debugReset();
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'slate');
+      expect(AppearanceController.instance.accentId, 'rose');
+      expect(AppColors.bg, AppSchemes.slate.bg);
+      expect(AppColors.copper, AppAccents.rose.base);
+    });
+
+    test('a corrupt stored scheme id loads as the rustic default', () async {
+      SharedPreferences.setMockInitialValues({'appearance.scheme': 'hot-dog-stand'});
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.schemeId, 'rustic');
+      expect(AppColors.bg, AppSchemes.rustic.bg);
+    });
+
+    test('setBackdrop persists and load restores it (device round-trip)', () async {
+      const custom = BackdropStyle(
+        wash: Color(0xFF204060),
+        bloom: Color(0xFFAA5511),
+        angleDeg: 210,
+        intensity: 0.6,
+      );
+      await AppearanceController.instance.setBackdrop(custom);
+      expect(AppearanceController.instance.backdrop, custom);
+
+      AppearanceController.instance.debugReset();
+      expect(AppearanceController.instance.backdrop, const BackdropStyle());
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.backdrop, custom);
+    });
+
+    test('"back to scheme default" persists as absence, not as a frozen copy', () async {
+      await AppearanceController.instance.setBackdrop(
+          const BackdropStyle(wash: Color(0xFF123456), intensity: 0.4));
+      await AppearanceController.instance.setBackdrop(const BackdropStyle());
+
+      final prefs = await SharedPreferences.getInstance();
+      // No pinned stops left behind: a device on the default keeps following
+      // whatever the accent (and future defaults) say.
+      expect(prefs.getString('appearance.backdrop.wash'), isNull);
+      expect(prefs.getString('appearance.backdrop.bloom'), isNull);
+
+      AppearanceController.instance.debugReset();
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.backdrop.isDefault, isTrue);
+    });
+
+    test('corrupt stored backdrop values load as the default, never as junk', () async {
+      SharedPreferences.setMockInitialValues({
+        'appearance.backdrop.wash': 'reddish',
+        'appearance.backdrop.bloom': '#12345', // five digits — invalid
+      });
+      await AppearanceController.instance.load();
+      expect(AppearanceController.instance.backdrop.wash, isNull);
+      expect(AppearanceController.instance.backdrop.bloom, isNull);
     });
   });
 

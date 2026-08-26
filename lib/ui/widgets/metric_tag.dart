@@ -33,7 +33,7 @@ class TickTag extends StatelessWidget {
         // StatusChip in the same narrow tile row, so it has to give way too.
         ChipLabel(
           label,
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 10.5,
             fontWeight: FontWeight.w500,
             color: AppColors.textSecondary,
@@ -78,7 +78,7 @@ class MicroStat extends StatelessWidget {
             ],
             ChipLabel(
               value,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
                 color: AppColors.textPrimary,

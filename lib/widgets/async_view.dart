@@ -252,6 +252,146 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
   }
 }
 
+/// Cache-primed boot for the screens whose orchestration cannot live inside an
+/// AsyncView — server-side pagination (Audit log, Guests), action flows that
+/// own their refresh (Waitlist's call/seat, the cash drawer), composed loads
+/// with local filter state (Accounting). Those screens FEED the persisted GET
+/// cache through RestClient but used to never paint from it, so they were the
+/// only modules still opening on a skeleton.
+///
+/// This is AsyncView._boot extracted, not a second mechanism: the screen's
+/// replayable fetch runs under the same [GetCachePolicy.runCacheOnly] zone, the
+/// same [CacheReplayStamp] decides between "paint the saved copy" and "the
+/// skeleton is more honest", and the same [_StaleBanner] is the affordance. The
+/// only difference is that painting goes through the screen's own [setState]
+/// (via `apply`) because these screens hold their data in fields, not in an
+/// AsyncView slot.
+///
+/// Contract for every mixed-in screen:
+///  * every load path (loud, silent, append) starts with `bumpCacheGen()` and
+///    drops its result unless `cacheGenIs` still holds — the guard that keeps a
+///    slow stale refresh from clobbering a newer answer;
+///  * a load that lands from the network calls [markCacheLive] inside its
+///    setState; a refresh that fails while data is on screen calls
+///    [markCacheOffline] instead of replacing the data with an error;
+///  * the build wraps its data-bearing return in [cacheStaleOverlay].
+mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
+  /// True while what is on screen came out of the persisted store rather than
+  /// the network. Cleared by [markCacheLive].
+  bool _primedFromCache = false;
+
+  /// True after a refresh failed while good data was on screen.
+  bool _cacheOffline = false;
+
+  /// When the payload on screen was last confirmed by the network — the save
+  /// time of the oldest cache entry that fed it, or the moment a load landed.
+  DateTime? _cacheAsOf;
+
+  /// Identifies the newest request in flight, exactly like AsyncView's `_gen`.
+  int _cacheGen = 0;
+
+  Timer? _cacheAgeTick;
+
+  int bumpCacheGen() => ++_cacheGen;
+  bool cacheGenIs(int gen) => gen == _cacheGen;
+
+  @override
+  void dispose() {
+    _cacheAgeTick?.cancel();
+    super.dispose();
+  }
+
+  /// initState entry point. Replays [fetch] — the screen's initial GET
+  /// composition, with no side effects — against the persisted store. When
+  /// every GET hits, [apply] paints the saved payload (inside setState here,
+  /// so `apply` only assigns fields) and [refresh] — the screen's silent
+  /// in-place reload — chases it with the real network read. Any miss, or a
+  /// fetch that failed outright, falls back to [fallback], the screen's
+  /// ordinary loud first load: a composed payload with holes would render as
+  /// confident zeros, and the skeleton is more honest than that.
+  Future<void> primeFromCache<D>({
+    required Future<D> Function() fetch,
+    required void Function(D data) apply,
+    required Future<void> Function() refresh,
+    required Future<void> Function() fallback,
+  }) async {
+    final gen = bumpCacheGen();
+    final stamp = CacheReplayStamp();
+    D data;
+    try {
+      data = await GetCachePolicy.runCacheOnly(fetch, stamp);
+    } catch (_) {
+      if (!mounted || !cacheGenIs(gen)) return;
+      await fallback();
+      return;
+    }
+    if (!mounted || !cacheGenIs(gen)) return;
+    if (stamp.misses > 0 || stamp.hits == 0) {
+      await fallback();
+      return;
+    }
+    setState(() {
+      apply(data);
+      _primedFromCache = true;
+      _cacheOffline = false;
+      _cacheAsOf = stamp.oldestSavedAt ?? DateTime.now();
+    });
+    _syncCacheAgeTick();
+    await refresh();
+  }
+
+  /// A network load landed: the data on screen is live. Call inside setState.
+  void markCacheLive() {
+    _primedFromCache = false;
+    _cacheOffline = false;
+    _cacheAsOf = DateTime.now();
+    _syncCacheAgeTick();
+  }
+
+  /// A refresh failed while data stayed on screen. Call inside setState.
+  void markCacheOffline() {
+    _cacheOffline = true;
+    _syncCacheAgeTick();
+  }
+
+  void _syncCacheAgeTick() {
+    final need = _cacheOffline || _primedFromCache;
+    if (need) {
+      _cacheAgeTick ??= Timer.periodic(const Duration(seconds: 30), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _cacheAgeTick?.cancel();
+      _cacheAgeTick = null;
+    }
+  }
+
+  /// The same staleness affordance AsyncView paints: offline always shows, a
+  /// saved copy still being refreshed labels itself once old enough to mislead.
+  Widget cacheStaleOverlay(Widget content) {
+    final asOf = _cacheAsOf;
+    final aged = asOf != null &&
+        DateTime.now().difference(asOf) > const Duration(seconds: 60);
+    if (!_cacheOffline && !(_primedFromCache && aged)) return content;
+    return Stack(
+      fit: StackFit.passthrough,
+      children: [
+        content,
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: AppSpacing.xl,
+          child: IgnorePointer(
+            child: Center(
+              child: _StaleBanner(offline: _cacheOffline, asOf: asOf),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 /// Floating, non-blocking staleness pill. Reuses the design system's chip
 /// language (StatusChip for a warning state, InfoChip for quiet metadata) on a
 /// raised opaque backing so it stays readable over any module body.

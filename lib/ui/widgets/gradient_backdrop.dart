@@ -3,6 +3,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
+import '../theme/appearance.dart';
+import '../theme/backdrop_style.dart';
 
 /// The guest ordering page's warmth, brought to the owner app.
 ///
@@ -50,73 +52,129 @@ class GradientBackdrop extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final h = heroHeight ?? (MediaQuery.sizeOf(context).height * 0.42).clamp(180.0, 520.0);
+    final style = AppearanceController.instance.backdrop;
+
+    // The shipped copper-on-rustic look, verbatim. Untouched knobs on the
+    // shipped scheme AND the shipped accent paint EXACTLY the layer stack that
+    // shipped in 1.8.0 — including its guest-page neutrals (#0B0B0D, #060607)
+    // that are near but not equal to the rustic tokens — so "default" stays a
+    // promise, not an approximation. Everything else (an owner-moved knob, a
+    // non-rustic scheme, a non-copper accent) takes the computed path below,
+    // where the AA guard runs: copper's glow passes the guard untouched at
+    // full alpha (measured 7.79:1 under primary ink), so gating on copper here
+    // skips no clamp that would ever have engaged — while teal's brighter glow,
+    // which grazes the floor, gets the trim the shipped constants never did.
+    if (style.isDefault && AppColors.shell.id == 'rustic' && AppColors.accent.id == 'copper') {
+      return _layers(
+        h: h,
+        base: AppColors.bg,
+        orbNear: _Orb(size: 360, color: AppColors.glowMid, opacity: 0.22),
+        orbFar: _Orb(size: 340, color: AppColors.glowDeep, opacity: 0.22),
+        wash: LinearGradient(
+          // 150deg in CSS runs top-left -> bottom-right; these alignments
+          // are the same axis expressed the way Flutter wants it.
+          begin: const Alignment(-0.7, -1),
+          end: const Alignment(0.7, 1),
+          colors: [AppColors.glowDeep, const Color(0xFF0B0B0D)],
+          stops: const [0.0, 0.78],
+        ),
+        bloom: _Orb(size: 340, color: AppColors.glowBright, opacity: 0.34, stop: 0.62),
+        darken: const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Color(0x26060607),
+            Color(0x66060607),
+            Color(0xF508080A),
+          ],
+          stops: [0.0, 0.45, 1.0],
+        ),
+      );
+    }
+
+    // The owner-mixed (or non-rustic-scheme) backdrop: same five layers, tones
+    // and axis resolved from style x glow ramp x scheme — with the AA guard
+    // already applied (resolveBackdrop clamps the wash's top stop and the
+    // bloom so body ink stays >= 4.5:1 on the brightest thing they compose).
+    final r = resolveBackdrop(
+      style: style,
+      glowBright: AppColors.glowBright,
+      glowMid: AppColors.glowMid,
+      glowDeep: AppColors.glowDeep,
+      bg: AppColors.bg,
+      ink: AppColors.textPrimary,
+    );
+    return _layers(
+      h: h,
+      base: AppColors.bg,
+      orbNear: _Orb(size: 360, color: r.orbNearColor, opacity: r.orbNearOpacity),
+      orbFar: _Orb(size: 340, color: r.orbFarColor, opacity: r.orbFarOpacity),
+      wash: LinearGradient(
+        begin: r.washBegin,
+        end: r.washEnd,
+        // The top stop is pre-composited onto the scheme ground (opaque), so
+        // fading to the scheme's own bg keeps the wash landing on the page
+        // whatever ground the scheme wears.
+        colors: [r.washColor, AppColors.bg],
+        stops: const [0.0, 0.78],
+      ),
+      bloom: _Orb(size: 340, color: r.bloomColor, opacity: r.bloomOpacity, stop: 0.62),
+      darken: LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          AppColors.bgDeep.withValues(alpha: 0.15),
+          AppColors.bgDeep.withValues(alpha: 0.40),
+          AppColors.bg.withValues(alpha: 0.96),
+        ],
+        stops: const [0.0, 0.45, 1.0],
+      ),
+    );
+  }
+
+  /// The one five-layer recipe both paths share, so "custom" can never drift
+  /// structurally from "shipped" — only the tones differ.
+  Widget _layers({
+    required double h,
+    required Color base,
+    required _Orb orbNear,
+    required _Orb orbFar,
+    required LinearGradient wash,
+    required _Orb bloom,
+    required LinearGradient darken,
+  }) {
     return Stack(
       children: [
         // 1 — the base every other layer sits on.
-        const Positioned.fill(child: ColoredBox(color: AppColors.bg)),
+        Positioned.fill(child: ColoredBox(color: base)),
 
         // 5 — ambient orbs. Painted before the hero so the hero reads as the
         // brighter event and these stay atmosphere.
-        Positioned(
-          top: -120,
-          left: -80,
-          child: _Orb(size: 360, color: AppColors.glowMid, opacity: 0.22),
-        ),
-        Positioned(
-          bottom: -140,
-          right: -60,
-          child: _Orb(size: 340, color: AppColors.glowDeep, opacity: 0.22),
-        ),
+        Positioned(top: -120, left: -80, child: orbNear),
+        Positioned(bottom: -140, right: -60, child: orbFar),
 
-        // 2 — the hero wash: copper at the top-left, gone by ~78% of its own height.
+        // 2 — the hero wash: the warm event at the top, gone by ~78% of its
+        // own height.
         Positioned(
           left: 0,
           right: 0,
           top: 0,
           height: h,
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                // 150deg in CSS runs top-left -> bottom-right; these alignments
-                // are the same axis expressed the way Flutter wants it.
-                begin: Alignment(-0.7, -1),
-                end: Alignment(0.7, 1),
-                colors: [AppColors.glowDeep, Color(0xFF0B0B0D)],
-                stops: [0.0, 0.78],
-              ),
-            ),
-          ),
+          child: DecoratedBox(decoration: BoxDecoration(gradient: wash)),
         ),
 
         // 3 — the bright bloom spilling off the top-right corner. This is the
         // part that makes the header feel lit rather than merely tinted.
-        Positioned(
-          top: -120,
-          right: -70,
-          child: _Orb(size: 340, color: AppColors.glowBright, opacity: 0.34, stop: 0.62),
-        ),
+        Positioned(top: -120, right: -70, child: bloom),
 
         // 4 — the darkening pass that lands the wash back on the page colour.
-        // Without it the copper stays milky where content begins.
+        // Without it the wash stays milky where content begins.
         Positioned(
           left: 0,
           right: 0,
           top: 0,
           height: h,
-          child: const DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  Color(0x26060607),
-                  Color(0x66060607),
-                  Color(0xF508080A),
-                ],
-                stops: [0.0, 0.45, 1.0],
-              ),
-            ),
-          ),
+          child: DecoratedBox(decoration: BoxDecoration(gradient: darken)),
         ),
 
         // The app itself, over all of it.

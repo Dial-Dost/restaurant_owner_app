@@ -179,7 +179,7 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
           const SizedBox(height: 8),
           Text('Default: ${AppConfig.builtBackendUrl}',
-              style: const TextStyle(fontSize: 12, color: AppColors.textTertiary)),
+              style: TextStyle(fontSize: 12, color: AppColors.textTertiary)),
         ]),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, ''), child: const Text('Reset to default')),
@@ -301,7 +301,7 @@ class _LoginScreenState extends State<LoginScreen> {
         const SizedBox(width: 14),
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: const [
+          children: [
             Text(
               'RESTAURANT DASH',
               style: TextStyle(
@@ -336,7 +336,7 @@ class _LoginScreenState extends State<LoginScreen> {
         const SizedBox(height: AppSpacing.x3l),
         Text('Set up this device', style: Theme.of(context).textTheme.titleLarge),
         const SizedBox(height: 4),
-        const Text('Enter your restaurant name to get started.',
+        Text('Enter your restaurant name to get started.',
             style: TextStyle(color: AppColors.textSecondary, fontSize: 13)),
         const SizedBox(height: 24),
         TextField(
@@ -347,7 +347,7 @@ class _LoginScreenState extends State<LoginScreen> {
           onSubmitted: (_) => _saveRestaurant(),
         ),
         const SizedBox(height: 8),
-        const Text('Saved on this device — staff just sign in after this.',
+        Text('Saved on this device — staff just sign in after this.',
             style: TextStyle(fontSize: 12, color: AppColors.textTertiary)),
         const SizedBox(height: 24),
         Align(
@@ -387,7 +387,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   Expanded(
                     child: Text(_savedRestaurant!,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontWeight: FontWeight.w600,
                           color: AppColors.textPrimary,
                         )),
@@ -439,7 +439,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 decoration: const InputDecoration(labelText: 'Outlet'),
                 dropdownColor: AppColors.surface,
                 iconEnabledColor: AppColors.textSecondary,
-                style: const TextStyle(color: AppColors.textPrimary, fontSize: 14),
+                style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
                 items: [
                   for (final o in _outlets)
                     DropdownMenuItem<String>(

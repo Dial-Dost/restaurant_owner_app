@@ -115,7 +115,7 @@ class InfoChip extends StatelessWidget {
           ],
           ChipLabel(
             label,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 11,
               fontWeight: FontWeight.w500,
               color: AppColors.textSecondary,

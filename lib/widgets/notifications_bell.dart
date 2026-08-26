@@ -233,7 +233,7 @@ class _NotificationsBellState extends State<NotificationsBell> {
           backgroundColor: AppColors.cardRaised,
           icon: Icon(Icons.info_outline, color: AppColors.copperHi),
           title: const Text("Can't open that yet"),
-          content: Text(message, style: const TextStyle(color: AppColors.textSecondary)),
+          content: Text(message, style: TextStyle(color: AppColors.textSecondary)),
           actions: actions,
         );
       },
@@ -336,7 +336,7 @@ class _NotificationsBellState extends State<NotificationsBell> {
                 const Divider(height: 1, color: AppColors.divider),
                 Flexible(
                   child: _items.isEmpty
-                      ? const Padding(
+                      ? Padding(
                           padding: EdgeInsets.all(40),
                           child: Text('No notifications yet',
                               style: TextStyle(color: AppColors.textTertiary)))
@@ -358,11 +358,11 @@ class _NotificationsBellState extends State<NotificationsBell> {
                               subtitle: Tooltip(
                                 message: RestaurantTime.stamp('${n['created_at'] ?? ''}'),
                                 child: Text('${n['body'] ?? ''}\n${_fmt('${n['created_at'] ?? ''}')}',
-                                    style: const TextStyle(color: AppColors.textSecondary)),
+                                    style: TextStyle(color: AppColors.textSecondary)),
                               ),
                               isThreeLine: true,
                               trailing: IconButton(
-                                icon: const Icon(Icons.close, size: 18, color: AppColors.textTertiary),
+                                icon: Icon(Icons.close, size: 18, color: AppColors.textTertiary),
                                 tooltip: 'Clear',
                                 onPressed: () => _do(() async {
                                   await widget.rest.delete('/notifications/${n['id']}');

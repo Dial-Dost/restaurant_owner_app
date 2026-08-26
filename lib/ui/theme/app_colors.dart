@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'contrast.dart';
+
 /// One owner-app accent voice: the six-stop ramp every control/text accent is
 /// drawn from, plus the three saturated "glow" tones the gradient backdrop
 /// dims down. Same tonal recipe as the shipped Rustic Fork copper (a
@@ -39,6 +41,47 @@ class AppAccent {
   final Color glowDeep;
 }
 
+/// One complete dark shell voice: the ground -> surface -> card ladder plus
+/// the ink that sits on it. The same tonal RECIPE as the shipped Rustic Fork
+/// shell (a near-black page, hairline-separated warm surfaces, three ink
+/// weights), re-tilted per scheme — warm, cool, blue, neutral — so every
+/// choice stays inside the design system instead of fighting it. The curated
+/// catalogue + the per-device controller live in appearance.dart; this type
+/// sits here so AppColors can hold one without an import cycle (the same
+/// arrangement as [AppAccent]).
+@immutable
+class AppShellScheme {
+  const AppShellScheme({
+    required this.id,
+    required this.label,
+    required this.bg,
+    required this.bgDeep,
+    required this.surface,
+    required this.card,
+    required this.cardTop,
+    required this.cardBottom,
+    required this.cardRaised,
+    required this.inset,
+    required this.textPrimary,
+    required this.textSecondary,
+    required this.textTertiary,
+  });
+
+  final String id;
+  final String label;
+  final Color bg;
+  final Color bgDeep;
+  final Color surface;
+  final Color card;
+  final Color cardTop;
+  final Color cardBottom;
+  final Color cardRaised;
+  final Color inset;
+  final Color textPrimary;
+  final Color textSecondary;
+  final Color textTertiary;
+}
+
 /// The Rustic Fork palette — a near-black workspace with a single warm
 /// copper accent, sampled from the reference design.
 ///
@@ -48,33 +91,64 @@ class AppAccent {
 ///  * Status is never color-alone: every status surface pairs its tint
 ///    with a text label (and usually a dot).
 abstract final class AppColors {
-  // ── Surfaces ────────────────────────────────────────────────────────
-  // Warm-neutral, not grey. Every one of these used to lean COOL — B was higher
-  // than R in all eight (bg -1, cardRaised -5) — which is invisible on a black
-  // page and reads as grey the moment a warm backdrop sits behind it. They now
-  // lean warm by the same small amount, tilted toward the glow* orange.
+  // ── Surfaces + ink: the active shell scheme ─────────────────────────
+  // Historically eight const surfaces and three const inks; now backed by a
+  // swappable AppShellScheme exactly the way the copper ramp is backed by a
+  // swappable AppAccent: every call site keeps reading AppColors.bg /
+  // AppColors.textPrimary and the device's scheme choice recolours the whole
+  // app with no per-module edits. The default IS the original Rustic shell,
+  // byte-identical by construction (aliased, not copied), applied before
+  // anything can read these.
   //
-  // The tilt raises R and drops B while HOLDING G, which carries ~72% of
-  // relative luminance: every surface below moves by less than 0.0006, so no
-  // contrast ratio measured against these changes.
-  static const Color bg = Color(0xFF0C0A09);
-  static const Color bgDeep = Color(0xFF080605);
-  static const Color surface = Color(0xFF151211);
-  static const Color card = Color(0xFF1B1716);
-  static const Color cardTop = Color(0xFF201B1A);
-  static const Color cardBottom = Color(0xFF181412);
-  static const Color cardRaised = Color(0xFF231E1E);
-  static const Color inset = Color(0xFF110E0D);
+  // On the rustic values themselves: warm-neutral, not grey. Every surface
+  // used to lean COOL — B higher than R in all eight — which is invisible on
+  // a black page and reads as grey the moment a warm backdrop sits behind it.
+  // They lean warm by the same small amount, tilted toward the glow* orange,
+  // holding G (which carries ~72% of relative luminance) so no contrast ratio
+  // measured against them changed.
+  static const AppShellScheme rusticShell = AppShellScheme(
+    id: 'rustic',
+    label: 'Rustic',
+    bg: Color(0xFF0C0A09),
+    bgDeep: Color(0xFF080605),
+    surface: Color(0xFF151211),
+    card: Color(0xFF1B1716),
+    cardTop: Color(0xFF201B1A),
+    cardBottom: Color(0xFF181412),
+    cardRaised: Color(0xFF231E1E),
+    inset: Color(0xFF110E0D),
+    textPrimary: Color(0xFFECEAE6),
+    textSecondary: Color(0xFF9A978F),
+    textTertiary: Color(0xFF615E57),
+  );
+
+  static AppShellScheme _shell = rusticShell;
+
+  /// The active shell scheme. Set ONLY by AppearanceController (which persists
+  /// the per-device choice and notifies the app root to rebuild).
+  static AppShellScheme get shell => _shell;
+  static void applyShell(AppShellScheme s) => _shell = s;
+
+  static Color get bg => _shell.bg;
+  static Color get bgDeep => _shell.bgDeep;
+  static Color get surface => _shell.surface;
+  static Color get card => _shell.card;
+  static Color get cardTop => _shell.cardTop;
+  static Color get cardBottom => _shell.cardBottom;
+  static Color get cardRaised => _shell.cardRaised;
+  static Color get inset => _shell.inset;
 
   // ── Strokes ─────────────────────────────────────────────────────────
+  // Alpha-white on purpose: a translucent hairline reads correctly over ANY
+  // dark ground, so strokes need no per-scheme variants.
   static const Color border = Color(0x12FFFFFF); //  7% white
   static const Color borderStrong = Color(0x1FFFFFFF); // 12% white
   static const Color divider = Color(0x0DFFFFFF); //  5% white
 
   // ── Ink ─────────────────────────────────────────────────────────────
-  static const Color textPrimary = Color(0xFFECEAE6);
-  static const Color textSecondary = Color(0xFF9A978F);
-  static const Color textTertiary = Color(0xFF615E57);
+  static Color get textPrimary => _shell.textPrimary;
+  static Color get textSecondary => _shell.textSecondary;
+  static Color get textTertiary => _shell.textTertiary;
 
   // ── Accent ramp (sequential, light -> dark) ────────────────────────
   // Historically a const copper ramp; now backed by a swappable AppAccent so
@@ -135,11 +209,49 @@ abstract final class AppColors {
         colors: [copperHi, copperMid],
       );
 
-  static const LinearGradient cardGradient = LinearGradient(
-    begin: Alignment.topCenter,
-    end: Alignment.bottomCenter,
-    colors: [cardTop, cardBottom],
-  );
+  // ── Shell chrome (nav rail + phone drawer) ─────────────────────────
+  // These used to be FROZEN hexes in home_shell.dart — copper composites
+  // sampled by hand from what the desktop rail paints over the backdrop. That
+  // is exactly why the phone sidebar ignored the accent setting: the drawer
+  // floats opaque above the page, so it cannot inherit the backdrop's glow the
+  // way the translucent rail does, and its sampled stand-ins stayed copper
+  // whatever ramp the device wore. Deriving the same composites from the LIVE
+  // glow tokens keeps the two form factors reading as one product for EVERY
+  // accent (and later scheme), not just the one that was sampled.
+  //
+  // The alphas re-create the shipped copper samples to within one display byte
+  // per channel (0.43 -> #3A170B vs #3A170C, etc.), so the default look is
+  // preserved; they are not new design decisions.
+  //
+  // drawerTop alone is clamped: it is the brightest chrome surface, and the
+  // greener glows (sage, teal) run brighter than copper's at the same alpha —
+  // measured 4.47–4.48:1 under secondary ink, a hair below the 4.5 floor the
+  // rest of the shell holds. The clamp trades a whisper of glow for the floor
+  // instead of trading readability for glow.
+  static Color get drawerTop => Color.alphaBlend(
+      glowDeep.withValues(
+          alpha: maxAlphaForContrast(
+              tint: glowDeep, ground: bgDeep, ink: textSecondary, max: 0.43)),
+      bgDeep);
+  static Color get drawerMid =>
+      Color.alphaBlend(glowDeep.withValues(alpha: 0.125), bg);
+  static Color get drawerBottom =>
+      Color.alphaBlend(glowDeep.withValues(alpha: 0.205), bg);
+
+  /// The rail's mid-height scrim: the warm near-black the desktop sidebar
+  /// passes through between the hero wash and the floor glow, at 58% so the
+  /// backdrop still reads through it. Previously the frozen #94140D0A.
+  static Color get railScrimMid => Color.alphaBlend(glowDeep.withValues(alpha: 0.075), bg)
+      .withValues(alpha: 0.58);
+
+  /// The rail's floor glow — glowDeep at 10%, previously the frozen #1A7C2D12.
+  static Color get railGlowFloor => glowDeep.withValues(alpha: 0.10);
+
+  static LinearGradient get cardGradient => LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [cardTop, cardBottom],
+      );
 
   // ── Status (always shipped with a text label, never color alone) ───
   static const Color success = Color(0xFF8FB27C);
