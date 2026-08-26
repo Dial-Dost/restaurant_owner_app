@@ -9,6 +9,8 @@ import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/theme/backdrop_style.dart';
+import 'package:restaurant_owner_app/ui/theme/contrast.dart';
 import 'package:restaurant_owner_app/ui/widgets/gradient_backdrop.dart';
 
 /// The owner's report: "changing the accent does not recolour the sidebar on my
@@ -148,6 +150,53 @@ void main() {
     await tester.pump();
     expect(ground(), AppSchemes.graphite.bg);
     expect(AppColors.textPrimary, AppSchemes.graphite.textPrimary);
+  });
+
+  testWidgets('backdrop knobs restyle the live shell; one tap returns to default', (tester) async {
+    final auth = await _signIn();
+    await tester.pumpWidget(_appRoot(() => HomeShell(auth: auth, startPrinterAgent: false)));
+    await tester.pump();
+    await tester.pump();
+
+    // The hero wash: the first band-shaped LinearGradient inside the backdrop
+    // whose top stop is NOT a translucent darkener (the darken pass has
+    // alpha < 1 on every stop; the wash's top stop is opaque).
+    LinearGradient wash() {
+      final boxes = tester.widgetList<DecoratedBox>(
+        find.descendant(of: find.byType(GradientBackdrop), matching: find.byType(DecoratedBox)),
+      );
+      for (final b in boxes) {
+        final deco = b.decoration;
+        if (deco is BoxDecoration && deco.gradient is LinearGradient) {
+          final g = deco.gradient! as LinearGradient;
+          if (g.colors.first.a == 1.0) return g;
+        }
+      }
+      fail('no hero wash gradient found');
+    }
+
+    // Shipped default: copper glowDeep fading into the guest-page neutral.
+    expect(wash().colors.first, AppAccents.copper.glowDeep);
+
+    // The owner pins a custom wash stop. The painted top stop is the GUARDED
+    // composite — never the raw hex (white raw would be unreadable).
+    const pinned = Color(0xFFFFFFFF);
+    await AppearanceController.instance
+        .setBackdrop(const BackdropStyle(wash: pinned, angleDeg: 90, intensity: 1.0));
+    await tester.pump();
+    final custom = wash();
+    expect(custom.colors.first, isNot(pinned));
+    expect(contrastRatio(AppColors.textPrimary, custom.colors.first),
+        greaterThanOrEqualTo(4.5));
+    // And the axis follows the angle: 90° runs left -> right.
+    expect((custom.begin as Alignment).x, closeTo(-1, 1e-9));
+    expect((custom.end as Alignment).x, closeTo(1, 1e-9));
+
+    // One tap back: the shipped layers, bit for bit.
+    await AppearanceController.instance.setBackdrop(const BackdropStyle());
+    await tester.pump();
+    expect(wash().colors.first, AppAccents.copper.glowDeep);
+    expect(wash().colors.last, const Color(0xFF0B0B0D));
   });
 
   testWidgets('an OPEN dialog recolours with the accent', (tester) async {

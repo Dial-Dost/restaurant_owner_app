@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_colors.dart';
+import 'backdrop_style.dart';
 
 /// The curated accent set. Every `hi`/`base` stop clears WCAG AA 4.5:1 against
 /// the near-black ground (bg #0C0A09) — measured, not hoped: hi ranges 8.4–13.2,
@@ -161,6 +162,10 @@ class AppearanceController extends ChangeNotifier {
 
   static const String _prefsKey = 'appearance.accent';
   static const String _schemePrefsKey = 'appearance.scheme';
+  static const String _washPrefsKey = 'appearance.backdrop.wash';
+  static const String _bloomPrefsKey = 'appearance.backdrop.bloom';
+  static const String _anglePrefsKey = 'appearance.backdrop.angle';
+  static const String _intensityPrefsKey = 'appearance.backdrop.intensity';
 
   String _accentId = AppAccents.defaultId;
   String get accentId => _accentId;
@@ -170,6 +175,20 @@ class AppearanceController extends ChangeNotifier {
   String get schemeId => _schemeId;
   AppShellScheme get scheme => AppSchemes.byId(_schemeId);
 
+  BackdropStyle _backdrop = const BackdropStyle();
+  BackdropStyle get backdrop => _backdrop;
+
+  // '#RRGGBB' <-> Color. Prefs-only: anything unparseable loads as null
+  // ("follow the accent"), never as a junk colour.
+  static String _hexOf(Color c) =>
+      '#${(c.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+  static Color? _colorOf(String? hex) {
+    if (hex == null) return null;
+    final m = RegExp(r'^#?([0-9a-fA-F]{6})$').firstMatch(hex.trim());
+    if (m == null) return null;
+    return Color(0xFF000000 | int.parse(m.group(1)!, radix: 16));
+  }
+
   /// Restore the device's appearance before the first frame (called from
   /// main()). Any failure (fresh install, corrupt prefs) lands on the shipped
   /// copper-on-rustic default.
@@ -178,9 +197,16 @@ class AppearanceController extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _accentId = AppAccents.byId(prefs.getString(_prefsKey)).id;
       _schemeId = AppSchemes.byId(prefs.getString(_schemePrefsKey)).id;
+      _backdrop = BackdropStyle(
+        wash: _colorOf(prefs.getString(_washPrefsKey)),
+        bloom: _colorOf(prefs.getString(_bloomPrefsKey)),
+        angleDeg: (prefs.getDouble(_anglePrefsKey) ?? BackdropStyle.defaultAngle) % 360,
+        intensity: (prefs.getDouble(_intensityPrefsKey) ?? 1.0).clamp(0.0, 1.0),
+      );
     } catch (_) {
       _accentId = AppAccents.defaultId;
       _schemeId = AppSchemes.defaultId;
+      _backdrop = const BackdropStyle();
     }
     AppColors.applyAccent(AppAccents.byId(_accentId));
     AppColors.applyShell(AppSchemes.byId(_schemeId));
@@ -207,6 +233,38 @@ class AppearanceController extends ChangeNotifier {
     await _persist(_schemePrefsKey, resolved.id);
   }
 
+  /// One entry point for every backdrop knob (stops, angle, intensity), so the
+  /// Appearance card's controls and the one-tap "back to scheme default"
+  /// (`setBackdrop(const BackdropStyle())`) walk the same path.
+  Future<void> setBackdrop(BackdropStyle style) async {
+    final normalized = BackdropStyle(
+      wash: style.wash,
+      bloom: style.bloom,
+      angleDeg: style.angleDeg % 360,
+      intensity: style.intensity.clamp(0.0, 1.0),
+    );
+    if (normalized == _backdrop) return;
+    _backdrop = normalized;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      // A null stop means "follow the accent" — persisted as ABSENCE so a
+      // future default change reaches devices that never pinned a colour.
+      if (normalized.wash == null) {
+        await prefs.remove(_washPrefsKey);
+      } else {
+        await prefs.setString(_washPrefsKey, _hexOf(normalized.wash!));
+      }
+      if (normalized.bloom == null) {
+        await prefs.remove(_bloomPrefsKey);
+      } else {
+        await prefs.setString(_bloomPrefsKey, _hexOf(normalized.bloom!));
+      }
+      await prefs.setDouble(_anglePrefsKey, normalized.angleDeg);
+      await prefs.setDouble(_intensityPrefsKey, normalized.intensity);
+    } catch (_) {/* keep the in-memory choice */}
+  }
+
   Future<void> _persist(String key, String value) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -219,6 +277,7 @@ class AppearanceController extends ChangeNotifier {
   void debugReset() {
     _accentId = AppAccents.defaultId;
     _schemeId = AppSchemes.defaultId;
+    _backdrop = const BackdropStyle();
     AppColors.applyAccent(AppAccents.copper);
     AppColors.applyShell(AppSchemes.rustic);
     notifyListeners();

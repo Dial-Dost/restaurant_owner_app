@@ -3,7 +3,9 @@ import 'package:flutter/material.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
 import '../ui/theme/appearance.dart';
+import '../ui/theme/backdrop_style.dart';
 import '../ui/widgets/fork_card.dart';
+import '../ui/widgets/gradient_backdrop.dart';
 
 /// "Appearance — this device": the owner-app shell scheme + accent picker.
 ///
@@ -54,10 +56,270 @@ class AppearanceCard extends StatelessWidget {
                   onTap: () => ctl.setAccent(a.id),
                 ),
             ]),
+            const SizedBox(height: AppSpacing.lg),
+            Text('BACKDROP', style: text.labelSmall),
+            const SizedBox(height: 8),
+            // The style is a FIELD, not read inside, so this subtree can never
+            // be `const` — an identical instance would short-circuit
+            // Element.updateChild and freeze the sliders/preview on their
+            // first-build values while the controller moves on.
+            _BackdropControls(style: ctl.backdrop),
           ]),
         );
       },
     );
+  }
+}
+
+/// The backdrop mixer: pick the wash and bloom stops (accent-derived tones or
+/// a custom hex), set the wash angle and the overall intensity — previewed
+/// live in a miniature of the real backdrop, because the real backdrop sits
+/// BEHIND the module being edited and the change there is easy to miss.
+///
+/// Every control writes straight through AppearanceController.setBackdrop, so
+/// the preview, the shell behind it, and persistence can never disagree. The
+/// wash/bloom extremes an owner can reach are AA-guarded in resolveBackdrop —
+/// picking white does not buy an unreadable header, it buys as much white as
+/// the ink can carry.
+class _BackdropControls extends StatelessWidget {
+  const _BackdropControls({required this.style});
+
+  final BackdropStyle style;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final ctl = AppearanceController.instance;
+    final accent = ctl.accent;
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // The miniature: the real GradientBackdrop (same widget, same resolver),
+      // with the two body inks sitting on its brightest region so the owner
+      // SEES the readability the guard is promising.
+      ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: SizedBox(
+          height: 116,
+          child: GradientBackdrop(
+            heroHeight: 116,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Rustic Fork', style: text.titleMedium),
+                const SizedBox(height: 2),
+                Text('Covers 42 · APC ₹512 · 6 open bills', style: text.bodySmall),
+                const Spacer(),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    gradient: AppColors.cardGradient,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: Text('Live preview — this is your backdrop',
+                      style: text.labelMedium),
+                ),
+              ]),
+            ),
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
+      _StopRow(
+        label: 'WASH',
+        current: style.wash,
+        // The wash wants DEPTH: the glow trio plus the ramp's two dark ends.
+        options: [accent.glowDeep, accent.glowMid, accent.glowBright, accent.shadow],
+        defaultTone: accent.glowDeep,
+        onPick: (c) => ctl.setBackdrop(style.copyWith(wash: c)),
+      ),
+      const SizedBox(height: 8),
+      _StopRow(
+        label: 'BLOOM',
+        current: style.bloom,
+        // The bloom wants LIGHT: the bright glows plus the ramp's readable top.
+        options: [accent.glowBright, accent.glowMid, accent.glowDeep, accent.hi],
+        defaultTone: accent.glowBright,
+        onPick: (c) => ctl.setBackdrop(style.copyWith(bloom: c)),
+      ),
+      const SizedBox(height: 10),
+      _SliderRow(
+        label: 'ANGLE',
+        value: style.angleDeg,
+        min: 0,
+        max: 360,
+        display: '${style.angleDeg.round()}°',
+        onChanged: (v) => ctl.setBackdrop(style.copyWith(angleDeg: v)),
+      ),
+      _SliderRow(
+        label: 'INTENSITY',
+        value: style.intensity,
+        min: 0,
+        max: 1,
+        display: '${(style.intensity * 100).round()}%',
+        onChanged: (v) => ctl.setBackdrop(style.copyWith(intensity: v)),
+      ),
+      Align(
+        alignment: Alignment.centerRight,
+        child: TextButton.icon(
+          onPressed: style.isDefault
+              ? null
+              : () => ctl.setBackdrop(const BackdropStyle()),
+          icon: const Icon(Icons.replay, size: 14),
+          label: const Text('Back to scheme default'),
+        ),
+      ),
+    ]);
+  }
+}
+
+/// One stop's choices: "follow the accent" first, the derived tones, then a
+/// hex field for anything else. Selection is by VALUE (a pinned tone equal to
+/// a derived one lights that swatch), and the default swatch is only "on"
+/// while the stop is genuinely null — following, not merely matching.
+class _StopRow extends StatelessWidget {
+  const _StopRow({
+    required this.label,
+    required this.current,
+    required this.options,
+    required this.defaultTone,
+    required this.onPick,
+  });
+
+  final String label;
+  final Color? current; // null = follow the accent
+  final List<Color> options;
+  final Color defaultTone;
+  final ValueChanged<Color?> onPick;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    Widget dot(Color c, {required bool selected, required VoidCallback onTap, String? tip}) {
+      final swatch = MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: onTap,
+          child: AnimatedContainer(
+            duration: AppDurations.fast,
+            width: 26,
+            height: 26,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: c,
+              border: Border.all(
+                color: selected ? AppColors.copperHi : AppColors.borderStrong,
+                width: selected ? 2 : 1,
+              ),
+            ),
+          ),
+        ),
+      );
+      return tip == null ? swatch : Tooltip(message: tip, child: swatch);
+    }
+
+    return Row(children: [
+      SizedBox(width: 64, child: Text(label, style: text.labelSmall)),
+      dot(defaultTone,
+          selected: current == null,
+          onTap: () => onPick(null),
+          tip: 'Follow the accent'),
+      const SizedBox(width: 6),
+      for (final c in options) ...[
+        dot(c, selected: current == c, onTap: () => onPick(c)),
+        const SizedBox(width: 6),
+      ],
+      const SizedBox(width: 4),
+      Expanded(child: _HexField(current: current, onSubmit: onPick)),
+    ]);
+  }
+}
+
+/// A six-digit hex entry for a custom stop. Applies on submit; junk is
+/// ignored rather than half-applied (the same posture the guest branding
+/// editor takes with its hex field).
+class _HexField extends StatefulWidget {
+  const _HexField({required this.current, required this.onSubmit});
+
+  final Color? current;
+  final ValueChanged<Color?> onSubmit;
+
+  @override
+  State<_HexField> createState() => _HexFieldState();
+}
+
+class _HexFieldState extends State<_HexField> {
+  final TextEditingController _text = TextEditingController();
+  static final RegExp _hexRe = RegExp(r'^#?([0-9a-fA-F]{6})$');
+
+  @override
+  void dispose() {
+    _text.dispose();
+    super.dispose();
+  }
+
+  void _apply(String raw) {
+    final m = _hexRe.firstMatch(raw.trim());
+    if (m == null) return;
+    widget.onSubmit(Color(0xFF000000 | int.parse(m.group(1)!, radix: 16)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cur = widget.current;
+    final hint = cur == null
+        ? '#custom'
+        : '#${(cur.toARGB32() & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+    return TextField(
+      controller: _text,
+      onSubmitted: _apply,
+      style: Theme.of(context).textTheme.bodySmall,
+      decoration: InputDecoration(
+        hintText: hint,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      ),
+    );
+  }
+}
+
+class _SliderRow extends StatelessWidget {
+  const _SliderRow({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.display,
+    required this.onChanged,
+  });
+
+  final String label;
+  final double value;
+  final double min;
+  final double max;
+  final String display;
+  final ValueChanged<double> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Row(children: [
+      SizedBox(width: 64, child: Text(label, style: text.labelSmall)),
+      Expanded(
+        child: Slider(
+          value: value.clamp(min, max),
+          min: min,
+          max: max,
+          activeColor: AppColors.copper,
+          inactiveColor: AppColors.inset,
+          onChanged: onChanged,
+        ),
+      ),
+      SizedBox(
+        width: 44,
+        child: Text(display, textAlign: TextAlign.right, style: text.bodySmall),
+      ),
+    ]);
   }
 }
 
