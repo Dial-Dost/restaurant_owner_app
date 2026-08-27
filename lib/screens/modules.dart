@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/profile.dart';
+import '../models/table_assignment.dart';
 import '../services/api_client.dart';
 import '../services/rest_client.dart';
 import '../services/printer_service.dart';
@@ -36,7 +37,9 @@ import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/stat_card.dart';
 import '../ui/widgets/status_chip.dart';
 import '../widgets/appearance_card.dart';
+import '../models/menu_badge.dart';
 import '../widgets/async_view.dart';
+import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
 import '../widgets/table_bill.dart';
 import 'order_entry.dart';
@@ -2699,12 +2702,40 @@ Widget menuModule(RestClient rest, Profile p) {
               .where((e) => e.isNotEmpty)
               .toList();
         } catch (_) {/* sections unavailable — items still render */}
-        return {'items': items, 'sections': sections};
+        // The tenant's badge catalogue + the starter set the server offers.
+        // Both empty for a restaurant that configured none, which is why the
+        // menu looks unchanged for every existing tenant.
+        List<MenuBadge> badges = const [];
+        List<MenuBadge> badgePresets = const [];
+        var badgeLabelMax = 24;
+        var badgePerItemMax = 8;
+        try {
+          final b = await rest.getMap('/menu/badges');
+          badges = parseMenuBadges(b['badges']);
+          badgePresets = parseMenuBadges(b['presets']);
+          badgeLabelMax = (b['label_max'] as num?)?.toInt() ?? 24;
+          badgePerItemMax = (b['per_item_max'] as num?)?.toInt() ?? 8;
+        } catch (_) {/* badges unavailable — the menu still renders without them */}
+        return {
+          'items': items,
+          'sections': sections,
+          'badges': badges,
+          'badge_presets': badgePresets,
+          'badge_label_max': badgeLabelMax,
+          'badge_per_item_max': badgePerItemMax,
+        };
       },
       builder: (context, data, reload) {
         final messenger = ScaffoldMessenger.of(context);
         final rows = (data['items'] as List?) ?? const [];
         final sections = List<String>.from(data['sections'] as List? ?? const []);
+        final badges = List<MenuBadge>.from(data['badges'] as List? ?? const []);
+        final badgePresets = List<MenuBadge>.from(data['badge_presets'] as List? ?? const []);
+        final badgeLabelMax = (data['badge_label_max'] as int?) ?? 24;
+        final badgePerItemMax = (data['badge_per_item_max'] as int?) ?? 8;
+        int badgeUsage(String id) => rows
+            .where((r) => (r as Map)['badges'] is List && ((r['badges'] as List).map((t) => '$t')).contains(id))
+            .length;
         final byCat = <String, List<Map>>{};
         for (final r in rows) {
           final m = r as Map;
@@ -2724,6 +2755,17 @@ Widget menuModule(RestClient rest, Profile p) {
           } catch (e) {
             messenger.showSnackBar(SnackBar(content: Text('$e')));
           }
+        }
+
+        // What a walk-in still WAITING in the queue may pre-order. A second,
+        // narrower view of this same menu — narrowing it never touches the
+        // dine-in menu, which is the whole point (see _QueueMenuDialog).
+        Future<void> queueMenu() async {
+          final changed = await showDialog<bool>(
+            context: context,
+            builder: (_) => _QueueMenuDialog(rest: rest),
+          );
+          if (changed == true) reload();
         }
 
         // Manage the tenant's kitchen sections (add/rename/delete). Rename cascades
@@ -2802,6 +2844,37 @@ Widget menuModule(RestClient rest, Profile p) {
           } catch (e) {
             messenger.showSnackBar(SnackBar(content: Text('$e')));
           }
+        }
+
+        // Manage the badge CATALOGUE. A save can release tagged dishes, so the
+        // module reloads whenever anything was written — the server, not this
+        // app, is the authority on which dishes still carry what.
+        Future<void> manageBadges() async {
+          final changed = await showDialog<bool>(
+            context: context,
+            builder: (_) => MenuBadgesDialog(
+              rest: rest,
+              initial: badges,
+              presets: badgePresets,
+              labelMax: badgeLabelMax,
+              usage: badgeUsage,
+            ),
+          );
+          if (changed == true) reload();
+        }
+
+        // Bulk-tag dishes. Ids and tags travel, never whole items.
+        Future<void> tagBadges() async {
+          final changed = await showDialog<bool>(
+            context: context,
+            builder: (_) => MenuBadgeTagDialog(
+              rest: rest,
+              items: [for (final r in rows) r as Map],
+              catalogue: badges,
+              perItemMax: badgePerItemMax,
+            ),
+          );
+          if (changed == true) reload();
         }
 
         Future<void> addCategory() async {
@@ -2920,6 +2993,12 @@ Widget menuModule(RestClient rest, Profile p) {
                   alignment: Alignment.centerLeft,
                   child: _sectionTag(station, managed: managed),
                 ),
+                // Exactly what a guest will see on this dish, in the guest's
+                // order — warnings, then dietary, then the owner's highlights.
+                if (badges.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  MenuBadgeChips(catalogue: badges, item: item),
+                ],
               ]);
               final availability = AnimatedSwitcher(
                 duration: AppDurations.base,
@@ -2945,6 +3024,13 @@ Widget menuModule(RestClient rest, Profile p) {
                     if (detail.isNotEmpty) _kv('Costing', detail),
                     _kv('Kitchen section', station.isEmpty ? '—' : station),
                     _kv('Availability', soldOut ? 'Sold out' : 'Available'),
+                    // The sheet has room, so nothing is trimmed here: the tile's
+                    // cap is a layout concession, never a decision about what a
+                    // guest is allowed to know.
+                    if (resolveMenuBadges(badges, item['badges'], item['allergens']).isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      MenuBadgeChips(catalogue: badges, item: item, promoLimit: 99),
+                    ],
                     if (blurb.isNotEmpty) ...[
                       const SizedBox(height: 10),
                       Text(blurb, style: text.bodySmall!.copyWith(color: AppColors.textTertiary)),
@@ -3036,6 +3122,10 @@ Widget menuModule(RestClient rest, Profile p) {
                 ForkButton.ghost(label: 'Add category', icon: Icons.create_new_folder_outlined, dense: true, onPressed: addCategory),
                 ForkButton.ghost(label: 'Import from Excel', icon: Icons.upload_file, dense: true, onPressed: importMenu),
                 ForkButton.ghost(label: 'Kitchen sections', icon: Icons.soup_kitchen_outlined, dense: true, onPressed: manageSections),
+                ForkButton.ghost(label: 'Menu badges', icon: Icons.sell_outlined, dense: true, onPressed: manageBadges),
+                if (badges.any((b) => b.enabled && !b.derived))
+                  ForkButton.ghost(label: 'Tag dishes', icon: Icons.label_outline, dense: true, onPressed: tagBadges),
+                ForkButton.ghost(label: 'Queue pre-order menu', icon: Icons.timer_outlined, dense: true, onPressed: queueMenu),
               ]),
               const SizedBox(height: AppSpacing.lg),
               _MenuSearchField(initial: query, onChanged: (v) => setTab(() => query = v)),
@@ -3162,6 +3252,546 @@ Widget _sectionTag(String station, {required bool managed}) {
     color: AppColors.warning,
     dense: true,
   );
+}
+
+// THE QUEUE PRE-ORDER MENU editor.
+//
+// A walk-in waiting in the queue can stage a pre-order before they sit down.
+// Until now that list was the WHOLE dine-in menu, which is wrong for a kitchen
+// that cannot start a 40-minute biryani for a party still at the door — and
+// "mark it sold out" is not the answer, because that takes it off the table
+// menu too. This is the second, narrower view of the same menu.
+//
+// The rule is enforced SERVER-SIDE: GET /qr/:slug/queue-menu serves only the
+// allowed dishes and the pre-order write refuses the rest. This dialog only says
+// what the rule is. Each row's `queue_included` comes from the same server
+// function the guest endpoint uses, so the preview cannot drift from reality.
+//
+// Pops `true` when anything was saved, so the menu module reloads.
+class _QueueMenuDialog extends StatefulWidget {
+  final RestClient rest;
+  const _QueueMenuDialog({required this.rest});
+
+  @override
+  State<_QueueMenuDialog> createState() => _QueueMenuDialogState();
+}
+
+// Mirrors the server-side caps (queue_menu.ts) so a field stops where the
+// sanitizer would otherwise silently trim it.
+const int _queueHeadlineMax = 80;
+const int _queueIntroMax = 240;
+
+const List<(String, String, String)> _queueModes = [
+  ('all', 'Everything', 'The whole menu, exactly as it is today.'),
+  ('include', 'Only what I pick', 'Nothing is pre-orderable unless you tick it.'),
+  ('exclude', 'Everything except', 'Keep the slow dishes off the queue list.'),
+];
+
+String _qKey(String v) => v.trim().toLowerCase();
+
+/// The order the queue page will render its tabs in: the categories the owner
+/// arranged lead, the rest stay alphabetical. Mirrors the server's
+/// orderQueueMenuCategories, so this preview matches what a guest gets.
+List<String> _orderQueueCategories(List<String> order, List<String> categories) {
+  final rest = [...categories]..sort();
+  if (order.isEmpty) return rest;
+  final rank = <String, int>{};
+  for (var i = 0; i < order.length; i++) {
+    rank.putIfAbsent(_qKey(order[i]), () => i);
+  }
+  final pinned = <String>[];
+  final tail = <String>[];
+  for (final c in rest) {
+    if (rank.containsKey(_qKey(c))) {
+      pinned.add(c);
+    } else {
+      tail.add(c);
+    }
+  }
+  pinned.sort((a, b) => (rank[_qKey(a)] ?? 0).compareTo(rank[_qKey(b)] ?? 0));
+  return [...pinned, ...tail];
+}
+
+class _QueueMenuDialogState extends State<_QueueMenuDialog> {
+  final _headline = TextEditingController();
+  final _intro = TextEditingController();
+
+  bool _loading = true;
+  bool _busy = false;
+  bool _saved = false;
+  String? _error;
+
+  // Loaded state.
+  List<Map> _items = const [];
+  bool _configured = false;
+  bool _queueShowMenu = true;
+
+  // The draft the owner is editing.
+  String _mode = 'all';
+  final List<String> _pickedItems = [];
+  final List<String> _pickedCategories = [];
+  List<String> _categoryOrder = [];
+  bool _showPrices = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _headline.dispose();
+    _intro.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final d = await widget.rest.getMap('/queue-menu-config');
+      final cfg = (d['config'] as Map?) ?? const {};
+      if (!mounted) return;
+      setState(() {
+        _items = ((d['items'] as List?) ?? const []).whereType<Map>().toList();
+        _configured = d['configured'] == true;
+        _queueShowMenu = d['queue_show_menu'] != false;
+        _mode = _queueModes.any((m) => m.$1 == '${cfg['mode']}') ? '${cfg['mode']}' : 'all';
+        _pickedItems
+          ..clear()
+          ..addAll(((cfg['items'] as List?) ?? const []).map((e) => '$e'));
+        _pickedCategories
+          ..clear()
+          ..addAll(((cfg['categories'] as List?) ?? const []).map((e) => '$e'));
+        _categoryOrder = ((cfg['category_order'] as List?) ?? const []).map((e) => '$e').toList();
+        _showPrices = cfg['show_prices'] != false;
+        _headline.text = '${cfg['headline'] ?? ''}';
+        _intro.text = '${cfg['intro'] ?? ''}';
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  List<String> get _allCategories {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final it in _items) {
+      final c = _s(it, 'category', '').trim();
+      if (c.isEmpty || !seen.add(_qKey(c))) continue;
+      out.add(c);
+    }
+    out.sort();
+    return out;
+  }
+
+  /// Does this dish reach a queuing guest under the CURRENT draft? The same
+  /// union rule the server applies — an item is listed by id OR by category.
+  bool _allowed(Map it) {
+    if (it['available'] == false) return false;
+    if (_mode == 'all') return true;
+    final listed = _pickedItems.any((id) => _qKey(id) == _qKey(_s(it, 'id'))) ||
+        _pickedCategories.any((c) => _qKey(c) == _qKey(_s(it, 'category', '')));
+    return _mode == 'include' ? listed : !listed;
+  }
+
+  void _toggle(List<String> list, String value) {
+    setState(() {
+      final i = list.indexWhere((v) => _qKey(v) == _qKey(value));
+      if (i >= 0) {
+        list.removeAt(i);
+      } else {
+        list.add(value);
+      }
+    });
+  }
+
+  void _move(String category, int delta) {
+    final base = _categoryOrder.isEmpty ? [..._allCategories] : _orderQueueCategories(_categoryOrder, _allCategories);
+    final from = base.indexWhere((c) => _qKey(c) == _qKey(category));
+    final to = from + delta;
+    if (from < 0 || to < 0 || to >= base.length) return;
+    final next = [...base];
+    final moved = next.removeAt(from);
+    next.insert(to, moved);
+    setState(() => _categoryOrder = next);
+  }
+
+  Future<void> _save() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      // Blank copy travels as '' on purpose: the server reads that as a CLEAR,
+      // which is the only way to remove custom wording once it has been set.
+      await widget.rest.post('/queue-menu-config', {
+        'mode': _mode,
+        'items': _pickedItems,
+        'categories': _pickedCategories,
+        'category_order': _categoryOrder,
+        'headline': _headline.text,
+        'intro': _intro.text,
+        'show_prices': _showPrices,
+      });
+      _saved = true;
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _reset() async {
+    final ok = await _confirm(context, 'Show the whole menu again',
+        'Queuing guests will be able to pre-order anything on the menu, and your custom wording is removed.');
+    if (!ok) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.rest.post('/queue-menu-config', {'reset': true});
+      _saved = true;
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _busy = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final narrow = MediaQuery.sizeOf(context).width < 900;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: narrow ? 460 : 840,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: AppColors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 620),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('WALK-IN QUEUE', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('Queue pre-order menu', style: text.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'What a guest waiting in the queue can order before they sit down. '
+              'Leaving a dish off here does NOT take it off the dine-in menu.',
+              style: text.bodySmall,
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 40),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else
+              Flexible(
+                child: narrow
+                    ? SingleChildScrollView(
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          ..._editor(text),
+                          const SizedBox(height: AppSpacing.xl),
+                          _preview(text),
+                        ]),
+                      )
+                    : Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Expanded(
+                          flex: 3,
+                          child: SingleChildScrollView(
+                            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: _editor(text)),
+                          ),
+                        ),
+                        const SizedBox(width: AppSpacing.xl),
+                        Expanded(flex: 2, child: SingleChildScrollView(child: _preview(text))),
+                      ]),
+              ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            const SizedBox(height: AppSpacing.lg),
+            Row(children: [
+              ForkButton.subtle(
+                label: 'Back to the whole menu',
+                icon: Icons.restart_alt,
+                onPressed: (_busy || !_configured) ? null : _reset,
+              ),
+              const Spacer(),
+              ForkButton.ghost(
+                label: 'Cancel',
+                dense: true,
+                onPressed: _busy ? null : () => Navigator.pop(context, _saved),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton(
+                label: _busy ? 'Saving…' : 'Save',
+                icon: Icons.check,
+                dense: true,
+                onPressed: (_busy || _loading) ? null : _save,
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _editor(TextTheme text) {
+    final cats = _allCategories;
+    final ordered = _orderQueueCategories(_categoryOrder, cats);
+    return [
+      Text('WHICH DISHES', style: text.labelSmall),
+      const SizedBox(height: AppSpacing.sm),
+      for (final m in _queueModes)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: ForkCard(
+            inset: true,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            onTap: () => setState(() => _mode = m.$1),
+            child: Row(children: [
+              Icon(
+                _mode == m.$1 ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                size: 16,
+                color: _mode == m.$1 ? AppColors.copperHi : AppColors.textTertiary,
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                  Text(m.$2, style: text.titleSmall),
+                  Text(m.$3, style: text.bodySmall),
+                ]),
+              ),
+            ]),
+          ),
+        ),
+      if (_mode != 'all') ...[
+        const SizedBox(height: AppSpacing.md),
+        Text(_mode == 'include' ? 'OFFER THESE' : 'KEEP THESE OFF', style: text.labelSmall),
+        const SizedBox(height: 4),
+        Text('Tick a whole category, or individual dishes. Both lists apply together.', style: text.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final c in cats)
+            _QueueChoiceChip(
+              key: Key('queue_cat_$c'),
+              label: c,
+              selected: _pickedCategories.any((v) => _qKey(v) == _qKey(c)),
+              onTap: () => _toggle(_pickedCategories, c),
+            ),
+        ]),
+        const SizedBox(height: AppSpacing.sm),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 240),
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: _items.length,
+            itemBuilder: (_, i) {
+              final it = _items[i];
+              final byCategory = _pickedCategories.any((c) => _qKey(c) == _qKey(_s(it, 'category', '')));
+              final ticked = byCategory || _pickedItems.any((v) => _qKey(v) == _qKey(_s(it, 'id')));
+              return CheckboxListTile(
+                dense: true,
+                value: ticked,
+                // A dish already covered by its whole category is decided;
+                // letting the row toggle would look like it worked and change
+                // nothing.
+                onChanged: byCategory ? null : (_) => _toggle(_pickedItems, _s(it, 'id')),
+                controlAffinity: ListTileControlAffinity.leading,
+                title: Text(_s(it, 'name'), style: text.bodyMedium, overflow: TextOverflow.ellipsis),
+                subtitle: Text(
+                  it['available'] == false ? '${_s(it, 'category', '—')} · sold out' : _s(it, 'category', '—'),
+                  style: text.bodySmall,
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+      const SizedBox(height: AppSpacing.lg),
+      Text('HOW IT READS', style: text.labelSmall),
+      const SizedBox(height: AppSpacing.sm),
+      TextField(
+        controller: _headline,
+        maxLength: _queueHeadlineMax,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(labelText: 'Heading', hintText: 'Get a head start', isDense: true),
+      ),
+      TextField(
+        controller: _intro,
+        maxLength: _queueIntroMax,
+        maxLines: 2,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Line underneath',
+          hintText: "Pick what you'd like — we'll confirm once you're seated.",
+          isDense: true,
+        ),
+      ),
+      const SizedBox(height: 4),
+      Text(
+        'Leave both blank to keep the built-in wording, which is translated for Hindi guests. '
+        'Your own words are shown exactly as typed.',
+        style: text.bodySmall,
+      ),
+      const SizedBox(height: AppSpacing.md),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        value: _showPrices,
+        onChanged: (v) => setState(() => _showPrices = v),
+        title: Text('Show prices', style: text.titleSmall),
+        subtitle: Text('Nothing is charged while they wait either way.', style: text.bodySmall),
+      ),
+      if (cats.length > 1) ...[
+        const SizedBox(height: AppSpacing.md),
+        Text('CATEGORY ORDER', style: text.labelSmall),
+        const SizedBox(height: 4),
+        Text('The order the tabs appear in on the queue page.', style: text.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        for (var i = 0; i < ordered.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: ForkCard(
+              inset: true,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(children: [
+                Expanded(child: Text(ordered[i], style: text.titleSmall, overflow: TextOverflow.ellipsis)),
+                ForkIconButton(
+                  icon: Icons.arrow_upward,
+                  tooltip: 'Move ${ordered[i]} up',
+                  onPressed: i == 0 ? null : () => _move(ordered[i], -1),
+                ),
+                const SizedBox(width: 4),
+                ForkIconButton(
+                  icon: Icons.arrow_downward,
+                  tooltip: 'Move ${ordered[i]} down',
+                  onPressed: i == ordered.length - 1 ? null : () => _move(ordered[i], 1),
+                ),
+              ]),
+            ),
+          ),
+      ],
+    ];
+  }
+
+  Widget _preview(TextTheme text) {
+    final kept = _items.where(_allowed).toList();
+    final groups = <String, List<Map>>{};
+    for (final it in kept) {
+      (groups[_s(it, 'category', 'Menu').trim()] ??= []).add(it);
+    }
+    final order = _orderQueueCategories(_categoryOrder, groups.keys.toList());
+    final first = order.isEmpty ? const <Map>[] : (groups[order.first] ?? const <Map>[]);
+    return ForkCard(
+      key: const Key('queue_preview'),
+      inset: true,
+      padding: const EdgeInsets.all(14),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        Text('WHAT A QUEUING GUEST SEES', style: text.labelSmall),
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          key: const Key('queue_preview_headline'),
+          _headline.text.trim().isEmpty ? 'Get a head start' : _headline.text.trim(),
+          style: text.titleSmall,
+        ),
+        const SizedBox(height: 2),
+        Text(
+          key: const Key('queue_preview_intro'),
+          _intro.text.trim().isEmpty
+              ? "Pick what you'd like — we'll confirm with you once you're seated, then it goes to the kitchen."
+              : _intro.text.trim(),
+          style: text.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.md),
+        if (kept.isEmpty)
+          Text(
+            'Nothing is offered — guests will see their place in the queue and no menu.',
+            style: text.bodySmall!.copyWith(color: AppColors.warning),
+          )
+        else ...[
+          Wrap(key: const Key('queue_preview_tabs'), spacing: 6, runSpacing: 6, children: [
+            for (var i = 0; i < order.length; i++)
+              StatusChip(
+                label: order[i],
+                color: i == 0 ? AppColors.copperHi : AppColors.textTertiary,
+                dense: true,
+              ),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
+          for (final it in first)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Row(children: [
+                Expanded(child: Text(_s(it, 'name'), style: text.bodyMedium, overflow: TextOverflow.ellipsis)),
+                if (_showPrices) Text(_money(it['price']), style: text.bodySmall),
+              ]),
+            ),
+          const SizedBox(height: 6),
+          Text('Showing the first tab · ${kept.length} of ${_items.length} dishes offered', style: text.bodySmall),
+        ],
+        if (!_queueShowMenu) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            'The queue page is currently set to show no menu at all. Turn that back on in Settings for any of this to appear.',
+            style: text.bodySmall!.copyWith(color: AppColors.warning),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
+// A tappable category chip for the include/exclude lists. Selection is carried
+// by the border and a tick, never by colour alone.
+class _QueueChoiceChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _QueueChoiceChip({super.key, required this.label, required this.selected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(999),
+          color: selected ? AppColors.copperHi.withValues(alpha: 0.16) : Colors.transparent,
+          border: Border.all(color: selected ? AppColors.copperHi : AppColors.borderStrong),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          if (selected) ...[
+            Icon(Icons.check, size: 13, color: AppColors.copperHi),
+            const SizedBox(width: 4),
+          ],
+          Text(label, style: text.bodySmall),
+        ]),
+      ),
+    );
+  }
 }
 
 // Manage the tenant's kitchen sections (KOT routing): list, add, rename (cascades
@@ -6941,10 +7571,26 @@ class _TableSheetState extends State<_TableSheet> {
   }
 
   Future<void> _seat(ScaffoldMessengerState messenger) async {
+    // Read off the theme BEFORE any await - the outcome snackbar below is shown
+    // after the occupy round-trip, and BuildContext must not cross that gap.
+    final unattendedColour = Theme.of(context).colorScheme.error;
     final covers = await _askCovers(context);
     if (covers == null) return;
     try {
-      await widget.rest.post('/occupy-table', {'table_name': _name, 'num_covers': covers});
+      final res = await widget.rest.post('/occupy-table', {'table_name': _name, 'num_covers': covers});
+      // Seating is what makes the seater this table's waiter. Say whether it
+      // actually happened: the reported failure was silent on BOTH ends — the
+      // server skipped the assignment without logging and this screen never
+      // asked — so a floor with no waiter on any table looked normal for weeks.
+      final assignment = TableAssignmentOutcome.parse(res is Map ? res['assignment'] : null);
+      if (assignment != null) {
+        messenger.showSnackBar(SnackBar(
+          content: Text('Seated $_name · ${assignment.message}'),
+          backgroundColor: assignment.leftTableUnattended
+              ? unattendedColour
+              : null,
+        ));
+      }
       if (!mounted) return;
       Navigator.of(context).pop();
       await Navigator.of(context).push(
@@ -17583,6 +18229,9 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
 
   Future<void> _seat(Map e) async {
     final messenger = ScaffoldMessenger.of(context);
+    // Captured before the table-picker dialog and the seat round-trip, for the
+    // same reason as the tables sheet: no BuildContext across an async gap.
+    final unattendedColour = Theme.of(context).colorScheme.error;
     if (_freeTables.isEmpty) {
       messenger.showSnackBar(const SnackBar(content: Text('No free tables — free one first.')));
       return;
@@ -17613,8 +18262,18 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
     await _act('${e['id']}', () async {
       final r = await widget.rest.post('/waitlist/${e['id']}/seat', {'table_name': chosen});
       held = r is Map ? r['pending_preorder'] as Map? : null;
+      // WHO is serving this table, said in the same breath as "seated". The host
+      // is standing with the party right now, which is the cheapest moment there
+      // will ever be to fix a table that came out of seating with no waiter.
+      final assignment = TableAssignmentOutcome.parse(r is Map ? r['assignment'] : null);
       messenger.showSnackBar(SnackBar(
-          content: Text('Seated at $chosen${held == null ? '' : ' · confirm their pre-order'}')));
+        content: Text('Seated at $chosen'
+            '${held == null ? '' : ' · confirm their pre-order'}'
+            '${assignment == null ? '' : ' · ${assignment.message}'}'),
+        backgroundColor: assignment != null && assignment.leftTableUnattended
+            ? unattendedColour
+            : null,
+      ));
     });
     final pre = held;
     if (pre == null || !mounted) return;
@@ -24478,6 +25137,11 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
               reload: reload,
             ),
             const SizedBox(height: 14),
+            // Sits with the branding cards because it is the same job — what the
+            // guest pages look like — and is gated the same way (the backend
+            // poster routes require Manage Branding).
+            _PostersCard(rest: rest, isAdmin: p.isAdmin),
+            const SizedBox(height: 14),
             _FeedbackSettingsCard(
               rest: rest,
               initial: (m['feedback_config'] as Map?) ?? const {},
@@ -26508,6 +27172,391 @@ double _brandCtrlRadius(String shape) => switch (shape) {
       'square' => 4,
       _ => 13,
     };
+
+// Guest-menu POSTERS: the owner's library of promotional images shown with the
+// menu on the QR ordering page and the walk-in queue page.
+//
+// Fetches its own data (GET /posters) rather than reading the settings map,
+// because posters are ROWS with their own lifecycle, not a settings key — the
+// same reason the backend gave them a table instead of a brand_config blob.
+//
+// "SHOWING NOW" IS THE RESTAURANT'S DAY, NOT THIS LAPTOP'S. The server sends
+// `today` as a YYYY-MM-DD key in the tenant's timezone and the badge is computed
+// against that. An owner working from a different country — or simply a laptop
+// whose clock has drifted — would otherwise be told a poster is live when their
+// diners cannot see it, which is the one thing this badge exists to say.
+//
+// Gated on isAdmin to match the backend, which requires Manage Branding.
+class _PostersCard extends StatefulWidget {
+  final RestClient rest;
+  final bool isAdmin;
+  const _PostersCard({required this.rest, required this.isAdmin});
+
+  @override
+  State<_PostersCard> createState() => _PostersCardState();
+}
+
+class _PostersCardState extends State<_PostersCard> {
+  static final RegExp _dateKey = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+
+  List<Map<String, dynamic>> _posters = const [];
+  List<Map<String, dynamic>> _placements = const [];
+  String _today = '';
+  String _zone = '';
+  int _maxPosters = 24;
+  int _maxBytes = 3 * 1024 * 1024;
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    try {
+      final res = await widget.rest.get('/posters');
+      if (!mounted) return;
+      final m = (res is Map) ? res : const {};
+      setState(() {
+        _posters = [
+          for (final p in (m['posters'] as List?) ?? const [])
+            if (p is Map) Map<String, dynamic>.from(p),
+        ];
+        _placements = [
+          for (final p in (m['placements'] as List?) ?? const [])
+            if (p is Map) Map<String, dynamic>.from(p),
+        ];
+        _today = '${m['today'] ?? ''}';
+        _zone = '${m['timezone'] ?? ''}';
+        _maxPosters = (m['max_posters'] is num) ? (m['max_posters'] as num).toInt() : _maxPosters;
+        _maxBytes = (m['max_upload_bytes'] is num) ? (m['max_upload_bytes'] as num).toInt() : _maxBytes;
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = '$e'; });
+    }
+  }
+
+  /// The server's predicate, restated for the badge. Both bounds INCLUSIVE and a
+  /// plain string compare — ISO day keys sort chronologically, so there is no
+  /// date arithmetic here to get wrong.
+  bool _isShowing(Map<String, dynamic> p) {
+    if (p['active'] == false) return false;
+    final start = p['start_on'] is String ? p['start_on'] as String : null;
+    final end = p['end_on'] is String ? p['end_on'] as String : null;
+    if (start == null && end == null) return true;
+    if (!_dateKey.hasMatch(_today)) return false;
+    if (start != null && start.compareTo(_today) > 0) return false;
+    if (end != null && end.compareTo(_today) < 0) return false;
+    return true;
+  }
+
+  String _scheduleLabel(Map<String, dynamic> p) {
+    if (p['active'] == false) return 'Paused';
+    final start = p['start_on'] is String ? p['start_on'] as String : null;
+    final end = p['end_on'] is String ? p['end_on'] as String : null;
+    if (start == null && end == null) return 'Always on';
+    if (start != null && end != null) {
+      return start == end ? 'On ${RestaurantTime.day(start)}' : '${RestaurantTime.day(start)} → ${RestaurantTime.day(end)}';
+    }
+    if (start != null) return 'From ${RestaurantTime.day(start)}';
+    return 'Until ${RestaurantTime.day(end!)}';
+  }
+
+  void _say(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _add() async {
+    final picked = await FilePicker.pickFiles(type: FileType.image, withData: true);
+    final file = picked?.files.single;
+    final bytes = file?.bytes;
+    if (bytes == null) return;
+    // The SIZE pre-check runs on this machine so a 12 MB camera export never
+    // leaves it. The TYPE is left to the server, which validates the BYTES and
+    // not the file name — a .png that is really a zip is caught there.
+    if (bytes.length > _maxBytes) {
+      final mb = (bytes.length / (1024 * 1024)).toStringAsFixed(1);
+      final cap = (_maxBytes / (1024 * 1024)).toStringAsFixed(0);
+      _say('That image is $mb MB. Posters must be under $cap MB — try exporting it smaller.');
+      return;
+    }
+    final ext = (file!.extension ?? 'png').toLowerCase();
+    final contentType = switch (ext) {
+      'png' => 'image/png',
+      'webp' => 'image/webp',
+      _ => 'image/jpeg',
+    };
+    setState(() => _busy = true);
+    try {
+      await widget.rest.post('/posters', {
+        'image_base64': base64Encode(bytes),
+        'content_type': contentType,
+        // A new poster starts LIVE, unscheduled, in the menu slot: the owner just
+        // picked a promo they want up, so the zero-click outcome is the one they
+        // meant. Everything below is editable on the tile.
+        'placement': 'menu',
+        'sort_order': _posters.length,
+        'active': true,
+      });
+      await _load();
+      _say('Poster added — it is live on your guest menu now.');
+    } catch (e) {
+      _say('$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _patch(String id, Map<String, dynamic> body) async {
+    setState(() => _busy = true);
+    try {
+      await widget.rest.patch('/posters/$id', body);
+      await _load();
+    } catch (e) {
+      // Reload on failure too: the tile is showing a control the owner just
+      // moved, and leaving it there would tell them a lie about what their
+      // guests see.
+      await _load();
+      _say('$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _delete(Map<String, dynamic> p) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete poster?'),
+        content: const Text('It will stop showing on your guest menu immediately.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _busy = true);
+    try {
+      await widget.rest.delete('/posters/${p['id']}');
+      await _load();
+      _say('Poster deleted.');
+    } catch (e) {
+      _say('$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// Pick a bound, or clear it. The picker opens on the RESTAURANT's today (not
+  /// this device's) so the default landing month is the one the owner's diners
+  /// are living in.
+  Future<void> _pickDate(Map<String, dynamic> p, String key) async {
+    final current = p[key] is String ? DateTime.tryParse(p[key] as String) : null;
+    final anchor = RestaurantTime.nowIn(_zone.isEmpty ? RestaurantTime.zone : _zone) ?? DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: current ?? anchor,
+      firstDate: DateTime(anchor.year - 1),
+      lastDate: DateTime(anchor.year + 3),
+    );
+    if (picked == null) return;
+    final key0 = '${picked.year.toString().padLeft(4, '0')}-'
+        '${picked.month.toString().padLeft(2, '0')}-'
+        '${picked.day.toString().padLeft(2, '0')}';
+    await _patch('${p['id']}', {key: key0});
+  }
+
+  Widget _dateField(Map<String, dynamic> p, String key, String label) {
+    final value = p[key] is String ? p[key] as String : null;
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      ForkButton.ghost(
+        label: value == null ? label : RestaurantTime.day(value),
+        icon: Icons.event_outlined,
+        dense: true,
+        onPressed: _busy ? null : () => unawaited(_pickDate(p, key)),
+      ),
+      if (value != null)
+        ForkIconButton(
+          icon: Icons.backspace_outlined,
+          tooltip: 'Clear $label',
+          // null CLEARS the bound server-side. Without this an owner could set a
+          // date and never take it off again.
+          onPressed: _busy ? null : () => unawaited(_patch('${p['id']}', {key: null})),
+        ),
+    ]);
+  }
+
+  Widget _tile(Map<String, dynamic> p) {
+    final text = Theme.of(context).textTheme;
+    final showing = _isShowing(p);
+    final w = (p['width'] is num) ? (p['width'] as num).toDouble() : 0.0;
+    final h = (p['height'] is num) ? (p['height'] as num).toDouble() : 0.0;
+    // The poster's own ratio when the encoder reported one, so the list does not
+    // reflow as thumbnails load. 16:9 is the fallback, not a crop.
+    final ratio = (w > 0 && h > 0) ? w / h : 16 / 9;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: AppColors.inset,
+          borderRadius: AppRadius.tileAll,
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(
+            width: 160,
+            child: AspectRatio(
+              aspectRatio: ratio,
+              child: ClipRRect(
+                borderRadius: AppRadius.tileAll,
+                child: Opacity(
+                  opacity: showing ? 1 : 0.45,
+                  child: Image.network(
+                    '${p['image_url']}',
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => Container(
+                      color: AppColors.surface,
+                      child: Icon(Icons.broken_image_outlined, color: AppColors.textSecondary),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                StatusChip(
+                  label: showing ? 'Showing now' : 'Not showing',
+                  color: showing ? AppColors.success : AppColors.neutral,
+                  dense: true,
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                Flexible(child: Text(_scheduleLabel(p), style: text.bodySmall, overflow: TextOverflow.ellipsis)),
+              ]),
+              const SizedBox(height: AppSpacing.sm),
+              TextFormField(
+                initialValue: '${p['title'] ?? ''}',
+                maxLength: 80,
+                enabled: !_busy,
+                decoration: const InputDecoration(
+                  labelText: 'Caption (also the image description for screen readers)',
+                  hintText: 'Sunday brunch, 11–3',
+                  isDense: true,
+                  counterText: '',
+                ),
+                // Saved when the field loses focus, not per keystroke: one PATCH
+                // per edit rather than one per character.
+                onFieldSubmitted: (v) => unawaited(_patch('${p['id']}', {'title': v.trim()})),
+                onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              Wrap(spacing: 12, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                DropdownButton<String>(
+                  value: '${p['placement'] ?? 'menu'}',
+                  underline: const SizedBox.shrink(),
+                  items: [
+                    for (final pl in _placements)
+                      DropdownMenuItem(value: '${pl['value']}', child: Text('${pl['label']}')),
+                  ],
+                  onChanged: _busy ? null : (v) { if (v != null) unawaited(_patch('${p['id']}', {'placement': v})); },
+                ),
+                _dateField(p, 'start_on', 'Starts'),
+                _dateField(p, 'end_on', 'Ends'),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text('Live', style: text.bodySmall),
+                  const SizedBox(width: 6),
+                  SizedBox(
+                    height: 24,
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: Switch(
+                        value: p['active'] != false,
+                        onChanged: _busy ? null : (v) => unawaited(_patch('${p['id']}', {'active': v})),
+                      ),
+                    ),
+                  ),
+                ]),
+                ForkIconButton(
+                  icon: Icons.delete_outline,
+                  tooltip: 'Delete poster',
+                  onPressed: _busy ? null : () => unawaited(_delete(p)),
+                ),
+              ]),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.isAdmin) return const SizedBox.shrink();
+    final text = Theme.of(context).textTheme;
+    final showingCount = _posters.where(_isShowing).length;
+    final full = _posters.length >= _maxPosters;
+
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Guest menu posters', style: text.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Promotional images shown with your menu on the QR ordering page and the walk-in queue page.'
+          '${_zone.isEmpty ? '' : " Dates follow your restaurant's clock ($_zone)."}',
+          style: text.bodySmall,
+        ),
+        const SizedBox(height: AppSpacing.lg),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.md),
+            child: Text(_error!, style: text.bodySmall?.copyWith(color: AppColors.danger)),
+          ),
+        Row(children: [
+          ForkButton(
+            label: _busy ? 'Working…' : 'Add poster',
+            icon: Icons.add_photo_alternate_outlined,
+            dense: true,
+            onPressed: (_busy || _loading || full) ? null : () => unawaited(_add()),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Text(
+              _loading
+                  ? 'Loading…'
+                  : full
+                      ? 'You have reached the limit of $_maxPosters posters. Delete one to add another.'
+                      : _posters.isEmpty
+                          ? 'No posters yet — your guest menu looks exactly as it does today.'
+                          : '$showingCount of ${_posters.length} showing right now.',
+              style: text.bodySmall,
+            ),
+          ),
+        ]),
+        if (_posters.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.lg),
+          for (final p in _posters) _tile(p),
+          for (final pl in _placements)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text('${pl['label']}: ${pl['hint']}', style: text.bodySmall),
+            ),
+        ],
+      ]),
+    );
+  }
+}
 
 // Guest page theme editor. The guest surfaces (ordering, feedback, valet) are one
 // committed dark design that themes itself from a single accent ramp, so this card
