@@ -21,11 +21,13 @@ import '../models/table_assignment.dart';
 import '../services/api_client.dart';
 import '../services/rest_client.dart';
 import '../services/printer_service.dart';
+import '../services/date_range.dart';
 import '../services/restaurant_time.dart';
 import '../services/tz_offsets.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
 import '../ui/widgets/charts.dart';
+import '../ui/widgets/date_range_picker.dart';
 import '../ui/widgets/empty_state.dart';
 import '../ui/widgets/food_tile.dart';
 import '../ui/widgets/fork_button.dart';
@@ -11576,10 +11578,65 @@ class _SegmentChip extends StatelessWidget {
 }
 
 // Month-by-month business summary, up to 3 years back.
-Widget historyModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
-      load: () => rest.getMap('/analytics/history?months=36'),
+Widget historyModule(RestClient rest, Profile p) => _HistoryModule(rest: rest);
+
+/// Holds History's reporting window. It opens WIDER than the 30-day default the
+/// other modules use — a month-by-month table cut to one month is a single row,
+/// which looks like a broken screen — but it is the same control, so a range
+/// picked here reads exactly like a range picked in Accounting.
+class _HistoryModule extends StatefulWidget {
+  const _HistoryModule({required this.rest});
+  final RestClient rest;
+  @override
+  State<_HistoryModule> createState() => _HistoryModuleState();
+}
+
+class _HistoryModuleState extends State<_HistoryModule> {
+  // A year back, unless this session already chose something here. `has` is
+  // what tells "nothing chosen" from "chose the 30-day default" — without it,
+  // an owner who deliberately narrowed History would be bounced back to a year.
+  DateRange _range = DateRangeMemory.of(
+    'history',
+    fallback: DateRange.normalized(addDaysToKey(todayKey(), -364), todayKey()),
+  );
+
+  void _setRange(DateRange next) {
+    setState(() => _range = next);
+    DateRangeMemory.remember('history', next);
+  }
+
+  @override
+  Widget build(BuildContext context) => _historyBody(
+        widget.rest,
+        _range,
+        _setRange,
+        key: ValueKey('history-${_range.from}-${_range.to}'),
+      );
+}
+
+Widget _historyBody(
+  RestClient rest,
+  DateRange range,
+  ValueChanged<DateRange> onRange, {
+  Key? key,
+}) => AsyncView<Map<String, dynamic>>(
+      key: key,
+      // The endpoint's series is "the last N months", so a range is served by
+      // asking for enough months to reach `from` and keeping the ones inside the
+      // window. 36 is the endpoint's own ceiling; a longer range simply shows
+      // what the server retains, which the chip states rather than hides.
+      load: () => rest.getMap('/analytics/history?months=${monthsSpanned(range, max: 36)}'),
       builder: (context, data, reload) {
-        final series = (data['series'] as List?) ?? [];
+        // Trim to the SELECTED window. A month is kept when it overlaps the range
+        // at all: an owner who picks 10 Aug - 20 Sep is asking about both months,
+        // and dropping a partly-covered one would silently subtract real trade
+        // from the totals below.
+        final fromMonth = range.from.substring(0, 7);
+        final toMonth = range.to.substring(0, 7);
+        final series = ((data['series'] as List?) ?? []).where((r) {
+          final m = '${(r as Map)['month'] ?? ''}';
+          return m.compareTo(fromMonth) >= 0 && m.compareTo(toMonth) <= 0;
+        }).toList();
         double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
         String money(double v) => '₹${v.toStringAsFixed(0)}';
         const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -11606,10 +11663,14 @@ Widget historyModule(RestClient rest, Profile p) => AsyncView<Map<String, dynami
         return RefreshIndicator(
           onRefresh: () async => reload(),
           child: ListView(padding: AppSpacing.pageNarrow, children: [
-            const SectionHeader(
+            SectionHeader(
               title: 'History',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: 'Last 3 years'),
+              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
             ),
+            const SizedBox(height: AppSpacing.sm),
+            // Every figure below is cut on this window, so it sits above them.
+            Row(children: [Expanded(child: DateRangeChip(value: range, onChanged: onRange))]),
+            const SizedBox(height: AppSpacing.md),
             // Every card on this screen opens the record behind it. The three
             // headline totals break down month by month; each month card opens
             // the settled bills that actually made it up.
@@ -14347,17 +14408,76 @@ Widget _dlButton(VoidCallback register) {
   return const SizedBox.shrink();
 }
 
-Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+Widget analyticsModule(RestClient rest, Profile p) => _AnalyticsModule(rest: rest, profile: p);
+
+/// Holds the module's reporting window so every card below is cut on the SAME
+/// days. Before this, each of the eight requests carried its own hardcoded span
+/// — 30 here, 90 there, 12 months in the trends card — and about a dozen
+/// captions said "last 30 days" regardless, so the screen showed three different
+/// periods at once and claimed all of them were the same one.
+class _AnalyticsModule extends StatefulWidget {
+  const _AnalyticsModule({required this.rest, required this.profile});
+  final RestClient rest;
+  final Profile profile;
+  @override
+  State<_AnalyticsModule> createState() => _AnalyticsModuleState();
+}
+
+class _AnalyticsModuleState extends State<_AnalyticsModule> {
+  DateRange _range = DateRangeMemory.of('analytics');
+
+  void _setRange(DateRange next) {
+    setState(() => _range = next);
+    DateRangeMemory.remember('analytics', next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rest = widget.rest;
+    final range = _range;
+    // AsyncView loads once and only reloads when asked, so a new window is a
+    // new view: keying it on the range remounts and refetches. Cheaper and far
+    // harder to get wrong than teaching AsyncView to diff its `load` closure.
+    return _analyticsBody(
+      rest,
+      widget.profile,
+      range,
+      _setRange,
+      key: ValueKey('analytics-${range.from}-${range.to}'),
+    );
+  }
+}
+
+// The module body. Named `_analyticsBody` and not `_analyticsView` because that
+// name is already taken by the top-level view-id string this screen persists.
+Widget _analyticsBody(
+  RestClient rest,
+  Profile p,
+  DateRange range,
+  ValueChanged<DateRange> onRange, {
+  Key? key,
+}) => AsyncView<Map<String, dynamic>>(
+      key: key,
       load: () async {
+        // Every window-aware read takes the SAME window. `from`/`to` AND `days`
+        // go on the wire together: /reports/* has always taken the dates, the
+        // /analytics/* routes were built around the rolling count, and sending
+        // both means a backend that understands the range uses it while one that
+        // does not still gets a window of the right LENGTH rather than silently
+        // answering for its own 30-day default.
+        final w = range.query;
         final r = await Future.wait([
           rest.getMap('/orders/apc'),
           rest.getMap('/feedback/summary'),
+          // Fixed at 14 points on purpose: this is the sparkline strip, not a
+          // report — it is a shape, and stretching it to a year of daily bars
+          // renders as a solid block.
           rest.getMap('/orders/daily-revenue?days=14'),
           rest.getMap('/orders/timing-stats'),
-          rest.getMap('/analytics/menu-insights?days=30').catchError((_) => <String, dynamic>{}),
-          rest.getMap('/orders/apc-trends?months=12').catchError((_) => <String, dynamic>{}),
-          rest.getMap('/analytics/advanced?days=90').catchError((_) => <String, dynamic>{}),
-          rest.getMap('/analytics/kitchen?days=30').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/analytics/menu-insights?$w').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/orders/apc-trends?months=${monthsSpanned(range)}').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/analytics/advanced?$w').catchError((_) => <String, dynamic>{}),
+          rest.getMap('/analytics/kitchen?$w').catchError((_) => <String, dynamic>{}),
           // Static "what is this number" copy for the stat tiles — no tenant
           // data, fetched once per load. Older backends omit the route and the
           // tiles simply render without an explainer.
@@ -14383,7 +14503,6 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         final suppressedCount = (suppressedMap['count'] as num?)?.toInt() ?? suppressedItems.length;
         final topWaiters = (menu['top_waiters'] as List?) ?? [];
         final slowMovers = (menu['slow_movers'] as List?) ?? [];
-        final menuDays = (menu['period_days'] as num?)?.toInt() ?? 30;
 
         double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
         String money(double v) => '₹${v.toStringAsFixed(0)}';
@@ -14685,6 +14804,12 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
         }).toList();
 
         return ListView(padding: AppSpacing.pageNarrow, children: [
+          // The window, first thing on the screen and above the view tabs: every
+          // figure below is cut on it, so it has to be the first thing read.
+          Row(children: [
+            Expanded(child: DateRangeChip(value: range, onChanged: onRange)),
+          ]),
+          const SizedBox(height: AppSpacing.sm),
           ForkTabs(
             tabs: [for (final v in _analyticsViews) v.$2],
             selected: _analyticsViews.indexWhere((v) => v.$1 == view) < 0
@@ -14717,7 +14842,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       [
                         'Avg prep',
                         _fmtDur(((timing['avg_prep_ms'] ?? 0) as num).toInt()),
-                        kOrdersTimed == 0 ? '' : '$kOrdersTimed tickets timed in the last $kitchenDays days',
+                        kOrdersTimed == 0 ? '' : '$kOrdersTimed tickets timed in ${range.label()}',
                       ],
                       ['Avg rating', '${fb['averageRating'] ?? 0}', '${fb['totalResponses'] ?? 0} responses'],
                     ])),
@@ -14753,7 +14878,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
               metricCard('Avg prep', _fmtDur(((timing['avg_prep_ms'] ?? 0) as num).toInt()), Icons.timer,
                   width: tile,
                   explainerKey: 'avg_prep_ms',
-                  note: kOrdersTimed == 0 ? null : '$kOrdersTimed tickets timed in the last $kitchenDays days',
+                  note: kOrdersTimed == 0 ? null : '$kOrdersTimed tickets timed in ${range.label()}',
                   series: kSectionAvg,
                   fmt: dur,
                   jumpTo: 'kitchen'),
@@ -15009,10 +15134,11 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       ['Slowest ticket', _fmtDur(num0(kSummary['max_prep_ms']).toInt())],
                       ['Avg bark → served', _fmtDur(num0(kSummary['avg_bark_to_served_ms']).toInt())],
                       ['Orders timed', kOrdersTimed],
+                      ['Period', '${range.from} to ${range.to}'],
                       ['Period (days)', kitchenDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $kitchenDays days'),
+                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
               ]),
             ),
             if (kOrdersTimed == 0 && kByDish.isEmpty && kBySection.isEmpty)
@@ -15441,7 +15567,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                         ],
                     ])),
                 const SizedBox(width: 8),
-                const InfoChip(icon: Icons.calendar_today_outlined, label: 'Last 12 months'),
+                InfoChip(icon: Icons.calendar_today_outlined, label: 'Last ${monthsSpanned(range)} months'),
               ]),
             ),
             _chartCard(context, 'Revenue by month', _barChart(context, revByMonth, money),
@@ -15523,10 +15649,11 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       ['Late shifts', attSummary['late_shifts'] ?? 0],
                       ['Absent days', attSummary['absent_days'] ?? 0],
                       ['Awaiting approval', attSummary['pending_shifts'] ?? 0],
+                      ['Window', '${range.from} to ${range.to}'],
                       ['Window (days)', attDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $attDays days'),
+                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
               ]),
             ),
             if (attendance.isEmpty)
@@ -15658,7 +15785,7 @@ Widget analyticsModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
             const SizedBox(height: AppSpacing.sm),
             SectionHeader(
               title: 'Actionable insights',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: 'Last $menuDays days'),
+              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
             ),
           ],
           if (vis('menu', onOverview: true) && topDishes.isNotEmpty) ...[
@@ -15919,7 +16046,14 @@ class _AccountingView extends StatefulWidget {
 }
 
 class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen {
-  int _days = 30;
+  // The shared reporting window (see services/date_range.dart). Replaces a
+  // private Day/Week/Month/Quarter/Half-year/Year tab row that could name six
+  // spans and no CALENDAR RANGE at all — "1-15 August", the thing an owner
+  // reconciling a fortnight actually asks for, was unaskable here.
+  //
+  // Restored from this session's memory so switching to Menu and back does not
+  // silently reset the period the owner was reasoning about.
+  DateRange _range = DateRangeMemory.of('accounting');
   bool _loading = true;
   bool _hasData = false;
   String? _error;
@@ -15961,21 +16095,17 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     super.dispose();
   }
 
-  // "Last N days" is counted on the RESTAURANT's calendar. Off the device clock
-  // a till in another zone would pull a window shifted by a day, which is
-  // exactly the kind of silent mismatch that breaks a tally.
-  ({String from, String to}) _range() {
-    final now = RestaurantTime.nowWall();
-    final to = DateTime.utc(now.year, now.month, now.day);
-    final from = to.subtract(Duration(days: _days - 1));
-    return (from: RestaurantTime.isoDate(from), to: RestaurantTime.isoDate(to));
+  // Adopt a window the owner picked, remember it for the session, refetch.
+  void _setRange(DateRange next) {
+    setState(() => _range = next);
+    DateRangeMemory.remember('accounting', next);
+    _load();
   }
 
   /// Side-effect-free GET composition over the CURRENT window/month — replayable
   /// against the persisted cache at boot and the network path of every [_load].
   Future<List<Map<String, dynamic>>> _fetch() {
-    final r = _range();
-    final q = 'from=${r.from}&to=${r.to}';
+    final q = _range.reportQuery;
     return Future.wait([
       widget.rest.getMap('/reports/sales?$q'),
       widget.rest.getMap('/reports/gst?$q'),
@@ -16185,7 +16315,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   Future<void> _exportPdf() async {
     ScaffoldMessenger.of(context)
         .showSnackBar(const SnackBar(content: Text('Preparing the PDF…')));
-    final r = _range();
+    // The SELECTED window, not a default: an export that quietly disagrees with
+    // the figures on screen is worse than no export — it is the copy that gets
+    // filed, and nothing on the page would say the two are different periods.
+    final r = _range;
     final doc = pw.Document();
     String money(dynamic v) {
       final n = v is num ? v : num.tryParse('${v ?? ''}');
@@ -16254,12 +16387,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
 
   String _billsWord(int n) => '$n bill${n == 1 ? '' : 's'}';
 
-  /// "Last 30 days · 01/07 to 30/07" — every sheet says which window it is
-  /// describing, because the tab above it can be changed behind a sheet.
-  String get _windowLabel {
-    final r = _range();
-    return '$_days-day window · ${_ddmm(r.from)} to ${_ddmm(r.to)}';
-  }
+  /// "1–15 Aug · 15 days" — every sheet says which window it is describing,
+  /// because the control above it can be changed while a sheet is open.
+  String get _windowLabel =>
+      '${_range.label()} · ${_range.days} day${_range.days == 1 ? '' : 's'}';
 
   Future<void> _netSalesSheet() {
     final gross = _n(_sales['total_sales']);
@@ -16533,9 +16664,9 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   // save it (parity with the web accounting page).
   Future<void> _exportTally() async {
     final messenger = ScaffoldMessenger.of(context);
-    final r = _range();
+    final r = _range;
     try {
-      final xml = await widget.rest.getText('/reports/tally.xml?from=${r.from}&to=${r.to}');
+      final xml = await widget.rest.getText('/reports/tally.xml?${r.reportQuery}');
       final path = await FilePicker.saveFile(
         dialogTitle: 'Save Tally XML',
         fileName: 'tally-${r.from}-to-${r.to}.xml',
@@ -16575,12 +16706,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     final width = MediaQuery.sizeOf(context).width;
     final narrow = width < 760;
     final cols = width >= 1100 ? 4 : (narrow ? 1 : 2);
-    // Reporting periods an owner actually files against: a single day for the
-    // shift just gone, then the windows a P&L or a tally is cut on. All six are
-    // plain day counts because /reports/* takes from/to dates -- the server
-    // applies no cap, so a full year is a legitimate range.
-    const dayOptions = [1, 7, 30, 90, 180, 365];
-    const dayLabels = ['Day', 'Week', 'Month', 'Quarter', 'Half year', 'Year'];
+    // The period is now the shared DateRangeChip: the same six one-tap presets
+    // an owner files against, PLUS a calendar, because /reports/* has always
+    // taken from/to dates and the six fixed spans were the only thing stopping
+    // this module from expressing "1-15 August".
 
     // Dense financial table row — label in the quiet voice, amount right.
     //
@@ -16644,25 +16773,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
       child: ListView(padding: AppSpacing.pageNarrow, children: [
-        // The two exports drop below the period tabs on a phone, and wrap again
-        // between themselves if they still do not fit. Side by side on one line
-        // with the tabs they wanted 410px of a 358px column at 1.3x, and
-        // ForkTabs — which scrolls, so it accepts any width it is handed — was
-        // the only child able to give, which it did all the way down to nothing
-        // while the buttons still overflowed by 52.
+        // The two exports drop below the period control on a phone, and wrap
+        // again between themselves if they still do not fit. Side by side on one
+        // line they wanted 410px of a 358px column at 1.3x.
         Builder(builder: (_) {
-          final tabs = ForkTabs(
-            tabs: dayLabels,
-            // Fall back to the Month tab by VALUE, not by a hardcoded index --
-            // an index literal silently points at a different period the next
-            // time this list changes.
-            selected: dayOptions.contains(_days)
-                ? dayOptions.indexOf(_days)
-                : dayOptions.indexOf(30),
-            onSelected: (i) {
-              setState(() => _days = dayOptions[i]);
-              _load();
-            },
+          final tabs = Align(
+            alignment: Alignment.centerLeft,
+            child: DateRangeChip(value: _range, onChanged: _setRange),
           );
           final exports = Wrap(
             alignment: WrapAlignment.end,
@@ -16813,7 +16930,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         const SizedBox(height: AppSpacing.sm),
         SectionHeader(
           title: 'Settled bills',
-          trailing: InfoChip(icon: Icons.event_outlined, label: 'Last $_days days'),
+          trailing: InfoChip(icon: Icons.event_outlined, label: _range.label()),
           padding: const EdgeInsets.only(bottom: 6),
         ),
         Text('Every bill closed in this period, newest first — tap one for its items, taxes, payment and who closed it.',
@@ -16875,7 +16992,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         ]),
         const SizedBox(height: AppSpacing.md),
         Builder(builder: (_) {
-          final r = _range();
+          final r = _range;
           return _ClosedBillsList(
             rest: widget.rest,
             filter: _ClosedBillFilter(
@@ -16885,8 +17002,8 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
               paymentMethod: _billMethod,
             ),
             emptyCaption: _billTerm.isEmpty && _billMethod == null
-                ? 'No bills were closed in the last $_days days.'
-                : 'No settled bill in the last $_days days matches that filter.',
+                ? 'No bills were closed in ${_range.label()}.'
+                : 'No settled bill in ${_range.label()} matches that filter.',
           );
         }),
         const SizedBox(height: AppSpacing.xxl),
@@ -20022,6 +20139,18 @@ class _CashView extends StatefulWidget {
 }
 
 class _CashViewState extends State<_CashView> with CachePrimedScreen {
+  // Z-report hunting is its own question, so this screen keeps its own window —
+  // the same control everywhere else uses, remembered separately. Before this
+  // the past-sessions list had NO date filter at all: it showed whatever the
+  // endpoint's default returned, with nothing on screen saying which days.
+  DateRange _range = DateRangeMemory.of('cash');
+
+  void _setRange(DateRange next) {
+    setState(() => _range = next);
+    DateRangeMemory.remember('cash', next);
+    _load();
+  }
+
   bool _loading = true;
   // First payload landed — _current may legitimately be null (no open session).
   bool _hasData = false;
@@ -20128,8 +20257,11 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
   /// Side-effect-free GET composition — replayable against the persisted cache
   /// at boot and the network path of every [_load].
   Future<({Map<String, dynamic>? current, List history})> _fetch() async {
+    // The OPEN drawer is "right now" and takes no window; the history does.
     final cur = await widget.rest.getMap('/cash/current');
-    final hist = await widget.rest.getMap('/cash/sessions').catchError((_) => <String, dynamic>{});
+    final hist = await widget.rest
+        .getMap('/cash/sessions?${_range.reportQuery}')
+        .catchError((_) => <String, dynamic>{});
     return (
       current: cur['session'] is Map ? Map<String, dynamic>.from(cur['session'] as Map) : null,
       history: (hist['sessions'] as List?) ?? const [],
@@ -20233,9 +20365,19 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
               : KeyedSubtree(key: const ValueKey('cash-open'), child: _openSessionCard(cur)),
         ),
         const SizedBox(height: AppSpacing.xxl),
-        SectionHeader(title: 'Past sessions', count: closed.length),
+        SectionHeader(
+          title: 'Past sessions',
+          count: closed.length,
+          trailing: InfoChip(icon: Icons.calendar_today_outlined, label: _range.label()),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Row(children: [Expanded(child: DateRangeChip(value: _range, onChanged: _setRange))]),
+        const SizedBox(height: AppSpacing.md),
         if (closed.isEmpty)
-          Text('No closed sessions yet.', style: text.bodySmall)
+          // Names the window rather than saying "yet": with a filter on screen,
+          // "no closed sessions yet" would read as "this restaurant has never
+          // closed a drawer", which is a different and alarming claim.
+          Text('No closed sessions in ${_range.label()}.', style: text.bodySmall)
         else
           ...closed.map((s) {
             final m = s as Map;
@@ -29862,7 +30004,16 @@ class _SimulationViewState extends State<_SimulationView> {
               tooltip: 'Reload the live baseline',
               onPressed: widget.reloadBaseline),
         ),
-        Text('Live, from the last $days days. All ₹ figures are pre-tax (bill subtotal), per day.',
+        // NO DateRangeChip on this screen, deliberately. Every other reporting
+        // surface carries one, but GET /simulation/baseline takes no window at
+        // all -- it is fixed at the backend's SIM_WINDOW_DAYS. A picker here
+        // would let an owner select "1-15 Aug" and be shown a projection built
+        // from the last 30 days regardless, which is a worse failure than having
+        // no control: it looks answered. So the window is STATED, from the
+        // server's own echo, and the screen says plainly that it is fixed.
+        Text(
+            'Live, from the last $days days -- a fixed window, unlike the other'
+            ' reporting screens. All ₹ figures are pre-tax (bill subtotal), per day.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.sm),
         row('Covers / day', _simNum(_simFin(b['covers_per_day'])), 'covers_per_day'),
