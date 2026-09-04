@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/outbox.dart';
 import '../services/phone_validation.dart';
 import '../services/rest_client.dart';
 import '../ui/theme/app_colors.dart';
@@ -197,6 +198,32 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         });
       }
       if (mounted) Navigator.pop(context, true);
+    } on OfflineQueued catch (queued) {
+      // The order is SAVED, not SENT — and the difference has to survive this
+      // screen. Two things follow from that, and both matter:
+      //
+      //  * the screen closes exactly as a sent order closes it. If it stayed
+      //    open with the cart live, the obvious next move is to tap Send again,
+      //    and that queues a SECOND copy under a second key — a duplicate the
+      //    idempotency contract cannot collapse, because they really are two
+      //    different requests. Closing is what makes the queued order singular.
+      //  * the message says what actually happened. Not "Order sent", which is
+      //    the lie; the kitchen has not seen this and will not until the line
+      //    is back, and the table's own card on the floor plan now carries a
+      //    "Not sent yet" chip that says so at a glance.
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: AppColors.card,
+            duration: const Duration(seconds: 6),
+            content: Text(
+              'Saved on this device — ${queued.what}. '
+              'The kitchen has NOT seen it yet; it sends when the connection returns.',
+            ),
+          ),
+        );
+        Navigator.pop(context, true);
+      }
     } catch (e) {
       setState(() {
         _error = '$e';

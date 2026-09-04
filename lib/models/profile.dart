@@ -9,6 +9,16 @@ class Profile {
   final String role;
   final List<String> roleAll;
   final String firstName;
+
+  /// The LOGIN identity, as stored. Served by /auth/employee-login and /auth/me.
+  ///
+  /// It is here for exactly one job: pre-filling the `authorised_by` field on a
+  /// comp / void / service-charge waiver, which is the "a manager acting alone
+  /// signs their own name" case migration 034's header describes. It is NEVER
+  /// the actor of a write — every one of those routes takes the actor from the
+  /// verified session and has no body field that could set it. Empty on an
+  /// older backend, which the capture forms handle by simply not pre-filling.
+  final String employeeUsername;
   final List<String> actionNames;
   final List<String> actions; // action UUIDs or ["*"]; used for permission gating
   final Map<String, dynamic> features;
@@ -23,6 +33,7 @@ class Profile {
     required this.role,
     required this.roleAll,
     required this.firstName,
+    this.employeeUsername = '',
     required this.actionNames,
     required this.actions,
     required this.features,
@@ -65,6 +76,7 @@ class Profile {
       role: (j['role'] ?? '').toString(),
       roleAll: _stringList(j['role_all']),
       firstName: (j['emp_Fname'] ?? '').toString(),
+      employeeUsername: (j['employeeUsername'] ?? '').toString(),
       actionNames: _stringList(j['action_names']),
       actions: _stringList(j['actions_set']),
       features: _map(j['features']),

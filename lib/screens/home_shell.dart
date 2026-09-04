@@ -14,6 +14,7 @@ import '../ui/widgets/gradient_backdrop.dart';
 import 'modules.dart' as m;
 import '../widgets/module_navigator.dart';
 import '../widgets/notifications_bell.dart';
+import '../widgets/outbox_chip.dart';
 
 /// The app-wide phone/narrow breakpoint.
 ///
@@ -98,6 +99,23 @@ const _navSections = <_NavSection>[
     // match no action name are not harmless padding, they are a silent lie.
     _Module('Simulation', Icons.tune, ['analytics', 'apc', 'report'], m.simulationModule, feature: 'analytics'),
     _Module('History', Icons.calendar_month, ['analytics', 'report'], m.historyModule, feature: 'analytics'),
+    // The MIS / control pack — Item Wise, Discount, Void KOT, Bill Edit, Sales
+    // Summary, Order Summary, Executive Summary, Cover Size, Settlement.
+    //
+    // THE GATE MIRRORS WHAT THE SERVER ACTUALLY ENFORCES, exactly as Simulation's
+    // does, and the two halves come from two different places:
+    //   * KEYWORDS are Analytics' list VERBATIM, because every /reports/mis/*
+    //     route is validateAction(ACCOUNTING_PERM) and that action is NAMED
+    //     "View Order APC" — 'apc' is the keyword that matches it. Accounting's
+    //     wider list ('accounting', 'finance', 'expense') matches no action name
+    //     that authorises these routes, and padding a list with keywords that
+    //     match nothing is a silent lie about who can open the section.
+    //   * FEATURE is 'accounting', not 'analytics', because FEATURE_BY_PREFIX
+    //     maps the /reports prefix to the accounting plan flag. A tenant whose
+    //     plan drops accounting gets a 403 from these routes, so the tile must
+    //     go with it.
+    _Module('Reports', Icons.summarize, ['analytics', 'apc', 'report'], m.reportsModule,
+        feature: 'accounting'),
   ]),
   _NavSection('MONEY', [
     _Module('Accounting', Icons.account_balance, ['report', 'accounting', 'finance', 'expense', 'analytics'], m.accountingModule, feature: 'accounting'),
@@ -734,6 +752,12 @@ class _HomeShellState extends State<HomeShell> {
           // Wide chrome, unchanged: outlet switcher, bell, refresh, "Sign out".
           // Narrow keeps only the bell — the one action that is time-sensitive and
           // carries a count — and folds the other three into `_chromeOverflow`.
+          //
+          // The outbox chip sits ahead of all of it and is NEVER folded away: it
+          // is the one piece of chrome that says the kitchen has not been told
+          // yet, and it renders nothing at all while the queue is empty, so on a
+          // healthy connection this line adds no pixels.
+          OutboxChip(rest: rest),
           if (!compactChrome && _outlets.length > 1) _outletSwitcher(),
           NotificationsBell(
             rest: rest,

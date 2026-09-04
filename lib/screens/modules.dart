@@ -19,9 +19,11 @@ import '../config.dart';
 import '../models/profile.dart';
 import '../models/table_assignment.dart';
 import '../services/api_client.dart';
+import '../services/outbox.dart';
 import '../services/rest_client.dart';
 import '../services/printer_service.dart';
 import '../services/date_range.dart';
+import '../services/report_export.dart';
 import '../services/restaurant_time.dart';
 import '../services/tz_offsets.dart';
 import '../ui/theme/app_colors.dart';
@@ -43,8 +45,31 @@ import '../models/menu_badge.dart';
 import '../widgets/async_view.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
+import '../widgets/outbox_chip.dart';
 import '../widgets/table_bill.dart';
 import 'order_entry.dart';
+
+// The Reports workspace (Insights -> Reports): the fifteen MIS / control reports.
+//
+// A PART, not a separate library, and deliberately: its row drill-down has to
+// open THE SAME bill body the History screen renders (`_closedBillBody`) and
+// format money, timestamps and blanks through the same private helpers as every
+// other module here. Duplicating those into a second library is how a control
+// report ends up disagreeing with the screen it was reconciled against.
+part 'reports.dart';
+
+// The capture screens (migrations 034-039): the comp sheet, the void reason, the
+// service-charge waiver, the tender/tip/till payment screen, and the menu group
+// and variation editors.
+//
+// A PART for the same reason reports.dart is one — and a stronger one. Every
+// entry point it serves is a screen in THIS library: the table sheet's comp and
+// waiver buttons, the order card's void, the settle dialog's tenders, the menu
+// tile's price points. It also has to print money through the same `_money` and
+// dates through the same `_fmtTime` the bill beside it uses, because a till that
+// showed a comp as "₹240.0" next to a bill line reading "₹240.00" is a till
+// somebody will eventually key wrong.
+part 'mis_capture.dart';
 
 // Feature modules for the owner app. Each is a builder `(RestClient, Profile) ->
 // Widget` that loads from the live backend via AsyncView and renders the data.
@@ -2441,7 +2466,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         onPressed: () {
                           Navigator.of(c).pop();
                           _changeOrderStatus(c, rest, '${o['id']}', status, reload,
-                              barked: _orderBarked(o));
+                              barked: _orderBarked(o), profile: p, value: _money(o['total']));
                         },
                       ),
                     if (unbarked)
@@ -2462,6 +2487,24 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         icon: Icons.table_restaurant_outlined,
                         dense: true,
                         onPressed: () => showTableBillSheet(c, rest: rest, tableName: _s(o, 'table')),
+                      ),
+                    // A comp is taken on the LINE, and this sheet is where the
+                    // lines of one ticket are. Offered only to whoever holds the
+                    // permission \u2014 never as a control that would 403 on tap.
+                    if (!cancelled && _holdsAction(p, _permNonChargeable))
+                      ForkButton.ghost(
+                        label: 'Comp an item',
+                        icon: Icons.card_giftcard,
+                        dense: true,
+                        onPressed: () {
+                          Navigator.of(c).pop();
+                          misOpenComps(c,
+                              rest: rest,
+                              profile: p,
+                              tableName: _s(o, 'table', ''),
+                              orderIds: ['${o['id']}'],
+                              onChanged: reload);
+                        },
                       ),
                   ]),
                 ],
@@ -2549,7 +2592,18 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         label: 'Decline',
                         icon: Icons.close,
                         dense: true,
-                        onPressed: () => _advanceOrder(messenger, rest, '${o['id']}', 'Cancelled', reload),
+                        // Same rule as the stage sheet: whoever can give a reason
+                        // is asked for one, everybody else keeps the fast path.
+                        onPressed: () async {
+                          if (_holdsAction(p, _permVoidOrder)) {
+                            final voided = await misVoidOrder(c, rest: rest, profile: p,
+                                orderId: '${o['id']}', what: 'this order',
+                                value: _money(o['total']));
+                            if (voided) reload();
+                            return;
+                          }
+                          await _advanceOrder(messenger, rest, '${o['id']}', 'Cancelled', reload);
+                        },
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -3057,6 +3111,28 @@ Widget menuModule(RestClient rest, Profile p) {
                           assignStation(item);
                         },
                       ),
+                      // Sizes (migration 039). Only for a SAVED dish: a variation
+                      // is a row pointing at a menu id, so there is nothing to
+                      // point at until the item exists.
+                      if (_s(item, 'id', '').isNotEmpty)
+                        ForkButton.ghost(
+                          key: const ValueKey('menu-variations'),
+                          label: 'Price points',
+                          icon: Icons.straighten,
+                          dense: true,
+                          onPressed: () async {
+                            Navigator.of(context).pop();
+                            final changed = await misOpenMenuVariations(
+                              context,
+                              rest: rest,
+                              profile: p,
+                              menuId: '${item['id']}',
+                              itemName: _s(item, 'name'),
+                              basePrice: _numOf(item['price']),
+                            );
+                            if (changed) reload();
+                          },
+                        ),
                       ForkButton.ghost(
                         label: 'Delete item',
                         icon: Icons.delete_outline,
@@ -3125,6 +3201,18 @@ Widget menuModule(RestClient rest, Profile p) {
                 ForkButton.ghost(label: 'Import from Excel', icon: Icons.upload_file, dense: true, onPressed: importMenu),
                 ForkButton.ghost(label: 'Kitchen sections', icon: Icons.soup_kitchen_outlined, dense: true, onPressed: manageSections),
                 ForkButton.ghost(label: 'Menu badges', icon: Icons.sell_outlined, dense: true, onPressed: manageBadges),
+                // Migration 039's revenue groups — what the Group Summary report
+                // rolls sales up by. A menu with no groups reports entirely as
+                // Unclassified, which is what every tenant has on day one.
+                ForkButton.ghost(
+                  key: const ValueKey('menu-groups'),
+                  label: 'Menu groups',
+                  icon: Icons.category_outlined,
+                  dense: true,
+                  onPressed: () async {
+                    if (await misOpenMenuGroups(context, rest: rest, profile: p)) reload();
+                  },
+                ),
                 if (badges.any((b) => b.enabled && !b.derived))
                   ForkButton.ghost(label: 'Tag dishes', icon: Icons.label_outline, dense: true, onPressed: tagBadges),
                 ForkButton.ghost(label: 'Queue pre-order menu', icon: Icons.timer_outlined, dense: true, onPressed: queueMenu),
@@ -6473,6 +6561,12 @@ class _TableBox extends StatelessWidget {
                 child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
               ),
               if (paymentPending) const StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
+              // Per-table honesty. An order taken during an outage is saved on
+              // this device and the kitchen has NOT seen it — so the table it
+              // belongs to says so on the floor plan, not just a global counter
+              // in the AppBar. Renders a zero-size box (and zero gap) when this
+              // table has nothing waiting, which is every moment online.
+              OutboxTagBadge(tag: 'table:$name', gap: paymentPending ? 6 : 0),
             ]),
             const SizedBox(height: 8),
             // State and APC tick share one line while they fit and the tick sits
@@ -7404,9 +7498,20 @@ class _TableSheetState extends State<_TableSheet> {
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                   billRow('Subtotal', _money(_bill!['subtotal'] ?? _bill!['total_amt'])),
+                  // COMPED FOOD, SHOWN RATHER THAN SIMPLY ABSENT (migration 034).
+                  // `nc_total` is deliberately NOT part of the subtotal — that is
+                  // the entire point of a non-chargeable — so without this line
+                  // the dish would just quietly not appear and neither the guest
+                  // nor the waiter could tell a comp from a missing item.
+                  if (_bn('nc_total') > 0)
+                    billRow('Non-chargeable (given away)', _money(_bill!['nc_total'])),
                   if (_bn('discount') > 0)
                     billRow('Discount${_s(_bill!, 'discount_type') == 'percent' ? ' (${_bn('discount_value').toStringAsFixed(_bn('discount_value') % 1 == 0 ? 0 : 1)}%)' : ''}', '− ${_money(_bill!['discount'])}'),
                   if (_bn('service_charge') > 0) billRow('Service charge', _money(_bill!['service_charge'])),
+                  // Why the charge is zero, rather than leaving the guest and the
+                  // waiter to work it out from an absent line.
+                  if (_bill!['service_charge_waived'] == true)
+                    billRow('Service charge', 'waived'),
                   if (_bn('tax_total') > 0) billRow('Tax', _money(_bill!['tax_total'])),
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
@@ -7429,6 +7534,20 @@ class _TableSheetState extends State<_TableSheet> {
                 ]),
               ),
               _apcInsight(),
+              // The live service-charge waiver, or the control to take the
+              // charge off. Renders nothing at all on an outlet that charges no
+              // service charge — see misServiceChargeBlock.
+              misServiceChargeBlock(
+                context,
+                rest: widget.rest,
+                profile: widget.profile,
+                bill: _bill!,
+                tableName: _name,
+                onChanged: () async {
+                  await _loadBill();
+                  widget.reload();
+                },
+              ),
               const SizedBox(height: 14),
               Wrap(spacing: 8, runSpacing: 8, children: [
                 ForkButton.ghost(
@@ -7438,6 +7557,24 @@ class _TableSheetState extends State<_TableSheet> {
                   icon: Icons.receipt_long,
                   dense: true,
                   onPressed: () => _previewBill(messenger),
+                ),
+                // Comping is a MANAGER act (migration 034's own permission). A
+                // waiter sees it dimmed AND SAYING SO IN ITS OWN LABEL — this
+                // button sits in a wrap of eight, where a separate sentence
+                // beside it would read as belonging to the row rather than to
+                // the control. Never an enabled button that 403s under a guest's
+                // nose, and never an absent one that leaves a waiter arguing
+                // that the screen has no such option.
+                ForkButton.ghost(
+                  key: const ValueKey('table-comps'),
+                  label: !_holdsAction(widget.profile, _permNonChargeable)
+                      ? 'Comp an item — manager only'
+                      : _bn('nc_total') > 0
+                          ? 'Comps · ${_money(_bill!['nc_total'])}'
+                          : 'Comp an item',
+                  icon: Icons.card_giftcard,
+                  dense: true,
+                  onPressed: _holdsAction(widget.profile, _permNonChargeable) ? _comps : null,
                 ),
                 ForkButton.ghost(
                   label: 'Reprint (no service charge)',
@@ -7620,9 +7757,34 @@ class _TableSheetState extends State<_TableSheet> {
     }
     final done = await showDialog<bool>(
       context: context,
-      builder: (_) => _SettleDialog(rest: widget.rest, orderId: '${orderIds.first}', totalText: _money(_bill?['grand_total'] ?? _bill?['total_amt'])),
+      builder: (_) => _PaymentSheet(
+        rest: widget.rest,
+        profile: widget.profile,
+        orderId: '${orderIds.first}',
+        tableName: _name,
+        fallbackTotal: _money(_bill?['grand_total'] ?? _bill?['total_amt']),
+      ),
     );
     if (done == true) _popAndReload();
+  }
+
+  /// Comp a dish off this table's bill (migration 034).
+  ///
+  /// It works off the table's ORDERS, not off the merged bill lines above:
+  /// the comp route addresses one line of one order and `/bill-for-table`
+  /// deliberately merges lines for printing, so the ids simply are not there.
+  Future<void> _comps() async {
+    await misOpenComps(
+      context,
+      rest: widget.rest,
+      profile: widget.profile,
+      tableName: _name,
+      orderIds: [for (final id in (_bill?['order_ids'] as List?) ?? const []) '$id'],
+    );
+    // The bill total changes when a line comes off it, so re-read rather than
+    // leave the sheet showing what the guest owed a minute ago.
+    await _loadBill();
+    widget.reload();
   }
 
   Future<void> _release(ScaffoldMessengerState messenger) async {
@@ -8839,278 +9001,11 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
   }
 }
 
-/// Settle a table's bill: pick a payment method (the aggregator methods need a
-/// payment proof PHOTO, captured/picked here and uploaded before settling),
-/// then record payment -> approve -> close (which frees the table). Approval is
-/// permission-gated on the backend.
-class _SettleDialog extends StatefulWidget {
-  final RestClient rest;
-  final String orderId;
-  final String totalText;
-  const _SettleDialog({required this.rest, required this.orderId, required this.totalText});
-
-  @override
-  State<_SettleDialog> createState() => _SettleDialogState();
-}
-
-class _SettleDialogState extends State<_SettleDialog> {
-  static const _methods = ['Upi', 'Cash', 'Card', 'Dineout', 'Zomato', 'Eazydiner', 'District'];
-  static const _needsProof = {'Dineout', 'Zomato', 'Eazydiner', 'District'};
-  // Same ~3MB ceiling POST /billing/upload-payment-proof enforces (its limit is
-  // on the base64 text, which is ~4/3 of the byte count), checked here so an
-  // oversized photo fails instantly instead of after a long upload.
-  static const int _maxProofBytes = 3000000;
-  String _method = 'Upi';
-  // The uploaded proof: the URL the settle call sends, plus the local bytes so
-  // staff can see what they attached before confirming. No URL is ever typed —
-  // the picture is uploaded and the returned URL is what settles the bill.
-  String? _proofUrl;
-  Uint8List? _proofPreview;
-  bool _uploading = false;
-  bool _busy = false;
-  String? _error;
-
-  /// Content type sniffed from the actual bytes rather than the file extension:
-  /// the backend checks the magic bytes, so a mislabelled ".jpg" would 400 there.
-  /// Returns null when the file is not a JPEG/PNG/WebP.
-  static String? _imageType(Uint8List b) {
-    if (b.length < 12) return null;
-    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return 'image/jpeg';
-    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return 'image/png';
-    if (b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
-        b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50) {
-      return 'image/webp';
-    }
-    return null;
-  }
-
-  // Capture (camera) or pick (gallery/file dialog) the proof and upload it right
-  // away, so by the time Confirm is pressed there is already a stored URL.
-  Future<void> _pickProof(ImageSource source) async {
-    setState(() {
-      _uploading = true;
-      _error = null;
-    });
-    try {
-      final shot = await ImagePicker().pickImage(source: source, maxWidth: 1600, imageQuality: 80);
-      if (shot == null) {
-        if (mounted) setState(() => _uploading = false);
-        return;
-      }
-      final bytes = await shot.readAsBytes();
-      final ct = _imageType(bytes);
-      if (ct == null) {
-        if (mounted) {
-          setState(() {
-            _uploading = false;
-            _error = 'That file is not a JPEG, PNG or WebP image.';
-          });
-        }
-        return;
-      }
-      if (bytes.length > _maxProofBytes) {
-        if (mounted) {
-          setState(() {
-            _uploading = false;
-            _error = 'That image is too large (max 3MB) — retake it at a lower quality.';
-          });
-        }
-        return;
-      }
-      final res = await widget.rest.post('/billing/upload-payment-proof', {
-        'image_base64': base64Encode(bytes),
-        'content_type': ct,
-      });
-      // The route returns payment_proof_screenshot_url (image_url is an alias).
-      final url = res is Map ? '${res['payment_proof_screenshot_url'] ?? res['image_url'] ?? ''}' : '';
-      if (!mounted) return;
-      setState(() {
-        _uploading = false;
-        if (url.isEmpty) {
-          _error = 'The upload came back without an image URL — please try again.';
-        } else {
-          _proofUrl = url;
-          _proofPreview = bytes;
-        }
-      });
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _uploading = false;
-          _error = '$e';
-        });
-      }
-    }
-  }
-
-  Future<void> _go() async {
-    // Unchanged rule: these methods cannot settle without a proof. It is now a
-    // real uploaded image rather than a pasted URL, so check the upload landed.
-    final needsProof = _needsProof.contains(_method);
-    final proof = _proofUrl ?? '';
-    if (needsProof && proof.isEmpty) {
-      setState(() => _error = 'Attach a payment proof photo before settling a $_method bill.');
-      return;
-    }
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
-    final oid = widget.orderId;
-    try {
-      await widget.rest.post('/bills/order/$oid/waiter-confirm-payment', {
-        'payment_method': _method,
-        if (needsProof) 'payment_proof_screenshot_url': proof,
-      });
-      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
-      await widget.rest.post('/bills/order/$oid/close');
-      if (mounted) Navigator.pop(context, true);
-    } catch (e) {
-      setState(() {
-        _error = '$e';
-        _busy = false;
-      });
-    }
-  }
-
-  // Selectable payment-method pill — copper outline + tint when chosen
-  // (status/selection is never colour alone: the label is the method name).
-  Widget _methodPill(String m) {
-    final selected = _method == m;
-    return MouseRegion(
-      cursor: _busy ? MouseCursor.defer : SystemMouseCursors.click,
-      child: GestureDetector(
-        onTap: _busy ? null : () => setState(() => _method = m),
-        child: AnimatedContainer(
-          duration: AppDurations.fast,
-          curve: Curves.easeOut,
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-          decoration: BoxDecoration(
-            color: selected ? AppColors.tint(AppColors.copper) : AppColors.inset,
-            borderRadius: AppRadius.controlAll,
-            border: Border.all(
-              color: selected ? AppColors.copper.withValues(alpha: 0.55) : AppColors.border,
-            ),
-          ),
-          child: Text(
-            m,
-            style: TextStyle(
-              fontSize: 12.5,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-              letterSpacing: 0.2,
-              color: selected ? AppColors.copperHi : AppColors.textSecondary,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final text = Theme.of(context).textTheme;
-    final needsProof = _needsProof.contains(_method);
-    final hasProof = (_proofUrl ?? '').isNotEmpty;
-    // Camera capture only exists on the phone/tablet builds — on Windows the
-    // picker falls back to the file dialog, so only "Choose image" is offered.
-    final platform = Theme.of(context).platform;
-    final canCapture = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
-    final locked = _busy || _uploading;
-    return Dialog(
-      backgroundColor: Colors.transparent,
-      child: Container(
-        width: 420,
-        padding: const EdgeInsets.all(22),
-        decoration: BoxDecoration(
-          gradient: AppColors.cardGradient,
-          borderRadius: AppRadius.cardAll,
-          border: Border.all(color: AppColors.borderStrong),
-        ),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('SETTLE BILL', style: text.labelSmall),
-            const SizedBox(height: 6),
-            Text(widget.totalText, style: text.displayMedium),
-            const SizedBox(height: 18),
-            Text('PAYMENT METHOD', style: text.labelSmall),
-            const SizedBox(height: 8),
-            Wrap(spacing: 8, runSpacing: 8, children: [for (final m in _methods) _methodPill(m)]),
-            if (needsProof) ...[
-              const SizedBox(height: 16),
-              Text('PAYMENT PROOF', style: text.labelSmall),
-              const SizedBox(height: 8),
-              if (_proofPreview != null) ...[
-                ClipRRect(
-                  borderRadius: AppRadius.controlAll,
-                  child: Image.memory(
-                    _proofPreview!,
-                    height: 150,
-                    width: double.infinity,
-                    fit: BoxFit.cover,
-                    // A preview that cannot decode must not take the dialog down.
-                    errorBuilder: (_, _, _) => Container(
-                      height: 150,
-                      alignment: Alignment.center,
-                      color: AppColors.inset,
-                      child: Text('Uploaded', style: text.bodySmall),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
-              ],
-              Row(children: [
-                if (canCapture) ...[
-                  ForkButton.ghost(
-                    label: hasProof ? 'Retake' : 'Take photo',
-                    icon: Icons.photo_camera_outlined,
-                    dense: true,
-                    onPressed: locked ? null : () => _pickProof(ImageSource.camera),
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                ForkButton.ghost(
-                  label: hasProof ? 'Replace image' : 'Choose image',
-                  icon: Icons.image_outlined,
-                  dense: true,
-                  onPressed: locked ? null : () => _pickProof(ImageSource.gallery),
-                ),
-              ]),
-              const SizedBox(height: 8),
-              Text(
-                _uploading
-                    ? 'Uploading…'
-                    : hasProof
-                        ? 'Proof attached — it uploads with the settlement.'
-                        : '$_method needs a payment screenshot. Capture or pick one; it uploads straight away.',
-                style: text.bodySmall!.copyWith(
-                  fontSize: 11.5,
-                  color: hasProof && !_uploading ? AppColors.success : AppColors.textTertiary,
-                ),
-              ),
-            ],
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
-              ),
-            const SizedBox(height: 12),
-            Text('Approval is required before the bill closes and the table frees.', style: text.bodySmall),
-            const SizedBox(height: 18),
-            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-              ForkButton.ghost(label: 'Cancel', onPressed: locked ? null : () => Navigator.pop(context, false)),
-              const SizedBox(width: 8),
-              ForkButton(
-                label: _busy ? 'Processing…' : 'Confirm & close',
-                icon: Icons.check,
-                onPressed: locked || (needsProof && !hasProof) ? null : _go,
-              ),
-            ]),
-          ]),
-        ),
-      ),
-    );
-  }
-}
+// The settle screen now lives in mis_capture.dart as `_PaymentSheet`: the same
+// three calls (record payment -> approve -> close) and the same payment-proof
+// rule, plus the tenders, tips and till that migrations 037/038 record. It was
+// MOVED rather than duplicated - two settle screens on one till is how a bill
+// gets taken twice.
 
 // ------------------------------------------------------------- order stages ----
 
@@ -9143,6 +9038,11 @@ Future<void> _changeOrderStatus(
   String current,
   VoidCallback reload, {
   bool barked = true,
+  /// Whose permissions decide whether a cancel can carry a reason. Optional so
+  /// a caller that has no profile to hand keeps the behaviour it always had.
+  Profile? profile,
+  /// What the order is worth, for the void form's headline. Display only.
+  String value = '',
 }) async {
   // Un-barked orders must pass the Barked step before they can be cooked/served —
   // BUT a Pending order isn't approved to the kitchen yet, so it can't be barked
@@ -9303,6 +9203,30 @@ Future<void> _changeOrderStatus(
     },
   );
   if (picked == null || picked == current) return;
+  // A CANCEL BY SOMEBODY WHO CAN GIVE A REASON GOES THROUGH THE VOID ROUTE.
+  //
+  // `PATCH /orders/:id/status → Cancelled` records no reason anywhere, which is
+  // why the Void KOT report has always counted those cancels with the reason
+  // "unknown". Migration 035's route fixes that, and it is offered by
+  // PERMISSION rather than by screen: the person holding "Void Orders With
+  // Reason" is exactly the person a control report needs a reason from, while a
+  // waiter keeps the fast path (which is also the only one the offline queue
+  // accepts) instead of being stopped mid-service by a form.
+  if (picked == 'Cancelled' && profile != null && _holdsAction(profile, _permVoidOrder)) {
+    // The stage sheet above was awaited, so the screen may be gone; a void form
+    // opened against a dead context is a form nobody can dismiss.
+    if (!context.mounted) return;
+    final voided = await misVoidOrder(
+      context,
+      rest: rest,
+      profile: profile,
+      orderId: orderId,
+      what: 'this order',
+      value: value,
+    );
+    if (voided) reload();
+    return;
+  }
   try {
     if (picked == 'Barked') {
       await rest.post('/orders/$orderId/bark');
@@ -9876,7 +9800,14 @@ class _KdsCardState extends State<_KdsCard> {
                         visualDensity: VisualDensity.compact,
                         icon: const Icon(Icons.check, size: 18, color: AppColors.success),
                         tooltip: 'Item served',
-                        onPressed: () => _post('/orders/$id/items/$iid/serve'),
+                        // `undo=0` states the intent instead of letting the
+                        // server infer it from state. This branch only renders
+                        // for an UNSERVED item, so the tap means serve — and if
+                        // it is queued offline and replayed after someone else
+                        // served it, it must stay a serve rather than becoming
+                        // an un-serve. The undo control below posts /unserve,
+                        // which was always explicit.
+                        onPressed: () => _post('/orders/$id/items/$iid/serve?undo=0'),
                       ),
                     ] else ...[
                       // A served item used to render a DEAD icon, so a mis-tapped
@@ -16995,6 +16926,9 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           final r = _range;
           return _ClosedBillsList(
             rest: widget.rest,
+            // Accounting is where a cash-up is reconciled, so it is where a bill
+            // rung on the wrong till gets moved.
+            profile: widget.profile,
             filter: _ClosedBillFilter(
               from: r.from,
               to: r.to,
@@ -17794,7 +17728,7 @@ String _billTitle(Map b) {
   return table.isEmpty ? left : '$left · $table';
 }
 
-void _openClosedBill(BuildContext context, RestClient rest, Map bill) {
+void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? profile]) {
   final id = _s(bill, 'id', '');
   if (id.isEmpty) return;
   showModalBottomSheet<void>(
@@ -17802,12 +17736,17 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill) {
     showDragHandle: true,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
-    builder: (_) => _ClosedBillSheet(rest: rest, billId: id, title: _billTitle(bill)),
+    builder: (_) => _ClosedBillSheet(
+      rest: rest,
+      billId: id,
+      title: _billTitle(bill),
+      profile: profile,
+    ),
   );
 }
 
 /// One row in the settled-bill list. Tapping it opens the full bill.
-Widget _closedBillRow(BuildContext context, RestClient rest, Map b) {
+Widget _closedBillRow(BuildContext context, RestClient rest, Map b, [Profile? profile]) {
   final text = Theme.of(context).textTheme;
   final method = _s(b, 'payment_method', '');
   final refunded = b['refunded'] == true;
@@ -17817,7 +17756,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b) {
     padding: const EdgeInsets.only(bottom: 8),
     child: ForkCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      onTap: () => _openClosedBill(context, rest, b),
+      onTap: () => _openClosedBill(context, rest, b, profile),
       child: Row(children: [
         Container(
           width: 36,
@@ -17859,10 +17798,16 @@ class _ClosedBillsList extends StatefulWidget {
   final int pageSize;
   final String emptyCaption;
 
+  /// Whose permissions decide whether a settled bill may be MOVED to another
+  /// till (migration 038). Optional: a surface with no profile to hand shows the
+  /// bill exactly as it always did, read-only.
+  final Profile? profile;
+
   const _ClosedBillsList({
     required this.rest,
     required this.filter,
     required this.emptyCaption,
+    this.profile,
     this.pageSize = 15,
   });
 
@@ -17973,7 +17918,7 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
       );
     }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      for (final b in _rows) _closedBillRow(context, widget.rest, b),
+      for (final b in _rows) _closedBillRow(context, widget.rest, b, widget.profile),
       if (_hasMore)
         Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -18001,7 +17946,16 @@ class _ClosedBillSheet extends StatelessWidget {
   final RestClient rest;
   final String billId;
   final String title;
-  const _ClosedBillSheet({required this.rest, required this.billId, required this.title});
+
+  /// Present only where a till correction belongs — see [misBillCounterAction].
+  final Profile? profile;
+
+  const _ClosedBillSheet({
+    required this.rest,
+    required this.billId,
+    required this.title,
+    this.profile,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -18012,8 +17966,23 @@ class _ClosedBillSheet extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
           child: AsyncView<Map<String, dynamic>>(
             load: () => rest.getMap('/bills/closed/$billId'),
-            builder: (context, bill, reload) =>
-                SingleChildScrollView(child: _closedBillBody(context, bill, title)),
+            builder: (context, bill, reload) => SingleChildScrollView(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                _closedBillBody(context, bill, title),
+                // OUTSIDE `_closedBillBody`, and that is the whole point: the
+                // same body is what a Reports drill-down renders, and the
+                // reports pack must stay read-only. A control added in there
+                // would put a write inside a fraud-control document.
+                if (profile != null)
+                  misBillCounterAction(
+                    context,
+                    rest: rest,
+                    profile: profile!,
+                    billId: billId,
+                    onChanged: reload,
+                  ),
+              ]),
+            ),
           ),
         ),
       ),
@@ -25232,6 +25201,11 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                   : int.tryParse('${m['bill_reopen_window_min']}') ?? 240,
               reload: reload,
             ),
+            const SizedBox(height: 14),
+            // The tills that ring sales here (migration 038). Sits with billing
+            // because a counter is what a cash-up reconciles against, and it is
+            // read by whoever takes money but configured only by an admin.
+            _BillingCountersCard(rest: rest, profile: p),
             const SizedBox(height: 14),
             _BillLogoCard(
               rest: rest,

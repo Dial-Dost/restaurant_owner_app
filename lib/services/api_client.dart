@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../config.dart';
 import '../models/profile.dart';
+import 'idempotency.dart';
 
 class ApiException implements Exception {
   final String message;
@@ -125,10 +126,17 @@ class ApiClient {
   /// Throws [ApiException] with the status on non-2xx (401 signals re-auth).
   Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
     final uri = _u(path);
+    // The idempotency key rides on EVERY mutating request, online and queued
+    // alike, so a retry the client cannot distinguish from a first attempt (a
+    // request that timed out after the server applied it) can be collapsed
+    // server-side. Read from the ambient zone, so no caller's signature — and
+    // no fake's override — had to change to carry it.
+    final idempotencyKey = method == 'GET' ? null : IdempotencyScope.key;
     final headers = <String, String>{
       'Authorization': 'Bearer $token',
       if (body != null) 'Content-Type': 'application/json',
       if (outletId != null && outletId.isNotEmpty) 'X-Outlet-Id': outletId,
+      'Idempotency-Key': ?idempotencyKey,
     };
     final encoded = body == null ? null : jsonEncode(body);
     http.Response res;

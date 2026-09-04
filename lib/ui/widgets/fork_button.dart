@@ -53,17 +53,31 @@ class _ForkButtonState extends State<ForkButton> {
     final primary = widget.kind == ForkButtonKind.primary;
     final ghost = widget.kind == ForkButtonKind.ghost;
 
+    // A NULL onPressed MUST LOOK LIKE ONE. This button used to render a disabled
+    // control identically to a live one — same colour, same hover lift, same
+    // click cursor — so "Comp an item" for a waiter, "Load more" with no next
+    // page and "Export" with no rows were all buttons that invited a tap and
+    // then did nothing. That is the dead-looking control this app has been
+    // bitten by before, and every gated affordance in the product rides on this
+    // one widget, so the honesty belongs here rather than at each call site.
+    final enabled = widget.onPressed != null;
+    final hovered = _hovered && enabled;
+
     final fg = primary
         ? AppColors.onCopper
-        : _hovered
+        : hovered
             ? AppColors.textPrimary
             : AppColors.textSecondary;
 
     return MouseRegion(
-      cursor: SystemMouseCursors.click,
+      // `defer`, not `basic`: a disabled button sitting on a tappable card must
+      // not override the card's own cursor.
+      cursor: enabled ? SystemMouseCursors.click : MouseCursor.defer,
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
-      child: GestureDetector(
+      child: Opacity(
+        opacity: enabled ? 1 : 0.42,
+        child: GestureDetector(
         onTap: widget.onPressed,
         child: AnimatedContainer(
           duration: AppDurations.fast,
@@ -76,13 +90,13 @@ class _ForkButtonState extends State<ForkButton> {
                 ? LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
-                    colors: _hovered
+                    colors: hovered
                         ? [AppColors.copperHi, AppColors.copper]
                         : [AppColors.copperHi, AppColors.copperMid],
                   )
                 : null,
             color: !primary
-                ? (_hovered
+                ? (hovered
                     ? Colors.white.withValues(alpha: 0.05)
                     : Colors.transparent)
                 : null,
@@ -92,7 +106,7 @@ class _ForkButtonState extends State<ForkButton> {
                 ? [
                     BoxShadow(
                       color: AppColors.copperShadow.withValues(alpha: 0.5),
-                      blurRadius: _hovered ? 18 : 10,
+                      blurRadius: hovered ? 18 : 10,
                       offset: const Offset(0, 4),
                     ),
                   ]
@@ -118,6 +132,7 @@ class _ForkButtonState extends State<ForkButton> {
               ),
             ],
           ),
+        ),
         ),
       ),
     );
@@ -148,23 +163,30 @@ class _ForkIconButtonState extends State<ForkIconButton> {
 
   @override
   Widget build(BuildContext context) {
+    // Same rule as [ForkButton]: a disabled icon button must look disabled. The
+    // −/+ stepper on a partial comp reaches its ends, and an inert "one fewer"
+    // that still lights up on hover is a control the till learns to distrust.
+    final enabled = widget.onPressed != null;
+    final hovered = _hovered && enabled;
     Widget child = MouseRegion(
-      cursor: SystemMouseCursors.click,
+      cursor: enabled ? SystemMouseCursors.click : MouseCursor.defer,
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
-      child: GestureDetector(
+      child: Opacity(
+        opacity: enabled ? 1 : 0.42,
+        child: GestureDetector(
         onTap: widget.onPressed,
         child: AnimatedContainer(
           duration: AppDurations.fast,
           width: 34,
           height: 34,
           decoration: BoxDecoration(
-            color: _hovered
+            color: hovered
                 ? Colors.white.withValues(alpha: 0.06)
                 : Colors.transparent,
             borderRadius: AppRadius.controlAll,
             border: Border.all(
-              color: _hovered ? AppColors.borderStrong : AppColors.border,
+              color: hovered ? AppColors.borderStrong : AppColors.border,
             ),
           ),
           child: Stack(
@@ -174,7 +196,7 @@ class _ForkIconButtonState extends State<ForkIconButton> {
                 widget.icon,
                 size: 16,
                 color:
-                    _hovered ? AppColors.textPrimary : AppColors.textSecondary,
+                    hovered ? AppColors.textPrimary : AppColors.textSecondary,
               ),
               if (widget.badge)
                 Positioned(
@@ -191,6 +213,7 @@ class _ForkIconButtonState extends State<ForkIconButton> {
                 ),
             ],
           ),
+        ),
         ),
       ),
     );
