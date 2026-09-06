@@ -34,6 +34,22 @@ is in the shipped 1.8.4 production build right now. The guard therefore looks fo
 
 ## One-time setup
 
+### 0. The one-command way
+
+```bash
+bash scripts/setup-ci-secrets.sh
+```
+
+Reads your local `android/app/upload-keystore.jks` and `android/key.properties`
+and sets all four secrets. Nothing is printed and nothing goes through the
+clipboard — which matters, because a base64 blob truncated on its way through a
+terminal or a text box is the one failure this setup cannot diagnose for you: it
+decodes to garbage and surfaces much later as an opaque Gradle error.
+
+Read the rest of this section anyway before running it. In particular §3: if this
+repo has ever published an APK, the key must be the SAME one, and the script
+cannot check that for you.
+
 ### 1. Create four repository secrets
 
 **Settings → Secrets and variables → Actions → New repository secret**, on
