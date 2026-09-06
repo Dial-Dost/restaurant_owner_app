@@ -1,0 +1,587 @@
+# =============================================================================
+# Release the clients — Restaurant Dash owner app
+#
+# Builds the Windows desktop bundle and the Android APK, proves each one is
+# actually shippable, and publishes both as GitHub RELEASE ASSETS.
+#
+# WHAT THIS REPLACES. Both artifacts used to be built by hand on a developer's
+# laptop, zipped by hand, and committed into Restaurant_Dashboard_UI/public/
+# downloads/ — ~115MB of binaries into git, every release, forever. That is the
+# last step of the release that still needed a specific human at a specific
+# machine, and it is the step where the three silent failures below live.
+#
+# THE THREE THINGS THAT FAIL SILENTLY, AND THE GUARDS THAT CATCH THEM
+# -----------------------------------------------------------------------------
+# Every one of these produces an artifact that BUILDS, INSTALLS, and is broken
+# only once it is on a restaurant's counter. None of them throw. That is why
+# each has an explicit assertion in this file rather than a line in a runbook.
+#
+#   1. THE DART-DEFINES GET DROPPED.  lib/config.dart defaults BACKEND_URL to
+#      http://localhost:3001 and ORDER_BASE_URL to http://localhost:9002. A
+#      build without --dart-define compiles clean, installs clean, opens to the
+#      login screen, and then reaches nothing at all. Guarded by `verify-baked-
+#      urls`: it greps the compiled Dart snapshot for the production hosts and
+#      fails if the localhost defaults survived. Two-sided on purpose — see the
+#      note in that step about why "grep for localhost" alone is wrong.
+#
+#   2. THE WINDOWS ZIP GAINS A WRAPPING FOLDER.  The in-app updater
+#      (lib/services/app_updater.dart) robocopies the extracted zip OVER the
+#      install directory. If the zip contains `Release/restaurant_owner_app.exe`
+#      instead of `restaurant_owner_app.exe`, the copy lands a nested folder
+#      beside the real exe, the running app is untouched, and it never updates
+#      again — from then on the only fix is a manual reinstall on every counter.
+#      Guarded by `assert-flat-zip`.
+#
+#   3. THE APK IS SIGNED WITH A DIFFERENT KEY.  android/app/build.gradle.kts
+#      falls back to the DEBUG keystore when android/key.properties is missing,
+#      which is precisely the state a CI runner starts in. The resulting APK is
+#      a perfectly valid release build that Android REFUSES to install over an
+#      existing one ("App not installed"), forcing every owner to uninstall —
+#      losing the device's local state — before they can take the update.
+#      Guarded by `assert-signing-identity`, which compares the signer
+#      certificate against the fingerprint of the build already in the field.
+#
+# TRIGGER. Version tags and manual dispatch only. Deliberately NOT push-to-main:
+# this is ~115MB of artifacts and a multi-minute Gradle run, and main moves for
+# reasons that have nothing to do with shipping a client.
+#
+# ONE-TIME SETUP (the secrets, the base64, and how to prove the signing is
+# right) is in docs/RELEASE.md. Read it before the first run.
+# =============================================================================
+
+name: Release clients
+
+on:
+  push:
+    tags:
+      # v1.8.5 — the tag IS the release. `gate` refuses to build if this does
+      # not match pubspec.yaml, because a tag/pubspec mismatch ships an APK
+      # whose versionName never changes and clients re-offer the same update
+      # on every launch, forever.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release (off = build + verify only)"
+        type: boolean
+        default: false
+
+# Only `publish` needs write, and it asks for it locally. Everything else reads.
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two releases of the same ref race for the same tag's assets.
+  group: release-clients-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # THE PRODUCTION DART-DEFINES. Changing either of these changes what every
+  # future build talks to; the guards below assert exactly these values landed
+  # in the binary, so a typo here fails the build rather than shipping.
+  BACKEND_URL: https://api.dialdost.com
+  ORDER_BASE_URL: https://experiosolutions.dialdost.com
+  # Pinned, not `stable`. `stable` moves under us and a Flutter upgrade is a
+  # thing to take deliberately, not to discover in a release build.
+  FLUTTER_VERSION: "3.38.6"
+  # windows/CMakeLists.txt BINARY_NAME. The updater refuses any archive without
+  # this file at the zip root, so the zip assertion checks for the same name.
+  WINDOWS_EXE: restaurant_owner_app.exe
+  # Stable asset filenames. The manifest in Restaurant_Backend/app_release.ts
+  # builds its download URLs from the tag plus these names, so they are part of
+  # the contract — renaming one 404s every client that reads the new manifest.
+  WINDOWS_ASSET: RestaurantDash-Windows.zip
+  ANDROID_ASSET: RestaurantDash-Android.apk
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GATE — cheap checks first. Nothing spends a Windows runner minute or a
+  # Gradle run until analyze, the test suite, and the version agreement pass.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Analyze, test, agree on a version
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: flutter analyze
+        run: flutter analyze
+
+      - name: flutter test
+        run: flutter test
+
+      - name: Resolve the version, and refuse a tag that disagrees with pubspec
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # pubspec `version: 1.8.4+49` -> name 1.8.4, code 49. The name is what
+          # /app/version compares against and what the update dialog shows; the
+          # code is what Android uses to decide an install is an upgrade.
+          raw="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}')"
+          name="${raw%%+*}"
+          code="${raw##*+}"
+          echo "pubspec version: $name (build $code)"
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            if [ "$tag" != "v$name" ]; then
+              echo "::error::Tag $tag does not match pubspec version $name."
+              echo "The tag is the release. Bump 'version:' in pubspec.yaml to"
+              echo "match, or retag — a mismatch ships an APK whose versionName"
+              echo "is unchanged, so every client keeps being offered an update"
+              echo "it already has."
+              exit 1
+            fi
+          else
+            # workflow_dispatch: pubspec is the authority, there is no tag.
+            tag="v$name"
+          fi
+
+          echo "version=$name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"      >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag (versionName $name, versionCode $code)"
+
+  # ---------------------------------------------------------------------------
+  # WINDOWS — build, prove the URLs are baked in, zip FLAT, prove it is flat.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows desktop
+    needs: gate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: flutter build windows
+        run: >
+          flutter build windows --release
+          --dart-define=BACKEND_URL=${{ env.BACKEND_URL }}
+          --dart-define=ORDER_BASE_URL=${{ env.ORDER_BASE_URL }}
+
+      # -- GUARD 1 -----------------------------------------------------------
+      - name: Verify the production URLs are baked into the binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The AOT snapshot. Dart stores ASCII string literals as contiguous
+          # Latin-1 bytes, so the dart-define values are findable verbatim —
+          # verified against the shipped 1.8.4 build before this was written.
+          $snapshot = 'build/windows/x64/runner/Release/data/app.so'
+          if (-not (Test-Path $snapshot)) { throw "No snapshot at $snapshot" }
+
+          # Read as Latin-1 (ISO-8859-1, codepage 28591) so every byte maps to
+          # exactly one char and no decoder mangles the middle of the file.
+          # Substring search, not regex.
+          #
+          # GetEncoding(28591), not ::Latin1 — the latter is .NET Core only, so
+          # it works under `shell: pwsh` here but throws in Windows PowerShell
+          # 5.1, which is what a developer gets running this by hand.
+          $bytes = [System.IO.File]::ReadAllBytes($snapshot)
+          $text  = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          if ($text.Length -ne $bytes.Length) { throw "Latin-1 decode was not 1:1 — the search would be unreliable." }
+
+          $failures = @()
+
+          # (a) The production hosts MUST be present.
+          foreach ($u in @('${{ env.BACKEND_URL }}', '${{ env.ORDER_BASE_URL }}')) {
+            if ($text.Contains($u)) { Write-Host "  present: $u" }
+            else { $failures += "MISSING from the binary: $u" }
+          }
+
+          # (b) The config.dart defaults MUST NOT be.
+          #
+          # Note these are the FULL default URLs, not the bare word "localhost".
+          # A bare-substring check looks stricter and is actually broken: the
+          # Dart runtime itself ships the string "localhost" inside the snapshot
+          # (it is in there right now, in a shipped production build), so
+          # "fail if the artifact contains localhost" fails every correct build.
+          # The two strings below appear only if config.dart's defaults were
+          # used, which is exactly the condition worth failing on.
+          foreach ($d in @('http://localhost:3001', 'http://localhost:9002')) {
+            if ($text.Contains($d)) { $failures += "DEFAULT LEAKED into the binary: $d" }
+            else { Write-Host "  absent:  $d" }
+          }
+
+          if ($failures.Count -gt 0) {
+            $failures | ForEach-Object { Write-Host "::error::$_" }
+            throw "The build did not bake in the production URLs. It would install fine and reach nothing."
+          }
+          Write-Host "Baked-URL check passed."
+
+      - name: Zip the bundle FLAT
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'build/windows/x64/runner/Release'
+          # The trailing \* is the whole point: it archives the CONTENTS of
+          # Release/, so the exe, the DLLs and data/ land at the zip ROOT.
+          # Without it Compress-Archive stores a wrapping `Release/` folder and
+          # the updater's robocopy nests a dead copy inside the install dir.
+          Compress-Archive -Path "$release\*" -DestinationPath '${{ env.WINDOWS_ASSET }}' -CompressionLevel Optimal -Force
+          Write-Host ("zip size: {0:N1} MB" -f ((Get-Item '${{ env.WINDOWS_ASSET }}').Length / 1MB))
+
+      # -- GUARD 2 -----------------------------------------------------------
+      - name: Assert the zip layout is flat
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = (Resolve-Path '${{ env.WINDOWS_ASSET }}').Path
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            # Compress-Archive writes BACKSLASH separators (the updater
+            # normalises both); normalise here too so the check is about layout,
+            # not about which tool wrote the archive.
+            $entries = $zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') }
+          } finally {
+            $zip.Dispose()
+          }
+
+          # @() is load-bearing: Sort-Object -Unique returns a SCALAR when there
+          # is exactly one result, and that is precisely the wrapping-folder case
+          # this step exists to catch — $topLevel[0] would then index the first
+          # CHARACTER of the name and report 'R' instead of 'Release'.
+          $topLevel = @($entries | ForEach-Object { ($_ -split '/')[0] } |
+                        Where-Object { $_ } | Sort-Object -Unique)
+
+          Write-Host "Top-level entries ($($topLevel.Count)):"
+          $topLevel | ForEach-Object { Write-Host "  $_" }
+
+          $failures = @()
+
+          # (a) The exe must sit at the ROOT. This is the exact assertion the
+          #     updater makes before it copies anything, so if this passes the
+          #     updater will not refuse the archive.
+          if ($entries -notcontains '${{ env.WINDOWS_EXE }}') {
+            $failures += "${{ env.WINDOWS_EXE }} is not at the zip root"
+          }
+
+          # (b) The zip's top level must be exactly the build output's top level.
+          #     Set equality, not a hardcoded list of 12 names — adding a plugin
+          #     legitimately adds a DLL, and a check that has to be edited for
+          #     that is a check somebody eventually deletes.
+          $onDisk = Get-ChildItem 'build/windows/x64/runner/Release' |
+                    Select-Object -ExpandProperty Name | Sort-Object -Unique
+          $missing = $onDisk | Where-Object { $topLevel -notcontains $_ }
+          $extra   = $topLevel | Where-Object { $onDisk -notcontains $_ }
+          if ($missing) { $failures += "in the build output but not the zip: $($missing -join ', ')" }
+          if ($extra)   { $failures += "in the zip but not the build output: $($extra -join ', ')" }
+
+          # (c) The named failure mode, called out separately so the log says
+          #     what went wrong rather than just dumping a set difference.
+          if ($topLevel.Count -eq 1) {
+            $failures += "the zip has ONE top-level entry ('$($topLevel[0])') — it wraps the bundle in a folder. The updater would nest a dead copy inside the install directory and the app would never update again."
+          }
+
+          # (d) The asset bundle must be at data/, not <folder>/data/.
+          if (-not ($entries | Where-Object { $_ -like 'data/flutter_assets/*' })) {
+            $failures += "no data/flutter_assets/* at the zip root"
+          }
+
+          if ($failures.Count -gt 0) {
+            $failures | ForEach-Object { Write-Host "::error::$_" }
+            throw "The Windows zip is not flat."
+          }
+          Write-Host "Flat-zip check passed: $($topLevel.Count) top-level entries, exe at root."
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows
+          path: ${{ env.WINDOWS_ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # ANDROID — build, prove the URLs are baked in, prove it is signed with THE
+  # SAME KEY as the build already installed on every owner's phone.
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android APK
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The signer certificate SHA-256 of the build in the field. This is the
+      # PUBLIC certificate digest, read out of the shipped 1.8.4 APK with
+      # `apksigner verify --print-certs` — it is not a secret and it is not
+      # derived from the private key, it is the same value every installed copy
+      # already carries. Pinning it here is what turns "we hope CI used the
+      # right keystore" into an assertion.
+      #
+      # If this ever legitimately changes, the update is a REINSTALL for every
+      # user; do not edit this line to make a red build go green.
+      EXPECTED_SIGNER_SHA256: 0e7fe2a45c1c0ff77157a8629a5b54291ffb9d3d6fbf7064bb009c34ae2ebbf3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          # Matches sourceCompatibility/jvmTarget 17 in android/app/build.gradle.kts.
+          java-version: "17"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      # -- SIGNING MATERIAL --------------------------------------------------
+      # Written at job time from secrets, never echoed, and deleted in the
+      # always() step at the end of the job.
+      - name: Write the signing material
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No `set -x` anywhere in this step, and nothing below prints a value.
+          # GitHub masks exact secret values in logs, but a base64 blob split
+          # across a line wrap can defeat that, so the rule here is simply that
+          # secrets are never an argument to anything that writes to stdout.
+
+          missing=()
+          [ -n "${KEYSTORE_BASE64:-}" ] || missing+=("ANDROID_KEYSTORE_BASE64")
+          [ -n "${STORE_PASSWORD:-}"  ] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [ -n "${KEY_PASSWORD:-}"    ] || missing+=("ANDROID_KEY_PASSWORD")
+          [ -n "${KEY_ALIAS:-}"       ] || missing+=("ANDROID_KEY_ALIAS")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secret(s): ${missing[*]}"
+            echo "Refusing to build. Without key.properties, android/app/build.gradle.kts"
+            echo "silently falls back to the DEBUG keystore and produces an APK that"
+            echo "Android will not install over an existing one. See docs/RELEASE.md."
+            exit 1
+          fi
+
+          # storeFile is resolved relative to android/app/ by build.gradle.kts.
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+
+          size=$(stat -c%s android/app/upload-keystore.jks)
+          if [ "$size" -lt 512 ]; then
+            echo "::error::Decoded keystore is only ${size} bytes — the secret is truncated or is not base64."
+            exit 1
+          fi
+          echo "keystore written (${size} bytes)"
+
+          # Written with printf, not a heredoc: a heredoc would put the
+          # passwords in the script body, and a shell trace or an error echo of
+          # the script would then leak them.
+          {
+            printf 'storePassword=%s\n' "$STORE_PASSWORD"
+            printf 'keyPassword=%s\n'   "$KEY_PASSWORD"
+            printf 'keyAlias=%s\n'      "$KEY_ALIAS"
+            printf 'storeFile=%s\n'     'upload-keystore.jks'
+          } > android/key.properties
+          chmod 600 android/key.properties
+          echo "key.properties written"
+
+      - name: flutter build apk
+        run: >
+          flutter build apk --release
+          --dart-define=BACKEND_URL=${{ env.BACKEND_URL }}
+          --dart-define=ORDER_BASE_URL=${{ env.ORDER_BASE_URL }}
+
+      - name: Stage the APK under its release name
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp build/app/outputs/flutter-apk/app-release.apk "${ANDROID_ASSET}"
+          ls -la "${ANDROID_ASSET}"
+
+      # -- GUARD 1 -----------------------------------------------------------
+      - name: Verify the production URLs are baked into the APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          # One libapp.so per ABI. Check EVERY one: a per-ABI difference would
+          # mean only some phones talk to production, which is worse than none.
+          unzip -o -q "${ANDROID_ASSET}" 'lib/*/libapp.so' -d "$work"
+          mapfile -t sos < <(find "$work" -name libapp.so | sort)
+          if [ ${#sos[@]} -eq 0 ]; then
+            echo "::error::No lib/*/libapp.so inside the APK — cannot verify the baked URLs."
+            exit 1
+          fi
+
+          failures=0
+          for so in "${sos[@]}"; do
+            abi="$(basename "$(dirname "$so")")"
+            # Present: the production hosts.
+            for u in "${BACKEND_URL}" "${ORDER_BASE_URL}"; do
+              if grep -q -a -F -- "$u" "$so"; then
+                echo "  [$abi] present: $u"
+              else
+                echo "::error::[$abi] MISSING from the APK: $u"
+                failures=$((failures + 1))
+              fi
+            done
+            # Absent: config.dart's defaults. Full URLs, not the bare word
+            # "localhost" — the Dart runtime ships that string itself, so a
+            # bare-substring check would fail every correct build. Verified
+            # against the shipped 1.8.4 APK.
+            for d in 'http://localhost:3001' 'http://localhost:9002'; do
+              if grep -q -a -F -- "$d" "$so"; then
+                echo "::error::[$abi] DEFAULT LEAKED into the APK: $d"
+                failures=$((failures + 1))
+              else
+                echo "  [$abi] absent:  $d"
+              fi
+            done
+          done
+
+          rm -rf "$work"
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::The APK did not bake in the production URLs. It would install fine and reach nothing."
+            exit 1
+          fi
+          echo "Baked-URL check passed across ${#sos[@]} ABI(s)."
+
+      # -- GUARD 3 -----------------------------------------------------------
+      - name: Assert the APK is signed with the release key
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Highest installed build-tools wins; the runner image ships several
+          # and hardcoding one makes this break on an image bump.
+          apksigner="$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -maxdepth 2 -name apksigner -type f \
+                        | sort -V | tail -1)"
+          if [ -z "$apksigner" ]; then
+            echo "::error::apksigner not found on the runner — cannot verify the signing identity."
+            exit 1
+          fi
+          echo "using $apksigner"
+
+          # --print-certs prints the signer CERTIFICATE. No private key material
+          # is read, printed, or otherwise handled here.
+          out="$("$apksigner" verify --print-certs "${ANDROID_ASSET}")"
+          echo "$out"
+
+          actual="$(printf '%s\n' "$out" \
+                    | grep -i 'certificate SHA-256 digest' \
+                    | head -1 | awk '{print $NF}' | tr 'A-Z' 'a-z')"
+
+          if [ -z "$actual" ]; then
+            echo "::error::Could not read a signer certificate digest from apksigner."
+            exit 1
+          fi
+
+          signers="$(printf '%s\n' "$out" | grep -ci 'certificate SHA-256 digest' || true)"
+          if [ "$signers" -ne 1 ]; then
+            echo "::error::Expected exactly one signer, found $signers."
+            exit 1
+          fi
+
+          if [ "$actual" != "$EXPECTED_SIGNER_SHA256" ]; then
+            echo "::error::SIGNING KEY MISMATCH."
+            echo "  expected: $EXPECTED_SIGNER_SHA256"
+            echo "  actual:   $actual"
+            echo ""
+            echo "This APK is signed by a different certificate than the build that is"
+            echo "already installed in the field. Android will REFUSE it as an update:"
+            echo "every owner would have to uninstall first and lose the app's local"
+            echo "state. Most likely the wrong keystore is in ANDROID_KEYSTORE_BASE64,"
+            echo "the alias is wrong, or the debug-keystore fallback was reached."
+            echo "Do NOT change EXPECTED_SIGNER_SHA256 to make this pass."
+            exit 1
+          fi
+          echo "Signing identity matches the build in the field."
+
+      - name: Shred the signing material
+        if: always()
+        shell: bash
+        run: rm -f android/key.properties android/app/upload-keystore.jks
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android
+          path: ${{ env.ANDROID_ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # PUBLISH — one GitHub Release, both assets, stable filenames.
+  #
+  # WHY RELEASE ASSETS AND NOT THE DASHBOARD REPO. The artifacts used to be
+  # committed to Restaurant_Dashboard_UI/public/downloads/. For CI that would
+  # mean a write token for a SECOND repository living in this one's secrets, and
+  # it would keep adding ~115MB of undeltifiable binary to a git history that
+  # every clone and every deploy pays for, permanently. Release assets are
+  # outside the object store, need only this repo's GITHUB_TOKEN, and give a
+  # stable public URL per tag.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish the release
+    needs: [gate, windows, android]
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show what is about to be published
+        shell: bash
+        run: ls -la dist/
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --clobber so a re-run replaces assets instead of failing on a name
+          # collision; the asset FILENAMES are part of the manifest contract and
+          # must not gain a "-1" suffix.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/${WINDOWS_ASSET}" "dist/${ANDROID_ASSET}" \
+              --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" \
+              "dist/${WINDOWS_ASSET}" "dist/${ANDROID_ASSET}" \
+              --repo "$REPO" \
+              --title "Restaurant Dash $VERSION" \
+              --generate-notes
+          fi
+
+          base="https://github.com/$REPO/releases/download/$TAG"
+          echo "### Published $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$base/${WINDOWS_ASSET}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$base/${ANDROID_ASSET}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Clients do not see these until \`APP_RELEASE.latest\` in" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`Restaurant_Backend/app_release.ts\` is bumped to \`$VERSION\` and deployed." >> "$GITHUB_STEP_SUMMARY"

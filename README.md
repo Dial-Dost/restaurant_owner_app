@@ -35,6 +35,17 @@ flutter run -d windows --dart-define=BACKEND_URL=http://localhost:3001 --dart-de
 
 ## Release builds
 
+> **Shipping a release is CI's job, not yours.** Bump `version:` in
+> `pubspec.yaml`, tag it `v<version>`, push — `.github/workflows/release-clients.yml`
+> builds both clients, proves the production URLs are baked in, proves the
+> Windows zip is flat, proves the APK carries the same signing key as the build
+> in the field, and publishes both as GitHub release assets. See
+> **[docs/RELEASE.md](docs/RELEASE.md)**.
+>
+> The rest of this section is what those jobs run, kept for local builds and for
+> debugging a failing one. Artifacts built by hand are **not** shipped, and are
+> no longer committed to `Restaurant_Dashboard_UI/public/downloads/`.
+
 Release builds bake the dart-defines in as the app's **defaults**:
 
 ### Windows
@@ -55,7 +66,14 @@ entire folder together.
 
 **Packaging (hand owners one artifact):**
 
-- **Simplest:** zip the `Release/` folder; the owner unzips and runs the `.exe`.
+- **Shipped format:** a **flat** zip of the *contents* of `Release/` — the exe,
+  the DLLs and `data/` at the zip root. Zip the folder itself and the in-app
+  updater's robocopy nests a dead copy inside the install directory, after which
+  the app never updates again. CI builds this and asserts the layout; locally:
+  ```powershell
+  Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath RestaurantDash-Windows.zip
+  ```
+  The `\*` is the whole point.
 - **Recommended:** build an MSIX installer:
   ```bash
   dart pub global activate msix
@@ -117,17 +135,27 @@ manifest against its own version (`pubspec.yaml` `version:`):
 - Newer version available → an update dialog offers the platform's download link.
 - App below the **minimum** version → the update dialog is **mandatory**.
 
-The manifest is driven by these backend environment variables (names only —
-values live in the backend's environment):
+The manifest lives in **code**, at `Restaurant_Backend/app_release.ts`, and rides
+the ordinary backend deploy. Releasing it is a push; nobody edits `.env` on the
+box. Bump `LATEST` there and the download URLs follow it.
 
-| Backend env var        | Meaning                                  |
-| ---------------------- | ---------------------------------------- |
-| `APP_LATEST_VERSION`   | Latest available app version             |
-| `APP_MIN_VERSION`      | Below this, updating is mandatory        |
-| `APP_UPDATE_NOTES`     | Release notes shown in the dialog        |
-| `APP_DOWNLOAD_WINDOWS` | Download URL offered to Windows builds   |
-| `APP_DOWNLOAD_ANDROID` | Download URL offered to Android builds   |
-| `APP_DOWNLOAD_IOS`     | Download URL offered to iOS builds       |
+For an incident — pulling a bad release, or forcing an upgrade — these
+environment variables override the shipped manifest field by field, without
+waiting for a deploy:
+
+| Backend env var             | Meaning                                |
+| --------------------------- | -------------------------------------- |
+| `APP_RELEASE_PIN_VERSION`   | Latest available app version           |
+| `APP_RELEASE_PIN_MIN`       | Below this, updating is mandatory      |
+| `APP_RELEASE_PIN_NOTES`     | Release notes shown in the dialog      |
+| `APP_RELEASE_PIN_WINDOWS`   | Download URL offered to Windows builds |
+| `APP_RELEASE_PIN_ANDROID`   | Download URL offered to Android builds |
+| `APP_RELEASE_PIN_IOS`       | Download URL offered to iOS builds     |
+
+> The older `APP_LATEST_VERSION` / `APP_MIN_VERSION` / `APP_UPDATE_NOTES` /
+> `APP_DOWNLOAD_*` names are **inert** — they may still be set on a box
+> provisioned before the manifest moved into code, where they now do nothing.
+> The backend logs them by name at boot so nobody debugs one at 2am.
 
 ## App icon
 
