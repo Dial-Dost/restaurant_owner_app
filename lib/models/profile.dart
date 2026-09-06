@@ -84,6 +84,30 @@ class Profile {
     );
   }
 
+  /// The inverse of [Profile.fromJson], so a session can be restored from disk
+  /// when the server cannot be reached.
+  ///
+  /// THE KEYS ARE THE WIRE'S KEYS, not Dart field names, and that is deliberate:
+  /// what gets written to disk is indistinguishable from what /auth/me returned,
+  /// so the restore path and the network path parse the same shape and cannot
+  /// drift into disagreeing about what a profile is. `profile_round_trips_test`
+  /// pins that — add a field to fromJson without adding it here and it fails.
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'employeeId': employeeId,
+        'restaurantName': restaurantName,
+        'restaurantUsername': restaurantUsername,
+        'res_id': resId,
+        'outlet_id': outletId,
+        'role': role,
+        'role_all': roleAll,
+        'emp_Fname': firstName,
+        'employeeUsername': employeeUsername,
+        'action_names': actionNames,
+        'actions_set': actions,
+        'features': features,
+        'limits': limits,
+      };
+
   static List<String> _stringList(dynamic v) =>
       v is List ? v.map((e) => e.toString()).toList() : const <String>[];
 

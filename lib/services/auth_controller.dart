@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -12,6 +14,11 @@ class AuthController extends ChangeNotifier {
 
   static const _tokenKey = 'owner_token';
   static const _outletKey = 'selected_outlet_id';
+  /// The last profile this device saw from the server, kept so a launch with no
+  /// connection can restore the session instead of signing the user out. Written
+  /// on login and on every successful /auth/me; removed only when the SERVER
+  /// rejects the token, never merely because it could not be reached.
+  static const _profileKey = 'owner_profile';
 
   String? _token;
   Profile? _profile;
@@ -53,26 +60,84 @@ class AuthController extends ChangeNotifier {
 
   bool get isAuthenticated => _token != null && _profile != null;
 
-  /// Restore a persisted session on launch (validating it against /auth/me).
+  /// Restore a persisted session on launch, refreshing it against /auth/me when
+  /// the server can be reached.
+  ///
+  /// THE OFFLINE CASE IS THE WHOLE POINT OF THIS METHOD'S SHAPE. It used to wrap
+  /// `api.me()` in a bare `catch (_)` that deleted the stored token, which meant
+  /// a launch with no connection was indistinguishable from a rejected session:
+  /// the app signed the user out, showed the login screen, and login needs the
+  /// network too. The read cache and the offline outbox were both unreachable —
+  /// not broken, just never given a chance to run, because you could not get
+  /// past the front door without a connection.
+  ///
+  /// So the two failures are now told apart by whether the SERVER ANSWERED:
+  ///   * an ApiException carrying a status is the backend saying no (401 = this
+  ///     token is dead). Clear it. Staying signed in on a revoked session would
+  ///     be a real security hole.
+  ///   * anything else — SocketException, TimeoutException, an ApiException with
+  ///     a null status — means we never reached anyone. That is not evidence
+  ///     about the token, so KEEP it and restore the profile saved beside it.
   Future<void> init() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final t = prefs.getString(_tokenKey);
       if (t != null && t.isNotEmpty) {
         try {
-          _profile = await api.me(t);
+          final fresh = await api.me(t);
+          _profile = fresh;
           _token = t;
           _selectedOutletId = prefs.getString(_outletKey);
+          // Refresh the cached copy on every successful launch, so an offline
+          // start reflects the permissions and plan flags as of the last time
+          // this device actually spoke to the server.
+          await prefs.setString(_profileKey, jsonEncode(fresh.toJson()));
+        } on ApiException catch (e) {
+          if (e.status == null) {
+            _restoreOffline(prefs, t);
+          } else {
+            await _forgetSession(prefs);
+          }
         } catch (_) {
-          await prefs.remove(_tokenKey);
-          _token = null;
-          _profile = null;
+          // Transport-level: SocketException, ClientException, TimeoutException.
+          // The server was never reached.
+          _restoreOffline(prefs, t);
         }
       }
     } finally {
       _initialized = true;
       notifyListeners();
     }
+  }
+
+  /// Bring the session back from disk when the server is unreachable. Falls back
+  /// to signing out only if there is no saved profile to restore — a session
+  /// with a token and no identity cannot gate a single screen, and pretending
+  /// otherwise would put a user in front of modules their role may not allow.
+  void _restoreOffline(SharedPreferences prefs, String token) {
+    final raw = prefs.getString(_profileKey);
+    if (raw == null || raw.isEmpty) {
+      _token = null;
+      _profile = null;
+      return;
+    }
+    try {
+      _profile = Profile.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+      _token = token;
+      _selectedOutletId = prefs.getString(_outletKey);
+    } catch (_) {
+      // A corrupt or half-written blob is not a session.
+      _token = null;
+      _profile = null;
+    }
+  }
+
+  /// The server said this token is no longer valid. Forget everything about it.
+  Future<void> _forgetSession(SharedPreferences prefs) async {
+    await prefs.remove(_tokenKey);
+    await prefs.remove(_profileKey);
+    _token = null;
+    _profile = null;
   }
 
   Future<bool> login(String restaurant, String username, String password, {String? outletId}) async {
@@ -86,6 +151,9 @@ class AuthController extends ChangeNotifier {
       _notice = null;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_tokenKey, result.token);
+      // Saved with the token, not later: a user who signs in and immediately
+      // loses connectivity must still be able to reopen the app.
+      await prefs.setString(_profileKey, jsonEncode(result.profile.toJson()));
       return true;
     } on ApiException catch (e) {
       _error = e.message;
@@ -114,6 +182,9 @@ class AuthController extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_tokenKey);
     await prefs.remove(_outletKey);
+    // The cached identity goes with the session. Leaving it behind would let the
+    // next launch restore a profile whose token is already gone.
+    await prefs.remove(_profileKey);
     // A voluntary sign-out is the "handing the device over" gesture, so the
     // saved GET cache goes with the token. An EXPIRED session keeps it: the
     // same person is about to sign straight back in, and the warm cache is
