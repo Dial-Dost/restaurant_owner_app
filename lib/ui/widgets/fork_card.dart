@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 
@@ -36,6 +37,24 @@ class _ForkCardState extends State<ForkCard> {
 
   @override
   Widget build(BuildContext context) {
+    // The design-system fork. Everything below this line is the Rustic Fork
+    // card, unchanged; GAIA's card is a different SHAPE (flat, hairlined, 2px)
+    // rather than a recolour, so it cannot be expressed as tokens and gets its
+    // own widget. Keeping the branch here — rather than at the ~200 call sites
+    // — is what lets every module render in either language untouched.
+    if (Gaia.of(context)) {
+      return GaiaCard(
+        padding: widget.padding,
+        onTap: widget.onTap,
+        selected: widget.selected,
+        // `inset` means "recessed panel" in Rustic. Gaia has no recess; the
+        // nearest thing it has is the raised step, which is what a panel
+        // distinguished from its page uses there.
+        raised: widget.inset,
+        child: widget.child,
+      );
+    }
+
     final interactive = widget.onTap != null;
 
     final border = widget.selected

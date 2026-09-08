@@ -33,6 +33,10 @@ class _FakeApi extends ApiClient {
   /// While true, every request throws like a dead network.
   bool offline = false;
 
+  /// When set, every request fails with a REAL HTTP status — the server
+  /// answered, so it is a refusal and not an outage.
+  int? status;
+
   @override
   Future<LoginResult> login(String restaurantName, String username, String password, {String? outletId}) async =>
       LoginResult(
@@ -52,6 +56,8 @@ class _FakeApi extends ApiClient {
   Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
     requests++;
     if (offline) throw ApiException('Connection refused', null);
+    final failWith = status;
+    if (failWith != null) throw ApiException('Server error', failWith);
     if (gate != null) await gate!.future;
     if (!routes.containsKey(path)) {
       // Writes to unrouted paths succeed generically — the bust tests only
@@ -136,6 +142,12 @@ void main() {
     await _warmCache(tester, rest);
 
     await rest.post('/orders/anything', {'x': 1});
+
+    // The invalidation is what an ordinary read SEES. The entry may survive on
+    // disk as a last-known-good copy, but nothing on the online path may serve
+    // it: that is the "one skeleton, never a stale bill" rule, unchanged.
+    expect(await GetCache.instance.read('res-1', 'out-1', '/dishes'), isNull,
+        reason: 'a write left a saved GET readable as though it were current');
 
     // With the cache busted and the network held open, there is nothing to
     // paint from — the skeleton (not a stale copy) is correct here.
@@ -227,14 +239,42 @@ void main() {
     expect(find.textContaining('Offline'), findsNothing);
   });
 
-  testWidgets('offline with NO saved copy keeps the existing error screen', (tester) async {
+  testWidgets('offline with NOTHING saved says what the reader can do about it',
+      (tester) async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
     final api = _FakeApi({'/dishes': {'items': [1, 2]}})..offline = true;
     final rest = await _signIn(api);
     await tester.pumpWidget(_host(_module(rest)));
     await tester.pumpAndSettle();
-    expect(find.text("Can't reach the server"), findsOneWidget);
+
+    // "Can't reach the server" named the APP's problem. This names the two
+    // things that are in the reader's hands, and the conclusion to draw when
+    // neither works.
+    expect(find.text(offlineNothingSavedTitle), findsOneWidget);
+    expect(find.text("Can't reach the server"), findsNothing);
+    expect(find.textContaining('Wi-Fi'), findsOneWidget);
+    expect(find.textContaining('hotspot'), findsOneWidget);
     expect(find.text('Retry'), findsOneWidget);
+  });
+
+  testWidgets('a server that ANSWERS still shows its own words, not the offline copy',
+      (tester) async {
+    // The offline wording and the last-known-good copy are both gated on the
+    // line being down. A 500 is a real answer: dressing it up as an outage
+    // would send someone to check a router that is working perfectly.
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final api = _FakeApi({'/dishes': {'items': [1, 2]}});
+    final rest = await _signIn(api);
+    await _warmCache(tester, rest);
+    await rest.post('/orders/anything', {'x': 1}); // supersede the saved copy
+
+    api.status = 500;
+    await tester.pumpWidget(_host(_module(rest)));
+    await tester.pumpAndSettle();
+    expect(find.text(offlineNothingSavedTitle), findsNothing);
+    expect(find.text("Couldn't load this section."), findsOneWidget);
+    expect(find.text('count 2'), findsNothing,
+        reason: 'a superseded copy must never answer for a server that replied');
   });
 
   testWidgets('an old saved copy labels itself "Updated ... ago" while the refresh is in flight',

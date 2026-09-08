@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 
 /// The label inside a pill, made to survive a narrow parent.
@@ -55,6 +56,13 @@ class StatusChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Gaia keeps the contract — a status is never colour alone, the label
+    // always ships — but draws it as an engraved outline rather than a tinted
+    // capsule.
+    if (Gaia.of(context)) {
+      return GaiaStatusChip(label: label, color: color, dense: dense);
+    }
+
     return Container(
       padding: EdgeInsets.symmetric(
         horizontal: dense ? 8 : 10,
@@ -99,12 +107,16 @@ class InfoChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final gaia = Gaia.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
       decoration: BoxDecoration(
-        color: AppColors.inset,
-        borderRadius: BorderRadius.circular(7),
-        border: Border.all(color: AppColors.border),
+        // `.pill` is unfilled and square in Gaia; the recessed rounded chip is
+        // Rustic's.
+        color: gaia ? Colors.transparent : AppColors.inset,
+        borderRadius: gaia ? GaiaRadius.all : BorderRadius.circular(7),
+        border: Border.all(
+            color: gaia ? GaiaColors.line2 : AppColors.border),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,

@@ -230,9 +230,18 @@ void main() {
     expect(Outbox.instance.entries, isEmpty);
     expect(Outbox.instance.pendingCount, 0);
 
+    // The invariant is what an ordinary read SEES, not whether a key survives:
+    // the replayed writes moved the server on, so nothing saved may be served
+    // as current. The copy itself is kept and marked — that is the offline last
+    // resort, and only a read that explicitly asks for a stale one can see it.
+    expect(await GetCache.instance.read('res-1', 'out-1', '/orders'), isNull,
+        reason: 'a successful replay must invalidate the read cache so screens refresh');
+    final kept = await GetCache.instance.read('res-1', 'out-1', '/orders', allowStale: true);
+    expect(kept, isNotNull,
+        reason: 'the payload must survive as a last-known-good copy for offline');
+    expect(kept!.superseded, isTrue, reason: 'and it must be MARKED as behind the server');
+
     prefs = await SharedPreferences.getInstance();
-    expect(prefs.getKeys().where((k) => k.startsWith(GetCache.keyPrefix)), isEmpty,
-        reason: 'a successful replay must bust the read cache so screens refresh');
     expect(prefs.getKeys().where((k) => k.startsWith(Outbox.keyPrefix)), isEmpty,
         reason: 'a drained queue must not leave its key on disk');
   });
@@ -605,12 +614,15 @@ void main() {
     final rest = await _signIn(api);
 
     await rest.getList('/orders');
-    var prefs = await SharedPreferences.getInstance();
+    final prefs = await SharedPreferences.getInstance();
     expect(prefs.getKeys().where((k) => k.startsWith(GetCache.keyPrefix)), hasLength(1));
 
     await rest.post('/occupy-table', {'table_name': 'T4', 'num_covers': 2});
-    prefs = await SharedPreferences.getInstance();
-    expect(prefs.getKeys().where((k) => k.startsWith(GetCache.keyPrefix)), isEmpty);
+    // Invalidated for every ordinary read — the online guarantee is unchanged —
+    // while the payload stays behind as the offline last resort.
+    expect(await GetCache.instance.read('res-1', 'out-1', '/orders'), isNull);
+    expect((await GetCache.instance.read('res-1', 'out-1', '/orders', allowStale: true))?.superseded,
+        isTrue);
   });
 
   test('ONLINE: every mutating request carries a key; GETs do not', () async {

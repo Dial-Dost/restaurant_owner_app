@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'screens/home_shell.dart';
 import 'screens/login_screen.dart';
 import 'services/auth_controller.dart';
+import 'ui/gaia/gaia.dart';
 import 'ui/theme/app_colors.dart';
 import 'ui/theme/app_theme.dart';
 import 'ui/theme/appearance.dart';
@@ -49,13 +50,24 @@ class _OwnerAppState extends State<OwnerApp> {
     // Rebuild the whole tree when the device accent changes: AppTheme.dark()
     // and every module read the accent through AppColors getters, so one
     // rebuild here recolours the app with no per-module wiring.
+    //
+    // The same rebuild is what makes the DESIGN SYSTEM switch live. Handing
+    // MaterialApp the other ThemeData restyles in place — Flutter tweens
+    // between the two themes and every module re-reads its text theme on the
+    // next build — so flipping Gaia on needs no restart and no route reset.
     return AnimatedBuilder(
       animation: AppearanceController.instance,
-      builder: (context, _) => MaterialApp(
+      // Above MaterialApp, so every primitive below can DEPEND on the design
+      // system rather than reading it statically. That dependency is what
+      // makes const call sites (there are 88 of them) restyle on a flip —
+      // see Gaia.of.
+      builder: (context, _) => GaiaScope(
+        system: AppearanceController.instance.designSystem,
+        child: MaterialApp(
       title: 'Restaurant Dash — Owner',
       debugShowCheckedModeBanner: false,
       scrollBehavior: _DragScrollBehavior(),
-      theme: AppTheme.dark(),
+      theme: Gaia.isActive ? GaiaTheme.dark() : AppTheme.dark(),
       home: AnimatedBuilder(
         animation: auth,
         builder: (context, _) {
@@ -70,6 +82,7 @@ class _OwnerAppState extends State<OwnerApp> {
           return auth.isAuthenticated ? HomeShell(auth: auth) : LoginScreen(auth: auth);
         },
       ),
+        ),
       ),
     );
   }

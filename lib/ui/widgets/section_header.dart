@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 
 /// Section title row — small copper tick, title, optional count badge and
@@ -20,6 +21,15 @@ class SectionHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (Gaia.of(context)) {
+      return GaiaSectionHeader(
+        title: title,
+        count: count,
+        trailing: trailing,
+        padding: padding,
+      );
+    }
+
     final text = Theme.of(context).textTheme;
     return Padding(
       padding: padding,

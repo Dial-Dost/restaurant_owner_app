@@ -431,9 +431,14 @@ void main() {
       expect(widget.overflow, anyOf(isNull, TextOverflow.clip),
           reason: 'line $k must not ellipse when the column narrows');
     }
-    // And the ticket still carries its own actions.
+    // And the ticket still carries its own actions. The print control is now
+    // labelled for what it produces: barking prints the thermal docket by
+    // itself, so this button is the LOCAL PDF copy and the separate Reprint
+    // button is the one that sends the real ticket to the kitchen printer again.
+    // Two controls that both said "Print KOT" would be a coin toss at the pass.
     expect(find.text('Mark Served'), findsOneWidget);
-    expect(find.byTooltip('Print KOT'), findsOneWidget);
+    expect(find.byTooltip('Print KOT (local PDF copy)'), findsOneWidget);
+    expect(find.byTooltip('Reprint kitchen docket'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox());
   });

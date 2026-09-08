@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/profile.dart';
+import '../models/role_scope.dart';
 import '../services/auth_controller.dart';
 import '../services/printer_service.dart';
 import '../services/rest_client.dart';
@@ -73,15 +74,24 @@ const _navSections = <_NavSection>[
     _Module('Inventory', Icons.inventory_2, ['inventory', 'stock'], m.inventoryModule, feature: 'inventory'),
     _Module('Purchase Orders', Icons.local_shipping, ['inventory', 'stock', 'purchase', 'vendor'], m.purchaseOrdersModule, feature: 'inventory'),
   ]),
-  _NavSection('GUESTS', [
-    _Module('Customers', Icons.people, ['customer'], m.customersModule),
-    _Module('Feedback', Icons.reviews, ['feedback'], m.feedbackModule),
-  ]),
   _NavSection('TEAM', [
     _Module('Attendance', Icons.schedule, [], m.attendanceModule),
     _Module('Employees', Icons.badge, ['employee', 'role', 'user'], m.employeesModule),
     _Module('Roles', Icons.shield, ['role', 'permission'], m.rolesModule),
     _Module('Valet', Icons.local_parking, ['valet', 'parking'], m.valetModule, feature: 'valet'),
+  ]),
+  // GUESTS SITS AFTER TEAM, AND FEEDBACK LEADS IT, so Feedback reads directly
+  // under Valet — the placement asked for. Both halves of that are deliberate:
+  // moving the SECTION (rather than lifting Feedback into TEAM) keeps a
+  // guest-facing module out of a staff group, and leading with Feedback is what
+  // makes it the next row after Valet rather than the one after Customers.
+  //
+  // Nothing else about the module moves. Its permission keywords (['feedback'])
+  // and its feature gate (none) are untouched, because those — not the row
+  // order — are what decide who sees the tile at all.
+  _NavSection('GUESTS', [
+    _Module('Feedback', Icons.reviews, ['feedback'], m.feedbackModule),
+    _Module('Customers', Icons.people, ['customer'], m.customersModule),
   ]),
   _NavSection('INSIGHTS', [
     _Module('Analytics', Icons.insights, ['analytics', 'apc', 'report'], m.analyticsModule, feature: 'analytics'),
@@ -134,6 +144,52 @@ const _navSections = <_NavSection>[
 // indices, `_visibleLabels`, `_openModule` — in section order.
 final _allModules = <_Module>[for (final s in _navSections) ...s.modules];
 
+/// The modules [p] may open, in registry order — the shell's one visibility
+/// rule, lifted out of `build` so the LANDING TAB can be chosen from the same
+/// list `build` is about to render rather than from a second, drifting copy.
+///
+/// Three gates were already here (`adminOnly`, permission keywords, plan
+/// feature). The fourth, [RoleScope.hidesModule], is the one that is about the
+/// person rather than the grant: see that file for why a keyword gate could not
+/// have done it — 'Waitlist' matches on ['table', 'order', 'waitlist'] and every
+/// waiter holds an order action, so it was never gated at all.
+///
+/// Pure in [p]: no context, no state, no ordering side effects.
+List<_Module> _visibleModulesFor(Profile p) => _allModules
+    .where((mod) =>
+        (!mod.adminOnly || p.isAdmin) &&
+        p.can(mod.keywords) &&
+        p.featureEnabled(mod.feature) &&
+        !RoleScope.hidesModule(p, mod.label))
+    .toList();
+
+/// Index into [visible] of the tab this user opens the app on.
+///
+/// Resolved by LABEL against the list actually being rendered, so a role whose
+/// landing module is hidden — a waiter at a tenant that never granted the tables
+/// action, a plan that dropped it — lands on the first module they really do
+/// have instead of on an index that addresses somebody else's screen.
+int _landingIndexIn(List<_Module> visible, Profile p) {
+  final want = RoleScope.landingModuleFor(p);
+  if (want == null) return 0;
+  final i = visible.indexWhere((mod) => mod.label == want);
+  return i < 0 ? 0 : i;
+}
+
+/// The nav, as labels — the module gating, testable without pumping the shell.
+@visibleForTesting
+List<String> visibleModuleLabelsFor(Profile p) =>
+    [for (final mod in _visibleModulesFor(p)) mod.label];
+
+/// The label of the tab [p] opens the app on, or '' when they have no modules
+/// at all (which the shell renders as its "no modules" state, not as a tab).
+@visibleForTesting
+String landingModuleLabelFor(Profile p) {
+  final visible = _visibleModulesFor(p);
+  if (visible.isEmpty) return '';
+  return visible[_landingIndexIn(visible, p)].label;
+}
+
 /// The signed-in shell: a permission-gated sidebar plus the selected module.
 class HomeShell extends StatefulWidget {
   final AuthController auth;
@@ -155,6 +211,16 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+  // False until the first build has placed this user on their landing tab.
+  //
+  // The choice is made in `build` rather than `initState` because that is where
+  // the visible list exists, and it is made ONCE because it is a starting
+  // position, not a rule: after this, `_index` belongs to whatever the user did
+  // last. Nothing can have navigated yet — `_openModule`, `_selectIndex` and
+  // `_goBack` are all reached through the tree this first build creates — so it
+  // cannot fight the deep-link or back-trail logic, and it leaves `_history`
+  // empty, which is what makes Back correctly dead on the landing tab.
+  bool _landed = false;
   int _refreshTick = 0;
   bool _checkedUpdate = false;
   bool _sidebarCollapsed = false;
@@ -645,11 +711,14 @@ class _HomeShellState extends State<HomeShell> {
     final p = widget.auth.profile!;
     final rest = RestClient(widget.auth);
 
-    final visible = _allModules
-        .where((mod) => (!mod.adminOnly || p.isAdmin) && p.can(mod.keywords) && p.featureEnabled(mod.feature))
-        .toList();
+    final visible = _visibleModulesFor(p);
     if (visible.isEmpty) {
       return const Scaffold(body: Center(child: Text('No modules available for your role.')));
+    }
+    // First build only: open on the tab this role starts work on.
+    if (!_landed) {
+      _landed = true;
+      _index = _landingIndexIn(visible, p);
     }
     if (_index >= visible.length) _index = 0;
     final current = visible[_index];

@@ -2,6 +2,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import '../theme/appearance.dart';
 import '../theme/backdrop_style.dart';
@@ -51,6 +52,14 @@ class GradientBackdrop extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // GAIA has no backdrop. Its depth is the flat ground ladder and a
+    // hairline — a warm wash and two ambient orbs are precisely the vocabulary
+    // it does not use, and leaving them on would read as the old look bleeding
+    // through the new one. So the layer stack collapses to the page ground.
+    if (Gaia.of(context)) {
+      return ColoredBox(color: GaiaColors.bg, child: child);
+    }
+
     final h = heroHeight ?? (MediaQuery.sizeOf(context).height * 0.42).clamp(180.0, 520.0);
     final style = AppearanceController.instance.backdrop;
 

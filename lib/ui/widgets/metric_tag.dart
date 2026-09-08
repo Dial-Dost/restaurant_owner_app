@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import 'status_chip.dart';
 
@@ -16,29 +17,42 @@ class TickTag extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = this.color ?? AppColors.copperHi;
+    final gaia = Gaia.of(context);
+    final color = this.color ?? (gaia ? GaiaColors.champagne : AppColors.copperHi);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Container(
-          width: 2.5,
-          height: 11,
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(2),
-          ),
-        ),
+        // Gaia marks a tagged item with `.dish .sq` — a 9px hairline SQUARE
+        // outline, not a filled tick. Same job, opposite weight.
+        gaia
+            ? Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(
+                  border: Border.all(color: color),
+                ),
+              )
+            : Container(
+                width: 2.5,
+                height: 11,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
         const SizedBox(width: 5),
         // Same rule as the pills in status_chip.dart — a tick sits beside a
         // StatusChip in the same narrow tile row, so it has to give way too.
         ChipLabel(
           label,
-          style: TextStyle(
-            fontSize: 10.5,
-            fontWeight: FontWeight.w500,
-            color: AppColors.textSecondary,
-            letterSpacing: 0.4,
-          ),
+          style: gaia
+              ? GaiaType.pill(color: GaiaColors.text2)
+              : TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w500,
+                  color: AppColors.textSecondary,
+                  letterSpacing: 0.4,
+                ),
         ),
       ],
     );

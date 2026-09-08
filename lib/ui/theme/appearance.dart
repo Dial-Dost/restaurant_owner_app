@@ -1,8 +1,35 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../gaia/gaia_colors.dart';
 import 'app_colors.dart';
 import 'backdrop_style.dart';
+
+/// Which complete visual language the app wears.
+///
+/// Not an accent and not a shell scheme — those are choices WITHIN a system.
+/// This picks the system: its palette, its type, its shapes and its
+/// primitives. The two are deliberately kept as separate axes so that turning
+/// Gaia off restores the exact copper-on-rustic the device had before, rather
+/// than leaving it on some half-migrated blend.
+enum DesignSystem {
+  /// The shipped look: near-black ground, copper accent, 14px radii, gradient
+  /// cards, ambient shadow. Lives in `lib/ui/theme` + `lib/ui/widgets`.
+  rustic('rustic', 'Rustic Fork'),
+
+  /// The GAIA look: forest ground, champagne accent, Cormorant Garamond
+  /// numerals over Instrument Sans, 2px edges, hairlines and no shadow at all.
+  /// Lives in `lib/ui/gaia`.
+  gaia('gaia', 'Gaia');
+
+  const DesignSystem(this.id, this.label);
+
+  final String id;
+  final String label;
+
+  static DesignSystem byId(String? id) =>
+      DesignSystem.values.firstWhere((d) => d.id == id, orElse: () => rustic);
+}
 
 /// The curated accent set. Every `hi`/`base` stop clears WCAG AA 4.5:1 against
 /// the near-black ground (bg #0C0A09) — measured, not hoped: hi ranges 8.4–13.2,
@@ -162,6 +189,7 @@ class AppearanceController extends ChangeNotifier {
 
   static const String _prefsKey = 'appearance.accent';
   static const String _schemePrefsKey = 'appearance.scheme';
+  static const String _designPrefsKey = 'appearance.designSystem';
   static const String _washPrefsKey = 'appearance.backdrop.wash';
   static const String _bloomPrefsKey = 'appearance.backdrop.bloom';
   static const String _anglePrefsKey = 'appearance.backdrop.angle';
@@ -177,6 +205,29 @@ class AppearanceController extends ChangeNotifier {
 
   BackdropStyle _backdrop = const BackdropStyle();
   BackdropStyle get backdrop => _backdrop;
+
+  /// Which visual language is on. Defaults to [DesignSystem.rustic] — the
+  /// shipped look — so nothing changes for anyone who does not opt in.
+  DesignSystem _designSystem = DesignSystem.rustic;
+  DesignSystem get designSystem => _designSystem;
+
+  /// The single place the AppColors ladder is set, so accent/scheme/design
+  /// can never disagree about what is currently painted.
+  ///
+  /// While Gaia is on, its palette PINS the ladder: the owner's accent and
+  /// scheme choices are still remembered (and still shown in their pickers),
+  /// they simply are not applied, because a champagne-on-forest design does
+  /// not have a copper variant. Turning Gaia off re-applies exactly what was
+  /// stored, which is what makes this reversible rather than destructive.
+  void _applyPalette() {
+    if (_designSystem == DesignSystem.gaia) {
+      AppColors.applyShell(GaiaColors.shellBridge);
+      AppColors.applyAccent(GaiaColors.accentBridge);
+    } else {
+      AppColors.applyShell(AppSchemes.byId(_schemeId));
+      AppColors.applyAccent(AppAccents.byId(_accentId));
+    }
+  }
 
   // '#RRGGBB' <-> Color. Prefs-only: anything unparseable loads as null
   // ("follow the accent"), never as a junk colour.
@@ -197,6 +248,7 @@ class AppearanceController extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _accentId = AppAccents.byId(prefs.getString(_prefsKey)).id;
       _schemeId = AppSchemes.byId(prefs.getString(_schemePrefsKey)).id;
+      _designSystem = DesignSystem.byId(prefs.getString(_designPrefsKey));
       _backdrop = BackdropStyle(
         wash: _colorOf(prefs.getString(_washPrefsKey)),
         bloom: _colorOf(prefs.getString(_bloomPrefsKey)),
@@ -206,10 +258,10 @@ class AppearanceController extends ChangeNotifier {
     } catch (_) {
       _accentId = AppAccents.defaultId;
       _schemeId = AppSchemes.defaultId;
+      _designSystem = DesignSystem.rustic;
       _backdrop = const BackdropStyle();
     }
-    AppColors.applyAccent(AppAccents.byId(_accentId));
-    AppColors.applyShell(AppSchemes.byId(_schemeId));
+    _applyPalette();
     notifyListeners();
   }
 
@@ -217,7 +269,10 @@ class AppearanceController extends ChangeNotifier {
     final resolved = AppAccents.byId(id);
     if (resolved.id == _accentId) return;
     _accentId = resolved.id;
-    AppColors.applyAccent(resolved);
+    // Through _applyPalette, not applyAccent directly: while Gaia is on this
+    // stores the choice without repainting, so the picker stays honest about
+    // what the device will wear when Gaia is turned back off.
+    _applyPalette();
     // Notify FIRST so the UI recolours instantly; persistence is best-effort
     // (a failed write only means the choice doesn't survive a restart).
     notifyListeners();
@@ -228,9 +283,20 @@ class AppearanceController extends ChangeNotifier {
     final resolved = AppSchemes.byId(id);
     if (resolved.id == _schemeId) return;
     _schemeId = resolved.id;
-    AppColors.applyShell(resolved);
+    _applyPalette();
     notifyListeners();
     await _persist(_schemePrefsKey, resolved.id);
+  }
+
+  /// Flip the whole visual language. Live: the app root listens to this
+  /// controller and rebuilds its MaterialApp with the other ThemeData, so the
+  /// switch restyles in place with no restart.
+  Future<void> setDesignSystem(DesignSystem system) async {
+    if (system == _designSystem) return;
+    _designSystem = system;
+    _applyPalette();
+    notifyListeners();
+    await _persist(_designPrefsKey, system.id);
   }
 
   /// One entry point for every backdrop knob (stops, angle, intensity), so the
@@ -277,9 +343,9 @@ class AppearanceController extends ChangeNotifier {
   void debugReset() {
     _accentId = AppAccents.defaultId;
     _schemeId = AppSchemes.defaultId;
+    _designSystem = DesignSystem.rustic;
     _backdrop = const BackdropStyle();
-    AppColors.applyAccent(AppAccents.copper);
-    AppColors.applyShell(AppSchemes.rustic);
+    _applyPalette();
     notifyListeners();
   }
 }

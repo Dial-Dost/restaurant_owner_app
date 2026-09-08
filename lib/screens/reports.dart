@@ -491,6 +491,16 @@ class _MisSegment extends StatelessWidget {
 
 // ------------------------------------------------------------- the report ----
 
+/// What one row of a report can be opened INTO, or [none] when the row is a
+/// total and there is nothing single behind it.
+///
+/// It is deliberately a property of the ROW, not of the report: Bill Edit and
+/// NC Summary carry whichever identifier the audit writer happened to record,
+/// so two rows of one report legitimately differ. Anything that describes
+/// drill-down to the reader is computed from this, so the description and the
+/// behaviour cannot disagree.
+enum _MisRowOpen { none, bill, kot, day, outlet }
+
 class _MisReportPane extends StatefulWidget {
   const _MisReportPane({
     super.key,
@@ -549,6 +559,7 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       apply: (d) {
         _apply(d);
         _loading = false;
+        _error = null;
       },
       refresh: () => _load(silent: true),
       fallback: _load,
@@ -642,9 +653,23 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
     } catch (e) {
       if (!mounted || !cacheGenIs(gen)) return;
       setState(() => _appending = false);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not load more rows: $e')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(_misWhyFailed('load more rows', e))));
     }
   }
+
+  /// A failure in the reader's words, not the transport's.
+  ///
+  /// The page on screen stays up when Load more or an export fails, so this is
+  /// a snackbar rather than an error pane — but the same rule holds as on the
+  /// pane: an unreachable server is the reader's Wi-Fi to act on, while a
+  /// server that answered gets its own words repeated. Dumping
+  /// "ClientException: Connection closed before full header was received" on a
+  /// cashier names neither.
+  String _misWhyFailed(String what, Object e) => isUnreachableError(e)
+      ? "Couldn't $what — this device can't reach the restaurant server. "
+          'Reconnect to the Wi-Fi and try again.'
+      : 'Could not $what: $e';
 
   // ---- columns -------------------------------------------------------------
 
@@ -779,7 +804,10 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       messenger.showSnackBar(SnackBar(content: Text(result.message)));
     } catch (e) {
       if (!mounted) return;
-      messenger.showSnackBar(SnackBar(content: Text('Could not export: $e')));
+      // A sweep for an export walks the WHOLE window, so it is the most likely
+      // thing on this screen to meet a dying line — and a half-swept file must
+      // never be offered as the report.
+      messenger.showSnackBar(SnackBar(content: Text(_misWhyFailed('export this report', e))));
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
@@ -787,34 +815,116 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
 
   // ---- drill-down ----------------------------------------------------------
 
-  /// What tapping a row DOES — and null when it does nothing, so a row is only
-  /// ever offered as a control when it is one.
-  VoidCallback? _rowAction(Map<String, dynamic> row) {
-    final billId = _s(row, 'bill_id', '');
-    if (billId.isNotEmpty) {
-      return () => _misOpenBill(context, widget.rest, billId, _misRowTitle(row));
-    }
-    final orderId = _s(row, 'order_id', '');
-    if (orderId.isNotEmpty) {
-      return () => _misOpenKot(context, widget.rest, orderId);
-    }
+  /// WHAT A ROW OPENS — the single classifier behind BOTH the tap and the words
+  /// that describe it.
+  ///
+  /// Split out from [_rowAction] on purpose. The reported complaint was that
+  /// reports "are not clickable", and the wiring was never broken: nine of the
+  /// fifteen reports have rows that open something and six do not, because six
+  /// of them are AGGREGATES. "Paneer Tikka, 47 sold" is 47 lines off some
+  /// unknown number of bills; there is no single bill behind it to open, and
+  /// inventing one would be worse than opening nothing. The bug was that the
+  /// screen never said which kind of report the reader was looking at, so a
+  /// correct dead row and a broken control looked exactly the same.
+  ///
+  /// Deriving the description from this classifier — rather than from a second
+  /// hand-kept table of report keys — is what makes the sentence on screen
+  /// unable to drift from what the tap actually does. A report that starts
+  /// carrying `bill_id` tomorrow becomes clickable AND starts saying so in the
+  /// same commit, with no client release listing it twice.
+  _MisRowOpen _rowOpens(Map<String, dynamic> row) {
+    if (_s(row, 'bill_id', '').isNotEmpty) return _MisRowOpen.bill;
+    if (_s(row, 'order_id', '').isNotEmpty) return _MisRowOpen.kot;
     // The Sales Summary's day rows narrow the window to that day — the question
     // an owner asks the instant a day looks wrong. Hour rows cannot: the window
     // is a pair of calendar DAYS, so an hour has nothing to narrow to.
-    if (widget.report.key == 'sales_summary' && widget.bucket == 'day') {
-      final day = _s(row, 'bucket', '');
-      if (isDayKey(day)) {
-        return () => widget.onRange(DateRange.normalized(day, day));
-      }
+    if (widget.report.key == 'sales_summary' &&
+        widget.bucket == 'day' &&
+        isDayKey(_s(row, 'bucket', ''))) {
+      return _MisRowOpen.day;
     }
     // An Executive Summary outlet row switches the whole app to that branch,
-    // which is what "why is Kalyani Nagar down" actually needs.
-    if (widget.report.key == 'executive_summary') {
-      final id = _s(row, 'outlet_id', '');
-      final switcher = ModuleNavigator.of(context)?.switchOutlet;
-      if (id.isNotEmpty && switcher != null) return () => switcher(id);
+    // which is what "why is Kalyani Nagar down" actually needs. A reader who
+    // cannot switch outlets at all gets no promise of one.
+    if (widget.report.key == 'executive_summary' &&
+        _s(row, 'outlet_id', '').isNotEmpty &&
+        ModuleNavigator.of(context)?.switchOutlet != null) {
+      return _MisRowOpen.outlet;
     }
-    return null;
+    return _MisRowOpen.none;
+  }
+
+  /// What tapping a row DOES — and null when it does nothing, so a row is only
+  /// ever offered as a control when it is one.
+  VoidCallback? _rowAction(Map<String, dynamic> row) {
+    switch (_rowOpens(row)) {
+      case _MisRowOpen.bill:
+        final id = _s(row, 'bill_id', '');
+        return () => _misOpenBill(context, widget.rest, id, _misRowTitle(row));
+      case _MisRowOpen.kot:
+        final id = _s(row, 'order_id', '');
+        return () => _misOpenKot(context, widget.rest, id);
+      case _MisRowOpen.day:
+        final day = _s(row, 'bucket', '');
+        return () => widget.onRange(DateRange.normalized(day, day));
+      case _MisRowOpen.outlet:
+        final id = _s(row, 'outlet_id', '');
+        // Re-read rather than trusting the classifier's: the closure outlives
+        // this build, and an inherited widget can be gone by the time it runs.
+        final switcher = ModuleNavigator.of(context)?.switchOutlet;
+        return switcher == null ? null : () => switcher(id);
+      case _MisRowOpen.none:
+        return null;
+    }
+  }
+
+  /// The one sentence that separates "this report is broken" from "this report
+  /// is a total" — read off the rows actually on screen, never off a list of
+  /// report names.
+  ///
+  /// Three shapes, because there are genuinely three situations:
+  ///   * every row opens something -> say what it opens;
+  ///   * no row opens anything -> say WHY, in the report's own terms, so a
+  ///     reader stops tapping and knows nothing is missing;
+  ///   * some do and some do not (Bill Edit and NC Summary carry whatever
+  ///     identifier the audit writer recorded, which is not always one) -> say
+  ///     both halves, with the count, rather than letting the reader discover
+  ///     by trial that half the rows are dead.
+  ({IconData icon, String label})? _drillNote() {
+    if (_rows.isEmpty) return null;
+    final kinds = <_MisRowOpen>{};
+    var open = 0;
+    for (final r in _rows) {
+      final k = _rowOpens(r);
+      if (k == _MisRowOpen.none) continue;
+      open++;
+      kinds.add(k);
+    }
+    if (open == 0) {
+      return (
+        icon: Icons.functions,
+        label: 'Each row totals many bills — no single one to open',
+      );
+    }
+    final what = kinds.length > 1
+        ? 'the bill or ticket it names'
+        : switch (kinds.first) {
+            _MisRowOpen.bill => 'its full bill',
+            _MisRowOpen.kot => 'its kitchen ticket',
+            _MisRowOpen.day => 'that day on its own',
+            _MisRowOpen.outlet => 'that branch',
+            _MisRowOpen.none => 'it',
+          };
+    final dead = _rows.length - open;
+    return (
+      icon: Icons.touch_app_outlined,
+      label: dead == 0
+          // "Some rows" rather than "tap a row" the moment any row is bare:
+          // the weaker verb is the true one, and the count is what tells a
+          // reader whether a mostly-dead report is a data gap worth chasing.
+          ? 'Tap a row to open $what'
+          : 'Some rows open $what · $dead of ${_rows.length} rows name none',
+    );
   }
 
   String _misRowTitle(Map<String, dynamic> row) {
@@ -830,11 +940,10 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return EmptyState(
-        icon: Icons.error_outline,
-        title: 'Could not load ${widget.report.title}.',
-        caption: _error!,
-        action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: _load),
+      return LoadErrorState(
+        whatFailed: 'Could not load ${widget.report.title}.',
+        error: _error!,
+        onRetry: _load,
       );
     }
 
@@ -931,6 +1040,7 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
   }
 
   Widget _actionBar(BuildContext context, {required bool narrow}) {
+    final drill = _drillNote();
     return Wrap(
       spacing: AppSpacing.sm,
       runSpacing: AppSpacing.sm,
@@ -975,6 +1085,19 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
           dense: true,
           onPressed: _load,
         ),
+        // WHETHER THESE ROWS OPEN ANYTHING, said in words, beside the controls
+        // that act on them. Six of the fifteen reports are aggregates whose
+        // rows correctly do nothing when tapped; without this the reader cannot
+        // tell those from a broken screen, which is exactly how "the reports
+        // are not clickable" was reported. The wording comes off the rows on
+        // screen (see [_drillNote]), so it can never promise a tap the grid
+        // will not honour.
+        if (drill != null)
+          InfoChip(
+            key: const ValueKey('reports-drill'),
+            icon: drill.icon,
+            label: drill.label,
+          ),
       ],
     );
   }
@@ -1899,9 +2022,27 @@ class _MisGridState extends State<_MisGrid> {
             Expanded(child: _cell(context, c, row[c.key]))
           else
             SizedBox(width: _misColWidth(c), child: _cell(context, c, row[c.key])),
+        // THE AFFORDANCE, ON THE ROW ITSELF. A pointer cursor that only appears
+        // once the pointer is already over the row tells a reader nothing
+        // before they try it, and tells a touch screen nothing at all — which
+        // is how a correctly-inert aggregate row and a broken control came to
+        // look identical. The chevron rides in the FROZEN half so it stays put
+        // while the table scrolls sideways, and it is decided per ROW: on Bill
+        // Edit, where only the rows the audit recorded an id on can open, its
+        // absence is the honest signal that this particular row has nothing
+        // behind it.
+        if (frozen && action != null)
+          Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: Icon(Icons.chevron_right, size: 15, color: AppColors.textTertiary),
+          ),
       ]),
     );
     if (action == null) {
+      // The hover tint stays on a row that opens nothing: across fifteen
+      // columns of horizontal scroll it is how a reader keeps their place, not
+      // a promise of a tap. The promise is the chevron and the cursor, and
+      // neither is drawn here.
       return MouseRegion(
         onEnter: (_) => setState(() => _hover = i),
         onExit: (_) => setState(() => _hover = -1),
@@ -1987,32 +2128,38 @@ class _MisCardList extends StatelessWidget {
     }
     final body = [for (final c in columns.skip(1)) if (c.key != headline?.key) c];
 
+    // The tap and the chevron read the SAME value, resolved once per row. Two
+    // separate calls to `actionFor` would let a card grow a chevron it does not
+    // honour (or eat a tap it never advertised) the moment that classifier
+    // stopped being pure — which is precisely the failure this pack is about.
+    final cards = [for (final row in rows) (row: row, action: actionFor(row))];
+
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      for (final row in rows)
+      for (final card in cards)
         Padding(
           padding: const EdgeInsets.only(bottom: AppSpacing.sm),
           child: ForkCard(
             padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-            onTap: actionFor(row),
+            onTap: card.action,
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 Expanded(
-                  child: Text(misText(title, row[title.key]),
+                  child: Text(misText(title, card.row[title.key]),
                       style: text.titleSmall, maxLines: 2, overflow: TextOverflow.ellipsis),
                 ),
                 if (headline != null) ...[
                   const SizedBox(width: AppSpacing.sm),
-                  Text(misText(headline, row[headline.key]),
+                  Text(misText(headline, card.row[headline.key]),
                       style: text.titleSmall!.copyWith(color: AppColors.copperHi)),
                 ],
-                if (actionFor(row) != null)
+                if (card.action != null)
                   Icon(Icons.chevron_right, size: 17, color: AppColors.textTertiary),
               ]),
               if (body.isNotEmpty) ...[
                 const SizedBox(height: 8),
                 Container(height: 1, color: AppColors.divider),
                 const SizedBox(height: 4),
-                for (final c in body) _misPair(context, c.label, misText(c, row[c.key])),
+                for (final c in body) _misPair(context, c.label, misText(c, card.row[c.key])),
               ],
             ]),
           ),

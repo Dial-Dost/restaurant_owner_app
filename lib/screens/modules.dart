@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/profile.dart';
+import '../models/role_scope.dart';
 import '../models/table_assignment.dart';
 import '../services/api_client.dart';
 import '../services/outbox.dart';
@@ -26,6 +27,7 @@ import '../services/date_range.dart';
 import '../services/report_export.dart';
 import '../services/restaurant_time.dart';
 import '../services/tz_offsets.dart';
+import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
 import '../ui/widgets/charts.dart';
@@ -1392,6 +1394,21 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
   // Open bills are settled on the floor plan but priced by the bills
   // permission, which rides with Orders for most roles.
   final wantsBills = can('Tables') || can('Orders');
+  // WHAT THIS USER'S OVERVIEW IS MADE OF, decided before a single request goes
+  // out. See [OverviewScope]: the page is composed from what they may see, not
+  // filtered after the fact, so a block they may not see is never fetched and
+  // never renders as a 403-shaped empty card.
+  final scope = OverviewScope.of(p);
+  // A waiter's own section, when the assignment roster is readable. The roster
+  // keys on the LOGIN USERNAME (GetTableAssignments returns `l.emp_username` in
+  // its `employee_id` field), so an identity that carries no username cannot be
+  // matched and the block is dropped rather than reporting a confident "0 tables
+  // assigned to you" at someone who has four.
+  final ownIdentity = <String>{
+    p.employeeUsername.trim().toLowerCase(),
+    p.employeeId.trim().toLowerCase(),
+  }..removeWhere((s) => s.isEmpty);
+  final wantsOwnSection = scope.ownSection && ownIdentity.isNotEmpty;
 
   return AsyncView<Map<String, dynamic>>(
       load: () async {
@@ -1407,18 +1424,23 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           }
         }
 
+        // The money reads. All three are validateAction("df75119b-…") — the
+        // action named "View Order APC" — so `scope.money` is not a second
+        // opinion about who may have them, it is that same action asked one
+        // request earlier. An identity without it used to collect three 403s and
+        // render ₹0.00 three times.
         final r = await Future.wait<dynamic>([
-          rest.getMap('/orders/apc').catchError((_) => <String, dynamic>{}),
-          rest.getMap('/feedback/summary').catchError((_) => <String, dynamic>{}),
-          rest.getMap('/orders/daily-revenue?days=14').catchError((_) => <String, dynamic>{}),
-          rest.getList('/get-tables').catchError((_) => <dynamic>[]),
+          maybe(scope.money, () => rest.getMap('/orders/apc')),
+          maybe(scope.rating, () => rest.getMap('/feedback/summary')),
+          maybe(scope.money, () => rest.getMap('/orders/daily-revenue?days=14')),
+          maybe(scope.floor, () => rest.getList('/get-tables')),
           // One consolidated insight read — top dishes, best staff, kitchen speed,
           // peak trade and what needs attention. Composed server-side from the
           // same helpers the detail screens use, so these agree with them. It
           // also names the offenders behind every attention signal, which is why
           // the whole order and inventory lists no longer have to be pulled here
           // just to count them.
-          rest.getMap('/analytics/overview?days=30').catchError((_) => <String, dynamic>{}),
+          maybe(scope.insights, () => rest.getMap('/analytics/overview?days=30')),
           // The cross-tab metrics below. /analytics/overview composes none of
           // them, so each comes from the very endpoint its own module reads —
           // which is what stops the Overview quoting a number the destination
@@ -1431,18 +1453,32 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // `outstanding_total` are computed over EVERY open bill regardless of
           // paging, so one row is all this costs.
           maybe(wantsBills, () => rest.getMap('/bills/open?limit=1')),
+          // The two reads only a waiter's own-section block needs: who is on
+          // which table, and what is still open there. Both are optional —
+          // /table-assignments carries its own action, and a waiter without it
+          // simply gets the floor-wide figures the rest of the block already
+          // shows.
+          maybe(wantsOwnSection, () => rest.getList('/table-assignments')),
+          maybe(scope.ownSection && can('Orders'), () => rest.getList('/orders')),
         ]);
         return {
-          'apc': r[0],
-          'feedback': r[1],
-          'daily': r[2],
-          'tables': r[3],
-          'insights': r[4],
+          // `?? {}` / `?? []` rather than the raw null: every consumer below
+          // already reads these as an empty Map/List, and a skipped read is
+          // exactly "nothing to show" for them. The tiles that must tell "not
+          // fetched" apart from "fetched and empty" are the optional ones below,
+          // which keep their null.
+          'apc': r[0] ?? const <String, dynamic>{},
+          'feedback': r[1] ?? const <String, dynamic>{},
+          'daily': r[2] ?? const <String, dynamic>{},
+          'tables': r[3] ?? const <dynamic>[],
+          'insights': r[4] ?? const <String, dynamic>{},
           'inventory': r[5],
           'purchaseOrders': r[6],
           'bookings': r[7],
           'waitlist': r[8],
           'openBills': r[9],
+          'assignments': r[10],
+          'orders': r[11],
         };
       },
       builder: (context, data, reload) {
@@ -1679,6 +1715,16 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
 
         void openTables() {
           final occupiedRows = <Map>[for (final t in tables) if ((t as Map)['occupied'] == true) t];
+          // Null, never '': an empty trailing Text still costs the row's Wrap a
+          // gap, so a covers-only row would sit off its own edge.
+          String? tableAside(Map t) {
+            final parts = [
+              if (scope.billValue) '${t['covers'] ?? 1} cover(s)',
+              if (_tableOtp(t).isNotEmpty) 'OTP ${_tableOtp(t)}',
+              if (t['payment_pending'] == true) 'payment pending',
+            ].join(' · ');
+            return parts.isEmpty ? null : parts;
+          }
           _detailSheet(
             context,
             eyebrow: 'Floor',
@@ -1716,12 +1762,15 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                   _detailRow(
                     context,
                     _s(t, 'table_name'),
-                    _money(t['table_total']),
-                    trailing: [
-                      '${t['covers'] ?? 1} cover(s)',
-                      if (_tableOtp(t).isNotEmpty) 'OTP ${_tableOtp(t)}',
-                      if (t['payment_pending'] == true) 'payment pending',
-                    ].join(' · '),
+                    // The row's headline figure is what the table is WORTH, and
+                    // a per-table running total is the restaurant's money laid
+                    // out one table at a time. Without it the row still answers
+                    // the floor question it is on this sheet to answer — who is
+                    // sitting where, how many of them, and who has not paid — so
+                    // the covers move up into the value slot rather than the row
+                    // being dropped.
+                    scope.billValue ? _money(t['table_total']) : '${t['covers'] ?? 1} cover(s)',
+                    trailing: tableAside(t),
                   ),
             ],
           );
@@ -1791,8 +1840,12 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
             title: p.restaurantName,
             children: [
               _kv('Roles', _roleLabels(p.roleAll)),
-              _kv('Plan limits',
-                  p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
+              // The plan is the restaurant's billing arrangement — how many
+              // outlets and staff it has paid for. Nothing on a floor shift is
+              // decided by it.
+              if (scope.planLimits)
+                _kv('Plan limits',
+                    p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
             ],
           );
         }
@@ -1910,22 +1963,115 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
             icon: Icons.point_of_sale,
             accent: billCount > 0 ? AppColors.warning : AppColors.copperHi,
             value: '$billCount',
-            // Tax-inclusive and priced across every open bill, not just the
-            // one row this screen asked the server for.
+            // The COUNT survives every scope: how many tables have not settled
+            // is floor work, and a waiter is the person who has to go and ask.
+            // The VALUE does not — tax-inclusive takings across every open bill
+            // is the restaurant's money, and pricing it here would put the
+            // day's outstanding revenue on a waiter's landing screen in a tile
+            // labelled as an errand.
             sub: billCount == 0
                 ? 'nothing outstanding'
-                : '${_money(openBills['outstanding_total'])} uncollected',
+                : scope.billValue
+                    ? '${_money(openBills['outstanding_total'])} uncollected'
+                    : 'still to settle',
             onTap: jumpTo('Tables') ?? jumpTo('Orders'),
           ));
         }
 
-        return ListView(padding: AppSpacing.pageNarrow, children: [
-          Text('Welcome${p.firstName.isNotEmpty ? ', ${p.firstName}' : ''}', style: text.headlineMedium),
-          const SizedBox(height: AppSpacing.xs),
-          Text('${p.restaurantName} · ${p.role}', style: text.bodyMedium),
-          const SizedBox(height: AppSpacing.xxl),
+        // ---- the waiter's own section --------------------------------------
+        // Built for the role, not filtered for it: these two tiles exist ONLY on
+        // a waiter's Overview, because they are the answer to "what is mine" and
+        // nobody else asks a dashboard that.
+        //
+        // Both degrade rather than lie. /table-assignments carries its own
+        // action, so a waiter whose tenant did not grant it gets no roster —
+        // and the block then says "across the floor" instead of silently
+        // reporting that none of the twelve tables are theirs.
+        final assignRows = data['assignments'] as List?;
+        final myTables = <String>{
+          if (assignRows != null)
+            for (final a in assignRows)
+              if (a is Map &&
+                  ownIdentity.contains(_s(a, 'employee_id').trim().toLowerCase()))
+                _s(a, 'table_name').trim().toLowerCase(),
+        }..removeWhere((s) => s.isEmpty);
+        final knowsOwnTables = assignRows != null && myTables.isNotEmpty;
 
-          _dashGrid([
+        if (scope.ownSection) {
+          bool mine(Map t) => myTables.contains(_s(t, 'table_name').trim().toLowerCase());
+          final myRows = <Map>[for (final t in tables) if (mine(t as Map)) t];
+          final mineOccupied = myRows.where((t) => t['occupied'] == true).toList();
+          final myCovers = mineOccupied.fold<int>(0, (s, t) => s + (_int(t['covers']) ?? 1));
+          // Collected separately and pushed to the FRONT of the grid below. The
+          // only cross-tab tile that survives a waiter's gates is open bills —
+          // an errand — and an errand should not be the first thing on a screen
+          // whose heading says "Your section".
+          final mineTiles = <Widget>[];
+
+          if (assignRows != null) {
+            mineTiles.add(_metricTile(context,
+              label: 'your tables',
+              icon: Icons.table_restaurant,
+              value: '${myRows.length}',
+              // Named, not just counted: "3" is a score, "T4 · T7 · T9" is a
+              // round. Truncated at four so the tile keeps one line.
+              sub: myRows.isEmpty
+                  ? 'no tables assigned to you yet'
+                  : [
+                      for (final t in myRows.take(4)) _s(t, 'table_name'),
+                      if (myRows.length > 4) '+${myRows.length - 4}',
+                    ].join(' · '),
+              onTap: jumpTo('Tables'),
+            ));
+          }
+          mineTiles.add(_metricTile(context,
+            label: 'covers seated',
+            icon: Icons.groups,
+            value: '${knowsOwnTables ? myCovers : seatedCovers}',
+            sub: knowsOwnTables
+                ? '${mineOccupied.length} of your ${myRows.length} table(s) occupied'
+                : 'across the floor · $occupied of $totalTables table(s) occupied',
+            onTap: jumpTo('Tables'),
+          ));
+
+          // Their open tickets. `/orders` carries no employee attribution, so
+          // it is scoped by TABLE when the roster answered and left floor-wide
+          // when it did not — the same list the Orders module would show them,
+          // never a subset presented as if it were theirs.
+          final orderRows = data['orders'] as List?;
+          if (orderRows != null) {
+            final live = <Map>[
+              for (final o in orderRows)
+                if (o is Map &&
+                    _orderSection(_s(o, 'status', 'open')) != 2 &&
+                    (!knowsOwnTables || myTables.contains(_s(o, 'table').trim().toLowerCase())))
+                  o,
+            ];
+            final upcoming = live.where((o) => _orderSection(_s(o, 'status', 'open')) == 0).length;
+            mineTiles.add(_metricTile(context,
+              label: knowsOwnTables ? 'open on your tables' : 'open tickets',
+              icon: Icons.receipt_long,
+              accent: upcoming > 0 ? AppColors.warning : AppColors.copperHi,
+              value: '${live.length}',
+              sub: live.isEmpty
+                  ? 'nothing open'
+                  : upcoming > 0
+                      ? '$upcoming waiting to be accepted'
+                      : 'all accepted — none waiting',
+              onTap: jumpTo('Orders'),
+            ));
+          }
+          opsTiles.insertAll(0, mineTiles);
+        }
+
+        // ---- the headline cards, composed ----------------------------------
+        // A list rather than four literals in the grid, because which of them
+        // exist is now a question about the reader. Every card here is a whole
+        // block of the page: dropping one is the scope doing its job, not a
+        // layout tweak, and an owner (who passes every flag) gets the same four
+        // in the same order as before.
+        final statCards = <Widget>[
+          if (scope.money)
             _TappableStat(
               onTap: openRevenue,
               child: StatCard(
@@ -1959,6 +2105,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                       ),
               ),
             ),
+          if (scope.money)
             _TappableStat(
               onTap: openApc,
               child: StatCard(
@@ -1967,6 +2114,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                 footer: Text('${apc['total_covers'] ?? 0} covers this month', style: micro),
               ),
             ),
+          if (scope.floor)
             _TappableStat(
               onTap: openTables,
               child: StatCard(
@@ -1985,6 +2133,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                 ),
               ),
             ),
+          if (scope.rating)
             _TappableStat(
               onTap: openRating,
               child: StatCard(
@@ -1994,14 +2143,46 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
                 footer: Text('${fb['totalResponses'] ?? 0} responses', style: micro),
               ),
             ),
-          ], cols),
-          const SizedBox(height: 28),
+        ];
+
+        return ListView(padding: AppSpacing.pageNarrow, children: [
+          // The ONE design-system branch in this file. Everything else on the
+          // Overview restyles on its own — the theme swaps the type and the
+          // Fork* primitives swap their shape — but the greeting is a bare
+          // Text pair here, and Gaia's masthead is a composed block
+          // (wordmark/meta over a two-voice serif title). It cannot come out
+          // of a TextStyle, so it is the one thing worth a branch.
+          if (Gaia.of(context))
+            GaiaPageHeader(
+              wordmark: p.restaurantName,
+              meta: 'Overview',
+              title: 'Welcome,',
+              // Null when there is no name, so the header never renders a
+              // greeting with a dangling comma and nothing after it.
+              titleEmphasis: p.firstName.isNotEmpty ? '${p.firstName}.' : null,
+              sub: p.role,
+            )
+          else ...[
+            Text('Welcome${p.firstName.isNotEmpty ? ', ${p.firstName}' : ''}', style: text.headlineMedium),
+            const SizedBox(height: AppSpacing.xs),
+            Text('${p.restaurantName} · ${p.role}', style: text.bodyMedium),
+            const SizedBox(height: AppSpacing.xxl),
+          ],
+
+          if (statCards.isNotEmpty) ...[
+            _dashGrid(statCards, cols),
+            const SizedBox(height: 28),
+          ],
 
           // ---- ACROSS THE OTHER TABS -----------------------------------------
           // Inventory, purchase orders, reservations, the walk-in queue and the
           // money still on the floor — one figure each, packed several to a row.
+          //
+          // For a waiter this same grid holds their own tables, their covers and
+          // their open tickets, so the heading says whose section it is: nothing
+          // under it is a summary of anywhere else.
           if (opsTiles.isNotEmpty) ...[
-            const SectionHeader(title: 'Operations'),
+            SectionHeader(title: scope.ownSection ? 'Your section' : 'Operations'),
             _dashGrid(opsTiles, metricCols),
             const SizedBox(height: 28),
           ],
@@ -2015,24 +2196,35 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // and low stock now arrive from the server naming the actual offenders,
           // so only the signal it does not send — tables under their APC target,
           // which is a live floor reading — is still counted here.
-          ..._overviewInsights(context, ins, nav, columns: cols, metricColumns: metricCols, liveTiles: [
-            if (tablesBelow > 0)
-              // Routed through the same filter the server-composed rows use, so
-              // this tile cannot forward a key Tables does not read: `apc_status`
-              // survives nothing, the tap navigates with no focus request, and
-              // the floor plan opens without claiming a table is missing.
-              _actionTile(context, 'Tables below target', tablesBelow, Icons.trending_down, AppColors.danger,
-                  onTap: jumpTo('Tables',
-                      _attentionFocus('Tables', 'tables_below_target', const {'apc_status': 'below_target'}))),
-          ]),
+          // `scope.insights` is asked again here, not only in load(): the block
+          // must be absent because this reader may not have it, not merely
+          // because a request happened to come back empty. The two agree today
+          // and this is what keeps them agreeing.
+          ..._overviewInsights(context, scope.insights ? ins : const {}, nav,
+              columns: cols,
+              metricColumns: metricCols,
+              liveTiles: [
+                // "Below target" is an APC reading wearing a floor-plan hat: it
+                // ranks tables by what they spent. It rides with the money, not
+                // with /get-tables, even though that is where the field arrives.
+                if (scope.money && tablesBelow > 0)
+                  // Routed through the same filter the server-composed rows use, so
+                  // this tile cannot forward a key Tables does not read: `apc_status`
+                  // survives nothing, the tap navigates with no focus request, and
+                  // the floor plan opens without claiming a table is missing.
+                  _actionTile(context, 'Tables below target', tablesBelow, Icons.trending_down, AppColors.danger,
+                      onTap: jumpTo('Tables',
+                          _attentionFocus('Tables', 'tables_below_target', const {'apc_status': 'below_target'}))),
+              ]),
 
           const SectionHeader(title: 'Account'),
           ForkCard(
             onTap: openAccount,
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _kv('Roles', _roleLabels(p.roleAll)),
-              _kv('Plan limits',
-                  p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
+              if (scope.planLimits)
+                _kv('Plan limits',
+                    p.limits.isEmpty ? '—' : p.limits.entries.map((e) => '${e.key}: ${e.value}').join(', ')),
               const SizedBox(height: AppSpacing.sm),
               Row(children: [
                 Text(accountJumps ? 'Open Settings' : 'View profile', style: micro),
@@ -4681,7 +4873,7 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
     _scroll.addListener(_onScroll);
     unawaited(primeFromCache(
       fetch: () => _fetchPage(offset: 0),
-      apply: (res) { _applyPage(res, append: false); _loading = false; },
+      apply: (res) { _applyPage(res, append: false); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -5086,11 +5278,10 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       );
     }
     if (_error != null && _rows.isEmpty) {
-      return EmptyState(
-        icon: Icons.error_outline,
-        title: "Couldn't load the audit trail",
-        caption: _error!,
-        action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: _load),
+      return LoadErrorState(
+        whatFailed: "Couldn't load the audit trail",
+        error: _error!,
+        onRetry: _load,
       );
     }
     if (_rows.isEmpty) {
@@ -5640,29 +5831,50 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // carry still render underneath.
         var zones = const <String>[];
         var zoneError = '';
+        // The outlet's chosen section ORDER (migration 041), keyed the way the
+        // backend resolves a zone: lower(trim(name)) -> 1-based position. A key
+        // that is absent has no position and belongs in the alphabetical tail —
+        // which, on an outlet nobody has rearranged, is every key, so this map
+        // is empty and the floor plan reads exactly as it did on 1.8.5.
+        final order = <String, int>{};
+        // Positions ride on the TABLES too, not only on the admin-gated roster,
+        // so a manager or waiter who can see the floor but not the roster still
+        // sees the sections in the order the owner arranged them.
+        for (final t in tables) {
+          final label = _s(t as Map, 'section', '').trim();
+          final pos = _int(t['section_position']);
+          if (label.isEmpty || pos == null) continue;
+          order.putIfAbsent(label.toLowerCase(), () => pos);
+        }
         if (_canManageSections(p)) {
           try {
             final roster = await rest.getMap('/table-sections');
-            zones = ((roster['sections'] as List?) ?? const [])
-                .whereType<Map>()
-                .map((s) => _s(s, 'section', '').trim())
-                .where((s) => s.isNotEmpty)
-                .toList();
+            final rows = ((roster['sections'] as List?) ?? const []).whereType<Map>();
+            zones = rows.map((s) => _s(s, 'section', '').trim()).where((s) => s.isNotEmpty).toList();
+            // The roster is the only source that knows an EMPTY zone's position;
+            // it has no table to carry one.
+            for (final s in rows) {
+              final label = _s(s, 'section', '').trim();
+              final pos = _int(s['sort_order']);
+              if (label.isEmpty || pos == null) continue;
+              order[label.toLowerCase()] = pos;
+            }
           } catch (e) {
             // Not swallowed into an empty roster: the floor still renders from
             // the tables, and the banner says which half is missing.
             zoneError = '$e';
           }
         }
-        // Only the NAMES are kept. Table and seat counts are derived from the
-        // rows rendered below, so a group header can never disagree with the
-        // tiles inside it.
-        return {'tables': tables, 'zones': zones, 'zone_error': zoneError};
+        // Only the NAMES and their positions are kept. Table and seat counts are
+        // derived from the rows rendered below, so a group header can never
+        // disagree with the tiles inside it.
+        return {'tables': tables, 'zones': zones, 'zone_error': zoneError, 'order': order};
       },
       builder: (context, data, reload) {
         final rows = (data['tables'] as List?) ?? const [];
         final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
         final zoneError = _s(data, 'zone_error', '');
+        final zoneOrder = (data['order'] as Map?)?.cast<String, int>() ?? const <String, int>{};
         final occ = rows.where((r) => (r as Map)['occupied'] == true).length;
         final res = rows.where((r) {
           final m = r as Map;
@@ -5750,6 +5962,7 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                       rows: rows,
                       zones: zones,
                       zoneError: zoneError,
+                      zoneOrder: zoneOrder,
                       rest: rest,
                       profile: p,
                       reload: reload,
@@ -5808,6 +6021,12 @@ class _FloorSections extends StatefulWidget {
   /// Why the roster couldn't be read, '' when it was. Never silently empty:
   /// a blank roster and a failed one look identical on screen otherwise.
   final String zoneError;
+
+  /// The outlet's chosen section order: zone key (lower-cased, trimmed) -> its
+  /// 1-based position. A key that is ABSENT has no chosen position and sorts
+  /// into the alphabetical tail — so an empty map is 1.8.5's behaviour exactly,
+  /// and that is the state of every outlet until somebody rearranges one.
+  final Map<String, int> zoneOrder;
   final RestClient rest;
   final Profile profile;
   final VoidCallback reload;
@@ -5816,6 +6035,7 @@ class _FloorSections extends StatefulWidget {
     required this.rows,
     required this.zones,
     required this.zoneError,
+    required this.zoneOrder,
     required this.rest,
     required this.profile,
     required this.reload,
@@ -5836,9 +6056,36 @@ class _FloorSectionsState extends State<_FloorSections> {
   /// case-insensitively because that is how the backend resolves a zone name.
   final Map<String, String?> _zonePending = {};
 
+  /// The same bet for the ORDER: the zone keys in the sequence the user just
+  /// dragged them into, held until the server's own order agrees. Null = show
+  /// the server's order. Keys not in the list keep no position, so a section
+  /// created while a reorder is in flight still falls to the tail rather than
+  /// jumping to the front.
+  List<String>? _orderPending;
+
   @override
   void didUpdateWidget(covariant _FloorSections old) {
     super.didUpdateWidget(old);
+    // A reorder is confirmed once the reloaded positions rank the same keys in
+    // the same sequence. Compared as a RANKING rather than by number because the
+    // server renumbers the whole outlet: a stale request that had to be appended
+    // to comes back with different integers for the same visible order, and
+    // holding the optimistic list any longer than that would fight the reload.
+    final pending = _orderPending;
+    if (pending != null) {
+      final live = widget.zoneOrder;
+      var settled = pending.every(live.containsKey);
+      if (settled) {
+        final ranked = [...pending]..sort((a, b) => live[a]!.compareTo(live[b]!));
+        for (var i = 0; i < ranked.length; i++) {
+          if (ranked[i] != pending[i]) {
+            settled = false;
+            break;
+          }
+        }
+      }
+      if (settled) _orderPending = null;
+    }
     // Drop every optimistic value the server has now confirmed; a build follows
     // this callback, so no setState is needed (or allowed) here.
     if (_pending.isNotEmpty) {
@@ -5912,6 +6159,35 @@ class _FloorSectionsState extends State<_FloorSections> {
         _zonePending.remove(key);
       }
     });
+  }
+
+  /// Where a zone sits RIGHT NOW — the optimistic position while a drag of the
+  /// section list is in flight, otherwise the server's. Null = no chosen
+  /// position, which is every zone until somebody rearranges the floor.
+  int? _positionOf(String key) {
+    final pending = _orderPending;
+    if (pending != null) {
+      final i = pending.indexOf(key);
+      return i < 0 ? null : i + 1;
+    }
+    return widget.zoneOrder[key];
+  }
+
+  /// The one order this screen draws sections in, mirroring the server's
+  /// (sort_order IS NULL, sort_order, name): positioned zones first in their
+  /// chosen order, then everything unpositioned.
+  ///
+  /// The final tiebreak is the KEY rather than the display label because that is
+  /// precisely what `..sort()` over the group keys did before this feature
+  /// existed. An outlet nobody has rearranged has no positions at all, so every
+  /// comparison falls straight through to that line and the floor plan renders
+  /// byte-for-byte as it did on 1.8.5.
+  int _compareZoneKeys(String a, String b) {
+    final ap = _positionOf(a);
+    final bp = _positionOf(b);
+    if ((ap == null) != (bp == null)) return ap == null ? 1 : -1;
+    if (ap != null && bp != null && ap != bp) return ap - bp;
+    return a.compareTo(b);
   }
 
   String? _serverSection(Map t) {
@@ -6021,6 +6297,37 @@ class _FloorSectionsState extends State<_FloorSections> {
       messenger.showSnackBar(SnackBar(
         content: Text('${picked.name}: ${res.failed.join(', ')} could not be moved — ${res.error}'),
       ));
+    }
+  }
+
+  /// Rearrange the sections. One `PUT /table-sections/order` carrying the WHOLE
+  /// list, never "move this one to slot 3": a positional edit needs both ends to
+  /// agree on what the list currently is, and two tablets dragging at once do
+  /// not. Sending the finished list makes the write idempotent and makes a
+  /// collision resolve to "the other device's arrangement won", which is
+  /// something an owner can understand and undo, rather than a blend of two.
+  ///
+  /// Optimistic like every other write here: the new order shows immediately and
+  /// is rolled back only if the call fails. The server answers with the order it
+  /// actually holds — which differs from what was sent whenever this client was
+  /// stale — so the reload, not the request, has the last word.
+  Future<void> _reorderSections(List<({String key, String name, int tables})> items) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final picked = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => _ReorderSectionsDialog(items: items),
+    );
+    if (picked == null || !mounted) return;
+    final prev = _orderPending;
+    setState(() => _orderPending = [for (final n in picked) n.trim().toLowerCase()]);
+    try {
+      await widget.rest.put('/table-sections/order', {'sections': picked});
+      if (!mounted) return;
+      widget.reload();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _orderPending = prev);
+      messenger.showSnackBar(SnackBar(content: Text('Could not save the section order — $e')));
     }
   }
 
@@ -6244,7 +6551,10 @@ class _FloorSectionsState extends State<_FloorSections> {
       groups.putIfAbsent(key, () => <Map>[]);
       labels.putIfAbsent(key, () => name);
     });
-    final named = groups.keys.where((k) => k.isNotEmpty).toList()..sort();
+    // The owner's arrangement, falling through to alphabetical for anything
+    // they have not placed. "Unassigned" is never IN this list — it always
+    // renders last, so no table can hide behind a section it hasn't been given.
+    final named = groups.keys.where((k) => k.isNotEmpty).toList()..sort(_compareZoneKeys);
     final ordered = <String>[...named, if (groups.containsKey('')) ''];
     final canMove = _canMoveTables(widget.profile);
     final canManage = _canManageSections(widget.profile);
@@ -6253,22 +6563,48 @@ class _FloorSectionsState extends State<_FloorSections> {
       _ => false,
     };
 
+    // SectionHeader puts `trailing` in an unflexed slot, so two buttons there
+    // overflow a phone by ~43px. Same answer the legend above already uses:
+    // below 620 they move to their own line rather than being squeezed.
+    final actionsBelow = MediaQuery.sizeOf(context).width < 620;
+    final actions = <Widget>[
+      if (canManage) ...[
+        // Nothing to arrange with fewer than two zones, and a control that opens
+        // onto a one-line list is just a dead end.
+        if (named.length > 1)
+          ForkButton.ghost(
+            label: 'Arrange',
+            icon: Icons.swap_vert,
+            dense: true,
+            onPressed: () => _reorderSections([
+              for (final k in named)
+                (key: k, name: labels[k] ?? k, tables: (groups[k] ?? const <Map>[]).length),
+            ]),
+          ),
+        ForkButton.ghost(
+          label: 'New section',
+          icon: Icons.add,
+          dense: true,
+          onPressed: () => _createSection(all, [for (final k in named) labels[k] ?? k]),
+        ),
+      ],
+    ];
+
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const SizedBox(height: AppSpacing.lg),
       SectionHeader(
         title: 'Sections',
         count: named.length,
         padding: const EdgeInsets.only(bottom: 6),
-        trailing: canManage
-            ? ForkButton.ghost(
-                label: 'New section',
-                icon: Icons.add,
-                dense: true,
-                onPressed: () =>
-                    _createSection(all, [for (final k in named) labels[k] ?? k]),
-              )
-            : null,
+        trailing: actions.isEmpty || actionsBelow
+            ? null
+            : Wrap(spacing: 6, runSpacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: actions),
       ),
+      if (actionsBelow && actions.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Wrap(spacing: 6, runSpacing: 6, children: actions),
+        ),
       Text(
         canMove
             ? (touch
@@ -6428,6 +6764,188 @@ class _NewSectionDialogState extends State<_NewSectionDialog> {
               const SizedBox(width: AppSpacing.sm),
               ForkButton(label: 'Create section', icon: Icons.check, onPressed: _submit),
             ]),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+/// Rearrange the floor's sections. Returns the section NAMES in their new order,
+/// or null when dismissed.
+///
+/// WHY A SHEET AND NOT DRAGGING THE HEADERS IN PLACE. The floor plan is already
+/// a drag surface: every table tile is a Draggable, and on a phone that drag
+/// begins with a long press. Laying a second reorder gesture over the same cards
+/// would put both in one gesture arena — "press and pull" would sometimes carry
+/// a table and sometimes a whole zone, and no affordance can explain which. A
+/// list with no tables in it has only one thing a drag can mean.
+///
+/// THREE WAYS TO MOVE A ROW, because on this app one is never enough:
+///   * the HANDLE is a drag listener, which is pointer-kind agnostic — the same
+///     grab works under a mouse on the Windows desktop build and under a finger
+///     on the phone build. A handle wired to hover or to a mouse cursor would
+///     leave the phone unable to reorder at all.
+///   * MOVE UP / MOVE DOWN buttons, so the list is workable by keyboard, by
+///     screen reader, and by anyone for whom a precise drag is hard.
+///   * and the row itself is deliberately NOT a drag target, so a drag anywhere
+///     else still SCROLLS. A reorder list a phone cannot scroll is worse than
+///     no reorder list.
+///
+/// It renders in both design systems for free: every piece of it is a Fork*
+/// primitive or an AppColors token, and Gaia repaints those through the shell
+/// and accent bridges without this widget knowing it exists.
+class _ReorderSectionsDialog extends StatefulWidget {
+  final List<({String key, String name, int tables})> items;
+  const _ReorderSectionsDialog({required this.items});
+
+  @override
+  State<_ReorderSectionsDialog> createState() => _ReorderSectionsDialogState();
+}
+
+class _ReorderSectionsDialogState extends State<_ReorderSectionsDialog> {
+  late final List<({String key, String name, int tables})> _items = [...widget.items];
+
+  bool get _changed {
+    if (_items.length != widget.items.length) return true;
+    for (var i = 0; i < _items.length; i++) {
+      if (_items[i].key != widget.items[i].key) return true;
+    }
+    return false;
+  }
+
+  void _shift(int from, int to) {
+    if (to < 0 || to >= _items.length || from == to) return;
+    setState(() => _items.insert(to, _items.removeAt(from)));
+  }
+
+  void _onReorder(int oldIndex, int newIndex) {
+    setState(() {
+      // ReorderableListView reports the destination as a GAP index, so a
+      // downward move is one past where the row actually lands.
+      if (newIndex > oldIndex) newIndex -= 1;
+      _items.insert(newIndex, _items.removeAt(oldIndex));
+    });
+  }
+
+  Widget _row(BuildContext context, int i) {
+    final text = Theme.of(context).textTheme;
+    final it = _items[i];
+    return Container(
+      key: ValueKey(it.key),
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: AppColors.inset,
+        borderRadius: AppRadius.controlAll,
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(children: [
+        ReorderableDragStartListener(
+          index: i,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.grab,
+            child: Padding(
+              // Padded out to a comfortable finger target; the icon alone is 18px.
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+              child: Icon(Icons.drag_indicator, size: 18, color: AppColors.textSecondary),
+            ),
+          ),
+        ),
+        // The position, spelled out — the order is the whole subject of this
+        // screen, so it should never have to be counted off the rows.
+        SizedBox(
+          width: 22,
+          child: Text('${i + 1}', style: text.labelSmall, textAlign: TextAlign.center),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(it.name, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+            Text(
+              it.tables == 0 ? 'Empty' : '${it.tables} ${it.tables == 1 ? 'table' : 'tables'}',
+              style: text.bodySmall,
+            ),
+          ]),
+        ),
+        ForkIconButton(
+          icon: Icons.keyboard_arrow_up,
+          tooltip: 'Move up',
+          onPressed: i == 0 ? null : () => _shift(i, i - 1),
+        ),
+        ForkIconButton(
+          icon: Icons.keyboard_arrow_down,
+          tooltip: 'Move down',
+          onPressed: i == _items.length - 1 ? null : () => _shift(i, i + 1),
+        ),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 440, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            gradient: AppColors.cardGradient,
+            borderRadius: AppRadius.cardAll,
+            border: Border.all(color: AppColors.borderStrong),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('FLOOR', style: text.labelSmall),
+            const SizedBox(height: 6),
+            Text('Arrange sections', style: text.titleMedium),
+            const SizedBox(height: AppSpacing.md),
+            Text(
+              'Drag a handle, or use the arrows. This is the order the floor plan '
+              'shows for this outlet on every device. Tables with no section always '
+              'come last.',
+              style: text.bodySmall,
+            ),
+            const SizedBox(height: AppSpacing.md),
+            Flexible(
+              child: ReorderableListView.builder(
+                shrinkWrap: true,
+                buildDefaultDragHandles: false,
+                itemCount: _items.length,
+                onReorder: _onReorder,
+                // The dragged copy rides in an overlay outside this Dialog's
+                // Material, and the default proxy would stamp an elevation
+                // shadow on it — right for Rustic, wrong for Gaia's flat
+                // surfaces. Carrying the row's own decoration instead is
+                // correct in both, and matches how a dragged TABLE already looks.
+                proxyDecorator: (child, index, animation) =>
+                    Material(color: Colors.transparent, child: Opacity(opacity: 0.9, child: child)),
+                itemBuilder: (context, i) => _row(context, i),
+              ),
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            // A Wrap, not a Row: at 390px the dialog is 310 wide and these two
+            // buttons want 307 inside its padding, which a Row reports as a
+            // 43px overflow — a striped bar across the bottom of the sheet on
+            // exactly the device this feature most needs to work on.
+            Wrap(
+              alignment: WrapAlignment.end,
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.sm,
+              children: [
+                ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context)),
+                ForkButton(
+                  label: 'Save order',
+                  icon: Icons.check,
+                  // Nothing moved = nothing to save. Sending the list anyway
+                  // would stamp explicit positions on an outlet that had none,
+                  // which is a real change (new sections would start landing at
+                  // the end) dressed up as a no-op.
+                  onPressed: _changed ? () => Navigator.pop(context, [for (final it in _items) it.name]) : null,
+                ),
+              ],
+            ),
           ]),
         ),
       ),
@@ -9909,9 +10427,28 @@ class _KdsCardState extends State<_KdsCard> {
               ),
             ),
           const SizedBox(width: AppSpacing.sm),
+          // THE REPRINT. Barking now prints the docket by itself, so this is no
+          // longer how a ticket reaches the kitchen — it is how a kitchen with a
+          // jammed or out-of-paper printer asks for the SAME docket again. It
+          // carries the number already on paper, because the server keys a KOT
+          // on its contents (migration 029) and an unchanged order resolves to
+          // the ticket it already minted.
+          //
+          // Shown only once the order is barked (before that there is no docket
+          // to reprint) and only where thermal printing can actually happen:
+          // winspool does not exist on Android, and a control that cannot work
+          // on the platform showing it is a bug, not a convenience.
+          if (barked && PrinterService.instance.supported) ...[
+            ForkIconButton(
+              icon: Icons.replay_outlined,
+              tooltip: 'Reprint kitchen docket',
+              onPressed: () => _reprintKot(ScaffoldMessenger.of(context), widget.rest, id),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+          ],
           ForkIconButton(
             icon: Icons.print_outlined,
-            tooltip: 'Print KOT',
+            tooltip: 'Print KOT (local PDF copy)',
             onPressed: () => _printKot(_s(o, 'table'), items),
           ),
         ]),
@@ -9963,8 +10500,51 @@ Future<void> _barkOrder(
   VoidCallback reload,
 ) async {
   try {
-    await rest.post('/orders/$orderId/bark');
+    final res = await rest.post('/orders/$orderId/bark');
     reload();
+    // WHAT THE WAITER IS TOLD. Barking now also prints the docket, and "barked"
+    // and "the kitchen has paper" are different facts — a bare tick that meant
+    // either one would be the same silent-drop shape durable printing was built
+    // to remove. So the response's own report is read back: the KOT number when
+    // there is one, and an explicit warning when the docket did not go out.
+    final map = res is Map ? res : const {};
+    final kotNo = map['kot_no'];
+    if (map['kot_printed'] == true) {
+      messenger.showSnackBar(SnackBar(
+          content: Text(kotNo == null ? 'Sent to the kitchen.' : 'Sent to the kitchen - KOT-$kotNo')));
+    } else if (map['kot_skipped'] == 'disabled') {
+      // Auto-print is deliberately off for this restaurant; nothing is wrong.
+      messenger.showSnackBar(const SnackBar(content: Text('Sent to the kitchen.')));
+    } else if (map.containsKey('kot_printed')) {
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Sent to the kitchen, but the docket did not print. Use Reprint.')));
+    }
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
+/// Ask the server for one order's kitchen docket again.
+///
+/// A REPRINT IN THE STRICT SENSE. POST /print/kot/order/:id rebuilds the docket
+/// from the order's own lines and re-resolves its ticket key, so an unchanged
+/// order comes back with the number already on paper (`reprint: true`) instead
+/// of burning the next one in the day's series. That is what lets a jammed
+/// printer be answered without the pass ending up with two numbers for one
+/// order.
+Future<void> _reprintKot(
+  ScaffoldMessengerState messenger,
+  RestClient rest,
+  String orderId,
+) async {
+  try {
+    final res = await rest.post('/print/kot/order/$orderId');
+    final map = res is Map ? res : const {};
+    final kotNo = map['kot_no'];
+    final tickets = (map['tickets'] as num?)?.toInt() ?? 1;
+    final where = tickets > 1 ? ' ($tickets station tickets)' : '';
+    messenger.showSnackBar(SnackBar(
+        content: Text(kotNo == null ? 'Docket sent to the printer$where' : 'KOT-$kotNo sent again$where')));
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e')));
   }
@@ -11010,6 +11590,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
         _applyPage(d.page, append: false);
         _applyLeaders(d.leaders);
         _loading = false;
+        _error = null;
       },
       refresh: () => _load(silent: true),
       fallback: _load,
@@ -11233,6 +11814,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
   @override
   Widget build(BuildContext context) {
     final loaded = _rows.length;
+    if (Gaia.of(context)) return cacheStaleOverlay(_gaiaBody(context));
     return cacheStaleOverlay(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
@@ -11288,6 +11870,293 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
       ),
       Expanded(child: _body(context)),
     ]));
+  }
+
+  // ── GAIA: the BOKEH treatment ─────────────────────────────────────
+  //
+  // The mockup's own caption is the whole design: "Brightness follows spend and
+  // recency: a guest who dined this month glows, a name that only ever booked
+  // stays dim." So the guest book becomes a field of out-of-focus light with
+  // the people as the points in front of it, and how brightly a guest burns is
+  // the DATA — not decoration.
+  //
+  // Nothing about the loading is different. Same paged GET, same debounce, same
+  // three server-side rankings, same three failure states, same guest sheet on
+  // a tap. Only the drawing changes.
+
+  /// The brightness rule, applied to the fields `/customers/segments` returns.
+  GaiaBokehTone _toneOf(Map m) => gaiaBokehTone(
+        visits: _int(m['visits']) ?? 0,
+        spend: _numOf(m['total_spend']),
+        daysSinceLastVisit: _int(m['days_since_last_visit']),
+      );
+
+  Widget _gaiaBody(BuildContext context) {
+    final loaded = _rows.length;
+    // The field never takes a pointer, so every tap still reaches the list.
+    return LayoutBuilder(builder: (context, box) => Stack(children: [
+      Positioned.fill(
+        child: GaiaBokehBackdrop(
+          blobs: GaiaBokehBlob.customers,
+          scroll: _scroll,
+        ),
+      ),
+      Positioned.fill(
+        child: ListView(
+          controller: _scroll,
+          padding: _gaiaPagePadding(box.maxWidth),
+          children: [
+            GaiaPageHeader(
+              wordmark: 'Guests',
+              meta: _loading && loaded == 0
+                  ? 'Loading'
+                  : '$_total ${_total == 1 ? 'guest' : 'guests'}'
+                      '${loaded == 0 || loaded >= _total ? '' : ' \u00b7 $loaded loaded'}',
+              title: 'Guest',
+              titleEmphasis: 'book.',
+              sub: _spendBasis.isEmpty ? null : 'Spend basis \u00b7 $_spendBasis',
+            ),
+            GaiaSearchField(
+              controller: _searchField,
+              hint: 'Find a guest by name, phone or email',
+              onChanged: _onSearchChanged,
+              onClear: () {
+                _searchField.clear();
+                _onSearchChanged('');
+              },
+            ),
+            const SizedBox(height: 14),
+            Wrap(spacing: 6, runSpacing: 8, children: [
+              for (final seg in _customerSegments)
+                _GaiaSegmentPill(
+                  // The count stays part of the label, so selection is never
+                  // the only thing colour is carrying — the same contract the
+                  // Rustic `_SegmentChip` holds.
+                  label: _segmentCount(seg[0]) == null
+                      ? seg[1]
+                      : '${seg[1]} \u00b7 ${_segmentCount(seg[0])}',
+                  selected: _segment == seg[0],
+                  onTap: () {
+                    if (_segment == seg[0]) return;
+                    _applyFilter(() => _segment = seg[0]);
+                  },
+                ),
+            ]),
+            const SizedBox(height: GaiaSpacing.xxl),
+            // The three server-ranked leaderboards, kept in full. The mockup
+            // shows one ("Most spent") as a hero block; dropping the other two
+            // would drop a real answer the screen already computes, so all
+            // three render as hero blocks and the loading and per-ranking
+            // failure states come with them.
+            for (final srt in _customerSorts) ...[
+              _gaiaLeader(context, srt[0], srt[1]),
+              const SizedBox(height: GaiaSpacing.section),
+            ],
+            GaiaTabs(
+              tabs: [for (final srt in _customerSorts) srt[1]],
+              selected: _customerSorts
+                  .indexWhere((srt) => srt[0] == _sort)
+                  .clamp(0, _customerSorts.length - 1),
+              onSelected: (i) {
+                final next = _customerSorts[i][0];
+                if (next == _sort) return;
+                _applyFilter(() => _sort = next);
+              },
+            ),
+            const SizedBox(height: 6),
+            ..._gaiaList(context),
+            const SizedBox(height: GaiaSpacing.xxl),
+            Text(
+              'Brightness follows spend and recency: a guest who dined this '
+              'month glows, a name that only ever booked stays dim. Every row '
+              'prints the figures that decided it.',
+              style: GaiaType.italNote(),
+            ),
+            const SizedBox(height: GaiaSpacing.xl),
+            _gaiaPagingFoot(context),
+          ],
+        ),
+      ),
+    ]));
+  }
+
+  List<Widget> _gaiaList(BuildContext context) {
+    if (_loading && _rows.isEmpty) {
+      return [
+        for (var i = 0; i < 6; i++)
+          const Padding(
+            padding: EdgeInsets.only(top: 12),
+            child: SkeletonBox(height: 62, radius: GaiaRadius.edge),
+          ),
+      ];
+    }
+    if (_error != null && _rows.isEmpty) {
+      return [
+        const SizedBox(height: 28),
+        Text("Couldn't load the guest book", style: GaiaType.mid()),
+        const SizedBox(height: 8),
+        Text(_error!, style: GaiaType.detail(color: GaiaColors.coral)),
+        const SizedBox(height: 16),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: GaiaButton(label: 'Retry', dense: true, onPressed: _load),
+        ),
+      ];
+    }
+    if (_rows.isEmpty) {
+      return [
+        const SizedBox(height: 28),
+        Text(
+          _query.isEmpty && _segment == 'all'
+              ? 'No guests on record yet.'
+              : 'No guests match these filters.',
+          style: GaiaType.italNote(),
+        ),
+      ];
+    }
+    return [
+      for (var i = 0; i < _rows.length; i++)
+        Builder(builder: (context) {
+          final m = _rows[i];
+          final visits = _int(m['visits']) ?? 0;
+          final last = _s(m, 'last_visit', '');
+          final phone = _s(m, 'phone', '');
+          return GaiaBokehRow(
+            first: i == 0,
+            initials: _guestInitials(_s(m, 'name', 'Guest')),
+            tone: _toneOf(m),
+            title: _s(m, 'name', 'Guest'),
+            // The two facts the glow is made of, in words, on every row.
+            detail: '${last.isEmpty ? 'never visited' : 'last visit ${_fmtDay(last)}'}'
+                '${phone.isEmpty || phone == '\u2014' ? '' : ' \u00b7 $phone'}',
+            value: _money(m['total_spend']),
+            valueUnit: '$visits ${visits == 1 ? 'visit' : 'visits'}',
+            valueColor: visits == 0 ? GaiaColors.text3AA : null,
+            onTap: () => _guestSheet(m),
+          );
+        }),
+    ];
+  }
+
+  /// One ranking of the whole filtered set, drawn as a constellation: the
+  /// leader lit large, the runners-up beside them.
+  Widget _gaiaLeader(BuildContext context, String sort, String title) {
+    final rows = _leaders[sort] ?? const <Map>[];
+    final failed = _leaderErrors[sort];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      GaiaSectionHeader(
+        title: title,
+        padding: const EdgeInsets.only(bottom: 12),
+        trailing: sort == _sort
+            ? Text('SORTING THE LIST',
+                style: GaiaType.pill(color: GaiaColors.champagneDim))
+            : null,
+      ),
+      if (failed != null)
+        Text("Couldn't rank: $failed", style: GaiaType.detail(color: GaiaColors.coral))
+      else if (_leadersLoading && rows.isEmpty)
+        const SkeletonBox(height: 88, radius: GaiaRadius.edge)
+      else if (rows.isEmpty)
+        Text('Nothing to rank under these filters.', style: GaiaType.detail())
+      else ...[
+        GestureDetector(
+          onTap: () => _guestSheet(rows.first),
+          behavior: HitTestBehavior.opaque,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: Row(children: [
+              GaiaBokehAvatar(
+                initials: _guestInitials(_s(rows.first, 'name', 'Guest')),
+                tone: _toneOf(rows.first),
+                size: 72,
+              ),
+              const SizedBox(width: 22),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(_s(rows.first, 'name', 'Guest'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GaiaType.serif(size: 30, weight: 500, height: 1)),
+                    const SizedBox(height: 6),
+                    Text(_customerRankValue(rows.first, sort),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GaiaType.detail()),
+                  ],
+                ),
+              ),
+            ]),
+          ),
+        ),
+        if (rows.length > 1) ...[
+          const SizedBox(height: 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (var i = 1; i < rows.length; i++)
+                Expanded(
+                  child: GestureDetector(
+                    onTap: () => _guestSheet(rows[i]),
+                    behavior: HitTestBehavior.opaque,
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: Padding(
+                        padding: EdgeInsets.only(right: i == rows.length - 1 ? 0 : 8),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            GaiaBokehAvatar(
+                              initials: _guestInitials(_s(rows[i], 'name', 'Guest')),
+                              tone: _toneOf(rows[i]),
+                              size: 34,
+                              halo: false,
+                            ),
+                            const SizedBox(height: 8),
+                            Text(_s(rows[i], 'name', 'Guest'),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GaiaType.sans(size: 12.5)),
+                            Text(_customerRankValue(rows[i], sort),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GaiaType.sans(
+                                    size: 11, color: GaiaColors.text3AA)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ],
+    ]);
+  }
+
+  Widget _gaiaPagingFoot(BuildContext context) {
+    if (_loadingMore) {
+      return Text('Loading the next $_pageSize\u2026', style: GaiaType.detail());
+    }
+    if (_hasMore) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: GaiaButton(
+          label: 'Load more (${_rows.length} of $_total)',
+          kind: GaiaButtonKind.ghost,
+          dense: true,
+          onPressed: () => _load(append: true),
+        ),
+      );
+    }
+    return Text(
+      _error ?? 'All $_total shown',
+      style: GaiaType.detail(color: _error == null ? null : GaiaColors.coral),
+    );
   }
 
   Widget _body(BuildContext context) {
@@ -11466,6 +12335,31 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
       ),
     );
   }
+}
+
+/// `.pill` / `.pill.champ` — the Gaia half of [_SegmentChip]. Same contract:
+/// the count is part of the label, so selection is never colour alone.
+class _GaiaSegmentPill extends StatelessWidget {
+  const _GaiaSegmentPill({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GaiaPill(label,
+              color: selected ? GaiaColors.champagne : null),
+        ),
+      );
 }
 
 /// A segment filter pill carrying its own server-side count.
@@ -11648,7 +12542,28 @@ Widget _historyBody(
             ]),
             const SizedBox(height: AppSpacing.xxl),
             if (chart.isNotEmpty) ...[
-              _chartCard(context, 'Revenue by month', _barChart(context, chart, money)),
+              // STRATA owns this screen. Under Gaia the chart becomes the
+              // stacked area — one stratum here, because a month's revenue is
+              // one number and inventing a composition it does not have would
+              // be a picture of data the backend never sent.
+              _chartCard(
+                context,
+                'Revenue by month',
+                Gaia.of(context)
+                    ? GaiaStrataChart(
+                        series: [
+                          GaiaStrataSeries(
+                            label: 'Revenue',
+                            values: [for (final d in chart) d.value],
+                          ),
+                        ],
+                        format: money,
+                        axisLabels: [chart.first.label, chart.last.label],
+                        showKey: false,
+                        emptyMessage: 'No revenue in this window.',
+                      )
+                    : _barChart(context, chart, money),
+              ),
               const SizedBox(height: AppSpacing.xxl),
             ],
             if (withData.isEmpty)
@@ -11659,6 +12574,50 @@ Widget _historyBody(
               )
             else
               SectionHeader(title: 'Month by month', count: withData.length),
+            // The month list, as strata. A month IS a part of the window's
+            // total, so `share` mode is legitimate here and the band height is
+            // that month's share of the revenue above it — the mockup's "read
+            // the strata top down, thickness is share", applied to the one
+            // series on this screen where the parts genuinely sum to the whole.
+            if (Gaia.of(context) && withData.isNotEmpty)
+              GaiaStrataList(
+                mode: GaiaStrataMode.share,
+                extent: GaiaStrataList.extentFor(withData.length),
+                caption: 'Newest on top. Drawn from closed_at, the same basis'
+                    ' every report uses, so this page and Accounting never'
+                    ' disagree.',
+                strata: [
+                  for (final r in withData)
+                    () {
+                      final m = r as Map;
+                      final fb = num0(m['feedback_count']);
+                      return GaiaStratum(
+                        label: pretty('${m['month']}'),
+                        value: num0(m['revenue']),
+                        display: money(num0(m['revenue'])),
+                        tagLabel: '${m['bills'] ?? 0} cheques',
+                        tagColor: num0(m['bills']) > 0
+                            ? GaiaColors.champagneDim
+                            : null,
+                        caption: 'Average cheque ${money(num0(m['avg_bill']))}'
+                            ' · ${m['orders'] ?? 0} orders'
+                            '${fb > 0 ? ' · ${fb.toStringAsFixed(0)} feedback' : ''}',
+                        onTap: () => showModalBottomSheet<void>(
+                          context: context,
+                          showDragHandle: true,
+                          isScrollControlled: true,
+                          backgroundColor: AppColors.surface,
+                          builder: (_) => _MonthDetailSheet(
+                            rest: rest,
+                            month: m,
+                            title: pretty('${m['month']}'),
+                          ),
+                        ),
+                      );
+                    }(),
+                ],
+              ),
+            if (!Gaia.of(context))
             ...withData.map((r) {
               final m = r as Map;
               final fb = num0(m['feedback_count']);
@@ -11790,6 +12749,41 @@ class _MonthDetailSheet extends StatelessWidget {
 
 Widget bookingsModule(RestClient rest, Profile p) => _BookingsView(rest: rest, profile: p);
 
+/// GAIA page padding for a full-page screen.
+///
+/// The design has ONE gutter — 24px — and the mockup is a 430px phone, so on a
+/// 2240px till a `.kv` row would put its label and its figure most of a metre
+/// apart and a line of body copy would run to 300 characters. Past a reading
+/// measure the extra width goes into the margins instead: the column stays the
+/// width the type was drawn for, and the coverflow's fan still has ~900px to
+/// open into, which is more than it needs.
+EdgeInsets _gaiaPagePadding(double width, {double bottom = 40}) {
+  const measure = 900.0;
+  final side = width <= measure + GaiaSpacing.gutter * 2
+      ? GaiaSpacing.gutter
+      : (width - measure) / 2;
+  return EdgeInsets.fromLTRB(side, GaiaSpacing.gutter, side, bottom);
+}
+
+/// Translate a Rustic Fork semantic ink into its GAIA counterpart.
+///
+/// The two systems agree on WHAT the four states mean and disagree on the hue:
+/// Rustic's success is an olive (#8FB27C), Gaia's is sage (#9BC4A0). Module
+/// code decides a status colour once, in Rustic terms, and this maps it — so a
+/// screen keeps ONE status rule and neither design has to restate it.
+///
+/// Colour is never the carrier on either side: every call site here also ships
+/// the status word.
+Color _gaiaStatusInk(Color rustic) {
+  if (rustic == AppColors.success) return GaiaColors.sage;
+  if (rustic == AppColors.danger) return GaiaColors.coral;
+  if (rustic == AppColors.warning) return GaiaColors.amber;
+  if (rustic == AppColors.neutral) return GaiaColors.text3AA;
+  // Everything else is the accent — AppColors.copper, which the shell bridge
+  // has already turned champagne.
+  return GaiaColors.champagne;
+}
+
 class _BookingsView extends StatefulWidget {
   final RestClient rest;
   final Profile profile;
@@ -11809,12 +12803,27 @@ class _BookingsViewState extends State<_BookingsView> {
 
   bool get _isUpcoming => _window == 'upcoming';
 
+  /// GAIA only. Which booking the coverflow has at the front, and the scroll
+  /// controller used to bring it back into view when a list row picks one.
+  /// Both are inert under Rustic Fork, which draws a grid and has no focus.
+  int _flowIndex = 0;
+  final ScrollController _flowScroll = ScrollController();
+
+  @override
+  void dispose() {
+    _flowScroll.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(children: [
       // The window selector lives outside the AsyncView so it stays visible
       // (and switching feels instant) even while the chosen slice is loading.
-      Padding(
+      //
+      // Gaia draws its own tab strip inside the page, under the masthead, so
+      // this Rustic header would be a second copy of the same control.
+      if (!Gaia.of(context)) Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
         // Until the New-booking button existed the app could only ASSIGN
         // tables to bookings created elsewhere — walking in with a party of 8
@@ -12081,6 +13090,84 @@ class _BookingsViewState extends State<_BookingsView> {
               : '${parts.first.substring(0, 1)}${parts.last.substring(0, 1)}';
         }
 
+        // Everything a card cannot hold, plus every stage change. Actions live
+        // here rather than on the card so a mis-tap in a dense grid cannot
+        // cancel somebody's reservation.
+        //
+        // Hoisted out of the per-card loop it used to live in so the Gaia
+        // coverflow opens the SAME sheet with the SAME five actions. One action
+        // surface for both designs; there is no second copy to drift.
+        void openDetail(BuildContext c, Map b) {
+          final id = _s(b, 'booking_id');
+          final status = _s(b, 'status', 'Requested');
+          final when = _fmtDmy(_s(b, 'booking_date_time', ''));
+          final tableNames = _strList(b['table_names']);
+          final table = tableNames.isNotEmpty ? tableNames.join(' + ') : _s(b, 'table_name', '');
+          final notes = _s(b, 'notes', '');
+          final online = _s(b, 'source', '').toLowerCase() == 'online';
+          _detailSheet(
+            c,
+            eyebrow: status,
+            title: _s(b, 'customer_name', 'Guest'),
+            children: [
+              _kv('When', when.isEmpty ? '\u2014' : when),
+              _kv('Party', '${b['number_of_people'] ?? '\u2014'}'),
+              _kv('Table', table.isEmpty ? 'Not assigned' : (tableNames.length > 1 ? '$table (clubbed)' : table)),
+              _kv('Source', online ? 'Online' : 'In-house'),
+              if (_s(b, 'customer_phone').isNotEmpty) _kv('Phone', _s(b, 'customer_phone')),
+              if (notes.isNotEmpty) _kv('Notes', notes),
+              const SizedBox(height: 12),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                ForkButton.ghost(
+                  label: 'Assign / combine tables',
+                  icon: Icons.table_restaurant_outlined,
+                  dense: true,
+                  onPressed: () {
+                    Navigator.of(c).pop();
+                    assignTable(b);
+                  },
+                ),
+                ForkButton.ghost(
+                  label: 'Mark confirmed',
+                  icon: Icons.check,
+                  dense: true,
+                  onPressed: () {
+                    Navigator.of(c).pop();
+                    setStatus(id, 'Confirmed');
+                  },
+                ),
+                ForkButton.ghost(
+                  label: 'Mark seated',
+                  icon: Icons.event_seat,
+                  dense: true,
+                  onPressed: () {
+                    Navigator.of(c).pop();
+                    setStatus(id, 'Seated');
+                  },
+                ),
+                ForkButton.ghost(
+                  label: 'Cancel booking',
+                  icon: Icons.close,
+                  dense: true,
+                  onPressed: () {
+                    Navigator.of(c).pop();
+                    setStatus(id, 'Cancelled');
+                  },
+                ),
+                ForkButton.ghost(
+                  label: 'Delete',
+                  icon: Icons.delete_outline,
+                  dense: true,
+                  onPressed: () {
+                    Navigator.of(c).pop();
+                    deleteBooking(id);
+                  },
+                ),
+              ]),
+            ],
+          );
+        }
+
         // A reservation notification asked us to focus one booking.
         final focus = _focusOf(context, 'Bookings');
         final focusId = focus?.idOf(const ['booking_id']);
@@ -12165,76 +13252,9 @@ class _BookingsViewState extends State<_BookingsView> {
               if (online) const InfoChip(icon: Icons.language, label: 'Online'),
             ];
 
-            // Everything the tile cannot hold, plus every stage change. Actions
-            // live here rather than on the tile so a mis-tap in a dense grid
-            // cannot cancel somebody's reservation.
-            void openDetail() {
-              _detailSheet(
-                c,
-                eyebrow: status,
-                title: name,
-                children: [
-                  _kv('When', when.isEmpty ? '\u2014' : when),
-                  _kv('Party', '${b['number_of_people'] ?? '\u2014'}'),
-                  _kv('Table', table.isEmpty ? 'Not assigned' : (tableNames.length > 1 ? '$table (clubbed)' : table)),
-                  _kv('Source', online ? 'Online' : 'In-house'),
-                  if (_s(b, 'customer_phone').isNotEmpty) _kv('Phone', _s(b, 'customer_phone')),
-                  if (notes.isNotEmpty) _kv('Notes', notes),
-                  const SizedBox(height: 12),
-                  Wrap(spacing: 8, runSpacing: 8, children: [
-                    ForkButton.ghost(
-                      label: 'Assign / combine tables',
-                      icon: Icons.table_restaurant_outlined,
-                      dense: true,
-                      onPressed: () {
-                        Navigator.of(c).pop();
-                        assignTable(b);
-                      },
-                    ),
-                    ForkButton.ghost(
-                      label: 'Mark confirmed',
-                      icon: Icons.check,
-                      dense: true,
-                      onPressed: () {
-                        Navigator.of(c).pop();
-                        setStatus(id, 'Confirmed');
-                      },
-                    ),
-                    ForkButton.ghost(
-                      label: 'Mark seated',
-                      icon: Icons.event_seat,
-                      dense: true,
-                      onPressed: () {
-                        Navigator.of(c).pop();
-                        setStatus(id, 'Seated');
-                      },
-                    ),
-                    ForkButton.ghost(
-                      label: 'Cancel booking',
-                      icon: Icons.close,
-                      dense: true,
-                      onPressed: () {
-                        Navigator.of(c).pop();
-                        setStatus(id, 'Cancelled');
-                      },
-                    ),
-                    ForkButton.ghost(
-                      label: 'Delete',
-                      icon: Icons.delete_outline,
-                      dense: true,
-                      onPressed: () {
-                        Navigator.of(c).pop();
-                        deleteBooking(id);
-                      },
-                    ),
-                  ]),
-                ],
-              );
-            }
-
             cards.add(ForkCard(
               selected: isRequested || focused,
-              onTap: openDetail,
+              onTap: () => openDetail(c, b),
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Row(children: [
@@ -12316,6 +13336,275 @@ class _BookingsViewState extends State<_BookingsView> {
             ],
           );
         });
+
+        // ── GAIA: the COVERFLOW treatment ──────────────────────────────
+        //
+        // The mockup gives Bookings a coverflow and, under it, a key/value
+        // block describing the card at the front. That is a beautiful way to
+        // read the NEXT party and a bad way to find the 8pm one out of forty,
+        // so this keeps the mockup's flow AND a full hairline index below it:
+        // the flow is the hero, the list is still how a host finds someone,
+        // and tapping a row flies the flow to that booking. Nothing is
+        // reachable in one design and not the other — the same openDetail
+        // sheet, the same five stage changes, the same reservation QR.
+        if (Gaia.of(context)) {
+          final flowIndex = ordered.isEmpty ? 0 : _flowIndex.clamp(0, ordered.length - 1);
+          final focusedBooking = ordered.isEmpty ? null : ordered[flowIndex] as Map;
+          // Covers, not bookings: "18 covers" is the number a host is actually
+          // holding tables for.
+          var covers = 0;
+          for (final r in ordered) {
+            covers += _int((r as Map)['number_of_people']) ?? 0;
+          }
+
+          void goTo(int i) {
+            setState(() => _flowIndex = i);
+            // A row two screens down just changed what the flow shows; without
+            // this you would tap and see nothing move.
+            if (_flowScroll.hasClients && _flowScroll.offset > 8) {
+              _flowScroll.animateTo(0,
+                  duration: const Duration(milliseconds: 260), curve: Curves.easeOutCubic);
+            }
+          }
+
+          String whenOf(Map b) => _fmtDmy(_s(b, 'booking_date_time', ''));
+          String tableOf(Map b) {
+            final names = _strList(b['table_names']);
+            if (names.isNotEmpty) return names.join(' + ');
+            final one = _s(b, 'table_name', '');
+            return one == '\u2014' ? '' : one;
+          }
+
+          final title = switch (_window) {
+            'past' => ('Past', 'seatings.'),
+            'all' => ('Every', 'seating.'),
+            _ => ('Tonight\u2019s', 'seatings.'),
+          };
+
+          return LayoutBuilder(builder: (context, box) => ListView(
+            controller: _flowScroll,
+            padding: _gaiaPagePadding(box.maxWidth),
+            children: [
+              GaiaPageHeader(
+                wordmark: p.restaurantName,
+                meta: '${rows.length} ${_window == 'upcoming' ? 'upcoming' : _window}',
+                title: title.$1,
+                titleEmphasis: title.$2,
+                sub: ordered.isEmpty
+                    ? 'Nothing booked'
+                    : '${ordered.length} ${ordered.length == 1 ? 'party' : 'parties'} \u00b7 $covers covers',
+              ),
+              Row(children: [
+                Expanded(
+                  child: GaiaTabs(
+                    tabs: const ['Upcoming', 'Past', 'All'],
+                    selected: const ['upcoming', 'past', 'all'].indexOf(_window),
+                    onSelected: (i) => setState(() {
+                      _window = const ['upcoming', 'past', 'all'][i];
+                      _flowIndex = 0;
+                    }),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                GaiaButton(
+                  label: 'Share link',
+                  kind: GaiaButtonKind.subtle,
+                  onPressed: showReservationQr,
+                ),
+              ]),
+              if (banner != null) ...[const SizedBox(height: 16), banner],
+              if (ordered.isEmpty) ...[
+                const SizedBox(height: 40),
+                Center(
+                  child: Text(
+                    _window == 'past'
+                        ? 'No past bookings.'
+                        : _window == 'all'
+                            ? 'No bookings yet.'
+                            : 'No upcoming bookings. New reservations will appear here.',
+                    textAlign: TextAlign.center,
+                    style: GaiaType.italNote(),
+                  ),
+                ),
+                const SizedBox(height: 28),
+                Center(
+                  child: GaiaButton(label: 'New booking', onPressed: () => _newBooking(context)),
+                ),
+              ] else ...[
+                const SizedBox(height: 24),
+                GaiaCoverflow(
+                  itemCount: ordered.length,
+                  index: flowIndex,
+                  onIndexChanged: (i) => setState(() => _flowIndex = i),
+                  onActivate: (i) => openDetail(context, ordered[i] as Map),
+                  semanticsBuilder: (i) {
+                    final b = ordered[i] as Map;
+                    return '${_s(b, 'customer_name', 'Guest')}, party of '
+                        '${b['number_of_people'] ?? 'unknown'}, ${whenOf(b)}, '
+                        '${_s(b, 'status', 'Requested')}';
+                  },
+                  itemBuilder: (context, i) {
+                    final b = ordered[i] as Map;
+                    final table = tableOf(b);
+                    final notes = _s(b, 'notes', '');
+                    return GaiaCoverflowCard(
+                      who: _s(b, 'customer_name', 'Guest'),
+                      when: whenOf(b).isEmpty ? 'No time set' : whenOf(b),
+                      detail: [
+                        'Party of ${b['number_of_people'] ?? '\u2014'}'
+                            '${table.isEmpty ? '' : ' \u00b7 $table'}',
+                        if (notes.isNotEmpty)
+                          notes
+                        else if (_s(b, 'source', '').toLowerCase() == 'online')
+                          'Booked online'
+                        else if (_s(b, 'customer_phone').isNotEmpty)
+                          _s(b, 'customer_phone'),
+                      ],
+                      footLeft: table.isEmpty ? 'No table' : table,
+                      footRight: _s(b, 'status', 'Requested'),
+                      // Colour is a second reading of the word beside it, never
+                      // the carrier — same contract as StatusChip.
+                      footRightColor: _gaiaStatusInk(bookingColor(_s(b, 'status', 'Requested'))),
+                    );
+                  },
+                ),
+                GaiaCoverflowIndex(
+                  count: ordered.length,
+                  index: flowIndex,
+                  onTap: goTo,
+                ),
+                const SizedBox(height: GaiaSpacing.xxl),
+                if (focusedBooking != null) ...[
+                  GaiaKeyValue(
+                    first: true,
+                    label: '${_s(focusedBooking, 'customer_name', 'Guest')} \u00b7 '
+                        'party of ${focusedBooking['number_of_people'] ?? '\u2014'}',
+                    sub: whenOf(focusedBooking).isEmpty ? null : whenOf(focusedBooking),
+                    value: _s(focusedBooking, 'status', 'Requested'),
+                    serifValue: false,
+                  ),
+                  GaiaKeyValue(
+                    label: 'Table',
+                    value: tableOf(focusedBooking).isEmpty
+                        ? 'Not assigned'
+                        : (_strList(focusedBooking['table_names']).length > 1
+                            ? '${tableOf(focusedBooking)} (clubbed)'
+                            : tableOf(focusedBooking)),
+                    serifValue: false,
+                  ),
+                  GaiaKeyValue(
+                    label: 'Channel',
+                    value: _s(focusedBooking, 'source', '').toLowerCase() == 'online'
+                        ? 'Online \u00b7 reservation link'
+                        : 'In-house',
+                    serifValue: false,
+                  ),
+                  if (_s(focusedBooking, 'customer_phone').isNotEmpty)
+                    GaiaKeyValue(
+                      label: 'Phone',
+                      value: _s(focusedBooking, 'customer_phone'),
+                      serifValue: false,
+                    ),
+                  if (_s(focusedBooking, 'notes').isNotEmpty)
+                    GaiaKeyValue(
+                      label: 'Notes',
+                      value: _s(focusedBooking, 'notes'),
+                      serifValue: false,
+                    ),
+                  const SizedBox(height: GaiaSpacing.xl),
+                  // Confirm/decline stays on the FRONT of the screen for a
+                  // requested booking: an unconfirmed booking is the reason
+                  // this screen gets opened at all.
+                  if (_s(focusedBooking, 'status', 'Requested').toLowerCase() == 'requested')
+                    Row(children: [
+                      Expanded(
+                        child: GaiaButton(
+                          label: 'Decline',
+                          kind: GaiaButtonKind.ghost,
+                          dense: true,
+                          onPressed: () =>
+                              setStatus(_s(focusedBooking, 'booking_id'), 'Cancelled'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: GaiaButton(
+                          label: 'Confirm',
+                          dense: true,
+                          onPressed: () =>
+                              setStatus(_s(focusedBooking, 'booking_id'), 'Confirmed'),
+                        ),
+                      ),
+                    ])
+                  else ...[
+                    // Two rows, not the mockup's one. Its `.btns` grid puts
+                    // three buttons across a 430px phone, and a Gaia button
+                    // label is uppercase at .2em tracking: "MOVE TABLE" and
+                    // "DETAILS" both came out as "MOVE ..." and "DETAI...".
+                    // A truncated verb is not a control.
+                    Row(children: [
+                      Expanded(
+                        child: GaiaButton(
+                          label: 'Move table',
+                          kind: GaiaButtonKind.ghost,
+                          dense: true,
+                          onPressed: () => assignTable(focusedBooking),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: GaiaButton(
+                          label: 'Details',
+                          kind: GaiaButtonKind.ghost,
+                          dense: true,
+                          onPressed: () => openDetail(context, focusedBooking),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 12),
+                    Row(children: [
+                      Expanded(
+                        child: GaiaButton(
+                          label: 'New booking',
+                          dense: true,
+                          onPressed: () => _newBooking(context),
+                        ),
+                      ),
+                    ]),
+                  ],
+                ],
+                const SizedBox(height: GaiaSpacing.xxl),
+                // The scan path. Everything the flow holds, one hairline row
+                // each, in the server's order — which is what a host reads at
+                // 20:00 with a phone in one hand.
+                GaiaSectionHeader(title: 'Every booking', count: ordered.length),
+                for (var i = 0; i < ordered.length; i++)
+                  Builder(builder: (context) {
+                    final b = ordered[i] as Map;
+                    final table = tableOf(b);
+                    return GaiaListRow(
+                      first: i == 0,
+                      title: _s(b, 'customer_name', 'Guest'),
+                      detail: 'Party of ${b['number_of_people'] ?? '\u2014'}'
+                          '${whenOf(b).isEmpty ? '' : ' \u00b7 ${whenOf(b)}'}',
+                      value: table.isEmpty ? '\u2014' : table,
+                      valueUnit: _s(b, 'status', 'Requested'),
+                      dotColor: i == flowIndex
+                          ? GaiaColors.champagne
+                          : _gaiaStatusInk(bookingColor(_s(b, 'status', 'Requested'))),
+                      onTap: () => goTo(i),
+                    );
+                  }),
+                const SizedBox(height: GaiaSpacing.xxl),
+                Text(
+                  'Bookings taken by phone land here too. The guest reservation '
+                  'link opens the same list from the other side.',
+                  style: GaiaType.italNote(),
+                ),
+              ],
+            ],
+          ));
+        }
 
         return Column(children: [
           Padding(
@@ -13118,6 +14407,21 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
         final employees = (data['employees'] as List?) ?? [];
         final text = Theme.of(context).textTheme;
         final avgRating = double.tryParse('${sum['averageRating'] ?? 0}') ?? 0;
+        // GAIA: the BOKEH treatment. Same four payloads, same sheets, same
+        // recovery actions — a different drawing. It is a separate widget only
+        // because the field behind it needs a ScrollController to drift
+        // against, and this builder is a function with nowhere to keep one.
+        if (Gaia.of(context)) {
+          return _GaiaFeedbackBody(
+            rest: rest,
+            profile: p,
+            summary: sum,
+            items: items,
+            tickets: tickets,
+            employees: employees,
+            reload: reload,
+          );
+        }
         // A low-rating alert asked us to focus one response.
         final focus = _focusOf(context, 'Feedback');
         final focusId = focus?.idOf(const ['feedback_id']);
@@ -13350,6 +14654,325 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
       },
     );
 
+/// GAIA's Feedback screen — the mockup's screen 09.
+///
+/// The bokeh field, a conic ring for the average, the recovery queue and the
+/// full response list as lit rows. Every action the Rustic screen has is here:
+/// the three summary drill-downs, the per-waiter QR block (rendered by the very
+/// same `_employeeFeedbackQrSection`), the recovery ticket sheet, Resolve, and
+/// the question-by-question expansion on a tap.
+///
+/// Stateful for one reason: [GaiaBokehBackdrop] drifts against a
+/// [ScrollController], and `feedbackModule` is a function with nowhere to keep
+/// one without leaking it on every rebuild.
+class _GaiaFeedbackBody extends StatefulWidget {
+  const _GaiaFeedbackBody({
+    required this.rest,
+    required this.profile,
+    required this.summary,
+    required this.items,
+    required this.tickets,
+    required this.employees,
+    required this.reload,
+  });
+
+  final RestClient rest;
+  final Profile profile;
+  final Map summary;
+  final List items;
+  final List tickets;
+  final List employees;
+  final VoidCallback reload;
+
+  @override
+  State<_GaiaFeedbackBody> createState() => _GaiaFeedbackBodyState();
+}
+
+class _GaiaFeedbackBodyState extends State<_GaiaFeedbackBody> {
+  final ScrollController _scroll = ScrollController();
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// Brightness follows how recently a guest spoke, NOT what they scored.
+  ///
+  /// Deliberate: the score already has the biggest figure on the row, and
+  /// dimming a complaint would be the one place this style could actually lie
+  /// about the data. An unnamed response dims because there is less of a person
+  /// there, which is the same rule the guest book uses.
+  GaiaBokehTone _tone(Map m) {
+    if (_s(m, 'customer_name', '').isEmpty) return GaiaBokehTone.dim;
+    final at = DateTime.tryParse(_s(m, 'submitted_at', ''));
+    if (at == null) return GaiaBokehTone.cool;
+    return DateTime.now().toUtc().difference(at.toUtc()).inDays <= 30
+        ? GaiaBokehTone.warm
+        : GaiaBokehTone.cool;
+  }
+
+  String _who(Map m) {
+    final n = _s(m, 'customer_name', '');
+    return n.isEmpty ? 'Anonymous' : n;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sum = widget.summary;
+    final items = widget.items;
+    final tickets = widget.tickets;
+    final avg = double.tryParse('${sum['averageRating'] ?? 0}') ?? 0;
+
+    final focus = _focusOf(context, 'Feedback');
+    final focusId = focus?.idOf(const ['feedback_id']);
+    bool isFocused(Map m) => focusId != null && '${m['id']}' == focusId;
+    final focusFound = focusId != null &&
+        (items.any((m) => isFocused(m as Map)) || tickets.any((m) => isFocused(m as Map)));
+
+    return LayoutBuilder(builder: (context, box) => Stack(children: [
+      Positioned.fill(
+        child: GaiaBokehBackdrop(
+          blobs: GaiaBokehBlob.feedback,
+          scroll: _scroll,
+        ),
+      ),
+      Positioned.fill(
+        child: ListView(
+          controller: _scroll,
+          padding: _gaiaPagePadding(box.maxWidth),
+          children: [
+            GaiaPageHeader(
+              wordmark: widget.profile.restaurantName,
+              meta: '${sum['totalResponses'] ?? 0} responses',
+              title: 'What guests',
+              titleEmphasis: 'said.',
+              sub: 'Ratings, recovery queue and per-waiter QR',
+            ),
+            if (focus != null) ...[
+              _focusBanner(
+                context,
+                found: focusFound,
+                message: focusFound
+                    ? 'Highlighted the response from your notification.'
+                    : "That response isn't in this list — it may have been removed, or belong to another outlet.",
+              ),
+              const SizedBox(height: GaiaSpacing.xl),
+            ],
+            Row(children: [
+              GaiaRing(
+                fraction: avg / 5,
+                value: avg == 0 ? '\u2014' : avg.toStringAsFixed(2),
+                unit: '/5',
+              ),
+              const SizedBox(width: GaiaSpacing.xl),
+              Expanded(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  // Each of the three keeps the drill-down its Rustic stat card
+                  // had. A figure that used to open a sheet must not go inert
+                  // because the box around it changed.
+                  _tappableKv(
+                    first: true,
+                    label: 'Responses',
+                    value: '${sum['totalResponses'] ?? 0}',
+                    onTap: () => _feedbackVolumeSheet(context, sum, items),
+                  ),
+                  _tappableKv(
+                    label: 'Average rating',
+                    value: '${sum['averageRating'] ?? 0}',
+                    onTap: () => _feedbackRatingSheet(context, sum, items),
+                  ),
+                  _tappableKv(
+                    label: 'Recovery queue',
+                    value: '${tickets.length}',
+                    valueColor:
+                        tickets.isEmpty ? GaiaColors.sage : GaiaColors.coral,
+                    onTap: () => _recoveryQueueSheet(context, tickets),
+                  ),
+                ]),
+              ),
+            ]),
+            const SizedBox(height: GaiaSpacing.xxl),
+            if (tickets.isNotEmpty) ...[
+              GaiaSectionHeader(
+                title: 'Service recovery',
+                count: tickets.length,
+                trailing: const GaiaStatusChip(
+                    label: 'Needs follow-up', color: GaiaColors.coral, dense: true),
+              ),
+              for (var i = 0; i < tickets.length; i++)
+                Builder(builder: (context) {
+                  final m = tickets[i] as Map;
+                  return GaiaBokehRow(
+                    first: i == 0,
+                    selected: isFocused(m),
+                    initials: '${m['overall_rating'] ?? '-'}',
+                    tone: GaiaBokehTone.dim,
+                    title: _who(m),
+                    detail: _s(m, 'comments').isEmpty
+                        ? _fmtTime(_s(m, 'submitted_at'))
+                        : '"${_s(m, 'comments')}"',
+                    // Reading a complaint must never close it, so Resolve keeps
+                    // its own control — same rule the Rustic card holds.
+                    trailing: GaiaButton(
+                      label: 'Resolve',
+                      kind: GaiaButtonKind.ghost,
+                      dense: true,
+                      onPressed: () => _resolveRecovery(
+                          context, widget.rest, '${m['id']}', widget.reload),
+                    ),
+                    onTap: () => _recoveryTicketSheet(context, m, items),
+                  );
+                }),
+              const SizedBox(height: GaiaSpacing.xxl),
+            ],
+            GaiaSectionHeader(title: 'All feedback', count: items.length),
+            if (items.isEmpty)
+              Text('No feedback yet.', style: GaiaType.italNote())
+            else
+              for (var i = 0; i < items.length; i++)
+                Builder(builder: (context) {
+                  final m = items[i] as Map;
+                  final id = '${m['id'] ?? ''}';
+                  final open = _feedbackOpenId == id && id.isNotEmpty;
+                  final cats = (m['category_ratings'] as List?) ?? const [];
+                  final comment = _s(m, 'comments', '');
+                  return Column(mainAxisSize: MainAxisSize.min, children: [
+                    GaiaBokehRow(
+                      first: i == 0,
+                      selected: isFocused(m),
+                      initials: _guestInitials(_who(m)),
+                      tone: _tone(m),
+                      title: _who(m),
+                      detail: comment.isNotEmpty
+                          ? comment
+                          : '${cats.length} question${cats.length == 1 ? '' : 's'} answered'
+                              '${_fmtTime(_s(m, 'submitted_at')).isEmpty ? '' : ' \u00b7 ${_fmtTime(_s(m, 'submitted_at'))}'}',
+                      value: _score(m['overall_rating']),
+                      valueTail: '/5',
+                      trailing: id.isEmpty
+                          ? null
+                          : Icon(open ? Icons.expand_less : Icons.expand_more,
+                              size: 18, color: GaiaColors.text2),
+                      onTap: id.isEmpty
+                          ? null
+                          : () => setState(
+                              () => _feedbackOpenId = open ? '' : id),
+                    ),
+                    if (open) _expansion(m, cats),
+                  ]);
+                }),
+            const SizedBox(height: GaiaSpacing.xxl),
+            _employeeFeedbackQrSection(widget.profile, widget.employees, items),
+            const SizedBox(height: GaiaSpacing.xxl),
+            Text(
+              'The AI question bank regenerates nightly; the questions guests '
+              'see come from it.',
+              style: GaiaType.italNote(),
+            ),
+          ],
+        ),
+      ),
+    ]));
+  }
+
+  Widget _tappableKv({
+    required String label,
+    required String value,
+    required VoidCallback onTap,
+    Color? valueColor,
+    bool first = false,
+  }) =>
+      GestureDetector(
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GaiaKeyValue(
+            first: first,
+            label: label,
+            value: value,
+            valueColor: valueColor,
+            serifValue: true,
+          ),
+        ),
+      );
+
+  /// The question-by-question breakdown. Same content the Rustic card expands
+  /// to — the collapsed row alone cannot show WHY a score is what it is.
+  Widget _expansion(Map m, List cats) {
+    final nps = m['nps'];
+    return Padding(
+      padding: const EdgeInsets.only(left: 58, bottom: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (cats.isEmpty)
+            Text('No per-question ratings were recorded.', style: GaiaType.detail())
+          else
+            for (final c in cats)
+              Builder(builder: (context) {
+                final cm = c as Map;
+                final r = _numOf(cm['rating']);
+                final followUp = _s(cm, 'follow_up');
+                final answer = _s(cm, 'follow_up_answer');
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(children: [
+                        Expanded(
+                          child: Text(_s(cm, 'label', _s(cm, 'key')),
+                              style: GaiaType.body()),
+                        ),
+                        const SizedBox(width: 10),
+                        GaiaStatusChip(
+                          label: '${r.toStringAsFixed(0)}/5',
+                          color: r <= 2
+                              ? GaiaColors.coral
+                              : (r >= 4 ? GaiaColors.sage : GaiaColors.amber),
+                          dense: true,
+                        ),
+                      ]),
+                      if (_s(cm, 'question').isNotEmpty)
+                        Text(_s(cm, 'question'),
+                            style: GaiaType.sans(
+                                size: 11.5, color: GaiaColors.text3AA)),
+                      if (followUp.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(followUp,
+                                  style: GaiaType.sans(
+                                      size: 11.5, color: GaiaColors.text3AA)),
+                              Text(
+                                  answer.isEmpty ? '\u2014 not answered' : answer,
+                                  style: GaiaType.detail()),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              }),
+          Wrap(spacing: 6, runSpacing: 6, children: [
+            GaiaPill('Overall ${_score(m['overall_rating'])}/5 of ${cats.length}'),
+            if (nps != null)
+              GaiaPill('Recommend ${_numOf(nps).toStringAsFixed(0)}/10'),
+            if (_s(m, 'source').isNotEmpty) GaiaPill('Via ${_s(m, 'source')}'),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+
 /// The narrowest one [CopperColumns] column can be — 48px of column plus the
 /// chart's own fixed 8px gap.
 ///
@@ -13484,6 +15107,85 @@ Widget _barChart(
         onTap: () => open(i),
       ),
   ]);
+}
+
+// --- STRATA (Analytics, History) ---------------------------------------------
+//
+// The Gaia halves of the two chart helpers above. Both are opt-in at the CALL
+// SITE and both fall straight back to `_barChart` under Rustic Fork, so the
+// shipped look is byte-identical and only Analytics and History — the two
+// sections the design allocates STRATA to — pick it up.
+//
+// WHY THERE IS NO AUTOMATIC SWITCH. "Thickness is share" is an arithmetic
+// claim, and it is only TRUE when the series is a partition: revenue by month
+// adds up to the window, covers by table add up to the covers. Average per
+// cover by staff does not add up to anything — three waiters averaging ₹900
+// are not ₹2,700 of something — so drawing them as shares of a bar would
+// invent a proportion out of nothing. Only the call site knows which it has,
+// so only the call site may ask. `_strataArea` is safe for any series (it
+// draws values on one linear scale, no proportion claimed); `_strataShare` is
+// the one that makes the claim.
+
+/// A chronological series as the stacked area (`.strata-chart`), or the
+/// existing bar chart when Gaia is off. No proportion is claimed: each point
+/// is drawn at its value on one shared scale, with the peak labelled.
+Widget _strataArea(
+  BuildContext context,
+  List<({String label, double value})> data,
+  String Function(double) fmt, {
+  String label = 'Revenue',
+}) {
+  if (!Gaia.of(context)) return _barChart(context, data, fmt);
+  if (data.isEmpty) {
+    return Text('No data yet.', style: Theme.of(context).textTheme.bodySmall);
+  }
+  return GaiaStrataChart(
+    series: [
+      GaiaStrataSeries(label: label, values: [for (final d in data) d.value]),
+    ],
+    format: fmt,
+    axisLabels: [data.first.label, data.last.label],
+    showKey: false,
+  );
+}
+
+/// A PARTITION as strata bands, thickness = share (`.stratum`).
+///
+/// [shown] is what the screen lists; [total] is the true whole. They differ
+/// whenever a chart is topped at eight rows, and that gap is exactly where a
+/// share chart usually starts lying — eight of forty tables drawn as eight
+/// slices of a pie reports each table at roughly five times its real share. So
+/// the remainder is drawn as its own band rather than dropped.
+Widget _strataShare(
+  BuildContext context,
+  List<({String label, double value})> shown,
+  String Function(double) fmt, {
+  required double total,
+  String remainderLabel = 'Everything else',
+  String? caption,
+}) {
+  final listed = shown.fold<double>(0, (a, d) => a + d.value);
+  final rest = total - listed;
+  return GaiaStrataList(
+    mode: GaiaStrataMode.share,
+    extent: GaiaStrataList.extentFor(shown.length + 1, headroom: 260),
+    caption: caption,
+    strata: [
+      for (final d in shown)
+        GaiaStratum(label: d.label, value: d.value, display: fmt(d.value)),
+      // Only when there IS a remainder, and only when it is positive — a
+      // negative remainder means `total` and `shown` disagree, and inventing a
+      // band for that would hide a real inconsistency instead of showing it.
+      if (rest > 0.5)
+        GaiaStratum(
+          label: remainderLabel,
+          value: rest,
+          display: fmt(rest),
+          caption: 'The rows not listed above, kept in so every percentage on'
+              ' this strata is a share of the real total.',
+        ),
+    ],
+  );
 }
 
 Widget _chartCard(BuildContext context, String title, Widget child, {VoidCallback? onDownload}) => ForkCard(
@@ -14840,6 +16542,74 @@ Widget _analyticsBody(
                         ],
                     ])),
             const SizedBox(height: 12),
+            // KPI health as STRATA — but in RANK mode, not share.
+            //
+            // The mockup's own Analytics strata is "KPI health · by severity",
+            // and severity is a RANKING, not a partition: turnaround minutes,
+            // a rupee RevPASH and an NPS have no common total and adding them
+            // would be meaningless. So no thickness claim is made here at all
+            // — the band's POSITION, its indent and its ground tone carry the
+            // rank, and the status is a word as well as an ink. Height is
+            // content, exactly as the mockup draws it.
+            //
+            // The order is whatever the sort header is currently set to, not a
+            // severity order this section imposes: the sort control is a
+            // shipped affordance and quietly overriding it would make a
+            // working control look broken.
+            if (Gaia.of(context))
+              GaiaStrataList(
+                caption: 'Ranked in the order above; the indent and the ground'
+                    ' step with the rank. These metrics share no total, so no'
+                    ' band is a share of anything — read the figures.',
+                strata: [
+                  for (final kk in _applySort('kpis', visibleKpis, _kpiSortOpts, defaultDesc: false))
+                    () {
+                      final k = kk;
+                      final status = _s(k, 'status', 'grey');
+                      final v = k['value'];
+                      final home = _kpiHomeView[_s(k, 'key')];
+                      final homeLabel = home == null
+                          ? null
+                          : _analyticsViews
+                              .firstWhere((e) => e.$1 == home, orElse: () => (home, home))
+                              .$2;
+                      return GaiaStratum(
+                        label: _s(k, 'label'),
+                        // Rank mode draws nothing from this, but the value is
+                        // still handed over so a band never has to invent one.
+                        value: (v is num) ? v.toDouble() : 0,
+                        display: v == null ? '—' : '$v',
+                        unit: _s(k, 'unit', '').isEmpty ? null : _s(k, 'unit'),
+                        tagLabel: _kpiStatusLabel(status),
+                        tagColor: status == 'red'
+                            // The one ink lifted for this ground: --coral is
+                            // 4.22:1 on the lightest band, just under AA.
+                            ? GaiaStrataColors.tagCoral
+                            : _kpiColor(status),
+                        caption: _kpiMeaning[_s(k, 'key')],
+                        onTap: () => showModalBottomSheet(
+                          context: context,
+                          isScrollControlled: true,
+                          shape: const RoundedRectangleBorder(
+                              borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+                          builder: (_) => _KpiDrilldownSheet(
+                            kpi: k,
+                            adv: adv,
+                            viewRecordsLabel:
+                                homeLabel == null ? null : 'View full records in $homeLabel',
+                            onViewRecords: home == null
+                                ? null
+                                : () {
+                                    Navigator.pop(context);
+                                    setLocal(() => _analyticsView = home);
+                                  },
+                          ),
+                        ),
+                      );
+                    }(),
+                ],
+              )
+            else
             _tileWrap(preferred: 170, gap: 10, (tile) => [
               for (final kk in _applySort('kpis', visibleKpis, _kpiSortOpts, defaultDesc: false))
                 Builder(builder: (context) {
@@ -15480,7 +17250,7 @@ Widget _analyticsBody(
             const SizedBox(height: AppSpacing.lg),
           ],
           if (vis('sales', onOverview: true)) ...[
-            _chartCard(context, 'Revenue — last 14 days', _barChart(context, dailySeries, money),
+            _chartCard(context, 'Revenue — last 14 days', _strataArea(context, dailySeries, money),
                 onDownload: () => dl('revenue-last-14-days', const ['Date', 'Revenue'],
                     [for (final d in dailySeries) [d.label, money(d.value)]])),
             const SizedBox(height: AppSpacing.lg),
@@ -15504,21 +17274,44 @@ Widget _analyticsBody(
                 InfoChip(icon: Icons.calendar_today_outlined, label: 'Last ${monthsSpanned(range)} months'),
               ]),
             ),
-            _chartCard(context, 'Revenue by month', _barChart(context, revByMonth, money),
+            _chartCard(context, 'Revenue by month', _strataArea(context, revByMonth, money),
                 onDownload: () => dl('revenue-by-month', const ['Month', 'Revenue'],
                     [for (final d in revByMonth) [d.label, money(d.value)]])),
             const SizedBox(height: 14),
+            // Deliberately NOT strata. An average per cover is not a part of a
+            // sum — twelve monthly APCs do not add up to a year's APC — so a
+            // share of a total here would be a proportion that does not exist.
+            // It keeps the bar chart, in Gaia's colours.
             _chartCard(context, 'Average per cover by month', _barChart(context, apcByMonth, money),
                 onDownload: () => dl('apc-by-month', const ['Month', 'Avg per cover'],
                     [for (final d in apcByMonth) [d.label, money(d.value)]])),
             const SizedBox(height: 14),
-            _chartCard(context, 'Covers by month', _barChart(context, coversByMonth, (v) => v.toStringAsFixed(0)),
+            _chartCard(context, 'Covers by month',
+                _strataArea(context, coversByMonth, (v) => v.toStringAsFixed(0), label: 'Covers'),
                 onDownload: () => dl('covers-by-month', const ['Month', 'Covers'],
                     [for (final d in coversByMonth) [d.label, d.value.toStringAsFixed(0)]])),
             const SizedBox(height: AppSpacing.lg),
           ],
           if (vis('sales')) ...[
-            _chartCard(context, 'Revenue by table', _barChart(context, revenueByTable.take(8).toList(), money),
+            // A true partition — every table's revenue sums to the period's —
+            // so this is the one ranked chart where thickness may be share. The
+            // list is topped at eight; `total` is all of them, and the strata
+            // draws the remainder as its own band so the eight percentages are
+            // shares of the real total rather than of the visible eight.
+            _chartCard(
+                context,
+                'Revenue by table',
+                Gaia.of(context)
+                    ? _strataShare(
+                        context,
+                        revenueByTable.take(8).toList(),
+                        money,
+                        total: revenueByTable.fold<double>(0, (a, d) => a + d.value),
+                        remainderLabel: 'Other tables',
+                        caption: 'Thickness is each table’s share of the'
+                            ' period’s table revenue.',
+                      )
+                    : _barChart(context, revenueByTable.take(8).toList(), money),
                 onDownload: () => dl('revenue-by-table', const ['Table', 'Revenue'],
                     [for (final d in revenueByTable.take(8)) [d.label, money(d.value)]])),
             const SizedBox(height: AppSpacing.lg),
@@ -16016,7 +17809,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -16618,12 +18411,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('Could not load reports.\n$_error', textAlign: TextAlign.center),
-          const SizedBox(height: 8),
-          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-        ]),
+      return LoadErrorState(
+        whatFailed: 'Could not load reports',
+        error: '$_error',
+        onRetry: _load,
       );
     }
 
@@ -17833,7 +19624,7 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
     super.initState();
     unawaited(primeFromCache(
       fetch: () => _fetchPage(offset: 0),
-      apply: (res) { _applyPage(res, append: false); _loading = false; },
+      apply: (res) { _applyPage(res, append: false); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -18219,6 +20010,10 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
   static const double _twoColumnMin = 1000;
   static const double _railWidth = 320;
 
+  /// GAIA only. Which party the coverflow has at the front. Inert under Rustic
+  /// Fork, which opens on the QR hero and has no notion of a focused party.
+  int _flowIndex = 0;
+
   // The queue table. Fixed cells are multiplied by the system text scale so a
   // 1.3x label still fits its own box; the two free-text columns flex, which is
   // what keeps the row from ever overflowing.
@@ -18235,7 +20030,7 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -18499,11 +20294,11 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text('Could not load the waitlist.\n$_error', textAlign: TextAlign.center),
-        const SizedBox(height: 8),
-        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-      ]));
+      return LoadErrorState(
+        whatFailed: 'Could not load the waitlist',
+        error: '$_error',
+        onRetry: _load,
+      );
     }
     // A queue notification asked us to focus one party. The queue only holds
     // parties still waiting, so a party that has been seated / removed is simply
@@ -18545,9 +20340,25 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
       child: LayoutBuilder(builder: (context, c) {
         final wide = c.maxWidth >= _twoColumnMin;
         final mainWidth = wide ? c.maxWidth - _railWidth - AppSpacing.xl : c.maxWidth;
+        final gaia = Gaia.of(context);
         final main = <Widget>[
           ?banner,
-          _hero(mainWidth),
+          // GAIA: the COVERFLOW treatment.
+          //
+          // Rustic opens this screen on the entrance QR, because the queue used
+          // to be a thing you set up. The mockup opens it on the PEOPLE — the
+          // party at the front, big enough to read across a lobby, with the
+          // next two fanned behind. That is the right hero for a host standing
+          // at the door at 20:00, so under Gaia the QR steps back into the
+          // right-hand rail (where `_joinCard` already lives, unchanged) and
+          // the queue takes the top of the page.
+          //
+          // Everything below this line is untouched: the stat strip, the
+          // pending pre-orders, and the full queue TABLE with its per-row
+          // actions menu. The flow is the hero; the table is still how you find
+          // party number nineteen, and every action is still on it.
+          if (gaia) ..._gaiaQueueHero(ordered)
+          else _hero(mainWidth),
           const SizedBox(height: AppSpacing.lg),
           _statStrip(ordered, mainWidth),
           const SizedBox(height: AppSpacing.xl),
@@ -18668,6 +20479,142 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
   // The entrance "Join the queue" QR — how a walk-in gets INTO the queue when
   // tables are full. The motif is ornament only: it is dropped whole below 620px
   // rather than squeezed in beside the copy it would otherwise crowd.
+  /// The GAIA masthead + coverflow that replaces `_hero` under the Gaia design.
+  ///
+  /// Returns a LIST so the caller can splice it into the existing column
+  /// without a nesting change, which keeps the Rustic path byte-identical.
+  List<Widget> _gaiaQueueHero(List ordered) {
+    final flowIndex = ordered.isEmpty ? 0 : _flowIndex.clamp(0, ordered.length - 1);
+    final focused = ordered.isEmpty ? null : ordered[flowIndex] as Map;
+    final guests = _guestCount(ordered);
+    final free = _freeTables.length;
+
+    String waitOf(Map e) {
+      final m = _int(e['minutes_waiting']) ?? 0;
+      if (m < 60) return '$m min';
+      final h = m ~/ 60;
+      return '${h}h ${m % 60}m';
+    }
+
+    List<Map> preOf(Map e) =>
+        (e['pre_order'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    List<Map> memOf(Map e) =>
+        (e['party_members'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+
+    return [
+      GaiaPageHeader(
+        wordmark: widget.profile.restaurantName,
+        meta: ordered.isEmpty
+            ? 'Queue empty'
+            : '${ordered.length} in queue \u00b7 $guests ${guests == 1 ? 'guest' : 'guests'}',
+        title: 'The',
+        titleEmphasis: 'queue.',
+        sub: ordered.isEmpty
+            ? '$free ${free == 1 ? 'table' : 'tables'} free'
+            : '${(guests / ordered.length).toStringAsFixed(1)} average party '
+                '\u00b7 $free ${free == 1 ? 'table' : 'tables'} free',
+      ),
+      if (ordered.isEmpty)
+        // `.cf.dash` — the mockup's own "Nobody yet" placeholder, kept because
+        // an empty coverflow would otherwise read as a screen that failed to
+        // load rather than a door with no queue behind it.
+        GaiaCoverflow(
+          itemCount: 1,
+          index: 0,
+          onIndexChanged: (_) {},
+          dashedBuilder: (_) => true,
+          itemBuilder: (context, i) => const GaiaCoverflowCard(
+            who: 'Next',
+            when: 'Nobody yet',
+            detail: [
+              'The public queue page refreshes itself while it is open, and '
+                  'this board polls every ten seconds.',
+            ],
+            footLeft: '\u2014',
+            footRight: 'Empty',
+            dim: true,
+          ),
+        )
+      else ...[
+        GaiaCoverflow(
+          itemCount: ordered.length,
+          index: flowIndex,
+          onIndexChanged: (i) => setState(() => _flowIndex = i),
+          onActivate: (i) {
+            final e = ordered[i] as Map;
+            _partyDetails(e, preOf(e), memOf(e));
+          },
+          semanticsBuilder: (i) {
+            final e = ordered[i] as Map;
+            return '${_s(e, 'name')}, party of ${e['party_size'] ?? 1}, '
+                'position ${e['position'] ?? i + 1}, waiting ${waitOf(e)}';
+          },
+          itemBuilder: (context, i) {
+            final e = ordered[i] as Map;
+            final called = _s(e, 'status', 'waiting') == 'called';
+            final pre = preOf(e);
+            return GaiaCoverflowCard(
+              who: _s(e, 'name'),
+              when: called
+                  ? 'Notified \u00b7 on their way'
+                  : 'Waiting \u00b7 position ${e['position'] ?? i + 1}',
+              whenColor: called ? GaiaColors.amber : null,
+              detail: [
+                'Party of ${e['party_size'] ?? 1}'
+                    '${_s(e, 'phone', '').isEmpty ? '' : ' \u00b7 ${_s(e, 'phone', '')}'}',
+                if (pre.isNotEmpty)
+                  '${pre.length}-item pre-order held'
+                else
+                  'Joined from the queue page',
+              ],
+              footLeft: waitOf(e),
+              footRight: called ? 'Seat now' : 'Call',
+            );
+          },
+        ),
+        GaiaCoverflowIndex(
+          count: ordered.length,
+          index: flowIndex,
+          onTap: (i) => setState(() => _flowIndex = i),
+        ),
+        const SizedBox(height: GaiaSpacing.xl),
+        if (focused != null)
+          Row(children: [
+            Expanded(
+              child: GaiaButton(
+                label: _s(focused, 'status', 'waiting') == 'called'
+                    ? 'Party details'
+                    : 'Call',
+                kind: GaiaButtonKind.ghost,
+                dense: true,
+                onPressed: _busyId == '${focused['id']}'
+                    ? null
+                    : () {
+                        if (_s(focused, 'status', 'waiting') == 'called') {
+                          _partyDetails(focused, preOf(focused), memOf(focused));
+                        } else {
+                          _act('${focused['id']}',
+                              () => widget.rest.post('/waitlist/${focused['id']}/call'),
+                              ok: 'Notified ${_s(focused, 'name')}');
+                        }
+                      },
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              flex: 2,
+              child: GaiaButton(
+                label: 'Seat at a table',
+                dense: true,
+                onPressed:
+                    _busyId == '${focused['id']}' ? null : () => _seat(focused),
+              ),
+            ),
+          ]),
+      ],
+    ];
+  }
+
   Widget _hero(double w) {
     final text = Theme.of(context).textTheme;
     return ForkCard(
@@ -19817,7 +21764,7 @@ class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
     super.initState();
     unawaited(primeFromCache(
       fetch: () => widget.rest.getMap('/billing'),
-      apply: (info) { _info = info; _hasData = true; _loading = false; },
+      apply: (info) { _info = info; _hasData = true; _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -19893,11 +21840,11 @@ class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text('Could not load billing.\n$_error', textAlign: TextAlign.center),
-        const SizedBox(height: 8),
-        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-      ]));
+      return LoadErrorState(
+        whatFailed: 'Could not load billing',
+        error: '$_error',
+        onRetry: _load,
+      );
     }
     if (_info['configured'] == false) {
       return const EmptyState(
@@ -20171,7 +22118,7 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -20315,11 +22262,11 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text('Could not load cash sessions.\n$_error', textAlign: TextAlign.center),
-        const SizedBox(height: 8),
-        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-      ]));
+      return LoadErrorState(
+        whatFailed: 'Could not load cash sessions',
+        error: '$_error',
+        onRetry: _load,
+      );
     }
     final cur = _current;
     final closed = _history.where((s) => (s as Map)['status'] == 'closed').toList();
@@ -20659,7 +22606,7 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> with CachePrim
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -20850,11 +22797,11 @@ class _PurchaseOrdersViewState extends State<_PurchaseOrdersView> with CachePrim
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text('Could not load purchase orders.\n$_error', textAlign: TextAlign.center),
-        const SizedBox(height: 8),
-        ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-      ]));
+      return LoadErrorState(
+        whatFailed: 'Could not load purchase orders',
+        error: '$_error',
+        onRetry: _load,
+      );
     }
     return cacheStaleOverlay(Scaffold(
       backgroundColor: Colors.transparent,
@@ -21221,7 +23168,7 @@ class _AttendanceViewState extends State<_AttendanceView> with CachePrimedScreen
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -21576,12 +23523,10 @@ class _AttendanceViewState extends State<_AttendanceView> with CachePrimedScreen
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('Could not load attendance.\n$_error', textAlign: TextAlign.center),
-          const SizedBox(height: 8),
-          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-        ]),
+      return LoadErrorState(
+        whatFailed: 'Could not load attendance',
+        error: '$_error',
+        onRetry: _load,
       );
     }
     final clockedIn = _me['clocked_in'] == true;
@@ -21846,7 +23791,7 @@ class _OutletsViewState extends State<_OutletsView> with CachePrimedScreen {
     super.initState();
     unawaited(primeFromCache(
       fetch: _fetch,
-      apply: (d) { _apply(d); _loading = false; },
+      apply: (d) { _apply(d); _loading = false; _error = null; },
       refresh: () => _load(silent: true),
       fallback: _load,
     ));
@@ -22171,13 +24116,10 @@ class _OutletsViewState extends State<_OutletsView> with CachePrimedScreen {
   Widget build(BuildContext context) {
     if (_loading) return _loadingSkeleton();
     if (_error != null) {
-      return Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('Could not load outlets.\n$_error',
-              textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodyMedium),
-          const SizedBox(height: AppSpacing.md),
-          ForkButton.ghost(label: 'Retry', icon: Icons.refresh, onPressed: _load),
-        ]),
+      return LoadErrorState(
+        whatFailed: 'Could not load outlets',
+        error: '$_error',
+        onRetry: _load,
       );
     }
 
@@ -24911,9 +26853,18 @@ class _PasswordRequestsBanner extends StatelessWidget {
   }
 }
 
-// Built-in thermal printer agent UI: pick the printer, watch the realtime
+// Built-in thermal printer agent UI: set up the printers, watch the realtime
 // connection, and monitor the print queue/log. The PrinterService runs in the
 // background (started at login) — this screen just configures and observes it.
+//
+// THIS SCREEN IS NO LONGER WINDOWS-ONLY. It used to open on "Desktop only",
+// because the only transport was the Windows spooler. There is now a second one
+// — a raw socket to a network printer's port 9100 (NetworkPrinter) — which needs
+// no plugin and works identically on a phone, so an Android tablet configured
+// with a printer address is a real print client rather than a viewer. Each half
+// of the screen is still gated on the transport it belongs to: the spooler
+// controls appear only where a spooler exists, and nothing here offers a control
+// that cannot do anything on the device showing it.
 Widget printerModule(RestClient rest, Profile p) {
   final svc = PrinterService.instance;
   return AnimatedBuilder(
@@ -24922,12 +26873,17 @@ Widget printerModule(RestClient rest, Profile p) {
       if (!svc.supported) {
         return const EmptyState(
           icon: Icons.print_disabled_outlined,
-          title: 'Desktop only',
-          caption: 'Built-in printing is available on the Windows desktop app only.',
+          title: 'Printing unavailable',
+          caption: 'This build has no way to reach a printer.',
         );
       }
       final text = Theme.of(context).textTheme;
       final messenger = ScaffoldMessenger.of(context);
+      // A device with no spooler and no network printer cannot print anything,
+      // and PrinterService deliberately keeps it out of the outlet's realtime
+      // room until it can — so "Offline" here is a setup step, not a fault, and
+      // the card below says which.
+      final unconfigured = !svc.hasSpooler && svc.networkPrinters.isEmpty;
       return ListView(padding: AppSpacing.pageNarrow, children: [
         // Connection status
         ForkCard(
@@ -24946,9 +26902,13 @@ Widget printerModule(RestClient rest, Profile p) {
             const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Text(
-                  svc.connected ? 'Listening for print jobs in realtime' : 'Not connected to realtime',
+                  svc.connected
+                      ? 'Listening for print jobs in realtime'
+                      : unconfigured
+                          ? 'Add a printer below and this device starts printing'
+                          : 'Not connected to realtime',
                   style: text.bodySmall,
-                  maxLines: 1,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis),
             ),
             if (svc.paused) ...[
@@ -24963,8 +26923,12 @@ Widget printerModule(RestClient rest, Profile p) {
           ]),
         ),
         const SizedBox(height: AppSpacing.xxl),
-        const SectionHeader(title: 'Printer', padding: EdgeInsets.only(bottom: 6)),
-        Text('Choose the thermal printer bills are sent to. Bills print automatically when approved/printed.',
+        _NetworkPrintersCard(svc: svc),
+        const SizedBox(height: AppSpacing.xxl),
+        const SectionHeader(title: 'Default printer', padding: EdgeInsets.only(bottom: 6)),
+        Text(
+            'Everything prints here unless a rule below sends it somewhere else. '
+            'A dish whose station has no rule still comes out here, so nothing is ever lost.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.md),
         ForkCard(
@@ -24983,19 +26947,36 @@ Widget printerModule(RestClient rest, Profile p) {
                     underline: const SizedBox.shrink(),
                     dropdownColor: AppColors.cardRaised,
                     borderRadius: AppRadius.controlAll,
-                    value: svc.printers.contains(svc.selectedPrinter) ? svc.selectedPrinter : null,
-                    hint: Text(svc.selectedPrinter ?? 'Select a printer', style: text.bodyMedium),
-                    items: [for (final n in svc.printers) DropdownMenuItem(value: n, child: Text(n, overflow: TextOverflow.ellipsis))],
+                    // Both transports in one list: a Windows queue and a
+                    // `tcp://host:port` printer are the same choice to the
+                    // person making it.
+                    value: svc.selectedPrinter != null && svc.knowsTarget(svc.selectedPrinter!)
+                        ? svc.selectedPrinter
+                        : null,
+                    hint: Text(
+                        svc.selectedPrinter == null || svc.selectedPrinter!.isEmpty
+                            ? (svc.targets.isEmpty ? 'No printers set up yet' : 'Select a printer')
+                            : PrintTarget.label(svc.selectedPrinter!),
+                        style: text.bodyMedium),
+                    items: [
+                      for (final t in svc.targets)
+                        DropdownMenuItem(
+                            value: t, child: Text(PrintTarget.label(t), overflow: TextOverflow.ellipsis)),
+                    ],
                     onChanged: (v) { if (v != null) svc.setSelectedPrinter(v); },
                   ),
                 ),
               ),
-              const SizedBox(width: AppSpacing.sm),
-              ForkIconButton(
-                tooltip: 'Discover printers',
-                icon: Icons.refresh,
-                onPressed: () => svc.discoverPrinters(),
-              ),
+              // Only where there is a spooler to enumerate. On a phone this
+              // button could only ever report zero.
+              if (svc.hasSpooler) ...[
+                const SizedBox(width: AppSpacing.sm),
+                ForkIconButton(
+                  tooltip: 'Discover printers',
+                  icon: Icons.refresh,
+                  onPressed: () => svc.discoverPrinters(),
+                ),
+              ],
             ]),
             if (svc.selectedPrinter != null && svc.selectedPrinter!.isNotEmpty)
               Padding(
@@ -25003,7 +26984,9 @@ Widget printerModule(RestClient rest, Profile p) {
                 child: Row(children: [
                   const Icon(Icons.check_circle, size: 14, color: AppColors.success),
                   const SizedBox(width: 6),
-                  Expanded(child: Text('Default: ${svc.selectedPrinter}', style: text.bodySmall)),
+                  Expanded(
+                      child: Text('Default: ${PrintTarget.label(svc.selectedPrinter!)}',
+                          style: text.bodySmall)),
                 ]),
               ),
             const SizedBox(height: AppSpacing.md),
@@ -25012,14 +26995,19 @@ Widget printerModule(RestClient rest, Profile p) {
               child: ForkButton.ghost(
                 label: 'Print test slip',
                 icon: Icons.print_outlined,
-                onPressed: () {
-                  final ok = svc.testPrint();
-                  messenger.showSnackBar(SnackBar(content: Text(ok ? 'Test slip sent.' : 'Select a printer first / print failed.')));
+                onPressed: () async {
+                  // The REASON, not a bare failure: a network printer fails in
+                  // ways the owner can fix, and each of them looks the same
+                  // behind "print failed".
+                  final err = await svc.testPrint();
+                  messenger.showSnackBar(SnackBar(content: Text(err ?? 'Test slip sent.')));
                 },
               ),
             ),
           ]),
         ),
+        const SizedBox(height: AppSpacing.xxl),
+        _PrinterRoutingCard(rest: rest, svc: svc),
         const SizedBox(height: AppSpacing.xxl),
         SectionHeader(
           title: 'Print queue',
@@ -25049,6 +27037,15 @@ Widget printerModule(RestClient rest, Profile p) {
                         const SizedBox(height: 2),
                         Text('${j.bytes.length} bytes${j.attempts > 0 ? ' · attempt ${j.attempts}' : ''}',
                             style: text.bodySmall),
+                        // WHY IT HAS NOT PRINTED. A docket stuck in this queue is
+                        // a docket the kitchen never saw; leaving the reason in
+                        // the log only means nobody reads it until the table
+                        // complains.
+                        if (j.lastError != null) ...[
+                          const SizedBox(height: 3),
+                          Text(j.lastError!,
+                              style: text.bodySmall!.copyWith(color: AppColors.danger)),
+                        ],
                       ]),
                     ),
                   ]),
@@ -25077,6 +27074,375 @@ Widget printerModule(RestClient rest, Profile p) {
       ]);
     },
   );
+}
+
+/// PRINTERS THIS DEVICE REACHES OVER THE NETWORK — and the reason a phone can
+/// print at all.
+///
+/// THE PROBLEM. `PrinterService.supported` used to be `WinRawPrinter.supported`,
+/// so on Android the whole printing module opened on "Desktop only". That was
+/// never a statement about the app: the backend renders the finished ESC/POS
+/// docket itself (escpos.ts) and pushes the bytes down the `bill:print` socket.
+/// A Windows till writes them to a spooler queue. Nothing stopped a phone
+/// writing the SAME bytes to a socket — it just had nowhere to write them to.
+///
+/// THE TRANSPORT. Port 9100 ("RAW"/JetDirect) is a bare TCP stream that a
+/// thermal printer treats as its input buffer. `dart:io`'s Socket is the entire
+/// driver: no plugin, no platform channel, no pairing, no runtime permission
+/// beyond INTERNET, which the app already holds. See NetworkPrinter.
+///
+/// WHAT IT CANNOT REACH: BLUETOOTH PRINTERS. A handheld belt printer is usually
+/// Bluetooth SPP/BLE, not networked, and nothing here can talk to one — that
+/// needs a plugin, a pairing flow and the Android 12+ BLUETOOTH_CONNECT runtime
+/// permission. The caption below says so in as many words rather than letting an
+/// owner discover it by typing an address that can never work.
+///
+/// SHOWN ON EVERY PLATFORM, because it works on every platform. A Windows till
+/// with three USB printers has no need of it and simply leaves it empty; a
+/// tablet has nothing else.
+class _NetworkPrintersCard extends StatefulWidget {
+  const _NetworkPrintersCard({required this.svc});
+
+  final PrinterService svc;
+
+  @override
+  State<_NetworkPrintersCard> createState() => _NetworkPrintersCardState();
+}
+
+class _NetworkPrintersCardState extends State<_NetworkPrintersCard> {
+  /// Add a printer by address, with a TEST that runs BEFORE it is saved.
+  ///
+  /// The test is the whole point of the dialog. An address is four numbers and a
+  /// port; every way of getting it wrong produces the same silence at the pass
+  /// hours later, so the owner gets to put paper on the floor while they are
+  /// still looking at the box they typed it into.
+  Future<void> _add() async {
+    final host = TextEditingController();
+    final port = TextEditingController(text: '9100');
+    String? note;
+    var busy = false;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          int portOf() => int.tryParse(port.text.trim()) ?? -1;
+          return AlertDialog(
+            title: const Text('Add a network printer'),
+            content: SizedBox(
+              width: 380,
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                TextField(
+                  controller: host,
+                  autofocus: true,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'Printer IP address',
+                    hintText: '192.168.1.50',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: port,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Port',
+                    hintText: '9100',
+                    helperText: 'Almost always 9100.',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                if (note != null) ...[
+                  const SizedBox(height: 10),
+                  Text(note!, style: Theme.of(ctx).textTheme.bodySmall),
+                ],
+              ]),
+            ),
+            actions: [
+              TextButton(onPressed: busy ? null : () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+              TextButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        setLocal(() { busy = true; note = 'Sending a test slip…'; });
+                        final err = await widget.svc.testNetworkAddress(host.text, portOf());
+                        if (!ctx.mounted) return;
+                        setLocal(() {
+                          busy = false;
+                          note = err ?? 'Test slip sent. If paper came out, save it.';
+                        });
+                      },
+                child: const Text('Test print'),
+              ),
+              FilledButton(
+                onPressed: busy
+                    ? null
+                    : () async {
+                        final err = await widget.svc.addNetworkPrinter(host.text, portOf());
+                        if (!ctx.mounted) return;
+                        if (err != null) { setLocal(() => note = err); return; }
+                        Navigator.pop(ctx, true);
+                      },
+                child: const Text('Save'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (saved == true && mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final svc = widget.svc;
+    final text = Theme.of(context).textTheme;
+    final messenger = ScaffoldMessenger.of(context);
+    final printers = svc.networkPrinters;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      SectionHeader(
+        title: 'Network printers',
+        count: printers.length,
+        padding: const EdgeInsets.only(bottom: 6),
+        trailing: ForkButton.subtle(label: 'Add', icon: Icons.add, onPressed: _add),
+      ),
+      Text(
+          svc.hasSpooler
+              ? 'A printer with an IP address can be printed to directly, without installing it in Windows. '
+                  'This is also how a phone or tablet prints — it needs no printer driver at all.'
+              : 'This device prints straight to a printer on the same Wi-Fi, using its IP address. '
+                  'Add one and this device starts printing dockets like a till does. '
+                  'Bluetooth-only printers cannot be reached this way.',
+          style: text.bodySmall),
+      const SizedBox(height: AppSpacing.md),
+      ForkCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          if (printers.isEmpty)
+            Text(
+                svc.hasSpooler
+                    ? 'None added. Windows printers are listed below as usual.'
+                    : 'None added yet. Find the printer\'s IP address on its own '
+                        'self-test slip or in its network settings, then Add it above.',
+                style: text.bodySmall)
+          else
+            for (final target in printers)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(children: [
+                  Icon(Icons.lan_outlined, size: 15, color: AppColors.textSecondary),
+                  const SizedBox(width: AppSpacing.md),
+                  Expanded(
+                    child: Text(PrintTarget.label(target),
+                        style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+                  ForkIconButton(
+                    tooltip: 'Print a test slip',
+                    icon: Icons.print_outlined,
+                    onPressed: () async {
+                      final err = await svc.testPrintTo(target);
+                      messenger.showSnackBar(SnackBar(content: Text(err ?? 'Test slip sent.')));
+                    },
+                  ),
+                  const SizedBox(width: 4),
+                  ForkIconButton(
+                    tooltip: 'Remove this printer',
+                    icon: Icons.delete_outline,
+                    onPressed: () async {
+                      await svc.removeNetworkPrinter(target);
+                      if (context.mounted) setState(() {});
+                    },
+                  ),
+                ]),
+              ),
+          const SizedBox(height: AppSpacing.sm),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(Icons.info_outline, size: 14, color: AppColors.textSecondary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                  'A test slip proves the connection, not the paper: port 9100 sends no reply, '
+                  'so a printer that is out of paper accepts the job in silence — check the roll. '
+                  'Every device you set up prints the jobs its rules give it, so if a till is '
+                  'already printing everything, give this one only the jobs it should take.',
+                  style: text.bodySmall),
+            ),
+          ]),
+        ]),
+      ),
+    ]);
+  }
+}
+
+/// WHAT EACH PRINTER PRINTS.
+///
+/// A restaurant with three printers — one at the pass, one in the bar, one at
+/// the till — needs to say which is which. The backend already splits a kitchen
+/// ticket into one docket per STATION (escpos.ts buildKotBase64) and stamps each
+/// `bill:print` event with that station plus its `kind`, so this screen is only
+/// choosing a destination for facts the wire already carries.
+///
+/// THE STATION LIST IS THE MENU'S, NOT TYPED HERE. A free-text station box is a
+/// dead control waiting to happen: one typo and the rule silently never matches,
+/// with no way to tell from looking at it. So the choices come from the
+/// restaurant's own kitchen sections (Restaurant.kitchen_sections, the same list
+/// the menu editor assigns dishes from), unioned with any station this till has
+/// actually been sent a docket for — which covers a dish whose station was set
+/// before the section list existed.
+///
+/// THE DESTINATIONS ARE THIS DEVICE'S, whichever transport they use. A rule can
+/// name a Windows spooler queue or a `tcp://host:port` network printer, and the
+/// dropdown lists whatever this particular device can actually reach — which is
+/// why the map is stored per device and per outlet. A tablet in the bar and the
+/// till at the front desk see different printers and neither one's rules would
+/// mean anything on the other.
+class _PrinterRoutingCard extends StatefulWidget {
+  const _PrinterRoutingCard({required this.rest, required this.svc});
+
+  final RestClient rest;
+  final PrinterService svc;
+
+  @override
+  State<_PrinterRoutingCard> createState() => _PrinterRoutingCardState();
+}
+
+class _PrinterRoutingCardState extends State<_PrinterRoutingCard> {
+  List<String> _menuStations = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStations();
+  }
+
+  /// The kitchen sections, fetched once. A failure costs the SUGGESTIONS, not
+  /// the screen: the rules this till has already been given still show, and so
+  /// do the stations it has seen dockets for.
+  Future<void> _loadStations() async {
+    try {
+      final settings = await widget.rest.getMap('/restaurant/settings');
+      final raw = settings['kitchen_sections'];
+      if (raw is List && mounted) {
+        setState(() => _menuStations = [
+              for (final s in raw)
+                if ('$s'.trim().isNotEmpty) '$s'.trim(),
+            ]);
+      }
+    } catch (_) {
+      /* suggestions only — the card works without them */
+    }
+  }
+
+  /// Every station worth offering a rule for, menu order first.
+  List<String> get _stations {
+    final out = <String>[];
+    for (final s in [..._menuStations, ...widget.svc.seenStations]) {
+      if (out.any((e) => e.toLowerCase() == s.toLowerCase())) continue;
+      out.add(s);
+    }
+    return out;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final svc = widget.svc;
+    final text = Theme.of(context).textTheme;
+    final roles = <(String, String)>[
+      (PrintRole.bill, 'Bills'),
+      (PrintRole.anyKot, 'Kitchen dockets (any station)'),
+      for (final station in _stations) (PrintRole.kotStation(station), 'Kitchen: $station'),
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      SectionHeader(
+        title: 'What each printer prints',
+        count: svc.routes.length,
+        padding: const EdgeInsets.only(bottom: 6),
+      ),
+      Text(
+          'Send bills to the till printer and each kitchen station to its own. '
+          'One printer can take several jobs — leave everything on Default if a single printer does it all.',
+          style: text.bodySmall),
+      const SizedBox(height: AppSpacing.md),
+      ForkCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          for (final (role, label) in roles) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(children: [
+                Icon(
+                  role == PrintRole.bill ? Icons.receipt_long_outlined : Icons.soup_kitchen_outlined,
+                  size: 15,
+                  color: AppColors.textSecondary,
+                ),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: Text(label, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                SizedBox(
+                  width: 190,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: AppColors.inset,
+                      borderRadius: AppRadius.inputAll,
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: DropdownButton<String>(
+                      isExpanded: true,
+                      isDense: true,
+                      underline: const SizedBox.shrink(),
+                      dropdownColor: AppColors.cardRaised,
+                      borderRadius: AppRadius.controlAll,
+                      // The stored name only shows as selected when this device
+                      // can actually reach it — the same condition printerFor
+                      // routes on, so the screen can never claim a destination
+                      // the job would not really go to.
+                      value: svc.routes[role] != null && svc.knowsTarget(svc.routes[role]!)
+                          ? svc.routes[role]
+                          : '',
+                      items: [
+                        const DropdownMenuItem(value: '', child: Text('Default', overflow: TextOverflow.ellipsis)),
+                        for (final t in svc.targets)
+                          DropdownMenuItem(
+                              value: t, child: Text(PrintTarget.label(t), overflow: TextOverflow.ellipsis)),
+                      ],
+                      onChanged: (v) {
+                        if (v == null || v.isEmpty) {
+                          svc.clearRoute(role);
+                        } else {
+                          svc.setRoute(role, v);
+                        }
+                      },
+                    ),
+                  ),
+                ),
+              ]),
+            ),
+          ],
+          if (roles.length <= 2)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                  'No kitchen stations configured yet. Assign stations to dishes in Menu and they appear here.',
+                  style: text.bodySmall),
+            ),
+          const SizedBox(height: AppSpacing.sm),
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            // Not const: AppColors resolves through the appearance controller, so
+            // these values change with the active design system.
+            Icon(Icons.info_outline, size: 14, color: AppColors.textSecondary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                  'Anything without a rule — or whose printer is switched off or uninstalled — prints on the default printer instead of being dropped.',
+                  style: text.bodySmall),
+            ),
+          ]),
+        ]),
+      ),
+    ]);
+  }
 }
 
 Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
@@ -25119,6 +27485,11 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           'queue_show_menu': brand['queue_show_menu'] ?? settings['queue_show_menu'] ?? true,
           // Whether guests must enter the per-table 4-digit OTP before ordering.
           'require_table_otp': settings['require_table_otp'] == true,
+          // Whether barking an order also prints its kitchen docket. ABSENT
+          // READS AS ON, matching the backend: the column is NULL for every
+          // restaurant that predates migration 040, and an older backend that
+          // has never heard of the key must not present the feature as off.
+          'kot_auto_print': settings['kot_auto_print'] != false,
           // Guest page theme. The resolved config is on both endpoints; the font
           // allowlist, the live/legacy field split and the enum option lists only
           // on /settings (older backends omit them and the editor falls back to
@@ -25153,6 +27524,8 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             _AutoPushCard(rest: rest, initial: m['auto_push_orders'] != false),
             const SizedBox(height: 14),
             _RequireTableOtpCard(rest: rest, initial: m['require_table_otp'] == true),
+            const SizedBox(height: 14),
+            _KotAutoPrintCard(rest: rest, initial: m['kot_auto_print'] != false),
             const SizedBox(height: 14),
             _QueueMenuCard(rest: rest, initial: m['queue_show_menu'] != false),
             const SizedBox(height: AppSpacing.xxl),
@@ -26013,6 +28386,93 @@ class _RequireTableOtpCardState extends State<_RequireTableOtpCard> {
             Text('Require table OTP to order', style: text.titleSmall),
             const SizedBox(height: 3),
             Text('Guests enter a 4-digit code shown by staff before ordering. Admin-only.', style: text.bodySmall),
+          ]),
+        ),
+        const SizedBox(width: AppSpacing.md),
+        SizedBox(
+          height: 24,
+          child: FittedBox(fit: BoxFit.contain, child: Switch(value: _on, onChanged: _busy ? null : _set)),
+        ),
+      ]),
+    );
+  }
+}
+
+// Toggle: barking an order also prints its kitchen docket (migration 040).
+//
+// WHY THE SETTING EXISTS AT ALL, given the feature is the point. Barking stamps
+// "Orders".barked_at and rebases every prep timer — the kitchen clock starts
+// there — and until this shipped, nothing was printed: somebody had to remember
+// to press Print KOT afterwards, which on a busy pass is exactly the thing that
+// gets forgotten. So the default is ON, and a restaurant that never opens this
+// screen gets it. The switch is for the places the default is wrong for: a
+// kitchen with no thermal printer at all, or one that calls orders verbally and
+// prints only on demand. Turning it off restores the manual step exactly.
+//
+// DEFAULT ON, AND A MISSING VALUE READS AS ON. The column is NULL for every
+// restaurant that predates the migration, and GetRestaurantSettings maps NULL to
+// true, so this reads `!= false` rather than `== true` — the two differ for
+// precisely the tenants who have never been asked the question.
+//
+// Admin-only, like every other write on POST /restaurant/settings.
+class _KotAutoPrintCard extends StatefulWidget {
+  final RestClient rest;
+  final bool initial;
+  const _KotAutoPrintCard({required this.rest, required this.initial});
+
+  @override
+  State<_KotAutoPrintCard> createState() => _KotAutoPrintCardState();
+}
+
+class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
+  late bool _on = widget.initial;
+  bool _busy = false;
+
+  Future<void> _set(bool v) async {
+    setState(() { _on = v; _busy = true; });
+    try {
+      await widget.rest.post('/restaurant/settings', {'kot_auto_print': v});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(v
+              ? 'Barking an order now prints its kitchen docket automatically.'
+              : 'Dockets print only when someone presses Print KOT.'),
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _on = !v); // revert on failure
+        final msg = (e is ApiException && e.status == 403)
+            ? 'Only an admin can change this setting.'
+            : '$e';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text('Print the KOT when an order is barked', style: text.titleSmall),
+            const SizedBox(height: 3),
+            AnimatedSwitcher(
+              duration: AppDurations.base,
+              switchInCurve: Curves.easeOut,
+              child: Text(
+                _on
+                    ? 'The docket goes to the kitchen printer the moment the order is barked. The Reprint button sends the same ticket again.'
+                    : 'Nothing prints on a bark. Staff press Print KOT themselves.',
+                key: ValueKey('kot-auto-print-$_on'),
+                style: text.bodySmall,
+              ),
+            ),
           ]),
         ),
         const SizedBox(width: AppSpacing.md),

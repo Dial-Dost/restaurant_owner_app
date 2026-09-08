@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 
@@ -19,6 +20,12 @@ class ForkTabs extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Gaia's tabs are underlined, not pilled, and the row carries the rule the
+    // pills' copper tick separators stand in for here.
+    if (Gaia.of(context)) {
+      return GaiaTabs(tabs: tabs, selected: selected, onSelected: onSelected);
+    }
+
     final children = <Widget>[];
     for (var i = 0; i < tabs.length; i++) {
       if (i > 0) {

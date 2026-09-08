@@ -70,9 +70,10 @@ class RestClient {
       // swallow errors internally (the Overview wraps each GET in catchError):
       // the stamp is how AsyncView learns the replayed payload has holes.
       if (res != null && _cacheableGet(method, path)) {
-        final hit = await GetCache.instance.read(res, _cacheOutlet, path);
+        final hit = await GetCache.instance
+            .read(res, _cacheOutlet, path, allowStale: GetCachePolicy.allowStale);
         if (hit != null) {
-          GetCachePolicy.stamp?.recordHit(hit.savedAt);
+          GetCachePolicy.stamp?.recordHit(hit.savedAt, superseded: hit.superseded);
           return hit.data;
         }
       }
@@ -126,6 +127,13 @@ class RestClient {
           // the restaurant (a settle changes /orders, the bill and half of
           // /analytics/* at once), so the whole tenant is busted. Coarse on
           // purpose: the worst case is one skeleton, not a stale bill.
+          //
+          // "Busted" MARKS the saved copies rather than deleting them (see
+          // [GetCache.bustRestaurant]). Nothing about freshness changes — an
+          // invalidated copy is invisible to every read on this path — but the
+          // payload survives for the offline last resort, so an evening of
+          // ordinary writes no longer leaves the device with nothing to show
+          // the moment the Wi-Fi drops.
           await GetCache.instance.bustRestaurant(res);
         }
       }

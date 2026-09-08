@@ -8,6 +8,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 import '../config.dart';
 import 'api_client.dart';
 import 'auth_controller.dart';
+import 'net_raw_printer.dart';
 import 'restaurant_time.dart';
 import 'win_raw_printer.dart';
 
@@ -15,6 +16,91 @@ import 'win_raw_printer.dart';
 /// drive the queue without a real winspool handle — production always uses
 /// [WinRawPrinter.sendBytes].
 typedef SpoolerWrite = bool Function(String printerName, List<int> bytes);
+
+/// How the same bytes reach a printer over the network. Returns null on success
+/// or the reason it failed — a STRING rather than a bool because a docket the
+/// kitchen never saw has to be able to say why. Production always uses
+/// [NetworkPrinter.send].
+typedef NetworkWrite = Future<String?> Function(String host, int port, List<int> bytes);
+
+/// WHERE THE BYTES GO — one printer, named in a way that survives being stored.
+///
+/// There are two transports and a role has to be able to point at either:
+///
+///   * a WINDOWS SPOOLER QUEUE, named by the queue name winspool reports
+///     ("EPSON TM-T82 Receipt"). Stored bare, exactly as it always was, so every
+///     device that already has rules keeps them without a migration.
+///   * a NETWORK PRINTER, named `tcp://<host>:<port>` — the port 9100 raw
+///     socket that lets a PHONE print (see [NetworkPrinter]).
+///
+/// A bare string with a scheme prefix rather than a sealed class because these
+/// values live in SharedPreferences and in the `<role>=<target>` route entries
+/// that were written before network printing existed. Anything without the
+/// prefix is a spooler name, which is precisely what those old entries are.
+abstract final class PrintTarget {
+  static const String _scheme = 'tcp://';
+
+  /// The stored form of a network printer.
+  static String network(String host, int port) => NetworkPrinter.target(host, port);
+
+  static bool isNetwork(String target) => target.startsWith(_scheme);
+
+  /// The host and port of a network target, or null if this is a spooler name.
+  static ({String host, int port})? parse(String target) {
+    if (!isNetwork(target)) return null;
+    final rest = target.substring(_scheme.length);
+    final colon = rest.lastIndexOf(':');
+    if (colon <= 0) return null;
+    final host = rest.substring(0, colon).trim();
+    final port = int.tryParse(rest.substring(colon + 1).trim());
+    if (host.isEmpty || port == null || port < 1 || port > 65535) return null;
+    return (host: host, port: port);
+  }
+
+  /// How a target reads on screen: `192.168.1.50:9100`, or the queue name.
+  static String label(String target) =>
+      isNetwork(target) ? target.substring(_scheme.length) : target;
+}
+
+/// WHAT A PRINTER IS FOR, in this outlet.
+///
+/// A real restaurant has more than one thermal printer and each prints a
+/// different thing: a KOT printer at the pass, a second in the bar, a bill
+/// printer at the till. Every `bill:print` event already carries everything
+/// needed to tell them apart — `kind` ('bill' or 'kot') and, on a kitchen
+/// docket, the `station` buildKotBase64 split it by — so routing is a lookup,
+/// not a new concept. escpos.ts has said so since the split was written: "a
+/// printer agent that maps station -> printer routes each ticket to its zone".
+///
+/// A role is a STRING so a station role can name any station the menu uses
+/// without this file holding a copy of the station list:
+///   * `bill`          — customer bills
+///   * `kot`           — every kitchen docket, whatever its station
+///   * `kot:<STATION>` — dockets for that one station (case-insensitively)
+abstract final class PrintRole {
+  static const String bill = 'bill';
+  static const String anyKot = 'kot';
+
+  /// The role that routes ONE station's dockets. Upper-cased and trimmed so the
+  /// same station typed "Bar", "bar " and "BAR" is one rule, matching the way
+  /// groupKotItemsByStation keys its buckets.
+  static String kotStation(String station) => 'kot:${station.trim().toUpperCase()}';
+
+  /// The station a `kot:<STATION>` role names, or null for any other role.
+  static String? stationOf(String role) {
+    if (!role.startsWith('kot:')) return null;
+    final s = role.substring(4).trim();
+    return s.isEmpty ? null : s;
+  }
+
+  /// How a role reads in the UI and the activity log.
+  static String label(String role) {
+    if (role == bill) return 'Bills';
+    if (role == anyKot) return 'All kitchen dockets';
+    final station = stationOf(role);
+    return station == null ? role : 'Kitchen: $station';
+  }
+}
 
 class PrintJob {
   final String billId;
@@ -44,6 +130,12 @@ class PrintJob {
   final bool replay;
 
   int attempts = 0;
+
+  /// Why the last attempt failed, in words — "No answer from 192.168.1.50:9100"
+  /// rather than a bare false. Shown on the queue card and written to the log so
+  /// a docket that did not come out is a thing someone can act on rather than a
+  /// thing they discover from an angry table.
+  String? lastError;
 
   PrintJob(
     this.billId,
@@ -103,6 +195,31 @@ class PrinterService extends ChangeNotifier {
 
   static const _printerKey = 'selected_printer';
 
+  /// The role -> printer map, as `<role>=<printer name>` entries.
+  ///
+  /// STORED ON THE DEVICE, NOT ON THE SERVER, and that is a decision rather than
+  /// an omission. The values are WINDOWS SPOOLER NAMES — "EPSON TM-T82 (Bar)" —
+  /// which are facts about ONE machine. A till only ever prints to printers
+  /// installed on itself, and the outlet's second till has different ones. A
+  /// per-outlet copy on the backend would therefore be authoritative nonsense on
+  /// every device but the one that wrote it: the bar till would be told to send
+  /// bar dockets to a queue that does not exist on it, and the docket would fail
+  /// three times and settle as 'failed'.
+  ///
+  /// Keyed per outlet, because one machine can be signed into more than one, and
+  /// the printers it should use differ between them.
+  static const _routesKeyPrefix = 'printer_routes_';
+
+  /// The network printers configured on this device, as `tcp://host:port`.
+  ///
+  /// PER OUTLET AND ON THE DEVICE, for the same reason the routing map is: a
+  /// printer's address is a fact about the LAN this device is standing on. The
+  /// tablet in the bar and the till at the front desk of a second branch see
+  /// different 192.168.x.x networks, and an address copied between them points
+  /// at whatever happens to hold that lease — which is either nothing or, worse,
+  /// somebody else's printer.
+  static const _netKeyPrefix = 'printer_net_';
+
   /// Jobs this till has already dealt with, persisted so a restart cannot
   /// reprint them. Entries are `<jobId>|printed` or `<jobId>|failed`.
   static const _settledKey = 'printer_settled_jobs';
@@ -122,6 +239,21 @@ class PrinterService extends ChangeNotifier {
   // lands after a dead connection's hold has lapsed rather than bouncing off it.
   static const _replayRetryDelay = Duration(seconds: 150);
 
+  /// How long to wait before trying [target] again.
+  ///
+  /// A NETWORK printer gets a longer breath than a spooler does. A queue that
+  /// refuses a job refuses it now; a printer that is rebooting, roaming between
+  /// access points or renewing a DHCP lease is simply not there YET, and three
+  /// tries two seconds apart would write it off while it was still coming up.
+  ///
+  /// Derived from [_retryDelay] rather than being a constant of its own, so a
+  /// test that asks for instant retries gets them on both transports — an
+  /// 8-second sleep in a widget test is a flake waiting to be blamed on
+  /// something else.
+  @visibleForTesting
+  Duration retryDelayFor(String target) =>
+      PrintTarget.isNetwork(target) ? _retryDelay * 4 : _retryDelay;
+
   io.Socket? _socket;
   AuthController? _auth;
   Timer? _keepAlive;
@@ -138,8 +270,20 @@ class PrinterService extends ChangeNotifier {
   bool _paused = false;
   String? _selectedPrinter;
   List<String> _printers = const [];
+
+  /// role -> printer name, for the outlet this agent joined. Empty is the
+  /// shipped state and means "everything goes to the default printer" — which
+  /// is exactly what this app did before routing existed.
+  Map<String, String> _routes = <String, String>{};
+
+  /// The `tcp://host:port` printers this device can reach. Empty is the shipped
+  /// state on every platform: a Windows till prints through the spooler and
+  /// needs none of these, and a phone that has not been given one cannot print
+  /// at all — which is exactly what [canClaimJobs] reports.
+  List<String> _netTargets = <String>[];
   final List<PrintJob> _queue = [];
   final List<String> _logs = [];
+  final List<String> _seenStations = <String>[];
 
   /// The tenant + the CONCRETE outlet this agent joined. Held because the ack
   /// and the follow-up replay request both need them long after start() ran.
@@ -157,7 +301,9 @@ class PrinterService extends ChangeNotifier {
   int _replayRounds = 0;
 
   SpoolerWrite _write = WinRawPrinter.sendBytes;
+  NetworkWrite _netWrite = NetworkPrinter.send;
   bool? _supportedOverride;
+  bool? _spoolerOverride;
   Duration _retryDelay = const Duration(seconds: 2);
 
   /// A service instance isolated from the app-wide singleton, with the spooler
@@ -166,41 +312,107 @@ class PrinterService extends ChangeNotifier {
   factory PrinterService.forTest({
     required AuthController auth,
     required SpoolerWrite write,
+    NetworkWrite? netWrite,
     bool supported = true,
+    /// Whether this device has a Windows spooler. Defaults to [supported] so
+    /// every test written before network printing existed describes the same
+    /// Windows till it always did.
+    bool? spooler,
     String? printer = 'Test Printer',
     String? outletId = 'outlet-1',
     Duration retryDelay = Duration.zero,
+    List<String> networkPrinters = const <String>[],
   }) {
     final s = PrinterService._();
     s._auth = auth;
     s._write = write;
+    if (netWrite != null) s._netWrite = netWrite;
     s._supportedOverride = supported;
+    s._spoolerOverride = spooler ?? supported;
     s._selectedPrinter = printer;
     s._outletId = outletId;
     s._resId = 'res-1';
     s._retryDelay = retryDelay;
+    s._netTargets = List<String>.from(networkPrinters);
     return s;
   }
 
-  bool get supported => _supportedOverride ?? WinRawPrinter.supported;
+  /// Seed the routing map and the installed-printer list without touching
+  /// prefs or winspool. Tests only.
+  @visibleForTesting
+  void debugSetRouting({Map<String, String>? routes, List<String>? installed}) {
+    if (routes != null) _routes = Map<String, String>.from(routes);
+    if (installed != null) _printers = List<String>.from(installed);
+  }
+
+  /// Whether this device can print AT ALL, by either transport.
+  ///
+  /// This used to be `WinRawPrinter.supported` — i.e. "is this Windows" — and
+  /// the service logged "Printing is only supported on Windows." on everything
+  /// else. That was a statement about the SPOOLER, not about printing: the
+  /// backend has always pushed finished ESC/POS bytes down `bill:print`, and a
+  /// phone can put those on a socket (see [NetworkPrinter]) just as a till puts
+  /// them on a spooler queue. So the platform question is now [hasSpooler], and
+  /// this one is about capability.
+  bool get supported => _supportedOverride ?? (WinRawPrinter.supported || NetworkPrinter.supported);
+
+  /// Whether the WINDOWS spooler exists here. Gates every control that names a
+  /// Windows printer queue, because those controls are inert anywhere else.
+  bool get hasSpooler => _spoolerOverride ?? WinRawPrinter.supported;
+
   bool get connected => _connected;
   bool get paused => _paused;
   String? get selectedPrinter => _selectedPrinter;
   List<String> get printers => _printers;
+
+  /// The `tcp://host:port` printers configured on this device.
+  List<String> get networkPrinters => List.unmodifiable(_netTargets);
+
+  /// Everything a role can be pointed at, spooler queues first.
+  List<String> get targets => List.unmodifiable(<String>[..._printers, ..._netTargets]);
+
+  /// Whether [target] is something this device can actually reach right now — a
+  /// currently-installed spooler queue, or a configured network address.
+  bool knowsTarget(String target) =>
+      PrintTarget.isNetwork(target) ? _netTargets.contains(target) : _printers.contains(target);
+
+  /// The configured role -> printer rules. Unmodifiable: every change goes
+  /// through setRoute/clearRoute so it is persisted and logged.
+  Map<String, String> get routes => Map.unmodifiable(_routes);
+
+  /// Stations this till has actually been asked to print for, newest last.
+  ///
+  /// Learned from the dockets that arrive rather than fetched, deliberately: the
+  /// station list lives in the menu (Restaurant.kitchen_sections) and the
+  /// printer screen has no business holding a second copy of it that can be
+  /// stale. A station the kitchen never sends a docket for does not need a rule.
+  List<String> get seenStations => List.unmodifiable(_seenStations);
   List<PrintJob> get queue => List.unmodifiable(_queue);
   List<String> get logs => List.unmodifiable(_logs);
 
   /// Whether this device may be handed the outlet's outstanding backlog.
   ///
-  /// Tied to the ability to actually PRINT, not to being signed in. The app also
-  /// runs on Android, where winspool does not exist and [WinRawPrinter.sendBytes]
-  /// can only ever return false — an Android instance that claimed jobs would
-  /// take them off the queue that the outlet's real till is waiting on and then
-  /// fail to print every one of them. It therefore never advertises a version,
-  /// and the server's interlock hands it nothing. (start() already refuses to
-  /// open the socket at all off Windows; this is the same rule stated where the
-  /// claim is actually made, so it cannot be lost to a refactor.)
-  bool get canClaimJobs => supported;
+  /// TIED TO THE ABILITY TO ACTUALLY PRINT, not to being signed in and not to
+  /// the platform. A device that claims jobs takes them off the queue the
+  /// outlet's real till is waiting on; if it then cannot print them, every one
+  /// of those receipts is lost. So the rule is capability, stated per transport:
+  ///
+  ///   * A WINDOWS TILL always qualifies. It has a spooler, and a till with no
+  ///     printer selected yet holds its jobs and prints them the moment one is
+  ///     chosen — which is what it has always done.
+  ///   * ANYTHING ELSE qualifies only once it has a network printer configured.
+  ///     A phone with no printer address is a VIEWER: it cannot put a docket on
+  ///     paper by any route, so it must never be handed one. Add an address and
+  ///     it becomes a first-class print client on the next connect.
+  ///
+  /// start() refuses to open the socket at all when this is false, so a viewer
+  /// is not even in the room to receive a live emit — but the rule is restated
+  /// here, where the claim is actually made, so it cannot be lost to a refactor.
+  bool get canClaimJobs {
+    if (!supported) return false;
+    if (hasSpooler) return true;
+    return _netTargets.isNotEmpty;
+  }
 
   void _log(String msg) {
     // Restaurant time, like every other timestamp the app shows — a print log
@@ -239,7 +451,7 @@ class PrinterService extends ChangeNotifier {
   Future<void> start(AuthController auth) async {
     _auth = auth;
     if (!supported) {
-      _log('Printing is only supported on Windows.');
+      _log('This build cannot print — no printer transport is available.');
       return;
     }
     if (_started) return;
@@ -255,6 +467,10 @@ class PrinterService extends ChangeNotifier {
     final token = auth.token;
     final profile = auth.profile;
     if (token == null || profile == null) {
+      // _started is released, not left set: this is a start that did not happen,
+      // and leaving the latch on would make the next one — the one after the
+      // session arrives — a silent no-op.
+      _started = false;
       _log('Not signed in — cannot start printer.');
       return;
     }
@@ -262,6 +478,26 @@ class PrinterService extends ChangeNotifier {
     final outletId = resolveOutletId(auth.selectedOutletId, profile.outletId);
     _resId = resId;
     _outletId = outletId;
+    // AFTER the outlet is resolved, because both are per outlet — and before the
+    // socket opens, so the first job that arrives is already routed and
+    // canClaimJobs below is answered from the real configuration.
+    await _loadNetworkPrinters();
+    await _loadRoutes();
+
+    // A DEVICE THAT CANNOT PRINT DOES NOT JOIN THE ROOM.
+    //
+    // canClaimJobs already stops the server REPLAYING a backlog here, but a live
+    // `bill:print` goes to everyone in the outlet room regardless. A phone with
+    // no printer configured would therefore sit collecting dockets it can only
+    // report as 'No printer selected', growing a queue in memory for a service
+    // it will never print — so it stays out of the room entirely until it has
+    // somewhere to send them. addNetworkPrinter() starts it the moment it does.
+    if (!canClaimJobs) {
+      _started = false;
+      _log('No printer set up on this device yet — add one and printing starts.');
+      notifyListeners();
+      return;
+    }
 
     _log('Connecting to realtime…');
     try {
@@ -393,6 +629,7 @@ class PrinterService extends ChangeNotifier {
       _log('Bad escBase64 for $billId');
       return;
     }
+    if (kind == 'kot' && station != null) _rememberStation(station);
     _queue.add(PrintJob(billId, bytes, jobId: jobId, kind: kind, station: station, replay: replay));
     _log('Queued $billId (${bytes.length} bytes)${replay ? ' · re-sent by the server' : ''}');
     notifyListeners();
@@ -404,12 +641,12 @@ class PrinterService extends ChangeNotifier {
     _processing = true;
     try {
       while (_queue.isNotEmpty && !_paused) {
-        final printer = _selectedPrinter;
+        final job = _queue.first;
+        final printer = printerFor(job);
         if (printer == null || printer.isEmpty) {
           _log('No printer selected — ${_queue.length} job(s) waiting.');
           break; // leave jobs queued until a printer is chosen
         }
-        final job = _queue.first;
         final jobId = job.jobId;
         if (jobId != null && job.attempts == 0) {
           // RECORDED BEFORE THE BYTES GO OUT, on purpose. If the process dies
@@ -421,19 +658,25 @@ class PrinterService extends ChangeNotifier {
           // server is told nothing until the write below actually succeeds.
           await _remember(jobId, 'printed');
         }
-        final ok = _write(printer, job.bytes);
-        if (ok) {
+        final outcome = await _send(printer, job.bytes);
+        if (outcome.ok) {
           _queue.removeAt(0);
-          _log('Printed ${job.billId}');
+          job.lastError = null;
+          _log('Printed ${job.billId} on "${PrintTarget.label(printer)}"');
           if (job.replay) _replayPrinted++;
-          // ONLY NOW. The ack is the claim that paper came out of this printer,
-          // so it follows the spooler accepting the bytes and nothing else.
+          // ONLY NOW. The ack is the claim that the bytes reached this printer,
+          // so it follows the transport accepting them and nothing else.
           if (jobId != null) unawaited(_ack(jobId, 'printed'));
         } else {
           job.attempts++;
+          // THE REASON IS KEPT, NOT DISCARDED. A network printer fails in ways
+          // an owner can fix — wrong port, switched off, on the guest Wi-Fi —
+          // and every one of those looks identical as a bare false.
+          job.lastError = outcome.error;
+          final why = outcome.error == null ? '' : ': ${outcome.error}';
           if (job.attempts >= 3) {
             _queue.removeAt(0);
-            _log('Gave up on ${job.billId} after ${job.attempts} attempts');
+            _log('Gave up on ${job.billId} after ${job.attempts} attempts$why');
             if (jobId != null) {
               // Told to the server as a FAILURE, not left silent. An unacked job
               // would be replayed to this same broken printer on every
@@ -443,9 +686,9 @@ class PrinterService extends ChangeNotifier {
               unawaited(_ack(jobId, 'failed'));
             }
           } else {
-            _log('Print failed for ${job.billId} (attempt ${job.attempts}) — retrying');
+            _log('Print failed for ${job.billId} (attempt ${job.attempts})$why — retrying');
             notifyListeners();
-            await Future.delayed(_retryDelay);
+            await Future.delayed(retryDelayFor(printer));
           }
         }
         notifyListeners();
@@ -592,14 +835,280 @@ class PrinterService extends ChangeNotifier {
     }
   }
 
+  /// WHICH PRINTER THIS JOB GOES TO.
+  ///
+  /// Most specific rule first, and the DEFAULT PRINTER IS ALWAYS THE LAST STEP.
+  /// That ordering is the whole safety property of this feature: a docket for a
+  /// station nobody wrote a rule for is not dropped, not held and not guessed
+  /// at — it comes out of the same printer it came out of before routing
+  /// existed. An owner who configures nothing has one printer that prints
+  /// everything, which is the shipped behaviour and the right default for the
+  /// small place this app mostly runs in.
+  ///
+  ///   1. `kot:<STATION>` for this docket's own station,
+  ///   2. `kot` — every kitchen docket,
+  ///   3. `bill` — customer bills,
+  ///   4. the default printer.
+  ///
+  /// A rule naming a printer that is NOT INSTALLED falls through to the default
+  /// too. A printer can be uninstalled, renamed or simply belong to the other
+  /// till, and honouring a rule that points at nothing would hand the spooler a
+  /// name it must refuse — three failed attempts and a 'failed' ack for a
+  /// receipt that could have printed perfectly well downstairs.
+  @visibleForTesting
+  String? printerFor(PrintJob job) {
+    for (final role in rolesFor(job)) {
+      final name = _routes[role];
+      if (name != null && name.isNotEmpty && knowsTarget(name)) return name;
+    }
+    final fallback = _selectedPrinter;
+    // A DEFAULT THAT IS NOT REALLY THERE IS NOT A DEFAULT. On Windows this is
+    // permissive on purpose — a spooler queue that is momentarily missing from
+    // the enumeration is still worth trying, and that is the shipped behaviour.
+    // A stale NETWORK default is different: it is an address this device no
+    // longer has, so honouring it burns three attempts on a socket that cannot
+    // exist and settles the docket as failed.
+    if (fallback != null && PrintTarget.isNetwork(fallback) && !_netTargets.contains(fallback)) {
+      return null;
+    }
+    return fallback;
+  }
+
+  /// Put the bytes on whichever transport [target] names.
+  ///
+  /// The two are deliberately the same shape to the queue above: it asks for a
+  /// print and is told whether it happened and, if not, why. Everything the
+  /// durability contract rests on — the ack following the write, the three
+  /// attempts, the settled record — is written once and applies to both.
+  Future<({bool ok, String? error})> _send(String target, List<int> bytes) async {
+    final net = PrintTarget.parse(target);
+    if (net != null) {
+      final err = await _netWrite(net.host, net.port, bytes);
+      return (ok: err == null, error: err);
+    }
+    if (PrintTarget.isNetwork(target)) {
+      // An address that announces itself as one and cannot be read. Every path
+      // that stores a target validates it, so this is a corrupted preference
+      // rather than a live case — but falling through would hand the WINDOWS
+      // SPOOLER the string "tcp://...", and a queue-not-found from winspool is
+      // the least informative way this could possibly fail.
+      return (ok: false, error: 'Saved printer address "$target" cannot be read. Remove it and add the printer again.');
+    }
+    if (!hasSpooler) {
+      // Only reachable if a rule written on a Windows till were carried to a
+      // phone — the routing map is per device, so it should not happen, but a
+      // silent false here would look exactly like a printer that is switched off.
+      return (ok: false, error: 'This device has no Windows printer queues. Point this at a network printer instead.');
+    }
+    final ok = _write(target, bytes);
+    return (ok: ok, error: ok ? null : 'The Windows printer queue "$target" would not take the job.');
+  }
+
+  /// The roles that could route [job], most specific first.
+  @visibleForTesting
+  static List<String> rolesFor(PrintJob job) {
+    if (job.kind != 'kot') return const [PrintRole.bill];
+    final station = job.station?.trim() ?? '';
+    return [
+      if (station.isNotEmpty) PrintRole.kotStation(station),
+      PrintRole.anyKot,
+    ];
+  }
+
+  void _rememberStation(String station) {
+    final s = station.trim();
+    if (s.isEmpty) return;
+    if (_seenStations.any((e) => e.toLowerCase() == s.toLowerCase())) return;
+    _seenStations.add(s);
+    notifyListeners();
+  }
+
+  String get _routesKey => '$_routesKeyPrefix${_outletId ?? ''}';
+
+  Future<void> _loadRoutes() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final next = <String, String>{};
+      for (final entry in prefs.getStringList(_routesKey) ?? const <String>[]) {
+        final sep = entry.indexOf('=');
+        if (sep <= 0) continue;
+        final role = entry.substring(0, sep);
+        final name = entry.substring(sep + 1);
+        if (role.isEmpty || name.isEmpty) continue;
+        next[role] = name;
+        // A rule for a station is itself evidence the station exists, so the
+        // screen can show a configured rule before the day's first docket for
+        // it arrives.
+        final station = PrintRole.stationOf(role);
+        if (station != null) _rememberStation(station);
+      }
+      _routes = next;
+      if (_routes.isNotEmpty) _log('Loaded ${_routes.length} printer rule(s)');
+      notifyListeners();
+    } catch (_) {
+      // Unreadable prefs mean no rules, which means the default printer takes
+      // everything — degraded, but never a dropped docket.
+    }
+  }
+
+  Future<void> _saveRoutes() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+        _routesKey,
+        [for (final e in _routes.entries) '${e.key}=${e.value}'],
+      );
+    } catch (_) {
+      // The in-memory map still routes for this session.
+    }
+  }
+
+  String get _netKey => '$_netKeyPrefix${_outletId ?? ''}';
+
+  Future<void> _loadNetworkPrinters() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _netTargets = [
+        for (final entry in prefs.getStringList(_netKey) ?? const <String>[])
+          if (PrintTarget.parse(entry) != null) entry,
+      ];
+      if (_netTargets.isNotEmpty) {
+        _log('Loaded ${_netTargets.length} network printer(s)');
+      }
+      notifyListeners();
+    } catch (_) {
+      // Unreadable prefs mean no network printers. On a phone that means
+      // canClaimJobs is false and this device stays a viewer — degraded, but it
+      // never takes a docket it cannot print.
+    }
+  }
+
+  Future<void> _saveNetworkPrinters() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_netKey, _netTargets);
+    } catch (_) {
+      // The in-memory list still prints for this session.
+    }
+  }
+
+  /// Add a printer this device reaches over the network, at [host]:[port].
+  ///
+  /// Returns null once it is saved, or the reason it was not. The address is NOT
+  /// dialled here — a printer that is merely switched off has to be
+  /// configurable, and the alternative is an owner who cannot set the kitchen up
+  /// in the morning because the kitchen is not open yet. [testPrintTo] is how
+  /// they prove it works, and it says exactly what went wrong when it does not.
+  Future<String?> addNetworkPrinter(String host, int port) async {
+    final invalid = NetworkPrinter.validate(host, port);
+    if (invalid != null) return invalid;
+    final target = PrintTarget.network(host, port);
+    if (_netTargets.contains(target)) return 'That printer is already on the list.';
+    _netTargets = <String>[..._netTargets, target];
+    await _saveNetworkPrinters();
+    _log('Network printer added: ${PrintTarget.label(target)}');
+    // THE FIRST PRINTER ON A DEVICE THAT HAS NO OTHER BECOMES THE DEFAULT.
+    //
+    // Without this, adding a printer on a phone is a dead control: the address
+    // is saved, the agent connects, and every docket sits in the queue reporting
+    // "No printer selected" because nothing routes to it yet. It is the same
+    // courtesy discoverPrinters() has always done for a Windows till with
+    // exactly one installed queue.
+    //
+    // It never overrides a choice already made, and never fires on a machine
+    // that has spooler queues of its own — a till whose default is a USB printer
+    // must not silently start sending its bills across the network because
+    // somebody added a kitchen printer.
+    if ((_selectedPrinter == null || _selectedPrinter!.isEmpty) && _printers.isEmpty) {
+      await setSelectedPrinter(target);
+    }
+    // A phone that had nowhere to print now has somewhere, so the agent that
+    // declined to join the outlet room at start() can join it. On a Windows till
+    // this is already running and start() is idempotent.
+    final auth = _auth;
+    if (!_started && auth != null) {
+      unawaited(start(auth));
+    } else {
+      notifyListeners();
+      unawaited(_processQueue()); // anything held for want of a printer goes now
+    }
+    return null;
+  }
+
+  /// Forget a network printer, and every rule that pointed at it.
+  ///
+  /// The rules go too, deliberately. A rule naming an address this device no
+  /// longer has is a rule that silently falls through to the default printer,
+  /// which is the shape of bug where the bar's dockets quietly start coming out
+  /// at the till and nobody can see why from the screen.
+  Future<void> removeNetworkPrinter(String target) async {
+    if (!_netTargets.remove(target)) return;
+    _netTargets = List<String>.from(_netTargets);
+    await _saveNetworkPrinters();
+    final orphaned = [for (final e in _routes.entries) if (e.value == target) e.key];
+    if (orphaned.isNotEmpty) {
+      for (final role in orphaned) {
+        _routes.remove(role);
+      }
+      await _saveRoutes();
+    }
+    if (_selectedPrinter == target) {
+      _selectedPrinter = null;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove(_printerKey);
+      } catch (_) {/* the in-memory clear still holds for this session */}
+    }
+    _log('Network printer removed: ${PrintTarget.label(target)}'
+        '${orphaned.isEmpty ? '' : ' (${orphaned.length} rule(s) back to default)'}');
+    notifyListeners();
+    // A device that has just lost its only way to print leaves the outlet room,
+    // for the same reason it never joined one before it had a printer: a live
+    // `bill:print` reaches every agent in the room regardless of what any of
+    // them can claim, and a phone collecting dockets it cannot put on paper is
+    // a queue that grows all service and prints nothing.
+    if (!canClaimJobs && _started) {
+      _log('No printer left on this device — printing stopped.');
+      await stop();
+    }
+  }
+
+  /// Point one role at one printer. A printer may hold as many roles as the
+  /// owner gives it — the one-printer-does-everything shop is just every role
+  /// naming the same device.
+  Future<void> setRoute(String role, String printerName) async {
+    final name = printerName.trim();
+    if (role.isEmpty || name.isEmpty) return;
+    _routes[role] = name;
+    await _saveRoutes();
+    _log('${PrintRole.label(role)} -> "$name"');
+    notifyListeners();
+    await _processQueue(); // anything held for want of this rule goes now
+  }
+
+  /// Drop a rule. What it used to route falls back to the next rule that matches
+  /// and, in the end, to the default printer — never to nowhere.
+  Future<void> clearRoute(String role) async {
+    if (_routes.remove(role) == null) return;
+    await _saveRoutes();
+    _log('${PrintRole.label(role)} -> default printer');
+    notifyListeners();
+    await _processQueue();
+  }
+
   void discoverPrinters() {
+    // Enumerating winspool anywhere else returns an empty list and would log
+    // "Discovered 0 printer(s)" at a phone that was never going to have any — a
+    // true sentence that reads like a fault.
+    if (!hasSpooler) return;
     _printers = WinRawPrinter.listPrinters();
     // Auto-pick when there's exactly one, or keep a still-valid saved choice.
-    if (_selectedPrinter != null && !_printers.contains(_selectedPrinter)) {
+    final saved = _selectedPrinter;
+    if (saved != null && saved.isNotEmpty && !PrintTarget.isNetwork(saved) && !_printers.contains(saved)) {
       // saved printer no longer present; keep the name but warn
-      _log('Saved printer "$_selectedPrinter" not found among installed printers.');
+      _log('Saved printer "$saved" not found among installed printers.');
     }
-    if ((_selectedPrinter == null || _selectedPrinter!.isEmpty) && _printers.length == 1) {
+    if ((saved == null || saved.isEmpty) && _printers.length == 1) {
       setSelectedPrinter(_printers.first);
     }
     _log('Discovered ${_printers.length} printer(s)');
@@ -610,7 +1119,7 @@ class PrinterService extends ChangeNotifier {
     _selectedPrinter = name;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_printerKey, name);
-    _log('Default printer set to "$name"');
+    _log('Default printer set to "${PrintTarget.label(name)}"');
     notifyListeners();
     await _processQueue(); // flush anything that was waiting on a printer
   }
@@ -640,26 +1149,60 @@ class PrinterService extends ChangeNotifier {
     }
   }
 
-  /// Print a tiny ESC/POS test slip to verify the selected printer works.
-  bool testPrint() {
+  /// The bytes of the test slip: ESC @ (init), centred text, feed, full cut.
+  ///
+  /// Deliberately the smallest thing a thermal printer can be asked to do, so a
+  /// failure is a failure of the CONNECTION and not of the docket — a slip that
+  /// exercised the renderer as well would leave two explanations for one blank
+  /// piece of paper.
+  static List<int> testSlipBytes() => <int>[
+        0x1b, 0x40,
+        0x1b, 0x61, 0x01,
+        ...utf8.encode('Restaurant Dash\n'),
+        ...utf8.encode('Printer test OK\n'),
+        ...utf8.encode('${RestaurantTime.stampNow()}\n'),
+        0x0a, 0x0a, 0x0a,
+        0x1d, 0x56, 0x00,
+      ];
+
+  /// Print a test slip on the default printer. Null on success, else the reason.
+  Future<String?> testPrint() {
     final printer = _selectedPrinter;
     if (printer == null || printer.isEmpty) {
       _log('Select a printer first.');
-      return false;
+      return Future<String?>.value('Select a printer first.');
     }
-    // ESC @ (init), centered text, feed, full cut.
-    final bytes = <int>[
-      0x1b, 0x40,
-      0x1b, 0x61, 0x01,
-      ...utf8.encode('Restaurant Dash\n'),
-      ...utf8.encode('Printer test OK\n'),
-      ...utf8.encode('${RestaurantTime.stampNow()}\n'),
-      0x0a, 0x0a, 0x0a,
-      0x1d, 0x56, 0x00,
-    ];
-    final ok = _write(printer, bytes);
-    _log(ok ? 'Test slip sent to "$printer"' : 'Test print failed on "$printer"');
+    return testPrintTo(printer);
+  }
+
+  /// Print a test slip on ONE named target — a spooler queue or `tcp://host:port`.
+  ///
+  /// THE POINT OF THIS IS THAT AN OWNER CAN PROVE A PRINTER WORKS WITHOUT
+  /// RINGING UP A REAL ORDER. It is also the only honest confirmation available
+  /// for a network printer: port 9100 carries no application-level
+  /// acknowledgement, so the software can report that the bytes left this device
+  /// and nothing more. Paper coming out is the test.
+  Future<String?> testPrintTo(String target) async {
+    final outcome = await _send(target, testSlipBytes());
+    final label = PrintTarget.label(target);
+    _log(outcome.ok
+        ? 'Test slip sent to "$label"'
+        : 'Test print failed on "$label": ${outcome.error}');
     notifyListeners();
-    return ok;
+    return outcome.error;
+  }
+
+  /// Print a test slip at an address that has NOT been saved yet — the Test
+  /// button inside the add-a-printer dialog, so a typo is caught while someone
+  /// is still looking at it rather than becoming a rule that prints nowhere.
+  Future<String?> testNetworkAddress(String host, int port) async {
+    final invalid = NetworkPrinter.validate(host, port);
+    if (invalid != null) return invalid;
+    final err = await _netWrite(host.trim(), port, testSlipBytes());
+    _log(err == null
+        ? 'Test slip sent to $host:$port'
+        : 'Test print failed at $host:$port: $err');
+    notifyListeners();
+    return err;
   }
 }

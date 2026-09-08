@@ -49,5 +49,14 @@
 	<string>Used to photograph a vehicle number plate for valet check-in.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Used to pick a photo of a vehicle number plate for valet check-in.</string>
+	<!-- Thermal printing over the restaurant's own LAN: the app opens a TCP
+	     socket to the printer's port 9100 (see lib/services/net_raw_printer.dart).
+	     iOS 14+ refuses local-network connections without this purpose string,
+	     and refuses them SILENTLY the first time, so its absence would look
+	     exactly like a printer that is switched off. Declared here even though
+	     the release pipeline builds only Windows and Android today, because the
+	     iOS target is committed and the failure it prevents is invisible. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Used to send kitchen dockets and bills to thermal printers on your restaurant's network.</string>
 </dict>
 </plist>

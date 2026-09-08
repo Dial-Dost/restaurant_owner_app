@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 import 'status_chip.dart';
@@ -50,6 +51,25 @@ class _ForkButtonState extends State<ForkButton> {
 
   @override
   Widget build(BuildContext context) {
+    if (Gaia.of(context)) {
+      return GaiaButton(
+        label: widget.label,
+        icon: widget.icon,
+        onPressed: widget.onPressed,
+        kind: switch (widget.kind) {
+          ForkButtonKind.primary => GaiaButtonKind.primary,
+          ForkButtonKind.ghost => GaiaButtonKind.ghost,
+          ForkButtonKind.subtle => GaiaButtonKind.subtle,
+        },
+        // Gaia's own button is 52px tall — correct for a phone hero, far too
+        // tall for the toolbars and card footers this app puts buttons in. The
+        // dense variant (40px) is the honest match for the app's density, so
+        // the non-dense Rustic button maps onto it rather than doubling the
+        // height of every action row on flip.
+        dense: true,
+      );
+    }
+
     final primary = widget.kind == ForkButtonKind.primary;
     final ghost = widget.kind == ForkButtonKind.ghost;
 
@@ -163,6 +183,15 @@ class _ForkIconButtonState extends State<ForkIconButton> {
 
   @override
   Widget build(BuildContext context) {
+    if (Gaia.of(context)) {
+      return GaiaIconButton(
+        icon: widget.icon,
+        onPressed: widget.onPressed,
+        tooltip: widget.tooltip,
+        badge: widget.badge,
+      );
+    }
+
     // Same rule as [ForkButton]: a disabled icon button must look disabled. The
     // −/+ stepper on a partial comp reaches its ends, and an inert "one fewer"
     // that still lights up on hover is a control the till learns to distrust.

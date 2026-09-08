@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
 import '../ui/theme/appearance.dart';
@@ -25,6 +26,7 @@ class AppearanceCard extends StatelessWidget {
       animation: AppearanceController.instance,
       builder: (context, _) {
         final ctl = AppearanceController.instance;
+        final gaiaOn = ctl.designSystem == DesignSystem.gaia;
         return ForkCard(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text('Appearance', style: text.titleMedium),
@@ -34,28 +36,61 @@ class AppearanceCard extends StatelessWidget {
               'Scheme and accent mix freely: every combination is pre-checked to stay readable (WCAG AA).',
               style: text.bodySmall,
             ),
+
+            // ── The design system, first: it is the biggest choice on this
+            // card, and the two below it are choices WITHIN the Rustic system.
             const SizedBox(height: AppSpacing.lg),
-            Text('SHELL SCHEME', style: text.labelSmall),
+            Text('DESIGN SYSTEM', style: text.labelSmall),
             const SizedBox(height: 8),
             Wrap(spacing: 10, runSpacing: 10, children: [
-              for (final s in AppSchemes.all)
-                _SchemeSwatch(
-                  scheme: s,
-                  selected: s.id == ctl.schemeId,
-                  onTap: () => ctl.setScheme(s.id),
+              for (final d in DesignSystem.values)
+                _DesignSwatch(
+                  system: d,
+                  selected: d == ctl.designSystem,
+                  onTap: () => ctl.setDesignSystem(d),
                 ),
             ]),
-            const SizedBox(height: AppSpacing.lg),
-            Text('ACCENT', style: text.labelSmall),
             const SizedBox(height: 8),
-            Wrap(spacing: 10, runSpacing: 10, children: [
-              for (final a in AppAccents.all)
-                _AccentSwatch(
-                  accent: a,
-                  selected: a.id == ctl.accentId,
-                  onTap: () => ctl.setAccent(a.id),
-                ),
-            ]),
+            Text(
+              gaiaOn
+                  // Said plainly because it is the one surprising thing about
+                  // the switch: the pickers below still WORK, they just do not
+                  // paint anything while Gaia is on.
+                  ? 'Gaia brings its own palette (forest and champagne) and its own type, '
+                      'so the scheme and accent below are remembered but not applied. '
+                      'Switch back to Rustic Fork and they return exactly as they were.'
+                  : 'Rustic Fork is the shipped look. Gaia is a complete alternative — '
+                      'different palette, type and shapes — and switching is instant and reversible.',
+              style: text.bodySmall,
+            ),
+
+            const SizedBox(height: AppSpacing.lg),
+            Opacity(
+              opacity: gaiaOn ? 0.45 : 1,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('SHELL SCHEME', style: text.labelSmall),
+                const SizedBox(height: 8),
+                Wrap(spacing: 10, runSpacing: 10, children: [
+                  for (final s in AppSchemes.all)
+                    _SchemeSwatch(
+                      scheme: s,
+                      selected: s.id == ctl.schemeId,
+                      onTap: () => ctl.setScheme(s.id),
+                    ),
+                ]),
+                const SizedBox(height: AppSpacing.lg),
+                Text('ACCENT', style: text.labelSmall),
+                const SizedBox(height: 8),
+                Wrap(spacing: 10, runSpacing: 10, children: [
+                  for (final a in AppAccents.all)
+                    _AccentSwatch(
+                      accent: a,
+                      selected: a.id == ctl.accentId,
+                      onTap: () => ctl.setAccent(a.id),
+                    ),
+                ]),
+              ]),
+            ),
             const SizedBox(height: AppSpacing.lg),
             Text('BACKDROP', style: text.labelSmall),
             const SizedBox(height: 8),
@@ -63,7 +98,14 @@ class AppearanceCard extends StatelessWidget {
             // be `const` — an identical instance would short-circuit
             // Element.updateChild and freeze the sliders/preview on their
             // first-build values while the controller moves on.
-            _BackdropControls(style: ctl.backdrop),
+            if (gaiaOn)
+              Text(
+                'Gaia has no backdrop — its depth comes from flat grounds and hairlines, '
+                'so there is nothing here to mix. These settings are kept for Rustic Fork.',
+                style: text.bodySmall,
+              )
+            else
+              _BackdropControls(style: ctl.backdrop),
           ]),
         );
       },
@@ -451,6 +493,108 @@ class _AccentSwatch extends StatelessWidget {
             ),
           ),
         ]),
+      ),
+    );
+  }
+}
+
+
+/// A miniature of what each design system paints: its ground, a card on it,
+/// its accent, and — the thing that actually distinguishes them — a figure set
+/// in that system's own display face. Someone choosing between these is
+/// choosing about type as much as colour, so the swatch has to show type.
+class _DesignSwatch extends StatelessWidget {
+  const _DesignSwatch({
+    required this.system,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final DesignSystem system;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final gaia = system == DesignSystem.gaia;
+
+    // Each swatch paints its OWN system's colours, not the live ones, so both
+    // previews stay truthful whichever system is currently on.
+    final ground = gaia ? GaiaColors.bg : AppColors.rusticShell.bg;
+    final surface = gaia ? GaiaColors.surface : AppColors.rusticShell.card;
+    final accent = gaia ? GaiaColors.champagne : AppColors.rusticCopper.base;
+    final line = gaia ? GaiaColors.line : const Color(0x12FFFFFF);
+    final ink = gaia ? GaiaColors.text : AppColors.rusticShell.textPrimary;
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 122,
+              height: 82,
+              padding: const EdgeInsets.all(9),
+              decoration: BoxDecoration(
+                color: ground,
+                // The selection ring wears the ACTIVE accent, the same rule
+                // the scheme and accent swatches follow.
+                border: Border.all(
+                  color: selected ? AppColors.copperHi : AppColors.border,
+                  width: selected ? 2 : 1,
+                ),
+                borderRadius: BorderRadius.circular(gaia ? 2 : 10),
+              ),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+                decoration: BoxDecoration(
+                  color: surface,
+                  border: Border.all(color: line),
+                  // The corner radius is itself part of the preview: 2px vs
+                  // 14px is the most visible single difference between them.
+                  borderRadius: BorderRadius.circular(gaia ? 2 : 8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      '1,248',
+                      maxLines: 1,
+                      style: gaia
+                          ? GaiaType.serif(
+                              size: 26,
+                              weight: 500,
+                              height: 1,
+                              color: GaiaColors.champagne2)
+                          : TextStyle(
+                              fontSize: 24,
+                              height: 1,
+                              fontWeight: FontWeight.w300,
+                              letterSpacing: -0.8,
+                              color: ink,
+                            ),
+                    ),
+                    const SizedBox(height: 7),
+                    Container(width: 44, height: 3, color: accent),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              system.label,
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: selected ? AppColors.textPrimary : AppColors.textSecondary,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

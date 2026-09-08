@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.8.5+50
+version: 1.8.6+51
 
 environment:
   sdk: ^3.10.7
@@ -74,6 +74,27 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # GAIA design-system faces. These are the VARIABLE TTFs lifted verbatim out of
+  # the mockup's @font-face blocks (gaia-ui-revamp.html), so the app renders the
+  # same outlines the spec was drawn with rather than a lookalike.
+  #
+  # Cormorant Garamond's `wght` axis DEFAULTS TO 300 (Light) and Instrument
+  # Sans' to 400 — Flutter does not map `fontWeight` onto a variable axis, so
+  # every Gaia text style also ships `fontVariations: [FontVariation('wght', n)]`
+  # (see GaiaType.serif/sans). Declaring one weight per family here is correct:
+  # the axis, not the manifest, carries the weight.
+  fonts:
+    - family: Cormorant Garamond
+      fonts:
+        - asset: assets/fonts/CormorantGaramond-Regular.ttf
+        - asset: assets/fonts/CormorantGaramond-Italic.ttf
+          style: italic
+    - family: Instrument Sans
+      fonts:
+        - asset: assets/fonts/InstrumentSans-Regular.ttf
+        - asset: assets/fonts/InstrumentSans-Italic.ttf
+          style: italic
 
   # To add assets to your application, add an assets section, like this:
   # assets:

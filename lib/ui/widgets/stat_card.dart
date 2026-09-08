@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../gaia/gaia.dart';
 import '../theme/app_colors.dart';
 import 'fork_card.dart';
 import 'metric_tag.dart';
@@ -47,6 +48,8 @@ class StatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (Gaia.of(context)) return _gaia(context);
+
     final text = Theme.of(context).textTheme;
     return ForkCard(
       onTap: onTap,
@@ -98,6 +101,84 @@ class StatCard extends StatelessWidget {
           ],
         ],
       ),
+    );
+  }
+
+  /// The Gaia tile. Same information, the design's own order and voice:
+  /// the figure first and largest (serif, with the currency mark raised and
+  /// the decimal tail dropped — see [GaiaBigNumber]), then the chart, then the
+  /// caption as a tracked uppercase eyebrow beneath it. That is `.stats`'
+  /// n-over-l reading order rather than Rustic's value-then-caption card.
+  Widget _gaia(BuildContext context) {
+    return GaiaCard(
+      onTap: onTap,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      _GaiaFigure(value),
+                      if (unit != null) ...[
+                        const SizedBox(width: 5),
+                        Text(unit!.toUpperCase(), style: GaiaType.unit()),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              if (tag != null) TickTag(tag!, color: tagColor),
+            ],
+          ),
+          if (chart != null) ...[
+            const SizedBox(height: 16),
+            chart!,
+          ],
+          const SizedBox(height: 14),
+          Text(caption.toUpperCase(), style: GaiaType.eyebrow()),
+          if (footer != null) ...[
+            const SizedBox(height: 8),
+            footer!,
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// A StatCard figure at card scale. [GaiaBigNumber] is the 62px page hero; a
+/// grid tile takes the same typesetting rule at the theme's `displayMedium`
+/// (40px), which is where the mockup's own in-card figures sit.
+class _GaiaFigure extends StatelessWidget {
+  const _GaiaFigure(this.value);
+
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = GaiaBigNumber.splitNumber(value);
+    final big = Theme.of(context).textTheme.displayMedium;
+    final small = GaiaType.serif(
+      size: (big?.fontSize ?? 40) * 0.52,
+      weight: 400,
+      color: GaiaColors.champagneDim,
+    );
+    return RichText(
+      maxLines: 1,
+      text: TextSpan(children: [
+        if (parts.prefix.isNotEmpty) TextSpan(text: parts.prefix, style: small),
+        TextSpan(text: parts.whole, style: big),
+        if (parts.tail.isNotEmpty) TextSpan(text: parts.tail, style: small),
+      ]),
     );
   }
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/api_client.dart';
 import '../services/get_cache.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
@@ -9,6 +10,71 @@ import '../ui/widgets/empty_state.dart';
 import '../ui/widgets/fork_button.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/status_chip.dart';
+
+/// What a screen says when the line is down AND it has nothing saved to fall
+/// back on — the genuinely empty case, after [GetCache]'s last-known-good copy
+/// has been tried and had nothing either.
+///
+/// "Can't reach the server" was the old wording, and it told the person holding
+/// the tablet nothing they could act on: it named the app's problem, not
+/// theirs. These name the two things that are actually in their hands, and the
+/// one conclusion to draw when neither works. Shared as constants because the
+/// [CachePrimedScreen] modules must say the same words for the same state.
+const String offlineNothingSavedTitle = 'This device is offline';
+const String offlineNothingSavedCaption =
+    "It can't reach the restaurant server, and this section has nothing saved "
+    'to show. Reconnect to the restaurant Wi-Fi, or share a hotspot from a '
+    "phone, then tap Retry. If the other devices can't reach it either, the "
+    'server itself is down.';
+
+/// Whether a failure means the LINE is down rather than the server having
+/// answered with a refusal. Only the first may reach for a saved copy or wear
+/// the offline wording: a 403 or a 500 is a real answer and must be shown as
+/// one.
+///
+/// Same discrimination the offline outbox already makes on writes — an
+/// [ApiException] carrying no status never reached anyone.
+bool isUnreachableError(Object e) {
+  if (e is ApiException) return e.status == null;
+  final raw = e.toString();
+  return raw.contains('SocketException') ||
+      raw.contains('refused') ||
+      raw.contains('Failed host lookup') ||
+      raw.contains('Connection') ||
+      raw.contains('TimeoutException');
+}
+
+/// The pane a screen shows when it has nothing to show and the load failed.
+///
+/// Two different sentences for two different situations, which is the whole
+/// reason it exists: an unreachable server is the READER's problem to act on
+/// (their Wi-Fi, their hotspot), while a refusal is the server's own words and
+/// must be repeated verbatim rather than dressed up as an outage. [whatFailed]
+/// names the section for the second case only — offline, the section is
+/// irrelevant, because none of them can load.
+class LoadErrorState extends StatelessWidget {
+  const LoadErrorState({
+    super.key,
+    required this.whatFailed,
+    required this.error,
+    required this.onRetry,
+  });
+
+  final String whatFailed;
+  final String error;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final offline = isUnreachableError(error);
+    return EmptyState(
+      icon: offline ? Icons.wifi_off : Icons.error_outline,
+      title: offline ? offlineNothingSavedTitle : whatFailed,
+      caption: offline ? offlineNothingSavedCaption : error,
+      action: ForkButton(label: 'Retry', icon: Icons.refresh, dense: true, onPressed: onRetry),
+    );
+  }
+}
 
 /// Loads a future and renders loading / error+retry / content. Reused by every
 /// feature module so each screen is just "load this endpoint, render the data".
@@ -53,6 +119,12 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
   /// stays, a non-blocking "offline" banner appears over it. Cleared by any
   /// successful load.
   bool _offline = false;
+
+  /// True when what is on screen is a LAST-KNOWN-GOOD copy: saved before a
+  /// write this app has since made, and painted only because the network was
+  /// tried and could not be reached. It is a stronger claim than "a bit old",
+  /// so it gets its own sentence on the pill.
+  bool _superseded = false;
 
   /// When the payload on screen was last confirmed by the network: the save
   /// time of its oldest cache entry, or the moment a live load landed. Feeds
@@ -141,6 +213,46 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
     }
   }
 
+  /// THE OFFLINE LAST RESORT, and the only caller anywhere that is allowed to
+  /// read a superseded entry.
+  ///
+  /// It runs in exactly one situation: the network has already been tried on
+  /// this screen and could not be reached, and there is nothing on screen to
+  /// keep. Before this existed that combination produced "Can't reach the
+  /// server" on every module, because an evening of ordinary online writes had
+  /// invalidated every saved copy on the device — see [GetCache.bustRestaurant].
+  ///
+  /// Ordering matters and is deliberate: the network is tried FIRST, always.
+  /// A saved copy is never a shortcut past a reachable server, only a
+  /// replacement for a blank screen — and what it paints carries the offline
+  /// pill with the copy's own age on it, never a live-looking screen.
+  ///
+  /// The same all-or-nothing rule as the fast path: any miss means a composed
+  /// payload with holes, and holes render as confident zeros.
+  Future<bool> _paintLastKnownGood(int gen) async {
+    final stamp = CacheReplayStamp();
+    T data;
+    try {
+      data = await GetCachePolicy.runCacheOnly(widget.load, stamp, allowStale: true);
+    } catch (_) {
+      return false;
+    }
+    if (!mounted || gen != _gen) return false;
+    if (stamp.hits == 0 || stamp.misses > 0) return false;
+    setState(() {
+      _data = data;
+      _hasData = true;
+      _error = null;
+      _loading = false;
+      _fromCache = true;
+      _offline = true;
+      _superseded = stamp.supersededHits > 0;
+      _dataAsOf = stamp.oldestSavedAt;
+    });
+    _syncAgeTick();
+    return true;
+  }
+
   /// [silent] keeps whatever is on screen on screen while the refetch is in
   /// flight: no skeleton, and no error state if it fails. Because the widget tree
   /// at this slot never changes shape, nothing below is remounted either — scroll
@@ -158,6 +270,7 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
         _loading = false;
         _fromCache = false;
         _offline = false;
+        _superseded = false;
         _dataAsOf = DateTime.now();
       });
       _syncAgeTick();
@@ -175,9 +288,14 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
         _syncAgeTick();
         return;
       }
+      // Nothing on screen and nothing live. Before an error page — which tells
+      // a waiter nothing they can act on — try the last-known-good copy.
+      if (isUnreachableError(e) && await _paintLastKnownGood(gen)) return;
+      if (!mounted || gen != _gen) return;
       setState(() { _error = e; _loading = false; });
     }
   }
+
 
   /// The reload every caller already had: user-initiated, so it is allowed to
   /// show the skeleton while it refetches — and because it goes through the
@@ -200,19 +318,12 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
   Widget build(BuildContext context) {
     if (_loading) return const _LoadingSkeleton();
     if (_error != null) {
-      final raw = _error.toString();
-      final isConn = raw.contains('SocketException') ||
-          raw.contains('refused') ||
-          raw.contains('Failed host lookup') ||
-          raw.contains('Connection');
-      final title = isConn ? "Can't reach the server" : "Couldn't load this section.";
-      final detail = isConn
-          ? "The app can't connect to the backend. Make sure the server is running, then retry."
-          : raw;
+      final err = _error!;
+      final isConn = isUnreachableError(err);
       return EmptyState(
         icon: isConn ? Icons.wifi_off : Icons.error_outline,
-        title: title,
-        caption: detail,
+        title: isConn ? offlineNothingSavedTitle : "Couldn't load this section.",
+        caption: isConn ? offlineNothingSavedCaption : err.toString(),
         action: ForkButton(
           label: 'Retry',
           icon: Icons.refresh,
@@ -243,7 +354,7 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
           bottom: AppSpacing.xl,
           child: IgnorePointer(
             child: Center(
-              child: _StaleBanner(offline: _offline, asOf: asOf),
+              child: _StaleBanner(offline: _offline, asOf: asOf, superseded: _superseded),
             ),
           ),
         ),
@@ -283,12 +394,24 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
   /// True after a refresh failed while good data was on screen.
   bool _cacheOffline = false;
 
+  /// AsyncView's `_superseded`: the copy on screen predates a write this app
+  /// made, and is up only because the network could not be reached.
+  bool _cacheSuperseded = false;
+
   /// When the payload on screen was last confirmed by the network — the save
   /// time of the oldest cache entry that fed it, or the moment a load landed.
   DateTime? _cacheAsOf;
 
   /// Identifies the newest request in flight, exactly like AsyncView's `_gen`.
   int _cacheGen = 0;
+
+  /// How many times a load has landed FROM THE NETWORK on this screen.
+  ///
+  /// It is how [primeFromCache] learns whether the fallback it just awaited
+  /// actually reached the server, without the mixin having to know the name of
+  /// any screen's error field. Every screen already owes [markCacheLive] on a
+  /// landed load — that documented contract is what makes this readable.
+  int _cacheLiveMarks = 0;
 
   Timer? _cacheAgeTick;
 
@@ -309,6 +432,13 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
   /// fetch that failed outright, falls back to [fallback], the screen's
   /// ordinary loud first load: a composed payload with holes would render as
   /// confident zeros, and the skeleton is more honest than that.
+  ///
+  /// And when THAT fallback cannot reach the server either — the offline-launch
+  /// case — the last-known-good copy is tried before the screen is left showing
+  /// an error page. Same rule as AsyncView's: network first, always; a saved
+  /// copy is a replacement for a blank screen, never a shortcut past a
+  /// reachable server; and what it paints wears the offline pill with its own
+  /// age on it.
   Future<void> primeFromCache<D>({
     required Future<D> Function() fetch,
     required void Function(D data) apply,
@@ -322,28 +452,78 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
       data = await GetCachePolicy.runCacheOnly(fetch, stamp);
     } catch (_) {
       if (!mounted || !cacheGenIs(gen)) return;
-      await fallback();
+      await _fallbackThenLastKnownGood(fetch, apply, fallback);
       return;
     }
     if (!mounted || !cacheGenIs(gen)) return;
     if (stamp.misses > 0 || stamp.hits == 0) {
-      await fallback();
+      await _fallbackThenLastKnownGood(fetch, apply, fallback);
       return;
     }
     setState(() {
       apply(data);
       _primedFromCache = true;
       _cacheOffline = false;
+      _cacheSuperseded = false;
       _cacheAsOf = stamp.oldestSavedAt ?? DateTime.now();
     });
     _syncCacheAgeTick();
     await refresh();
   }
 
+  /// The screen's own loud load, and — only if it never reached the server —
+  /// the last-known-good copy.
+  ///
+  /// "Never reached the server" is read off [markCacheLive], which every screen
+  /// already calls when a load lands. That is why this needs no per-screen
+  /// predicate and no call-site changes: a fallback that landed bumps the
+  /// counter, and one that failed (for any reason: offline, 500, 403) does not.
+  /// A superseded copy is only ever painted for the first of those three,
+  /// because [GetCache] is asked for one only after a genuine outage — a
+  /// refusal that a server actually answered still shows as a refusal, since
+  /// nothing here can turn `_cacheGen` back or clear the screen's error unless
+  /// the replay fully hits.
+  Future<void> _fallbackThenLastKnownGood<D>(
+    Future<D> Function() fetch,
+    void Function(D data) apply,
+    Future<void> Function() fallback,
+  ) async {
+    final marksBefore = _cacheLiveMarks;
+    await fallback();
+    if (!mounted) return;
+    if (_cacheLiveMarks != marksBefore) return; // the network answered
+    // The generation to guard against is whatever the FALLBACK left current —
+    // it bumps the counter itself, so the prime's own generation is already
+    // spent by the time this line runs. What must still be caught is a load
+    // that starts AFTER this point (a filter change, a poll tick): its answer
+    // is newer than the copy about to be painted and must win.
+    final gen = _cacheGen;
+    final stamp = CacheReplayStamp();
+    D data;
+    try {
+      data = await GetCachePolicy.runCacheOnly(fetch, stamp, allowStale: true);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || !cacheGenIs(gen)) return;
+    if (_cacheLiveMarks != marksBefore) return;
+    if (stamp.hits == 0 || stamp.misses > 0) return;
+    setState(() {
+      apply(data);
+      _primedFromCache = true;
+      _cacheOffline = true;
+      _cacheSuperseded = stamp.supersededHits > 0;
+      _cacheAsOf = stamp.oldestSavedAt;
+    });
+    _syncCacheAgeTick();
+  }
+
   /// A network load landed: the data on screen is live. Call inside setState.
   void markCacheLive() {
+    _cacheLiveMarks++;
     _primedFromCache = false;
     _cacheOffline = false;
+    _cacheSuperseded = false;
     _cacheAsOf = DateTime.now();
     _syncCacheAgeTick();
   }
@@ -383,7 +563,7 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
           bottom: AppSpacing.xl,
           child: IgnorePointer(
             child: Center(
-              child: _StaleBanner(offline: _cacheOffline, asOf: asOf),
+              child: _StaleBanner(offline: _cacheOffline, asOf: asOf, superseded: _cacheSuperseded),
             ),
           ),
         ),
@@ -396,10 +576,16 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
 /// language (StatusChip for a warning state, InfoChip for quiet metadata) on a
 /// raised opaque backing so it stays readable over any module body.
 class _StaleBanner extends StatelessWidget {
-  const _StaleBanner({required this.offline, required this.asOf});
+  const _StaleBanner({required this.offline, required this.asOf, this.superseded = false});
 
   final bool offline;
   final DateTime? asOf;
+
+  /// The copy predates a change this app itself made — so it is not merely old,
+  /// it is known to be behind. Saying only "saved data" there would let a
+  /// waiter read a table board from before the order they just took as simply
+  /// a slightly late one.
+  final bool superseded;
 
   @override
   Widget build(BuildContext context) {
@@ -415,7 +601,9 @@ class _StaleBanner extends StatelessWidget {
       ),
       child: offline
           ? StatusChip(
-              label: 'Offline — showing saved data · $age',
+              label: superseded
+                  ? 'Offline — last copy from before your recent changes · $age'
+                  : 'Offline — showing saved data · $age',
               color: AppColors.warning,
             )
           : InfoChip(icon: Icons.history, label: 'Updated $age'),

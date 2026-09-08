@@ -34,6 +34,7 @@ import '../models/profile.dart';
 import '../models/simulation_params.dart';
 import '../services/outbox.dart';
 import '../services/rest_client.dart';
+import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
 import '../ui/widgets/fork_button.dart';
@@ -329,6 +330,15 @@ class _SimulationViewState extends State<_SimulationView> {
     final levers = _leversCard(context);
     final current = _currentCard(context);
     return ListView(padding: AppSpacing.pageNarrow, children: [
+      // BICOLOUR's opening move: the screen is cut in two, your restaurant on
+      // the dark side and the hypothesis on the champagne side. It restates
+      // one number that is already on this page twice over (in Current
+      // Performance and in the results table) — nothing is computed here, and
+      // nothing about the run changes.
+      if (Gaia.of(context)) ...[
+        _bicolourSplit(context, narrow),
+        const SizedBox(height: AppSpacing.lg),
+      ],
       if (narrow) ...[
         levers,
         const SizedBox(height: AppSpacing.lg),
@@ -345,19 +355,71 @@ class _SimulationViewState extends State<_SimulationView> {
     ]);
   }
 
+  /// `.bico`'s two-up header. The scenario half sits at rest — an em dash and
+  /// a sentence — until a run has actually happened: filling it with the
+  /// baseline before then would show a projection nobody asked for, and
+  /// filling it with zero would show a projection of ruin.
+  Widget _bicolourSplit(BuildContext context, bool narrow) {
+    final b = widget.baseline;
+    final res = _result;
+    final curNet = simFinite(b['net_profit_per_day']);
+    final curRev = simFinite(b['revenue_per_day']);
+    final curLab = simFinite(b['labour_cost_per_day']);
+
+    final sim = (res?['simulated'] as Map?) ?? const {};
+    final simNet = simFinite(sim['net_profit']);
+    final ran = res != null;
+
+    return GaiaBicolourSplit(
+      stacked: narrow,
+      current: GaiaBicolourFace(
+        eyebrow: 'Current · net per day',
+        value: _simMoney(curNet),
+        valueColor: curNet < 0 ? GaiaColors.coral : GaiaColors.text,
+        detail: 'Revenue ${_simMoney(curRev)} · labour ${_simMoney(curLab)}',
+      ),
+      scenario: GaiaBicolourFace(
+        eyebrow: 'Scenario · net per day',
+        value: _simMoney(simNet),
+        // Re-inked for the champagne ground by GaiaBicolourSplit — coral
+        // measures 1.71:1 there and would be invisible.
+        valueColor: simNet < 0 ? GaiaColors.coral : null,
+        pending: !ran,
+        detail: ran
+            ? 'Revenue ${_simMoney(simFinite(sim['revenue']))}'
+                ' · labour ${_simMoney(simFinite(sim['labour_cost']))}'
+            : 'Nothing run yet — set the levers and press Run Simulation.',
+      ),
+    );
+  }
+
   // ------------------------------------------------------------- levers ----
 
+  /// The levers panel. Under Gaia this is `.bico` — the champagne slab.
+  ///
+  /// The BICOLOUR restyle changes the GROUND and the ink and nothing else.
+  /// Every behaviour on this panel is untouched: the same picker, the same
+  /// per-tenant defaults, the same change dots, the same
+  /// remove-keeps-the-value contract, the same omit-inactive-levers POST. The
+  /// only structural difference is that a card becomes a slab, because a slab
+  /// is what an inverted ground is.
   Widget _leversCard(BuildContext context) {
-    final text = Theme.of(context).textTheme;
+    // Read OUTSIDE the panel: `Gaia.of` here decides whether to build the
+    // panel at all, and inside it every Theme lookup is already re-inked.
+    final bico = Gaia.of(context);
     // Active levers, grouped under the same category headers the picker uses
     // and in the same (alphabetical) order. A header appears ONLY when at least
     // one of its parameters is active.
     final groups = groupedParams(filter: (spec) => _active.contains(spec.key));
     final changed = _changedCount;
 
-    return ForkCard(
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SectionHeader(title: 'What-If Simulator', padding: EdgeInsets.only(bottom: 4)),
+    Widget body(BuildContext context) {
+      final text = Theme.of(context).textTheme;
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        if (bico)
+          const GaiaBicolourHeading(title: 'Levers')
+        else
+          const SectionHeader(title: 'What-If Simulator', padding: EdgeInsets.only(bottom: 4)),
         Text(
             'Pick the levers you want to test, adjust them, then run. Anything you'
             ' remove keeps its value and goes back to contributing your own default.'
@@ -367,38 +429,73 @@ class _SimulationViewState extends State<_SimulationView> {
 
         // Wrap, not Row: at 320dp these two buttons do not share a line.
         Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
-          ForkButton.ghost(
-            key: _addButtonKey,
-            label: 'Add a lever',
-            icon: Icons.add,
-            dense: true,
-            onPressed: _openPicker,
-          ),
-          ForkButton.subtle(
-            label: changed > 0 ? 'Reset values ($changed)' : 'Reset values',
-            icon: Icons.restart_alt,
-            // Disabled with nothing to reset — and ForkButton makes a null
-            // onPressed LOOK disabled, which is the point.
-            onPressed: changed == 0 ? null : _resetAllValues,
-          ),
+          if (bico) ...[
+            GaiaBicolourButton(
+              key: _addButtonKey,
+              label: 'Add a lever',
+              icon: Icons.add,
+              onPressed: _openPicker,
+            ),
+            GaiaBicolourButton(
+              label: changed > 0 ? 'Reset values ($changed)' : 'Reset values',
+              icon: Icons.restart_alt,
+              onPressed: changed == 0 ? null : _resetAllValues,
+            ),
+          ] else ...[
+            ForkButton.ghost(
+              key: _addButtonKey,
+              label: 'Add a lever',
+              icon: Icons.add,
+              dense: true,
+              onPressed: _openPicker,
+            ),
+            ForkButton.subtle(
+              label: changed > 0 ? 'Reset values ($changed)' : 'Reset values',
+              icon: Icons.restart_alt,
+              // Disabled with nothing to reset — and ForkButton makes a null
+              // onPressed LOOK disabled, which is the point.
+              onPressed: changed == 0 ? null : _resetAllValues,
+            ),
+          ],
         ]),
         const SizedBox(height: AppSpacing.md),
 
         if (groups.isEmpty)
-          ForkCard(
-            inset: true,
-            child: Text(
-                "Nothing active. Use '+ Add a lever' to pick what you want to test.",
-                style: text.bodySmall),
-          )
+          if (bico)
+            // No inset panel on a slab — a recess inside an inverted ground
+            // reads as a hole. A hairline box is the design's own answer.
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                border: Border.all(color: GaiaBicolourColors.line2),
+              ),
+              child: Text(
+                  "Nothing active. Use '+ Add a lever' to pick what you want to test.",
+                  style: text.bodySmall),
+            )
+          else
+            ForkCard(
+              inset: true,
+              child: Text(
+                  "Nothing active. Use '+ Add a lever' to pick what you want to test.",
+                  style: text.bodySmall),
+            )
         else
           SliderTheme(
             // The theme's copper primary already colours the active track; the
-            // rest keeps the hairline voice of the design system.
+            // rest keeps the hairline voice of the design system. On the
+            // champagne slab every one of these inverts — a copper thumb on
+            // champagne is the invisible-control failure this file already got
+            // bitten by once.
             data: SliderTheme.of(context).copyWith(
-              inactiveTrackColor: AppColors.borderStrong,
-              thumbColor: AppColors.copperHi,
-              overlayColor: AppColors.copper.withValues(alpha: 0.12),
+              inactiveTrackColor:
+                  bico ? GaiaBicolourColors.line2 : AppColors.borderStrong,
+              activeTrackColor: bico ? GaiaBicolourColors.ink : null,
+              thumbColor: bico ? GaiaBicolourColors.ink : AppColors.copperHi,
+              overlayColor: bico
+                  ? GaiaColors.ink.withValues(alpha: 0.10)
+                  : AppColors.copper.withValues(alpha: 0.12),
               trackHeight: 3,
             ),
             child: Column(
@@ -421,12 +518,25 @@ class _SimulationViewState extends State<_SimulationView> {
           runSpacing: AppSpacing.sm,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            ForkButton(
-                label: 'Run Simulation',
-                icon: Icons.play_arrow,
-                onPressed: _running ? null : _run),
+            if (bico)
+              GaiaBicolourButton(
+                  label: 'Run Simulation',
+                  icon: Icons.play_arrow,
+                  primary: true,
+                  dense: false,
+                  onPressed: _running ? null : _run)
+            else
+              ForkButton(
+                  label: 'Run Simulation',
+                  icon: Icons.play_arrow,
+                  onPressed: _running ? null : _run),
             if (_running)
-              const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: bico ? GaiaBicolourColors.ink : null)),
             Text(
                 _active.isEmpty
                     ? 'No levers active — this runs your baseline unchanged.'
@@ -434,8 +544,13 @@ class _SimulationViewState extends State<_SimulationView> {
                 style: text.bodySmall),
           ],
         ),
-      ]),
-    );
+      ]);
+    }
+
+    if (bico) {
+      return GaiaBicolourPanel(child: Builder(builder: body));
+    }
+    return ForkCard(child: Builder(builder: body));
   }
 
   /// One active lever. Slider, segmented control and toggle all share this row:
@@ -446,6 +561,14 @@ class _SimulationViewState extends State<_SimulationView> {
     final text = Theme.of(context).textTheme;
     final changed = isChanged(_values, _defaults, spec.key);
     final gate = spec.key == 'second_outlet' ? _secondOutletGate() : null;
+    // On the champagne slab every accent ink flips. Copper on champagne is a
+    // dead-looking control and amber on champagne measures 1.9:1 — the change
+    // dot and the "speculative" chip would both simply stop existing, which on
+    // this screen means an owner cannot see that a lever has been moved.
+    final bico = GaiaBicolour.of(context);
+    final accent = bico ? GaiaBicolourColors.ink : AppColors.copperHi;
+    final warn = bico ? GaiaBicolourColors.statusWarn : AppColors.warning;
+    final quiet = bico ? GaiaBicolourColors.body : AppColors.textSecondary;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpacing.md),
@@ -459,7 +582,7 @@ class _SimulationViewState extends State<_SimulationView> {
               ),
               if (spec.speculative) ...[
                 const SizedBox(width: 6),
-                const StatusChip(label: 'speculative', color: AppColors.warning, dense: true),
+                StatusChip(label: 'speculative', color: warn, dense: true),
               ],
               if (changed) ...[
                 const SizedBox(width: 6),
@@ -469,7 +592,7 @@ class _SimulationViewState extends State<_SimulationView> {
                     key: ValueKey('sim-dot-${spec.key}'),
                     width: 6,
                     height: 6,
-                    decoration: BoxDecoration(color: AppColors.copperHi, shape: BoxShape.circle),
+                    decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
                   ),
                 ),
                 const SizedBox(width: 2),
@@ -487,7 +610,12 @@ class _SimulationViewState extends State<_SimulationView> {
             Padding(
               padding: const EdgeInsets.only(left: AppSpacing.sm),
               child: Text(spec.format(numberValue(_values, spec.key), _simMoney),
-                  style: text.titleSmall!.copyWith(color: AppColors.copperHi),
+                  // `.lever .h .v` is the SERIF figure on the slab — the one
+                  // place the design puts a number in the display face inside
+                  // a control row.
+                  style: bico
+                      ? GaiaType.serif(size: 26, weight: 500, color: GaiaBicolourColors.ink)
+                      : text.titleSmall!.copyWith(color: AppColors.copperHi),
                   maxLines: 1,
                   overflow: TextOverflow.fade,
                   softWrap: false),
@@ -510,11 +638,9 @@ class _SimulationViewState extends State<_SimulationView> {
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Icon(Icons.lock_outline, size: 13, color: AppColors.warning),
+              Icon(Icons.lock_outline, size: 13, color: warn),
               const SizedBox(width: 6),
-              Expanded(
-                  child: Text(gate,
-                      style: text.bodySmall!.copyWith(color: AppColors.textSecondary))),
+              Expanded(child: Text(gate, style: text.bodySmall!.copyWith(color: quiet))),
             ]),
           ),
       ]),
@@ -768,7 +894,11 @@ class _SimulationViewState extends State<_SimulationView> {
           cell('DELTA', style: text.labelSmall),
         ]);
 
-    TableRow row(_SimRow r) {
+    /// One row's four figures and how the delta should be read. Shared by both
+    /// design systems so the arithmetic and the good/bad judgement can never
+    /// differ between them — only the drawing does.
+    ({String cur, String sim, String delta, Color color, int rise}) cells(
+        _SimRow r) {
       final c = simFinite(cur[r.key]);
       final s = simFinite(sim[r.key]);
       final d = simFinite(del[r.key]);
@@ -779,21 +909,36 @@ class _SimulationViewState extends State<_SimulationView> {
       final zero = dr == 0;
       // Green = good for the owner, red = bad; a rising cost or TAT inverts.
       final good = r.cost ? dr < 0 : dr > 0;
-      final color = zero || r.neutral
-          ? AppColors.textSecondary
-          : (good ? AppColors.success : AppColors.danger);
-      final deltaLabel = zero
-          ? (r.money ? '₹0' : (r.minutes ? '0 min' : '0'))
-          : '${dr > 0 ? '+' : ''}${plain(dr)}';
+      final neutral = zero || r.neutral;
+      return (
+        cur: plain(c),
+        sim: plain(s),
+        delta: zero
+            ? (r.money ? '₹0' : (r.minutes ? '0 min' : '0'))
+            : '${dr > 0 ? '+' : ''}${plain(dr)}',
+        color: neutral
+            ? AppColors.textSecondary
+            : (good ? AppColors.success : AppColors.danger),
+        // The non-colour channel on the delta is the SIGN, not the verdict —
+        // an arrow that pointed at good/bad would render a rising labour cost
+        // as "down 6,150" beside a "+6,150". The verdict is the colour, and
+        // the metric's own name (a cost, a turnaround) says which way is
+        // welcome.
+        rise: dr == 0 ? 0 : (dr > 0 ? 1 : -1),
+      );
+    }
+
+    TableRow row(_SimRow r) {
+      final v = cells(r);
       return TableRow(children: [
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 6),
           child: Text(r.label, style: text.bodySmall!.copyWith(color: AppColors.textSecondary)),
         ),
-        cell(plain(c)),
-        cell(plain(s)),
-        cell(deltaLabel,
-            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: color)),
+        cell(v.cur),
+        cell(v.sim),
+        cell(v.delta,
+            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: v.color)),
       ]);
     }
 
@@ -815,16 +960,44 @@ class _SimulationViewState extends State<_SimulationView> {
               ),
             const SizedBox(height: AppSpacing.sm),
           ],
-          Table(
-            columnWidths: const {
-              0: FlexColumnWidth(1.5),
-              1: FlexColumnWidth(1),
-              2: FlexColumnWidth(1.1),
-              3: FlexColumnWidth(1.1),
-            },
-            defaultVerticalAlignment: TableCellVerticalAlignment.middle,
-            children: [header(), ...visible.map(row)],
-          ),
+          // `.delta-row` — the same four columns, the same rows, the same
+          // visibility rule and the same good/bad judgement; only the drawing
+          // changes. The SIMULATED column goes serif, which is what makes four
+          // numeric columns scannable without a rule between them.
+          if (Gaia.of(context))
+            Column(children: [
+              const GaiaDeltaRow(
+                first: true,
+                header: true,
+                metric: 'Metric',
+                current: 'Current',
+                scenario: 'Scenario',
+                delta: 'Delta',
+              ),
+              for (final r in visible)
+                Builder(builder: (context) {
+                  final v = cells(r);
+                  return GaiaDeltaRow(
+                    metric: r.label,
+                    current: v.cur,
+                    scenario: v.sim,
+                    delta: v.delta,
+                    deltaColor: v.color,
+                    rise: v.rise,
+                  );
+                }),
+            ])
+          else
+            Table(
+              columnWidths: const {
+                0: FlexColumnWidth(1.5),
+                1: FlexColumnWidth(1),
+                2: FlexColumnWidth(1.1),
+                3: FlexColumnWidth(1.1),
+              },
+              defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+              children: [header(), ...visible.map(row)],
+            ),
           if (ranSpend > 0) ...[
             const SizedBox(height: AppSpacing.sm),
             if (beDays != null)
@@ -1057,6 +1230,9 @@ class _LeverIconButtonState extends State<_LeverIconButton> {
 
   @override
   Widget build(BuildContext context) {
+    // Two of these ride every changed lever row, and on the champagne slab
+    // their copper-on-dark inks read as blank space.
+    final bico = GaiaBicolour.of(context);
     return Tooltip(
       message: widget.tooltip,
       child: MouseRegion(
@@ -1071,13 +1247,22 @@ class _LeverIconButtonState extends State<_LeverIconButton> {
             width: 26,
             height: 26,
             decoration: BoxDecoration(
-              color: _hovered ? Colors.white.withValues(alpha: 0.06) : Colors.transparent,
+              color: _hovered
+                  ? (bico
+                      ? GaiaColors.ink.withValues(alpha: 0.07)
+                      : Colors.white.withValues(alpha: 0.06))
+                  : Colors.transparent,
               borderRadius: AppRadius.controlAll,
-              border: Border.all(color: _hovered ? AppColors.borderStrong : Colors.transparent),
+              border: Border.all(
+                  color: _hovered
+                      ? (bico ? GaiaBicolourColors.line2 : AppColors.borderStrong)
+                      : Colors.transparent),
             ),
             child: Icon(widget.icon,
                 size: 14,
-                color: _hovered ? AppColors.textPrimary : AppColors.textSecondary),
+                color: bico
+                    ? (_hovered ? GaiaBicolourColors.ink : GaiaBicolourColors.body)
+                    : (_hovered ? AppColors.textPrimary : AppColors.textSecondary)),
           ),
         ),
       ),

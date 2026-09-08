@@ -36,9 +36,12 @@ import 'package:restaurant_owner_app/services/printer_service.dart';
 ///     reprints and shared by every station ticket of one KOT, so deduplicating
 ///     on it would swallow a waiter's second copy and drop every kitchen but the
 ///     first.
-///   * AN AGENT THAT CANNOT PRINT MUST NOT CLAIM. The same app runs on Android,
-///     where winspool does not exist. Claiming there would take jobs off the
-///     queue the outlet's real till is waiting on and fail to print every one.
+///   * AN AGENT THAT CANNOT PRINT MUST NOT CLAIM. Claiming takes jobs off the
+///     queue the outlet's real till is waiting on, so a device that then fails
+///     to print loses every one of those receipts. The rule is CAPABILITY, not
+///     platform: a phone can now print over a socket (see
+///     printer_routing_test.dart), so what disqualifies it is having no printer
+///     configured at all rather than having no winspool.
 
 class _FakeApi extends ApiClient {
   _FakeApi({this.failAcks = false});
@@ -373,7 +376,9 @@ void main() {
     test('an agent that cannot print advertises no version, so it is sent nothing', () async {
       // The server replays only to an agent that names a version — its interlock
       // against replaying a backlog to a build that can neither dedupe nor ack.
-      // An Android instance has no winspool, so it must stay silent.
+      // A device with no printing capability at all must stay silent. (The
+      // narrower, live case — a phone that CAN print in principle but has no
+      // printer address yet — is in printer_routing_test.dart.)
       final api = _FakeApi();
       final android = PrinterService.forTest(
         auth: await _signIn(api),
