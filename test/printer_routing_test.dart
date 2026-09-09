@@ -180,6 +180,59 @@ void main() {
       expect(spooler.printers, <String>['Till Printer', 'Pass Printer', 'Bar Printer']);
     });
 
+    test('one order: the beverage docket and the food docket land on two printers', () async {
+      // THE ASK, IN THE OWNER'S WORDS: "the beverage kot goes to one printer and
+      // the food kot goes to another, instead of choosing the printer each and
+      // every time." Nothing new is needed to answer it — the backend already
+      // splits one order into one docket per kitchen station and stamps each
+      // `bill:print` with that station, so the two dockets below are what ONE
+      // order produces. The rules are written once, in Settings, and no print
+      // asks anybody anything after that.
+      final spooler = _Spooler();
+      final svc = PrinterService.forTest(auth: await _signIn(_FakeApi()), write: spooler.call);
+      svc.debugSetRouting(
+        routes: <String, String>{
+          PrintRole.kotStation('BAR'): 'Bar Printer',
+          // Everything that is not the bar is food, and one rule covers all of
+          // it however many kitchen sections the menu grows.
+          PrintRole.anyKot: 'Pass Printer',
+        },
+        installed: <String>['Test Printer', 'Bar Printer', 'Pass Printer'],
+      );
+
+      // One order, one KOT number, two station dockets — the pair dispatchKot
+      // enqueues for an order with a drink and a starter on it.
+      await svc.onPrintEvent(_event(billId: 'order-A', jobId: 'j-bar', station: 'BAR'));
+      await svc.onPrintEvent(_event(billId: 'order-A', jobId: 'j-food', station: 'TANDOOR'));
+      await pumpEventQueue();
+
+      expect(spooler.printers, <String>['Bar Printer', 'Pass Printer']);
+      // Neither docket waited for a decision, and neither was dropped.
+      expect(svc.queue, isEmpty);
+      expect(spooler.printers, isNot(contains('Test Printer')));
+    });
+
+    test('an unassigned dish still reaches paper, on the food printer', () async {
+      // A menu where only the drinks carry a station: everything else groups
+      // under buildKotBase64's shared "General" bucket. That is not a station
+      // anybody wrote a rule for, and it must still print — the any-kitchen
+      // rule catches it, and failing that the default would.
+      final spooler = _Spooler();
+      final svc = PrinterService.forTest(auth: await _signIn(_FakeApi()), write: spooler.call);
+      svc.debugSetRouting(
+        routes: <String, String>{
+          PrintRole.kotStation('BAR'): 'Bar Printer',
+          PrintRole.anyKot: 'Pass Printer',
+        },
+        installed: <String>['Test Printer', 'Bar Printer', 'Pass Printer'],
+      );
+
+      await svc.onPrintEvent(_event(billId: 'order-B', jobId: 'j-gen', station: 'General'));
+      await pumpEventQueue();
+      expect(spooler.printers.single, 'Pass Printer');
+      expect(svc.queue, isEmpty);
+    });
+
     test('a station typed in any case is one rule', () async {
       final spooler = _Spooler();
       final svc = PrinterService.forTest(auth: await _signIn(_FakeApi()), write: spooler.call);

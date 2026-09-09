@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../models/profile.dart';
+import '../models/role_scope.dart';
 import '../services/outbox.dart';
 import '../services/phone_validation.dart';
 import '../services/rest_client.dart';
@@ -21,11 +23,30 @@ class OrderEntryScreen extends StatefulWidget {
   final String? tableName;
   // 'dine_in' (default), 'takeaway', or 'delivery'.
   final String orderType;
+
+  /// ITEM 16 / CONSTRAINT C: THE TABLE IS NOT OCCUPIED YET, AND SENDING THIS
+  /// ORDER IS WHAT WILL OCCUPY IT.
+  ///
+  /// Set only by the table sheet, only for a reader who has no seating control
+  /// (a waiter), and only on a table that is currently free. Everybody else
+  /// still seats first and this stays false, so their flow is byte-for-byte the
+  /// one that shipped.
+  ///
+  /// WHY IT LIVES AT SEND RATHER THAN AT OPEN. "Occupancy follows the order"
+  /// means the table lights up because an order exists, not because a screen was
+  /// opened: a waiter who opens the pad and walks away leaves the table FREE,
+  /// where the old seat-first flow left it occupied and empty until somebody
+  /// noticed. It also keeps the covers question — which APC divides by, and
+  /// which nothing else can supply — at the one moment there is a real party to
+  /// count.
+  final bool occupyOnSend;
+
   const OrderEntryScreen({
     super.key,
     required this.rest,
     this.tableName,
     this.orderType = 'dine_in',
+    this.occupyOnSend = false,
   });
 
   bool get isDineIn => orderType == 'dine_in';
@@ -49,6 +70,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   final TextEditingController _custCtrl = TextEditingController();
   final TextEditingController _phoneCtrl = TextEditingController();
   final TextEditingController _addrCtrl = TextEditingController();
+  // Owned by the State, not by _askCovers, and that is a bug fix rather than a
+  // style: `showDialog` completes the moment the route is popped, but the
+  // dialog's TextField is still rebuilt while the barrier fades out — so a
+  // controller disposed on the line after the await is used after disposal, and
+  // the send that follows (which rebuilds this screen) is what makes it certain.
+  final TextEditingController _coversCtrl = TextEditingController(text: '2');
   String _query = '';
   bool _sending = false;
   String? _error;
@@ -56,6 +83,53 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // APC vs target). Dine-in only — a takeaway has no table to be per-head about.
   // Null until it loads, and stays null when the table has no open bill yet.
   Map<String, dynamic>? _tableBill;
+
+  /// Whose order this is. Read once from the session rather than passed in, so
+  /// every entry point into this screen (the table sheet, a takeaway, a
+  /// delivery) is scoped without any of them having to remember to be.
+  Profile? get _profile => widget.rest.auth.profile;
+
+  /// ITEM 19 ON THE ORDER PAD. False for a waiter, and it takes out the running
+  /// bill / APC strip at the top and the rupee total on the Send button.
+  ///
+  /// IT DELIBERATELY LEAVES THE MENU PRICES ALONE. That list is the card in the
+  /// guest's hands: a waiter who cannot answer "how much is the paneer tikka"
+  /// cannot take the order this screen exists to take. Hiding what a dish costs
+  /// is not hiding the restaurant's money, it is hiding the menu.
+  bool get _showsMoney => _profile == null || RoleScope.showsMoney(_profile!);
+
+  /// Whether THIS send is the one that occupies the table. Dine-in only: a
+  /// takeaway has no table to occupy, and its virtual table is provisioned
+  /// server-side.
+  bool get _occupyOnSend =>
+      widget.occupyOnSend && widget.isDineIn && (widget.tableName ?? '').trim().isNotEmpty;
+
+  /// The covers dialog, deliberately worded as a question about the party rather
+  /// than as an instruction to seat them: this is the send button's follow-up,
+  /// not a seating step wearing a different label.
+  Future<int?> _askCovers() async {
+    _coversCtrl.text = '2';
+    final n = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('How many guests at this table?'),
+        content: TextField(
+          controller: _coversCtrl,
+          keyboardType: TextInputType.number,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Number of guests'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, int.tryParse(_coversCtrl.text.trim()) ?? 1),
+            child: const Text('Send order'),
+          ),
+        ],
+      ),
+    );
+    return n == null ? null : (n < 1 ? 1 : n);
+  }
 
   @override
   void initState() {
@@ -90,6 +164,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _custCtrl.dispose();
     _phoneCtrl.dispose();
     _addrCtrl.dispose();
+    _coversCtrl.dispose();
     super.dispose();
   }
 
@@ -153,6 +228,21 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       setState(() => _error = _phoneError);
       return;
     }
+    // COVERS BEFORE ANYTHING IS SENT, and before the sending flag is raised —
+    // a cancelled dialog must leave the pad exactly as it was found.
+    //
+    // Covers are asked here for one reason: APC is the bill divided by the
+    // covers counted ONCE PER SEATING, and no other write in this flow can
+    // supply that number. Defaulting it to 1 would not be "no seating step", it
+    // would be a table of four silently recorded as one cover — an APC four
+    // times too high, in the analytics, in the MIS reports and in the simulator
+    // baseline. So the seating is still RECORDED; it stopped being a button a
+    // waiter presses before the guests have ordered.
+    int? covers;
+    if (_occupyOnSend) {
+      covers = await _askCovers();
+      if (covers == null || !mounted) return;
+    }
     setState(() {
       _sending = true;
       _error = null;
@@ -184,6 +274,22 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       'taken_by_employee_role': p?.role,
     };
     try {
+      if (_occupyOnSend && covers != null) {
+        // OCCUPY FIRST, ORDER SECOND, and the order is load-bearing rather than
+        // stylistic: the TableSessions row is written by a trigger on the
+        // free -> occupied transition, and every reader that ties money to a
+        // seating (staff APC, target APC, the cover-size report) matches a bill
+        // to the session whose `seated_at <= bill.created_at`. Send the order
+        // first and its bill predates the seating it belongs to, so it is
+        // attributed to the PREVIOUS party or to none at all.
+        try {
+          await widget.rest.post('/occupy-table', {'table_name': widget.tableName, 'num_covers': covers});
+        } on OfflineQueued catch (_) {
+          // Queued, not lost — and queued AHEAD of the order below, which the
+          // outbox replays in the order it was written. The kitchen ticket must
+          // not be held hostage to the seating write.
+        }
+      }
       if (widget.isDineIn) {
         await widget.rest.post('/orders', {...base, 'table': widget.tableName});
       } else {
@@ -251,11 +357,13 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
             child: TableApcStrip(
               bill: _tableBill!,
+              profile: _profile,
               pendingTotal: _total,
               onTap: () => showTableBillSheet(
                 context,
                 rest: widget.rest,
                 tableName: widget.tableName ?? '',
+                profile: _profile,
               ),
             ),
           ),
@@ -419,7 +527,9 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       child: Text(_sending
                           ? 'Sending…'
-                          : 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'),
+                          : _showsMoney
+                              ? 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'
+                              : 'Send order · $_count item${_count > 1 ? 's' : ''}'),
                     ),
                   ),
                 ),

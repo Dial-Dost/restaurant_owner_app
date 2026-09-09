@@ -692,10 +692,14 @@ void main() {
 // ---------------------------------------------------------------------------
 
 class _GateApi extends ApiClient {
-  _GateApi({required this.actions, required this.actionNames, this.features = const {}});
+  _GateApi({required this.actions, required this.actionNames, this.features = const {}, this.role});
   final List<String> actions;
   final List<String> actionNames;
   final Map<String, dynamic> features;
+
+  /// The signed-in ROLE, for the cases that are about the role rather than the
+  /// action. Null keeps the old shorthand (wildcard = admin, else waiter).
+  final String? role;
 
   @override
   Future<LoginResult> login(String restaurantName, String username, String password, {String? outletId}) async =>
@@ -704,7 +708,7 @@ class _GateApi extends ApiClient {
         Profile.fromJson(<String, dynamic>{
           'employeeId': 'e1',
           'restaurantName': 'CSR Organics',
-          'role': actions.contains('*') ? 'admin' : 'waiter',
+          'role': role ?? (actions.contains('*') ? 'admin' : 'waiter'),
           'actions_set': actions,
           'action_names': actionNames,
           'features': features,
@@ -722,6 +726,7 @@ Future<void> _pumpGateShell(
   required List<String> actions,
   required List<String> actionNames,
   Map<String, dynamic> features = const {},
+  String? role,
 }) async {
   await tester.pumpWidget(const SizedBox());
   // Tall on purpose: the nav rail is a lazy ListView, so a module below the
@@ -732,7 +737,8 @@ Future<void> _pumpGateShell(
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
   final auth = AuthController(
-      api: _GateApi(actions: actions, actionNames: actionNames, features: features));
+      api: _GateApi(
+          actions: actions, actionNames: actionNames, features: features, role: role));
   await auth.login('CSR Organics', 'u', 'p');
   await tester.pumpWidget(
       MaterialApp(theme: AppTheme.dark(), home: HomeShell(auth: auth, startPrinterAgent: false)));
@@ -753,7 +759,10 @@ void _gateTests() {
     // "tidies" the keyword list to mention simulation, this is the assertion
     // that fails.
     await _pumpGateShell(
-        tester, actions: const ['df75119b'], actionNames: const ['View Order APC']);
+        tester,
+        actions: const ['df75119b'],
+        actionNames: const ['View Order APC'],
+        role: 'manager');
     expect(find.text('Simulation'), findsOneWidget,
         reason: 'the gate must mirror the server action, whose name says APC, not simulation');
     expect(find.text('Analytics'), findsOneWidget,
@@ -762,6 +771,18 @@ void _gateTests() {
     // A waiter does not. The gate is the server's, mirrored — not a wider one.
     await _pumpGateShell(tester, actions: const ['x'], actionNames: const ['Add Orders']);
     expect(find.text('Simulation'), findsNothing);
+
+    // A WAITER WHOSE TENANT GRANTED THE ACTION STILL DOES NOT. The one
+    // deliberate narrowing: what-if planning over the restaurant's revenue is
+    // the restaurant's money, and RoleScope answers "what is this person here to
+    // do" where the per-tenant action grant cannot. Analytics goes with it, for
+    // the same reason and by the same rule.
+    await _pumpGateShell(
+        tester,
+        actions: const ['df75119b'],
+        actionNames: const ['View Orders', 'View Order APC']);
+    expect(find.text('Simulation'), findsNothing);
+    expect(find.text('Analytics'), findsNothing);
 
     // Nor does a tenant whose plan drops analytics: the projection is computed
     // from data that flag governs, so the tile goes with the 403.

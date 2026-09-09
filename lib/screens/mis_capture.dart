@@ -982,6 +982,16 @@ Widget misServiceChargeBlock(
   required Map bill,
   required String tableName,
   required VoidCallback onChanged,
+  /// Whether this reader may be shown the two rupee figures on the ALREADY-WAIVED
+  /// card — what came off the charge, and what came off the grand total.
+  ///
+  /// Defaults to true, so every existing caller behaves exactly as it did. The
+  /// table sheet passes a waiter's `false`: item 19 takes the restaurant's money
+  /// off their screen, and this card is the one place a waived amount survived
+  /// the bill block being removed. Everything else here — the waiver kind, the
+  /// reason, who waived it and who authorised it, and the inert "Put the charge
+  /// back" control — is unaffected, because none of it is a figure.
+  bool showsMoney = true,
 }) {
   final text = Theme.of(context).textTheme;
   final may = _holdsAction(profile, _permServiceChargeWaiver);
@@ -1006,15 +1016,17 @@ Widget misServiceChargeBlock(
                   style: text.titleSmall),
             ),
           ]),
-          const SizedBox(height: 6),
-          // BOTH numbers, because with GST on the charge they differ and the
-          // guest is told the second one: the charge itself came off, and the
-          // grand total fell by the charge PLUS the tax that rode on it.
-          Text(
-            '${_money(w['amount_waived'])} charge off · '
-            '${_money(w['grand_total_reduction'])} off the total',
-            style: text.bodyMedium,
-          ),
+          if (showsMoney) ...[
+            const SizedBox(height: 6),
+            // BOTH numbers, because with GST on the charge they differ and the
+            // guest is told the second one: the charge itself came off, and the
+            // grand total fell by the charge PLUS the tax that rode on it.
+            Text(
+              '${_money(w['amount_waived'])} charge off · '
+              '${_money(w['grand_total_reduction'])} off the total',
+              style: text.bodyMedium,
+            ),
+          ],
           const SizedBox(height: 4),
           Text('“${_s(w, 'reason')}” — ${_s(w, 'waived_by_username')}, '
               'authorised by ${_s(w, 'authorised_by_username')}',

@@ -175,6 +175,71 @@ const _assignments = [
   {'id': 'a3', 'table_name': 'T2', 'employee_id': 'sunil', 'employee_name': 'Sunil M'},
 ];
 
+/// `GET /me/scorecard` — the ONE read a waiter's Overview makes.
+///
+/// The shape is the route's, and the redaction is the route's too: there is no
+/// `benchmark` key on any component and no `benchmarks` block on the payload,
+/// because the server strips the house APC and the house turnaround BEFORE the
+/// answer leaves the process. The notes below are the shipped notes with their
+/// ", against a house …" tail already cut — which is exactly what an identity
+/// without the analytics action must never be able to read.
+const _scorecard = {
+  '/me/scorecard': {
+    'window_days': 30,
+    'from': '2026-08-10',
+    'to': '2026-09-09',
+    'timezone': 'Asia/Kolkata',
+    'generated_at': '2026-09-09T12:00:00.000Z',
+    'weights': {'apc': 0.35, 'rating': 0.30, 'attendance': 0.20, 'tat': 0.15},
+    'employee_id': 'emp-uuid-1',
+    'employee_name': 'Ravi K',
+    'role': 'waiter',
+    'score': 78.4,
+    'components_available': 4,
+    'effective_weights': {'apc': 0.35, 'rating': 0.30, 'attendance': 0.20, 'tat': 0.15},
+    'components': {
+      'apc': {
+        'value': 612.5,
+        'score': 88.0,
+        'available': true,
+        'unit': 'currency per cover',
+        'sample': 12,
+        'note': 'Pre-tax spend per cover across 12 settled bills (31 covers).',
+      },
+      'rating': {
+        'value': 4.6,
+        'score': 90.0,
+        'available': true,
+        'unit': 'stars (1-5)',
+        'sample': 9,
+        'note': 'Average of 9 guest ratings.',
+      },
+      'attendance': {
+        'value': 92.0,
+        'score': 92.0,
+        'available': true,
+        'unit': '% presence/punctuality',
+        'sample': 25,
+        'note': 'Present on 23 of 25 open days (1 excused by approved leave); 2 late starts.',
+      },
+      'tat': {
+        'value': 46.5,
+        'score': 71.0,
+        'available': true,
+        'unit': 'minutes per table',
+        'sample': 9,
+        'note': 'Median seated-to-released time over 9 tables.',
+      },
+    },
+    'attendance_now': {
+      'clocked_in': true,
+      'since': '2026-09-09T04:30:00.000Z',
+      'today_minutes': 195,
+      'pending_approval': false,
+    },
+  },
+};
+
 const _orders = [
   {'id': 'o1', 'table': 'T1', 'status': 'Preparing', 'items': <dynamic>[], 'total': 900},
   {'id': 'o2', 'table': 'T1', 'status': 'Pending', 'items': <dynamic>[], 'total': 300},
@@ -210,8 +275,10 @@ const _money = {
   '/bills/open?limit=1': {'total': 3, 'outstanding_total': 4200, 'bills': <dynamic>[]},
 };
 
-Map<String, dynamic> _floorRoutes({bool withAssignments = true}) => <String, dynamic>{
+Map<String, dynamic> _floorRoutes({bool withAssignments = true, bool withScorecard = true}) =>
+    <String, dynamic>{
       ..._money,
+      if (withScorecard) ..._scorecard,
       '/get-tables': _tables,
       '/orders': _orders,
       if (withAssignments) '/table-assignments': _assignments,
@@ -271,31 +338,124 @@ void main() {
       ]);
     });
 
-    test('a waiter loses Menu, Waitlist and Bookings — and keeps the floor', () {
+    test('a waiter loses Menu, Kitchen, Waitlist and Bookings — and keeps the floor', () {
       final nav = visibleModuleLabelsFor(_waiter);
-      expect(nav, isNot(contains('Menu')));
-      expect(nav, isNot(contains('Waitlist')));
-      expect(nav, isNot(contains('Bookings')));
-      expect(nav, containsAll(<String>['Tables', 'Orders', 'Kitchen']));
+      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings']) {
+        expect(nav, isNot(contains(gone)));
+      }
+      // What the shift is actually made of.
+      expect(nav, containsAll(<String>['Tables', 'Orders', 'Overview', 'Attendance']));
     });
 
     // The scouted hole: Waitlist's keywords are ['table', 'order', 'waitlist']
-    // and every waiter holds an order action, so no grant could have hidden it.
-    test('the three stay hidden even for a waiter granted the analytics action', () {
+    // and Kitchen's are ['order','kitchen','kot','kds'] — every waiter holds an
+    // order action, so no grant could ever have hidden either of them.
+    test('the four stay hidden even for a waiter granted the analytics action', () {
       final nav = visibleModuleLabelsFor(_waiterWithApc);
-      expect(nav, isNot(contains('Menu')));
-      expect(nav, isNot(contains('Waitlist')));
-      expect(nav, isNot(contains('Bookings')));
+      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings']) {
+        expect(nav, isNot(contains(gone)));
+      }
+    });
+
+    // THE OTHER ROUTE TO THE MONEY, and the reason this list is not just the
+    // four screens item 12 names.
+    //
+    // Taking the rupees off the floor plan is not "no money on a waiter's
+    // screen" while Analytics, Reports, Accounting, Cash register, Concerns,
+    // Simulation and History sit in the same nav — every one of them gated on
+    // ['analytics','apc','report'], which a tenant satisfies the moment it ticks
+    // "View Order APC" for the waiter role. That tenant is the case RoleScope
+    // exists for.
+    test('a waiter granted the analytics action still reaches no money module', () {
+      final nav = visibleModuleLabelsFor(_waiterWithApc);
+      for (final gone in const [
+        'Concerns', 'Analytics', 'Simulation', 'History', 'Reports',
+        'Accounting', 'Cash register', 'Billing',
+      ]) {
+        expect(nav, isNot(contains(gone)), reason: '$gone prices the restaurant');
+      }
     });
 
     // SCOPE DISCIPLINE. Only the role the owner named is narrowed; anyone else
     // holding the same action names keeps exactly what they had.
-    test('a cashier, captain or manager with the same actions keeps all three', () {
+    test('a cashier, captain or manager with the same actions keeps all four', () {
       for (final role in ['cashier', 'captain', 'manager', 'employee']) {
         final nav = visibleModuleLabelsFor(Profile.fromJson(_profileJson(role: role)));
-        expect(nav, containsAll(<String>['Menu', 'Waitlist', 'Bookings']),
+        expect(nav, containsAll(<String>['Menu', 'Kitchen', 'Waitlist', 'Bookings']),
             reason: '$role was not part of the request and must not be narrowed');
       }
+    });
+
+    // … and the money modules go with them, on the same action.
+    test('a non-waiter with the analytics action keeps every money module', () {
+      final manager = Profile.fromJson(_profileJson(
+        role: 'manager',
+        actionNames: [..._waiterActions, 'View Order APC'],
+      ));
+      // History's keywords are ['analytics','report'] and this fixture's action
+      // names contain neither word literally, so it is absent for a permission
+      // reason that has nothing to do with the role. The four that DO match are
+      // the point: the role never removes them from a non-waiter.
+      expect(visibleModuleLabelsFor(manager),
+          containsAll(<String>['Concerns', 'Analytics', 'Simulation', 'Reports']));
+    });
+  });
+
+  // -------------------------------------------------------------- nav order --
+
+  group('where the Overview sits in the nav', () {
+    test("an owner's Overview is still the first thing in the nav", () {
+      expect(visibleModuleLabelsFor(_admin).first, 'Overview');
+    });
+
+    // ITEM 13's second half. A waiter still HAS an Overview — it is their
+    // scorecard — but it is the last section of the nav, not the first.
+    test("a waiter's Overview is the LAST module in their nav", () {
+      for (final p in [_waiter, _waiterWithApc]) {
+        final nav = visibleModuleLabelsFor(p);
+        expect(nav, contains('Overview'));
+        expect(nav.last, 'Overview');
+        expect(nav.first, isNot('Overview'));
+      }
+    });
+
+    testWidgets('the sidebar draws it last, under its own heading', (tester) async {
+      final auth = await _signIn(_FakeApi(_profileJson(role: 'waiter')));
+      await _pumpShell(tester, auth);
+
+      final rail = find.byType(ListView).first;
+      double topOf(String label) => tester
+          .getTopLeft(find.descendant(of: rail, matching: find.text(label)))
+          .dy;
+
+      // The group header exists, and Overview is inside it — below every other
+      // nav row, which is what "the LAST section" means on screen.
+      expect(find.descendant(of: rail, matching: find.text('YOUR SHIFT')), findsOneWidget);
+      expect(topOf('Overview'), greaterThan(topOf('Tables')));
+      expect(topOf('Overview'), greaterThan(topOf('Orders')));
+      expect(topOf('Overview'), greaterThan(topOf('YOUR SHIFT') - 1));
+      // OPERATIONS still leads, and it no longer contains the Overview.
+      expect(topOf('OPERATIONS'), lessThan(topOf('YOUR SHIFT')));
+    });
+
+    testWidgets("an owner's sidebar is untouched — Overview under OPERATIONS, first",
+        (tester) async {
+      final auth = await _signIn(_FakeApi(_profileJson(
+        role: 'admin',
+        actionNames: const <String>[],
+        actions: const ['*'],
+      )));
+      await _pumpShell(tester, auth);
+      final rail = find.byType(ListView).first;
+      expect(find.descendant(of: rail, matching: find.text('YOUR SHIFT')), findsNothing);
+      final ops = tester.getTopLeft(
+          find.descendant(of: rail, matching: find.text('OPERATIONS'))).dy;
+      final overview = tester.getTopLeft(
+          find.descendant(of: rail, matching: find.text('Overview'))).dy;
+      expect(overview, greaterThan(ops));
+      expect(overview, lessThan(tester
+          .getTopLeft(find.descendant(of: rail, matching: find.text('Tables')))
+          .dy));
     });
   });
 
@@ -372,7 +532,7 @@ void main() {
       final s = OverviewScope.of(_admin);
       expect([s.money, s.insights, s.rating, s.floor, s.billValue, s.planLimits],
           everyElement(isTrue));
-      expect(s.ownSection, isFalse);
+      expect(s.scorecard, isFalse);
     });
 
     test('a waiter gets no money, granted the analytics action or not', () {
@@ -383,9 +543,12 @@ void main() {
         expect(s.rating, isFalse);
         expect(s.billValue, isFalse);
         expect(s.planLimits, isFalse);
-        // What they DO get.
-        expect(s.floor, isTrue);
-        expect(s.ownSection, isTrue);
+        // ITEM 13's "no restaurant-wide anything" — the floor read went with the
+        // money. How full the restaurant is, is the restaurant's business; the
+        // floor PLAN is one tap away and is the tab they land on.
+        expect(s.floor, isFalse);
+        // What they DO get, and the whole of it.
+        expect(s.scorecard, isTrue);
       }
     });
 
@@ -398,7 +561,7 @@ void main() {
       expect(s.insights, isFalse);
       expect(s.floor, isTrue);
       expect(s.billValue, isTrue, reason: 'a cashier collects money — that is the job');
-      expect(s.ownSection, isFalse, reason: 'nobody else grows a waiter section');
+      expect(s.scorecard, isFalse, reason: 'nobody else grows a waiter scorecard');
     });
 
     // /orders/apc and /orders/daily-revenue are NOT under the /analytics prefix
@@ -439,9 +602,9 @@ void main() {
       expect(find.text('Tables occupied right now'), findsOneWidget);
       expect(find.text('Operations'), findsOneWidget);
       expect(find.textContaining('₹4200.00 uncollected'), findsOneWidget);
-      // An owner still gets the waiter section's absence.
-      expect(find.text('Your section'), findsNothing);
-      expect(api.calls, isNot(contains('GET /table-assignments')));
+      // An owner grows no scorecard, and never asks for one.
+      expect(find.text('Your shift'), findsNothing);
+      expect(api.calls, isNot(contains('GET /me/scorecard')));
     });
 
     for (final granted in [false, true]) {
@@ -468,36 +631,52 @@ void main() {
 
         expect(tester.takeException(), isNull);
 
-        // 1. The requests are never made — composed, not filtered.
+        // 1. THE REQUESTS ARE NEVER MADE — composed, not filtered. The floor and
+        //    open-bills reads join the money reads here: item 13 leaves a waiter
+        //    ONE read, and it is the one about them.
         for (final route in const [
           'GET /orders/apc',
           'GET /orders/daily-revenue?days=14',
           'GET /analytics/overview?days=30',
           'GET /feedback/summary',
+          'GET /get-tables',
+          'GET /bills/open?limit=1',
+          'GET /table-assignments',
         ]) {
           expect(api.calls, isNot(contains(route)),
               reason: '$route feeds a block this reader may not see');
         }
+        expect(api.calls, contains('GET /me/scorecard'));
 
-        // 2. Nothing money-shaped is on the screen, at all.
-        for (final shown in _screenText(tester)) {
-          expect(shown.contains('₹'), isFalse, reason: 'a rupee figure leaked into "$shown"');
-        }
+        // 2. Nothing restaurant-shaped is on the screen, at all.
         expect(find.text('Revenue this month — all channels'), findsNothing);
         expect(find.text('Average per cover (APC), pre-tax'), findsNothing);
         expect(find.text('Average guest rating'), findsNothing);
+        expect(find.text('Tables occupied right now'), findsNothing);
         expect(find.text('Tables below target'), findsNothing);
+        expect(find.text('Operations'), findsNothing);
+        expect(find.text('OPEN BILLS'), findsNothing);
+        expect(find.textContaining('uncollected'), findsNothing);
         expect(find.textContaining('Plan limits'), findsNothing);
 
-        // 3. And what they DO get is their own floor.
-        expect(find.text('Your section'), findsOneWidget);
-        expect(find.text('Tables occupied right now'), findsOneWidget);
-        expect(find.text('YOUR TABLES'), findsOneWidget);
-        expect(find.text('COVERS SEATED'), findsOneWidget);
+        // 3. And what they DO get is themselves — item 13's four, and nothing
+        //    else that carries a figure.
+        expect(find.text('Your shift'), findsOneWidget);
+        expect(find.text('Your performance score, last 30 days'), findsOneWidget);
+        expect(find.text('YOUR APC'), findsOneWidget);
+        expect(find.text('YOUR GUEST RATING'), findsOneWidget);
+        expect(find.text('YOUR ATTENDANCE'), findsOneWidget);
+        expect(find.text('ON SHIFT NOW'), findsOneWidget);
       });
     }
 
-    testWidgets('the waiter section names their own tables and counts their own covers',
+    // THE ONE RUPEE FIGURE A WAITER KEEPS, and the seam between items 13 and 19.
+    //
+    // Item 19 takes the per-table APC off their screen; item 13 asks for THEIR
+    // APC by name. Those are different numbers: one is what the guests in front
+    // of them owe right now, the other is a month of their own service. Only the
+    // second survives, and only on this screen.
+    testWidgets('their own APC is on the scorecard, and it is the only ₹ on the page',
         (tester) async {
       _wide(tester);
       final api = _FakeApi(_profileJson(role: 'waiter'), _floorRoutes());
@@ -509,42 +688,26 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      // T1 and T3 are Ravi's; T2 is Sunil's and must not be counted.
-      expect(find.text('T1 · T3'), findsOneWidget);
-      expect(find.text('1 of your 2 table(s) occupied'), findsOneWidget);
-      // Only T1 is occupied of theirs, with 4 covers — not the floor's 6.
-      final coversTile = find.ancestor(
-        of: find.text('COVERS SEATED'),
-        matching: find.byType(Column),
-      );
-      expect(find.descendant(of: coversTile.first, matching: find.text('4')), findsOneWidget);
+      final rupees = [for (final t in _screenText(tester)) if (t.contains('₹')) t];
+      expect(rupees, hasLength(1), reason: 'exactly one money figure, and it is theirs: $rupees');
+      expect(rupees.single, contains('612.50'));
 
-      // Their open tickets: o1 + o2 on T1 (o3 is Sunil's table, o4 is paid).
-      expect(find.text('OPEN ON YOUR TABLES'), findsOneWidget);
-      expect(find.text('1 waiting to be accepted'), findsOneWidget);
+      // The rest of the card, read off the payload rather than invented here.
+      // The score is the StatCard's big value, which Gaia and Rustic both paint
+      // as a RichText span — read it off the glyphs, not with a Text finder.
+      expect(_screenText(tester).any((t) => t.startsWith('78')), isTrue,
+          reason: 'the composite score');
+      expect(find.text('4.60 / 5'), findsOneWidget);
+      expect(find.text('92%'), findsOneWidget);
+      expect(find.text('Clocked in'), findsOneWidget);
+      expect(find.textContaining('today: 3h 15m'), findsOneWidget);
     });
 
-    // /table-assignments carries its own action. Without it the block must say
-    // it is reporting the whole floor rather than claim none of it is theirs.
-    testWidgets('no assignment roster degrades to the floor, it does not lie', (tester) async {
-      _wide(tester);
-      final api = _FakeApi(_profileJson(role: 'waiter'), _floorRoutes(withAssignments: false));
-      final auth = await _signIn(api);
-
-      await tester.pumpWidget(_host(
-        m.overviewModule(RestClient(auth), auth.profile!),
-        visible: visibleModuleLabelsFor(_waiter),
-      ));
-      await tester.pumpAndSettle();
-
-      expect(find.text('YOUR TABLES'), findsNothing);
-      expect(find.text('COVERS SEATED'), findsOneWidget);
-      expect(find.textContaining('across the floor'), findsOneWidget);
-      expect(find.text('OPEN TICKETS'), findsOneWidget);
-    });
-
-    testWidgets('the open-bills tile keeps its count for a waiter and drops its price',
-        (tester) async {
+    // The house figures the score was measured against are the restaurant's
+    // money and its restaurant-wide turnaround. The ROUTE strips them; this is
+    // the client half of the same promise — nothing on this screen can print a
+    // benchmark, because the payload has none to print.
+    testWidgets('the score explains itself without ever quoting the house', (tester) async {
       _wide(tester);
       final api = _FakeApi(_profileJson(role: 'waiter'), _floorRoutes());
       final auth = await _signIn(api);
@@ -555,33 +718,50 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.text('OPEN BILLS'), findsOneWidget);
-      expect(find.text('still to settle'), findsOneWidget);
-      expect(find.textContaining('uncollected'), findsNothing);
-    });
-
-    // The occupancy drill-down is a floor sheet, and it used to headline every
-    // row with what that table is worth.
-    testWidgets('the occupancy drill-down shows a waiter covers, not table totals',
-        (tester) async {
-      _wide(tester);
-      final api = _FakeApi(_profileJson(role: 'waiter'), _floorRoutes());
-      final auth = await _signIn(api);
-
-      await tester.pumpWidget(_host(
-        m.overviewModule(RestClient(auth), auth.profile!),
-        visible: visibleModuleLabelsFor(_waiter),
-      ));
+      await tester.tap(find.text('Your performance score, last 30 days'));
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Tables occupied right now'));
-      await tester.pumpAndSettle();
-
-      expect(find.text('Occupied right now'), findsOneWidget);
-      expect(find.text('T1'), findsOneWidget);
-      expect(find.text('4 cover(s)'), findsOneWidget);
+      expect(find.text('78 out of 100'), findsOneWidget);
+      // Every component that built it, including the one with no tile.
+      expect(find.text('Average per cover'), findsOneWidget);
+      expect(find.text('Guest rating'), findsOneWidget);
+      expect(find.text('Attendance'), findsOneWidget);
+      expect(find.text('Table turnaround'), findsOneWidget);
       for (final shown in _screenText(tester)) {
-        expect(shown.contains('₹'), isFalse, reason: 'the sheet priced a table: "$shown"');
+        expect(shown.toLowerCase().contains('house'), isFalse,
+            reason: 'a house benchmark reached the screen: "$shown"');
+      }
+    });
+
+    // The score is the only figure that can be missing wholesale, and a missing
+    // measure is NOT a zero — a waiter with no feedback is not a zero-rated
+    // waiter, and the server says so component by component.
+    testWidgets('an unscoreable waiter is told so, not scored nil', (tester) async {
+      _wide(tester);
+      final api = _FakeApi(_profileJson(role: 'waiter'), <String, dynamic>{
+        '/me/scorecard': {
+          'window_days': 30,
+          'weights': {'apc': 0.35, 'rating': 0.30, 'attendance': 0.20, 'tat': 0.15},
+          'score': null,
+          'components_available': 0,
+          'components': null,
+          'attendance_now': {'clocked_in': false, 'today_minutes': 0},
+        },
+      });
+      final auth = await _signIn(api);
+
+      await tester.pumpWidget(_host(
+        m.overviewModule(RestClient(auth), auth.profile!),
+        visible: visibleModuleLabelsFor(_waiter),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('no measure could be taken yet'), findsOneWidget);
+      expect(find.text('0'), findsNothing, reason: 'unmeasured is not zero');
+      for (final shown in _screenText(tester)) {
+        expect(shown.contains('NaN'), isFalse);
+        expect(shown.toLowerCase().contains('null'), isFalse, reason: 'null leaked into "$shown"');
       }
     });
 
@@ -606,15 +786,17 @@ void main() {
         // would pass on Rustic and quietly skip the design system it is here
         // to cover.
         final painted = _screenText(tester);
-        expect(painted.map((s) => s.toLowerCase()), contains('your section'));
+        expect(painted.map((s) => s.toLowerCase()), contains('your shift'));
         for (final shown in painted) {
-          expect(shown.contains('₹'), isFalse, reason: '${system.name} leaked money: "$shown"');
           expect(shown.contains('NaN'), isFalse);
         }
+        // One rupee figure under BOTH systems, and it is theirs.
+        expect([for (final t in painted) if (t.contains('₹')) t], hasLength(1));
       });
     }
 
-    // A restaurant that has never taken an order still has to render.
+    // A restaurant with no scorecard yet (an older backend, a 500, an outlet the
+    // roster has no row in) still has to render.
     testWidgets("a waiter's Overview survives an empty restaurant", (tester) async {
       _wide(tester);
       final api = _FakeApi(_profileJson(role: 'waiter'), const <String, dynamic>{});
@@ -631,6 +813,7 @@ void main() {
       for (final shown in _screenText(tester)) {
         expect(shown.toLowerCase().contains('null'), isFalse, reason: 'null leaked into "$shown"');
         expect(shown.contains('NaN'), isFalse);
+        expect(shown.contains('₹'), isFalse, reason: 'a rupee figure was invented: "$shown"');
       }
     });
   });

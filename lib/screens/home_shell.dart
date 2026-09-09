@@ -47,12 +47,19 @@ class _NavSection {
 // sidebar sections. `feature` gates a module behind a subscription-plan flag
 // (additive — only hidden when the plan explicitly sets it false).
 //
-// Grouping is presentation only: `_allModules` below flattens these sections
+// Grouping is presentation only: `_allModulesFor` below flattens these sections
 // in order and stays the single source of module order for `visible`,
 // `_index` and `_visibleLabels` — every module appears in exactly one section.
+
+/// The Overview is pulled out as a NAMED const because one role moves it: a
+/// waiter's nav ends with it instead of opening on it (see [_sectionsFor]).
+/// Both lists must hold the SAME instance — `_navEntries` locates a module by
+/// `visible.indexOf`, which is identity for a class with a function field.
+const _overviewEntry = _Module('Overview', Icons.dashboard, [], m.overviewModule);
+
 const _navSections = <_NavSection>[
   _NavSection('OPERATIONS', [
-    _Module('Overview', Icons.dashboard, [], m.overviewModule),
+    _overviewEntry,
     // Sits directly under Overview because it is the same question asked harder:
     // the strip says what needs attention, this says how bad and what to do.
     //
@@ -140,9 +147,39 @@ const _navSections = <_NavSection>[
   ]),
 ];
 
+/// The sidebar groups THIS user is given, in the order they render.
+///
+/// Identical to [_navSections] for everyone except a waiter-only identity, whose
+/// Overview leaves OPERATIONS and becomes a trailing group of its own — item
+/// 13's "Overview must be the LAST section in a waiter's nav".
+///
+/// It has to be done HERE rather than by re-sorting the flat list, because
+/// `_navEntries` renders from the SECTIONS: a module lifted to the end of
+/// `visible` but left inside OPERATIONS would still be drawn first, and the tab
+/// indices (which are positions in the flat list) would then disagree with the
+/// rows the user is looking at. One function feeds both, so they cannot.
+List<_NavSection> _sectionsFor(Profile p) {
+  if (!RoleScope.movesOverviewLast(p)) return _navSections;
+  return <_NavSection>[
+    for (final s in _navSections)
+      if (s.modules.contains(_overviewEntry))
+        _NavSection(s.title, [for (final mod in s.modules) if (mod != _overviewEntry) mod])
+      else
+        s,
+    const _NavSection(RoleScope.trailingSectionTitle, [_overviewEntry]),
+  ];
+}
+
 // The flat list everything else keeps consuming — `visible` filtering, tab
 // indices, `_visibleLabels`, `_openModule` — in section order.
+//
+// The default ordering is still computed ONCE, because `_visibleModulesFor` runs
+// on every build of the shell and every module registered in this file is in it.
+// Only the reordered case allocates, and only for the one role that has it.
 final _allModules = <_Module>[for (final s in _navSections) ...s.modules];
+List<_Module> _allModulesFor(Profile p) => RoleScope.movesOverviewLast(p)
+    ? [for (final s in _sectionsFor(p)) ...s.modules]
+    : _allModules;
 
 /// The modules [p] may open, in registry order — the shell's one visibility
 /// rule, lifted out of `build` so the LANDING TAB can be chosen from the same
@@ -155,7 +192,7 @@ final _allModules = <_Module>[for (final s in _navSections) ...s.modules];
 /// waiter holds an order action, so it was never gated at all.
 ///
 /// Pure in [p]: no context, no state, no ordering side effects.
-List<_Module> _visibleModulesFor(Profile p) => _allModules
+List<_Module> _visibleModulesFor(Profile p) => _allModulesFor(p)
     .where((mod) =>
         (!mod.adminOnly || p.isAdmin) &&
         p.can(mod.keywords) &&
@@ -625,11 +662,11 @@ class _HomeShellState extends State<HomeShell> {
   // permissions / plan features contributes NOTHING — no orphan headers, no
   // stacked dividers. Indices are positions in `visible`, so selection and
   // the active highlight keep addressing the same flat list as before.
-  List<Widget> _navEntries(List<_Module> visible,
+  List<Widget> _navEntries(List<_Module> visible, Profile p,
       {required bool inDrawer, required bool collapsed}) {
     final entries = <Widget>[];
     var firstShown = true;
-    for (final section in _navSections) {
+    for (final section in _sectionsFor(p)) {
       final indices = <int>[];
       for (final mod in section.modules) {
         final i = visible.indexOf(mod);
@@ -699,7 +736,7 @@ class _HomeShellState extends State<HomeShell> {
         Expanded(
           child: ListView(
             padding: EdgeInsets.symmetric(horizontal: collapsed ? 8 : 12),
-            children: _navEntries(visible, inDrawer: inDrawer, collapsed: collapsed),
+            children: _navEntries(visible, p, inDrawer: inDrawer, collapsed: collapsed),
           ),
         ),
       ],

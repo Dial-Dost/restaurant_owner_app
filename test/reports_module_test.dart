@@ -576,10 +576,15 @@ Future<void> _openTab(WidgetTester tester, String title) async {
 /// A shell mount, so the module's PLACEMENT and GATE are pinned where they
 /// actually live (home_shell's registry) and not merely asserted in prose.
 class _ShellApi extends ApiClient {
-  _ShellApi({required this.actions, required this.actionNames, required this.features});
+  _ShellApi({required this.actions, required this.actionNames, required this.features, this.role});
   final List<String> actions;
   final List<String> actionNames;
   final Map<String, dynamic> features;
+
+  /// The signed-in ROLE, when the case under test is about the role rather than
+  /// about the action. Null keeps the old shorthand (wildcard = admin, anything
+  /// else = waiter), which every other case here still uses.
+  final String? role;
 
   @override
   Future<LoginResult> login(String restaurantName, String username, String password, {String? outletId}) async =>
@@ -588,7 +593,7 @@ class _ShellApi extends ApiClient {
         Profile.fromJson(<String, dynamic>{
           'employeeId': 'e1',
           'restaurantName': 'CSR Organics',
-          'role': actions.contains('*') ? 'admin' : 'waiter',
+          'role': role ?? (actions.contains('*') ? 'admin' : 'waiter'),
           'actions_set': actions,
           'action_names': actionNames,
           'features': features,
@@ -606,6 +611,7 @@ Future<void> _pumpShell(
   required List<String> actions,
   required List<String> actionNames,
   Map<String, dynamic> features = const {},
+  String? role,
 }) async {
   await tester.pumpWidget(const SizedBox());
   // Tall on purpose: the nav rail is a lazily-built ListView, so a module that
@@ -616,7 +622,8 @@ Future<void> _pumpShell(
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
   final auth = AuthController(
-      api: _ShellApi(actions: actions, actionNames: actionNames, features: features));
+      api: _ShellApi(
+          actions: actions, actionNames: actionNames, features: features, role: role));
   await auth.login('CSR Organics', 'u', 'p');
   // Printer agent off: it opens a real socket and a keep-alive timer that
   // fake-async cannot own.
@@ -650,12 +657,37 @@ void main() {
 
     // A role granted only the accounting/analytics action the /reports/mis/*
     // routes actually validate — which is NAMED "View Order APC" — sees it too.
-    await _pumpShell(tester, actions: const ['df75119b'], actionNames: const ['View Order APC']);
+    await _pumpShell(
+        tester,
+        actions: const ['df75119b'],
+        actionNames: const ['View Order APC'],
+        role: 'manager');
     expect(find.text('Reports'), findsOneWidget);
 
     // A waiter does not. The gate is the server's, mirrored, not a wider one.
     await _pumpShell(tester, actions: const ['x'], actionNames: const ['Add Orders']);
     expect(find.text('Reports'), findsNothing);
+
+    // AND A WAITER WHOSE TENANT GRANTED THAT ACTION STILL DOES NOT — the one
+    // place this module's gate is deliberately NARROWER than the server's.
+    //
+    // `Roles.actions_performable` is per-tenant JSON, so "waiters cannot see the
+    // restaurant's money" is not a promise the action gate can make: a
+    // restaurant that ticked "View Order APC" for its waiters has genuinely
+    // granted it, and the server will serve every /reports/mis/* route to them.
+    // RoleScope is what answers the other question — what this person is here to
+    // do — and it is the same override the Overview has applied to its money
+    // blocks since 1.8.6. Without it, a floor plan with the rupees taken off it
+    // sits two taps away from a full sales summary in the same nav.
+    await _pumpShell(
+        tester,
+        actions: const ['df75119b'],
+        actionNames: const ['View Orders', 'View Tables', 'View Order APC']);
+    expect(find.text('Reports'), findsNothing,
+        reason: 'a granted action changes what a waiter may READ, not what they ARE');
+    // findsWidgets, not findsOneWidget: Tables is both a nav row and the open
+    // tab's AppBar title, because it is the tab a waiter LANDS on.
+    expect(find.text('Tables'), findsWidgets, reason: 'their own floor is untouched');
 
     // Nor does a tenant whose plan drops accounting — /reports is the prefix
     // that flag governs, so the tile goes with the 403.

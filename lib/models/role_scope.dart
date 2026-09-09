@@ -30,23 +30,62 @@ class RoleScope {
   /// actually happens; the Overview is the owner's screen.
   static const String landingModule = 'Tables';
 
+  /// The module that moves to the END of a waiter's nav (see [movesOverviewLast]).
+  static const String overviewLabel = 'Overview';
+
+  /// The nav group a waiter's Overview is moved into, so it renders as the LAST
+  /// section rather than as an orphan row under OPERATIONS.
+  static const String trailingSectionTitle = 'YOUR SHIFT';
+
   /// Modules a waiter-only identity never sees in the nav, whatever their
   /// tenant's grants say.
   ///
-  /// Three NAMED modules rather than a rule, because each is here for a
-  /// different reason and each was reachable for a different reason:
+  /// Two groups, here for two different reasons.
+  ///
+  /// THE FLOOR MODULES THAT ARE NOT A WAITER'S JOB:
   ///   * MENU is the menu EDITOR — prices, sections, recipes, the destructive
   ///     surface. Its keyword is ['menu'], which any read-the-menu action name
   ///     matches, so the keyword gate never separated reading a menu from
   ///     rewriting one.
-  ///   * WAITLIST's keywords are ['table', 'order', 'waitlist'] and every waiter
-  ///     holds an order action, so that gate excluded nobody. It was too LOOSE,
-  ///     not absent.
+  ///   * KITCHEN is the KDS — the pass's own screen. Its keywords are
+  ///     ['order', 'kitchen', 'kot', 'kds'] and every waiter holds an order
+  ///     action, so that gate excluded nobody.
+  ///   * WAITLIST's keywords are ['table', 'order', 'waitlist'] — same hole,
+  ///     same reason. It was too LOOSE, not absent.
   ///   * BOOKINGS is the reservation book — a host/manager surface, and the one
-  ///     of the three whose own keyword (['booking']) may well already exclude a
-  ///     given waiter. It is named here so the answer does not depend on how one
+  ///     whose own keyword (['booking']) may well already exclude a given
+  ///     waiter. It is named here so the answer does not depend on how one
   ///     tenant spelled its action names.
-  static const Set<String> hiddenModules = {'Menu', 'Waitlist', 'Bookings'};
+  ///
+  /// THE MONEY MODULES, which are here because of the hiding rule rather than
+  /// because of a list of screens. "No money on a waiter's screen" is not a
+  /// promise the table sheet can keep on its own: Analytics, Simulation,
+  /// History, Reports, Concerns, Accounting and Cash register all price the
+  /// restaurant, and every one of them is gated on the SAME keyword list —
+  /// ['analytics', 'apc', 'report'] — that a tenant satisfies the moment it
+  /// ticks "View Order APC" for its waiters. That tenant exists; it is the exact
+  /// case this file was written for. Taking the rupees off the floor plan while
+  /// leaving a month-to-date revenue chart two taps away in the same nav is not
+  /// scoping, it is decoration.
+  ///
+  /// Note what is NOT here. Orders and Tables are the job. Attendance is their
+  /// own shift. Printer carries no keywords and no money and is left alone —
+  /// over-hiding is the failure mode this file's header warns about.
+  static const Set<String> hiddenModules = {
+    // the floor modules
+    'Menu',
+    'Kitchen',
+    'Waitlist',
+    'Bookings',
+    // the money modules
+    'Concerns',
+    'Analytics',
+    'Simulation',
+    'History',
+    'Reports',
+    'Accounting',
+    'Cash register',
+  };
 
   /// True when EVERY role this user holds is 'waiter'.
   ///
@@ -84,6 +123,35 @@ class RoleScope {
   /// it is actually about to render, and falls back when it is not there.
   static String? landingModuleFor(Profile p) =>
       isWaiterOnly(p) ? landingModule : null;
+
+  /// Whether the Overview leaves the OPERATIONS group and becomes the LAST
+  /// section of this user's nav.
+  ///
+  /// It is a MOVE, not a hide: a waiter still has an Overview and it is still
+  /// one tap away — it is a scorecard about them (see [OverviewScope]) and a
+  /// scorecard is what you check at the end of a shift, not the screen you
+  /// stand in front of during one. The shell reorders both the flat module list
+  /// and the sidebar from this, so the nav and the tab indices cannot disagree.
+  static bool movesOverviewLast(Profile p) => isWaiterOnly(p);
+
+  /// Whether this reader may be shown the restaurant's MONEY: what a table is
+  /// running at, what a dish on an open bill costs, what a ticket is worth, the
+  /// per-table APC and every total built out of them.
+  ///
+  /// One predicate for the whole app rather than a flag per screen, because the
+  /// question is the same question everywhere and the answer has to be. A
+  /// waiter's floor plan, their table sheet, their order list, the bill sheet
+  /// reached from a ticket and the order-entry strip all ask this one function.
+  ///
+  /// TWO THINGS IT DELIBERATELY DOES NOT COVER, and both are the job rather than
+  /// the restaurant's money:
+  ///   * the MENU price list in order entry — that is the card in the guest's
+  ///     hands, and a waiter who cannot answer "how much is the paneer tikka"
+  ///     cannot take an order;
+  ///   * the waiter's OWN average per cover on their own scorecard, which item
+  ///     13 asks for by name. That is a figure ABOUT THEM over a month, not the
+  ///     live value of the table they are standing at.
+  static bool showsMoney(Profile p) => !isWaiterOnly(p);
 }
 
 /// What the Overview may put on screen for one signed-in user.
@@ -92,8 +160,7 @@ class RoleScope {
 /// block, so a section this user may not see is never fetched, never rendered,
 /// and never leaves a 403-shaped hole behind. That is the whole point: an empty
 /// card where the money was is not scoping — it is a broken screen that still
-/// tells a waiter there is a revenue figure here, and it is what the Overview
-/// does today for anyone whose tenant did not grant the analytics action.
+/// tells a waiter there is a revenue figure here.
 ///
 /// Each flag is two gates ANDed, answering two different questions:
 ///
@@ -110,6 +177,13 @@ class RoleScope {
 ///     not hypothetical — a restaurant that ticked that box is showing its
 ///     waiters real revenue today — and the permission gate cannot fix it,
 ///     because it is doing exactly what the tenant asked it to do.
+///
+/// A WAITER'S OVERVIEW IS NOW A DIFFERENT PAGE, not a subset of this one. It is
+/// [scorecard]: their APC, their attendance, their guest ratings and the
+/// composite score built from them, and nothing else. The floor read that used
+/// to survive here went with the rest — "how many of the restaurant's tables are
+/// full" is a restaurant-wide figure, and the floor plan itself is one tap away
+/// and is the tab they land on.
 class OverviewScope {
   const OverviewScope({
     required this.money,
@@ -117,7 +191,7 @@ class OverviewScope {
     required this.rating,
     required this.floor,
     required this.billValue,
-    required this.ownSection,
+    required this.scorecard,
     required this.planLimits,
   });
 
@@ -143,21 +217,20 @@ class OverviewScope {
   /// The restaurant-wide guest-rating summary (/feedback/summary).
   final bool rating;
 
-  /// The floor read (/get-tables): occupancy and covers seated. The one block a
-  /// waiter keeps in full, because it is the floor they are working.
+  /// The floor read (/get-tables): occupancy and covers seated across the
+  /// restaurant. Restaurant-wide, so it goes with the rest for a waiter.
   final bool floor;
 
-  /// Whether the open-bills tile may price itself.
-  ///
-  /// Gates the RUPEES only, never the count. How many tables have not settled is
-  /// a waiter's own business and stays on their screen; what those tables are
-  /// worth is the restaurant's money and does not.
+  /// Whether the open-bills tile may price itself. Gates the RUPEES only, never
+  /// the count.
   final bool billValue;
 
-  /// The waiter-shaped blocks — which tables are theirs, and what is still open
-  /// on them. True only for the role those blocks are FOR: nobody else's landing
-  /// screen grows a section it did not have.
-  final bool ownSection;
+  /// The waiter's personal scorecard — their APC, attendance, guest rating and
+  /// the composite performance score, read from `/me/scorecard`.
+  ///
+  /// True only for the role it is FOR: nobody else's landing screen grows a
+  /// section it did not have. It is the whole of a waiter's Overview.
+  final bool scorecard;
 
   /// The tenant's subscription limits on the Account card. A plan is the
   /// restaurant's billing arrangement, not a floor role's business.
@@ -176,10 +249,106 @@ class OverviewScope {
       money: !waiterOnly && analytics,
       insights: !waiterOnly && analytics && p.featureEnabled('analytics'),
       rating: !waiterOnly && p.can(const ['feedback']),
-      floor: p.can(const ['table']),
+      floor: !waiterOnly && p.can(const ['table']),
       billValue: !waiterOnly,
-      ownSection: waiterOnly,
+      scorecard: waiterOnly,
       planLimits: !waiterOnly,
+    );
+  }
+}
+
+/// What a signed-in user may DO on a table, and whether they may see what it is
+/// worth.
+///
+/// The floor plan and its table sheet are one screen carrying fifteen actions,
+/// which is why this is a record of flags rather than a call to
+/// `isWaiterOnly` at each of fifteen call sites: the sheet asks ONE object what
+/// it is allowed to draw, so a control added later has to answer the question
+/// too rather than inheriting "visible" by omission.
+///
+/// EVERY FLAG IS TRUE FOR EVERYONE WHO IS NOT A WAITER-ONLY IDENTITY. This class
+/// takes nothing away from an admin, a manager, a cashier or a captain, and the
+/// permission gates that already stood in front of these actions (comps,
+/// service-charge waiver, refund's admin check) are untouched underneath it.
+class FloorScope {
+  const FloorScope({
+    required this.seat,
+    required this.settle,
+    required this.release,
+    required this.editSeating,
+    required this.deleteTable,
+    required this.addTable,
+    required this.billOps,
+    required this.guestQr,
+    required this.assignWaiter,
+    required this.money,
+  });
+
+  /// "Seat guests & take order" — POST /occupy-table.
+  ///
+  /// A waiter takes orders; the table becomes occupied because an order was
+  /// placed on it, not because somebody pressed a button (item 16). The seating
+  /// itself has NOT gone anywhere — see the notes on the occupancy trigger — it
+  /// stopped being a thing a waiter does by hand.
+  final bool seat;
+
+  /// "Settle bill", and the approve-a-guest-payment card that also closes the
+  /// table. Taking money is a cashier/manager act.
+  final bool settle;
+
+  /// "Release without payment" — POST /release-table. Freeing an occupied table
+  /// with an open bill on it is a write-off, whatever it is called.
+  final bool release;
+
+  /// "Edit seating" — PATCH /table/:name {capacity, max_capacity}. Floor layout,
+  /// not service.
+  final bool editSeating;
+
+  /// "Delete table" — DELETE /table/:name.
+  final bool deleteTable;
+
+  /// The floor plan's "Add table" button — POST /table.
+  ///
+  /// AN INFERENCE FROM ITEM 15, NOT A LINE OF IT, and flagged as one so it can
+  /// be reverted on its own. Item 15 names "edit seating" and "delete table";
+  /// this is the third control in that family, and leaving it while removing the
+  /// other two produces the worst of both — a waiter who can create tables on a
+  /// live floor plan and then cannot remove the one they mistyped. Adding a
+  /// table writes the layout every other screen reads.
+  final bool addTable;
+
+  /// Merge, split, discount, coupon, reprint-without-service-charge and refund:
+  /// every control that changes or re-presents what the guest owes.
+  final bool billOps;
+
+  /// The table's ordering QR block — the code, the URL and "Print QR". It is a
+  /// setup artefact (the printed sheet lives on the table), and taking it out is
+  /// what makes room for the two controls a waiter actually reaches for.
+  final bool guestQr;
+
+  /// The "No waiter assigned / Waiter: X" row with its Assign / Change / Remove
+  /// controls.
+  final bool assignWaiter;
+
+  /// Every rupee figure about this table: the per-dish amounts down the right of
+  /// the open order, the bill card (subtotal, discount, service charge, tax,
+  /// TOTAL PAYABLE), covers/APC/target APC, the APC traffic light and its upsell
+  /// card, and the bill/apc line on the floor tile.
+  final bool money;
+
+  factory FloorScope.of(Profile p) {
+    final waiterOnly = RoleScope.isWaiterOnly(p);
+    return FloorScope(
+      seat: !waiterOnly,
+      settle: !waiterOnly,
+      release: !waiterOnly,
+      editSeating: !waiterOnly,
+      deleteTable: !waiterOnly,
+      addTable: !waiterOnly,
+      billOps: !waiterOnly,
+      guestQr: !waiterOnly,
+      assignWaiter: !waiterOnly,
+      money: RoleScope.showsMoney(p),
     );
   }
 }

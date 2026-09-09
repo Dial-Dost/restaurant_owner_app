@@ -1391,24 +1391,20 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
   // whose answer the user could never be shown.
   final shellNav = ModuleNavigator.of(shell);
   bool can(String label) => shellNav?.canOpen(label) ?? false;
-  // Open bills are settled on the floor plan but priced by the bills
-  // permission, which rides with Orders for most roles.
-  final wantsBills = can('Tables') || can('Orders');
   // WHAT THIS USER'S OVERVIEW IS MADE OF, decided before a single request goes
   // out. See [OverviewScope]: the page is composed from what they may see, not
   // filtered after the fact, so a block they may not see is never fetched and
   // never renders as a 403-shaped empty card.
   final scope = OverviewScope.of(p);
-  // A waiter's own section, when the assignment roster is readable. The roster
-  // keys on the LOGIN USERNAME (GetTableAssignments returns `l.emp_username` in
-  // its `employee_id` field), so an identity that carries no username cannot be
-  // matched and the block is dropped rather than reporting a confident "0 tables
-  // assigned to you" at someone who has four.
-  final ownIdentity = <String>{
-    p.employeeUsername.trim().toLowerCase(),
-    p.employeeId.trim().toLowerCase(),
-  }..removeWhere((s) => s.isEmpty);
-  final wantsOwnSection = scope.ownSection && ownIdentity.isNotEmpty;
+  // Open bills are settled on the floor plan but priced by the bills
+  // permission, which rides with Orders for most roles.
+  //
+  // `!scope.scorecard` is the whole of the difference for a waiter: their
+  // Overview is not this page with blocks removed, it is a different page (their
+  // own scorecard), so not even the count of unsettled tables belongs on it. The
+  // errand itself has not gone anywhere — it is the floor plan, which is the tab
+  // they land on.
+  final wantsBills = !scope.scorecard && (can('Tables') || can('Orders'));
 
   return AsyncView<Map<String, dynamic>>(
       load: () async {
@@ -1453,13 +1449,16 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // `outstanding_total` are computed over EVERY open bill regardless of
           // paging, so one row is all this costs.
           maybe(wantsBills, () => rest.getMap('/bills/open?limit=1')),
-          // The two reads only a waiter's own-section block needs: who is on
-          // which table, and what is still open there. Both are optional —
-          // /table-assignments carries its own action, and a waiter without it
-          // simply gets the floor-wide figures the rest of the block already
-          // shows.
-          maybe(wantsOwnSection, () => rest.getList('/table-assignments')),
-          maybe(scope.ownSection && can('Orders'), () => rest.getList('/orders')),
+          // THE ONE READ A WAITER'S OVERVIEW MAKES. `/me/scorecard` is
+          // session-scoped — it takes no employee id, because the server reads
+          // that off the verified session — and it carries their own APC, guest
+          // rating, attendance and the composite score, with the house
+          // benchmarks those were measured against stripped out server-side.
+          //
+          // It is NOT gated on the analytics action, which is exactly why it
+          // exists: /analytics/staff-performance would answer this question and
+          // would 403 for the only role that asks it.
+          maybe(scope.scorecard, () => rest.getMap('/me/scorecard')),
         ]);
         return {
           // `?? {}` / `?? []` rather than the raw null: every consumer below
@@ -1477,8 +1476,7 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           'bookings': r[7],
           'waitlist': r[8],
           'openBills': r[9],
-          'assignments': r[10],
-          'orders': r[11],
+          'scorecard': r[10],
         };
       },
       builder: (context, data, reload) {
@@ -1978,90 +1976,157 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           ));
         }
 
-        // ---- the waiter's own section --------------------------------------
-        // Built for the role, not filtered for it: these two tiles exist ONLY on
-        // a waiter's Overview, because they are the answer to "what is mine" and
-        // nobody else asks a dashboard that.
+        // ---- the waiter's scorecard ----------------------------------------
+        // ITEM 13, and it is a DIFFERENT PAGE rather than this one with blocks
+        // taken out: their APC, their attendance, their guest ratings, and the
+        // composite score those three (plus turnaround) build. No revenue, no
+        // floor-wide occupancy, no restaurant total anywhere on it.
         //
-        // Both degrade rather than lie. /table-assignments carries its own
-        // action, so a waiter whose tenant did not grant it gets no roster —
-        // and the block then says "across the floor" instead of silently
-        // reporting that none of the twelve tables are theirs.
-        final assignRows = data['assignments'] as List?;
-        final myTables = <String>{
-          if (assignRows != null)
-            for (final a in assignRows)
-              if (a is Map &&
-                  ownIdentity.contains(_s(a, 'employee_id').trim().toLowerCase()))
-                _s(a, 'table_name').trim().toLowerCase(),
-        }..removeWhere((s) => s.isEmpty);
-        final knowsOwnTables = assignRows != null && myTables.isNotEmpty;
+        // One read backs all of it — `/me/scorecard`, which is
+        // `GET /analytics/staff-performance` filtered to the caller's own row
+        // BEFORE it leaves the server, with the house benchmarks it was scored
+        // against stripped out. So this block cannot show a colleague's number
+        // and cannot show the house average, because neither ever arrives.
+        //
+        // Every figure degrades to "—" and says why. A component the server
+        // could not measure is NOT a zero — a waiter with no feedback yet is not
+        // a zero-rated waiter — so the tile prints the server's own note instead
+        // of inventing a number.
+        final scorecardTiles = <Widget>[];
+        final headlineScore = <Widget>[];
+        if (scope.scorecard) {
+          final card = (data['scorecard'] as Map?) ?? const {};
+          final comps = (card['components'] as Map?) ?? const {};
+          final now = (card['attendance_now'] as Map?) ?? const {};
+          final weights = (card['effective_weights'] as Map?) ?? const {};
+          final windowDays = _int(card['window_days']) ?? 30;
+          Map? comp(String k) => comps[k] as Map?;
+          bool has(String k) => (comp(k)?['value']) != null;
+          String noteOf(String k) => _s(comp(k) ?? const {}, 'note', '');
 
-        if (scope.ownSection) {
-          bool mine(Map t) => myTables.contains(_s(t, 'table_name').trim().toLowerCase());
-          final myRows = <Map>[for (final t in tables) if (mine(t as Map)) t];
-          final mineOccupied = myRows.where((t) => t['occupied'] == true).toList();
-          final myCovers = mineOccupied.fold<int>(0, (s, t) => s + (_int(t['covers']) ?? 1));
-          // Collected separately and pushed to the FRONT of the grid below. The
-          // only cross-tab tile that survives a waiter's gates is open bills —
-          // an errand — and an errand should not be the first thing on a screen
-          // whose heading says "Your section".
-          final mineTiles = <Widget>[];
+          final rawScore = card['score'];
+          final hasScore = rawScore != null;
+          final score = _numOf(rawScore);
 
-          if (assignRows != null) {
-            mineTiles.add(_metricTile(context,
-              label: 'your tables',
-              icon: Icons.table_restaurant,
-              value: '${myRows.length}',
-              // Named, not just counted: "3" is a score, "T4 · T7 · T9" is a
-              // round. Truncated at four so the tile keeps one line.
-              sub: myRows.isEmpty
-                  ? 'no tables assigned to you yet'
-                  : [
-                      for (final t in myRows.take(4)) _s(t, 'table_name'),
-                      if (myRows.length > 4) '+${myRows.length - 4}',
-                    ].join(' · '),
-              onTap: jumpTo('Tables'),
-            ));
+          // What the composite was actually built from — the same four
+          // components, each with the share it carried and the server's own
+          // sentence about it. A score nobody can explain is a score nobody
+          // trusts, so turnaround appears HERE even though it is not one of the
+          // four tiles: it is part of the number, so it has to be part of the
+          // explanation.
+          void openScore() {
+            const names = {
+              'apc': 'Average per cover',
+              'rating': 'Guest rating',
+              'attendance': 'Attendance',
+              'tat': 'Table turnaround',
+            };
+            _detailSheet(
+              context,
+              eyebrow: 'Your score · last $windowDays days',
+              title: hasScore ? '${score.toStringAsFixed(0)} out of 100' : 'Not enough to score yet',
+              children: [
+                Text(
+                  'Built only from the measures below that could be taken. A measure with no '
+                  'data is left out of the score, never counted as a zero.',
+                  style: text.bodySmall,
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                for (final k in const ['apc', 'rating', 'attendance', 'tat'])
+                  Builder(builder: (_) {
+                    final c = comp(k) ?? const {};
+                    final available = c['available'] == true && c['score'] != null;
+                    final share = _numOf(weights[k]);
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: AppSpacing.md),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        _detailRow(
+                          context,
+                          names[k]!,
+                          available ? '${_numOf(c['score']).toStringAsFixed(0)} / 100' : 'not measured',
+                          trailing: available && share > 0
+                              ? 'counts for ${(share * 100).toStringAsFixed(0)}%'
+                              : null,
+                        ),
+                        if (_s(c, 'note', '').isNotEmpty)
+                          Text(_s(c, 'note'),
+                              style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+                      ]),
+                    );
+                  }),
+              ],
+            );
           }
-          mineTiles.add(_metricTile(context,
-            label: 'covers seated',
-            icon: Icons.groups,
-            value: '${knowsOwnTables ? myCovers : seatedCovers}',
-            sub: knowsOwnTables
-                ? '${mineOccupied.length} of your ${myRows.length} table(s) occupied'
-                : 'across the floor · $occupied of $totalTables table(s) occupied',
-            onTap: jumpTo('Tables'),
+
+          headlineScore.add(_TappableStat(
+            onTap: openScore,
+            child: StatCard(
+              value: hasScore ? score.toStringAsFixed(0) : '—',
+              unit: hasScore ? '/ 100' : null,
+              caption: 'Your performance score, last $windowDays days',
+              chart: Align(
+                alignment: Alignment.centerLeft,
+                child: DonutGauge(
+                  fraction: hasScore ? (score / 100).clamp(0.0, 1.0) : 0,
+                  size: 46,
+                  tooltip: hasScore
+                      ? 'Built from ${_int(card['components_available']) ?? 0} of 4 measures'
+                      : 'Nothing measurable in this window yet',
+                ),
+              ),
+              footer: Text(
+                hasScore
+                    ? 'from ${_int(card['components_available']) ?? 0} of 4 measures'
+                    : 'no measure could be taken yet',
+                style: micro,
+              ),
+            ),
           ));
 
-          // Their open tickets. `/orders` carries no employee attribution, so
-          // it is scoped by TABLE when the roster answered and left floor-wide
-          // when it did not — the same list the Orders module would show them,
-          // never a subset presented as if it were theirs.
-          final orderRows = data['orders'] as List?;
-          if (orderRows != null) {
-            final live = <Map>[
-              for (final o in orderRows)
-                if (o is Map &&
-                    _orderSection(_s(o, 'status', 'open')) != 2 &&
-                    (!knowsOwnTables || myTables.contains(_s(o, 'table').trim().toLowerCase())))
-                  o,
-            ];
-            final upcoming = live.where((o) => _orderSection(_s(o, 'status', 'open')) == 0).length;
-            mineTiles.add(_metricTile(context,
-              label: knowsOwnTables ? 'open on your tables' : 'open tickets',
-              icon: Icons.receipt_long,
-              accent: upcoming > 0 ? AppColors.warning : AppColors.copperHi,
-              value: '${live.length}',
-              sub: live.isEmpty
-                  ? 'nothing open'
-                  : upcoming > 0
-                      ? '$upcoming waiting to be accepted'
-                      : 'all accepted — none waiting',
-              onTap: jumpTo('Orders'),
-            ));
-          }
-          opsTiles.insertAll(0, mineTiles);
+          // THEIR OWN average per cover. This is the one rupee figure a waiter
+          // keeps, and item 13 asks for it by name: it is a month's average of
+          // their own service, not the live value of the table in front of them
+          // (which item 19 takes away everywhere it appeared).
+          scorecardTiles.add(_metricTile(context,
+            label: 'your apc',
+            icon: Icons.person_outline,
+            value: has('apc') ? _money(comp('apc')!['value']) : '—',
+            sub: has('apc') ? noteOf('apc') : 'no settled bill of yours could be tied to a seating yet',
+            onTap: openScore,
+          ));
+
+          scorecardTiles.add(_metricTile(context,
+            label: 'your guest rating',
+            icon: Icons.star_outline,
+            value: has('rating') ? '${_numOf(comp('rating')!['value']).toStringAsFixed(2)} / 5' : '—',
+            sub: has('rating') ? noteOf('rating') : 'no guest feedback names you yet',
+            onTap: openScore,
+          ));
+
+          scorecardTiles.add(_metricTile(context,
+            label: 'your attendance',
+            icon: Icons.schedule,
+            value: has('attendance')
+                ? '${_numOf(comp('attendance')!['value']).toStringAsFixed(0)}%'
+                : '—',
+            sub: has('attendance') ? noteOf('attendance') : 'no counted shift in this window',
+            onTap: openScore,
+          ));
+
+          // The live half of attendance, which a 30-day average cannot answer:
+          // am I on the clock right now, and for how long today.
+          final clockedIn = now['clocked_in'] == true;
+          final minutes = _int(now['today_minutes']) ?? 0;
+          scorecardTiles.add(_metricTile(context,
+            label: 'on shift now',
+            icon: clockedIn ? Icons.play_circle_outline : Icons.pause_circle_outline,
+            accent: clockedIn ? AppColors.success : AppColors.textSecondary,
+            value: clockedIn ? 'Clocked in' : 'Off',
+            sub: now['pending_approval'] == true
+                ? 'today: ${minutes ~/ 60}h ${minutes % 60}m · clock-in awaiting approval'
+                : 'today: ${minutes ~/ 60}h ${minutes % 60}m',
+            onTap: jumpTo('Attendance'),
+          ));
         }
 
         // ---- the headline cards, composed ----------------------------------
@@ -2071,6 +2136,9 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
         // layout tweak, and an owner (who passes every flag) gets the same four
         // in the same order as before.
         final statCards = <Widget>[
+          // A waiter's headline is their own score and nothing else — the four
+          // cards below are all restaurant figures and all gated off for them.
+          ...headlineScore,
           if (scope.money)
             _TappableStat(
               onTap: openRevenue,
@@ -2181,8 +2249,14 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // For a waiter this same grid holds their own tables, their covers and
           // their open tickets, so the heading says whose section it is: nothing
           // under it is a summary of anywhere else.
+          if (scorecardTiles.isNotEmpty) ...[
+            const SectionHeader(title: 'Your shift'),
+            _dashGrid(scorecardTiles, metricCols),
+            const SizedBox(height: 28),
+          ],
+
           if (opsTiles.isNotEmpty) ...[
-            SectionHeader(title: scope.ownSection ? 'Your section' : 'Operations'),
+            const SectionHeader(title: 'Operations'),
             _dashGrid(opsTiles, metricCols),
             const SizedBox(height: 28),
           ],
@@ -2406,6 +2480,17 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         final rows = (data['orders'] as List?) ?? const [];
         final scope = (data['scope'] as Map?) ?? const {};
         final messenger = ScaffoldMessenger.of(context);
+        // ITEM 19 IN THE ORDER LIST, which is the other half of "an open order":
+        // every ticket here carries what it is worth on the tile, again in the
+        // detail sheet's title, and a third time as a price down the right of
+        // each line. A waiter keeps the ticket — the dishes, the quantities, the
+        // notes, the stage, who took it and how long it has been cooking — and
+        // loses the four rupee figures.
+        final showsMoney = RoleScope.showsMoney(p);
+        // The void form's headline ("Void this order · ₹840"). Empty for a
+        // waiter, which the form already renders as no headline figure at all
+        // rather than as a zero.
+        final voidValue = showsMoney ? (dynamic v) => _money(v) : (dynamic _) => '';
         // A notification asked us to focus one order.
         final focus = _focusOf(context, 'Orders');
         final focusId = focus?.idOf(const ['order_id']);
@@ -2629,7 +2714,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         Text('${_numOf((it as Map)['qty'] ?? it['quantity'] ?? 1).toInt()}\u00d7 ',
                             style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
                         Expanded(child: Text(_s(it, 'name', _s(it, 'item_name')), style: text.bodySmall)),
-                        Text(_money(it['total'] ?? it['price']), style: text.bodySmall),
+                        if (showsMoney) Text(_money(it['total'] ?? it['price']), style: text.bodySmall),
                       ]),
                     ),
                   if (orderType != 'dine_in' && contact.isNotEmpty) ...[
@@ -2661,7 +2746,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         onPressed: () {
                           Navigator.of(c).pop();
                           _changeOrderStatus(c, rest, '${o['id']}', status, reload,
-                              barked: _orderBarked(o), profile: p, value: _money(o['total']));
+                              barked: _orderBarked(o), profile: p, value: voidValue(o['total']));
                         },
                       ),
                     if (unbarked)
@@ -2743,8 +2828,10 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  Text(_money(o['total']), style: text.titleSmall),
+                  if (showsMoney) ...[
+                    const SizedBox(width: 8),
+                    Text(_money(o['total']), style: text.titleSmall),
+                  ],
                 ]),
                 if (stale || focused || orderType != 'dine_in') ...[
                   const SizedBox(height: 8),
@@ -2793,7 +2880,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                           if (_holdsAction(p, _permVoidOrder)) {
                             final voided = await misVoidOrder(c, rest: rest, profile: p,
                                 orderId: '${o['id']}', what: 'this order',
-                                value: _money(o['total']));
+                                value: voidValue(o['total']));
                             if (voided) reload();
                             return;
                           }
@@ -5837,14 +5924,24 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // which, on an outlet nobody has rearranged, is every key, so this map
         // is empty and the floor plan reads exactly as it did on 1.8.5.
         final order = <String, int>{};
-        // Positions ride on the TABLES too, not only on the admin-gated roster,
-        // so a manager or waiter who can see the floor but not the roster still
-        // sees the sections in the order the owner arranged them.
+        // ...and, for every zone the owner has NOT positioned, when it came into
+        // being. That is the order the floor now reads in by default: a
+        // restaurant is built Entrance, then Main Hall, then Terrace, and that
+        // sequence is a real choice the owner already made. Alphabetical was
+        // never one — it was the only total order the schema could express
+        // before there was a column to put a position in.
+        final born = <String, DateTime>{};
+        // Both ride on the TABLES as well as on the admin-gated roster, so a
+        // manager or waiter who can see the floor but not the roster still sees
+        // the sections in the same order the owner does.
         for (final t in tables) {
           final label = _s(t as Map, 'section', '').trim();
+          if (label.isEmpty) continue;
+          final key = label.toLowerCase();
           final pos = _int(t['section_position']);
-          if (label.isEmpty || pos == null) continue;
-          order.putIfAbsent(label.toLowerCase(), () => pos);
+          if (pos != null) order.putIfAbsent(key, () => pos);
+          final at = DateTime.tryParse(_s(t, 'section_created_at', ''));
+          if (at != null) born.putIfAbsent(key, () => at);
         }
         if (_canManageSections(p)) {
           try {
@@ -5855,9 +5952,14 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             // it has no table to carry one.
             for (final s in rows) {
               final label = _s(s, 'section', '').trim();
+              if (label.isEmpty) continue;
+              final key = label.toLowerCase();
               final pos = _int(s['sort_order']);
-              if (label.isEmpty || pos == null) continue;
-              order[label.toLowerCase()] = pos;
+              if (pos != null) order[key] = pos;
+              // The roster is also the only source that knows when an EMPTY
+              // zone was created — it has no table to have been dated by.
+              final at = DateTime.tryParse(_s(s, 'created_at', ''));
+              if (at != null) born[key] = at;
             }
           } catch (e) {
             // Not swallowed into an empty roster: the floor still renders from
@@ -5868,32 +5970,42 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // Only the NAMES and their positions are kept. Table and seat counts are
         // derived from the rows rendered below, so a group header can never
         // disagree with the tiles inside it.
-        return {'tables': tables, 'zones': zones, 'zone_error': zoneError, 'order': order};
+        return {'tables': tables, 'zones': zones, 'zone_error': zoneError, 'order': order, 'born': born};
       },
       builder: (context, data, reload) {
         final rows = (data['tables'] as List?) ?? const [];
         final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
         final zoneError = _s(data, 'zone_error', '');
         final zoneOrder = (data['order'] as Map?)?.cast<String, int>() ?? const <String, int>{};
-        final occ = rows.where((r) => (r as Map)['occupied'] == true).length;
-        final res = rows.where((r) {
-          final m = r as Map;
-          return m['occupied'] != true && (m['reserved'] == true || m['booked'] == true);
-        }).length;
-        final free = rows.length - occ - res;
+        final zoneBorn = (data['born'] as Map?)?.cast<String, DateTime>() ?? const <String, DateTime>{};
+        // Counted off the SAME three-state rule the cards paint with, so the
+        // legend can never disagree with what is on screen.
+        final occ = rows.where((r) => _tableState(r as Map).label == 'Occupied').length;
+        final waiting = rows.where((r) => _tableState(r as Map).label == 'Seated').length;
+        final res = rows.where((r) => _tableState(r as Map).label == 'Reserved').length;
+        final free = rows.length - occ - waiting - res;
         // A caller (an order notification's "Open T4") asked us to focus a table.
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
         final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
         final legend = <Widget>[
           StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
+          // Only when there IS one. A restaurant where every seated table has
+          // ordered should not carry a permanent "0 Seated" chip explaining a
+          // distinction it never sees.
+          if (waiting > 0)
+            StatusChip(label: '$waiting Seated', color: AppColors.warning, dense: true),
           StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
           StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
         ];
         final legendBelow = MediaQuery.sizeOf(context).width < 620;
         return Scaffold(
           backgroundColor: Colors.transparent,
-          floatingActionButton: FloatingActionButton.extended(
+          // See [FloorScope.addTable]: the floor's layout controls travel
+          // together, and a waiter has none of them.
+          floatingActionButton: !FloorScope.of(p).addTable
+              ? null
+              : FloatingActionButton.extended(
             onPressed: () => _addTable(
               context,
               rest,
@@ -5963,6 +6075,7 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                       zones: zones,
                       zoneError: zoneError,
                       zoneOrder: zoneOrder,
+                      zoneBorn: zoneBorn,
                       rest: rest,
                       profile: p,
                       reload: reload,
@@ -6027,6 +6140,16 @@ class _FloorSections extends StatefulWidget {
   /// into the alphabetical tail — so an empty map is 1.8.5's behaviour exactly,
   /// and that is the state of every outlet until somebody rearranges one.
   final Map<String, int> zoneOrder;
+
+  /// When each zone first existed: zone key -> the earliest evidence the server
+  /// has of it (its roster row, or the first table ever put in it — whichever
+  /// is older; see readSectionBirthByKey). This is the tail of the order —
+  /// everything the owner has never dragged sorts by it, oldest first.
+  ///
+  /// A key that is ABSENT has no known birth and falls through to the
+  /// alphabetical tiebreak, so an outlet whose instants could not be read
+  /// renders exactly as 1.8.5 did rather than in some arbitrary order.
+  final Map<String, DateTime> zoneBorn;
   final RestClient rest;
   final Profile profile;
   final VoidCallback reload;
@@ -6036,6 +6159,7 @@ class _FloorSections extends StatefulWidget {
     required this.zones,
     required this.zoneError,
     required this.zoneOrder,
+    required this.zoneBorn,
     required this.rest,
     required this.profile,
     required this.reload,
@@ -6143,6 +6267,93 @@ class _FloorSectionsState extends State<_FloorSections> {
     return out;
   }
 
+  // ---- EDGE AUTO-SCROLL WHILE A TABLE IS BEING DRAGGED ---------------------
+  //
+  // WHY THIS EXISTS, AND WHAT WAS ACTUALLY BROKEN.
+  //
+  // "Long-press and drag does nothing" was reported against a drag that, tested
+  // on its own, works: a card really does pick up and a drop really does write
+  // PATCH /table/:name — under a mouse, under a finger, on Windows and on
+  // Android, with and without the app's own scroll behaviour. What does NOT
+  // work is doing it on a REAL floor plan. Each zone is ~240px tall, so a
+  // restaurant with four sections is already taller than a 1080p window, and
+  // the destination is below the fold. Pick a card up, drag it to the bottom
+  // edge, hold it there — and the page does not move, because a Draggable has
+  // won the gesture arena and the Scrollable is no longer receiving anything.
+  // There is nothing to aim at, so the drop lands on whatever zone happens to
+  // be under the cursor (usually the one you started in, which is refused) or
+  // outside every one of them, which is silently nothing.
+  //
+  // That is the whole bug, and it is invisible in a test with a tall viewport:
+  // the fix is not a different gesture, it is making the destination REACHABLE.
+  // Hold a card within [_edge] of the top or bottom of the scroll viewport and
+  // the floor plan scrolls under it until the zone you want is on screen.
+  //
+  // The Scrollable is found from context rather than passed in, so this keeps
+  // working whoever owns the scroll view — the module builds it today, and a
+  // page that later wraps this widget in its own gets the same behaviour for
+  // free.
+
+  /// How close to the viewport edge a dragged card has to be before the floor
+  /// plan starts moving. One card height, so the trigger zone is big enough to
+  /// hit with a finger and small enough not to fire mid-list.
+  static const double _edge = 96;
+
+  /// Pixels per frame at the very edge, tapering to zero at [_edge] away.
+  static const double _maxSpeed = 18;
+
+  Timer? _edgeScroll;
+  double _edgeSpeed = 0;
+
+  /// Called on every drag update with the pointer in GLOBAL coordinates.
+  void _autoScroll(Offset globalPosition) {
+    final scrollable = Scrollable.maybeOf(context);
+    final box = scrollable?.context.findRenderObject();
+    if (scrollable == null || box is! RenderBox || !box.hasSize) {
+      _stopAutoScroll();
+      return;
+    }
+    final top = box.localToGlobal(Offset.zero).dy;
+    final bottom = top + box.size.height;
+    final y = globalPosition.dy;
+    // Positive = scroll down (reveal what is below), negative = scroll up.
+    var speed = 0.0;
+    if (y > bottom - _edge) {
+      speed = _maxSpeed * ((y - (bottom - _edge)) / _edge).clamp(0.0, 1.0);
+    } else if (y < top + _edge) {
+      speed = -_maxSpeed * (((top + _edge) - y) / _edge).clamp(0.0, 1.0);
+    }
+    _edgeSpeed = speed;
+    if (speed == 0) {
+      _stopAutoScroll();
+      return;
+    }
+    // One ticker for the whole drag; the speed it reads is updated in place, so
+    // moving further into the edge accelerates without restarting anything.
+    _edgeScroll ??= Timer.periodic(const Duration(milliseconds: 16), (_) {
+      final sc = Scrollable.maybeOf(context);
+      if (sc == null || _edgeSpeed == 0) return;
+      final pos = sc.position;
+      final next = (pos.pixels + _edgeSpeed).clamp(pos.minScrollExtent, pos.maxScrollExtent);
+      // jumpTo, not animateTo: the pointer is the animation. An eased scroll
+      // would lag behind the finger and land the drop on the wrong zone.
+      if (next != pos.pixels) pos.jumpTo(next);
+    });
+  }
+
+  void _stopAutoScroll() {
+    _edgeScroll?.cancel();
+    _edgeScroll = null;
+    _edgeSpeed = 0;
+  }
+
+  @override
+  void dispose() {
+    // A timer that outlives the drag would keep scrolling a disposed page.
+    _stopAutoScroll();
+    super.dispose();
+  }
+
   /// Stages an optimistic zone change and hands back exactly what was there
   /// before, so a failed call can put it back (see [_restoreZone]).
   ({bool had, String? value}) _stageZone(String key, String? next) {
@@ -6174,19 +6385,33 @@ class _FloorSectionsState extends State<_FloorSections> {
   }
 
   /// The one order this screen draws sections in, mirroring the server's
-  /// (sort_order IS NULL, sort_order, name): positioned zones first in their
-  /// chosen order, then everything unpositioned.
+  /// comparator exactly (compareTableSections in table_sections_order.ts):
   ///
-  /// The final tiebreak is the KEY rather than the display label because that is
-  /// precisely what `..sort()` over the group keys did before this feature
-  /// existed. An outlet nobody has rearranged has no positions at all, so every
-  /// comparison falls straight through to that line and the floor plan renders
-  /// byte-for-byte as it did on 1.8.5.
+  ///   1. positioned zones first, in the position the owner chose,
+  ///   2. then everything unpositioned in CREATION order, oldest first,
+  ///   3. then, for anything with no known birth instant and for any tie,
+  ///      alphabetically on the key.
+  ///
+  /// Step 2 is what changed. Alphabetical was never a choice anyone made — it
+  /// was the only order the schema could express before there was a column for a
+  /// position — and it is the one ordering in this app that can file a room
+  /// opened this morning above one the restaurant has had for years. Creation
+  /// order is a choice the owner already made, by building the place in that
+  /// sequence.
+  ///
+  /// Step 3 still matters and is not a formality: the server materialises a
+  /// whole outlet's roster rows in ONE insert, so equal instants are the normal
+  /// case the first time anybody rearranges, and without it the list would flap
+  /// between two renders of identical data.
   int _compareZoneKeys(String a, String b) {
     final ap = _positionOf(a);
     final bp = _positionOf(b);
     if ((ap == null) != (bp == null)) return ap == null ? 1 : -1;
     if (ap != null && bp != null && ap != bp) return ap - bp;
+    final ab = widget.zoneBorn[a];
+    final bb = widget.zoneBorn[b];
+    if ((ab == null) != (bb == null)) return ab == null ? 1 : -1;
+    if (ab != null && bb != null && ab != bb) return ab.compareTo(bb);
     return a.compareTo(b);
   }
 
@@ -6408,11 +6633,27 @@ class _FloorSectionsState extends State<_FloorSections> {
       child: Opacity(opacity: 0.9, child: box(focus: false)),
     );
     final placeholder = Opacity(opacity: 0.3, child: box(focus: false));
+    // Both variants get the same edge-scroll wiring: the destination being
+    // below the fold is a property of the floor plan, not of the pointer.
+    void update(DragUpdateDetails d) => _autoScroll(d.globalPosition);
+    void stop() => _stopAutoScroll();
     return touch
         ? LongPressDraggable<Map>(
-            data: m, feedback: feedback, childWhenDragging: placeholder, child: box(focus: focused))
+            data: m,
+            feedback: feedback,
+            childWhenDragging: placeholder,
+            onDragUpdate: update,
+            onDragEnd: (_) => stop(),
+            onDraggableCanceled: (_, _) => stop(),
+            child: box(focus: focused))
         : Draggable<Map>(
-            data: m, feedback: feedback, childWhenDragging: placeholder, child: box(focus: focused));
+            data: m,
+            feedback: feedback,
+            childWhenDragging: placeholder,
+            onDragUpdate: update,
+            onDragEnd: (_) => stop(),
+            onDraggableCanceled: (_, _) => stop(),
+            child: box(focus: focused));
   }
 
   /// One zone. [key] is the lower-cased identity used for grouping and drop
@@ -6502,14 +6743,13 @@ class _FloorSectionsState extends State<_FloorSections> {
               ]),
               const SizedBox(height: AppSpacing.md),
               if (members.isEmpty)
-                Text(
-                  canMove
-                      ? (touch
-                          ? 'Nothing here yet — long-press a table and drag it in.'
-                          : 'Nothing here yet — drag a table in.')
-                      : 'Nothing here yet.',
-                  style: text.bodySmall,
-                )
+                // No gesture instruction. See the header on _autoScroll: telling
+                // someone to long-press and drag was the wrong sentence to put
+                // in front of them, because on a floor plan taller than the
+                // window the drag could not reach anywhere useful. The gesture
+                // still works — and now reaches the whole list — but it is not
+                // what this screen promises.
+                Text('Nothing here yet.', style: text.bodySmall)
               else
                 // Measured, not guessed: the tile sizes itself to the zone it is
                 // actually laid out in, which is what keeps a portrait phone at
@@ -6605,14 +6845,13 @@ class _FloorSectionsState extends State<_FloorSections> {
           padding: const EdgeInsets.only(bottom: 8),
           child: Wrap(spacing: 6, runSpacing: 6, children: actions),
         ),
-      Text(
-        canMove
-            ? (touch
-                ? 'Long-press a table and drag it onto another section to move it.'
-                : 'Drag a table onto another section to move it.')
-            : 'Tables are grouped by their floor section.',
-        style: text.bodySmall,
-      ),
+      // THE MESSAGE THAT WAS REMOVED. It read "Long-press a table and drag it
+      // onto another section to move it", and it was the one instruction on this
+      // screen that could not be followed: any restaurant with more than about
+      // three sections has the destination below the fold, and nothing scrolled
+      // while a card was held. What is left says what the screen IS rather than
+      // what to do to it — every action here is reachable by tapping a table.
+      Text('Tables are grouped by their floor section.', style: text.bodySmall),
       // The roster is half the picture — if it didn't load, say so instead of
       // quietly showing only the zones that happen to have a table in them.
       if (widget.zoneError.isNotEmpty) ...[
@@ -6953,6 +7192,70 @@ class _ReorderSectionsDialogState extends State<_ReorderSectionsDialog> {
   }
 }
 
+// ---- WHAT "OCCUPIED" MEANS ON SCREEN, AND WHAT IT STILL MEANS IN THE DATABASE --
+//
+// THE ASK: a table should only read Occupied once an order has been placed on
+// it. THE HAZARD: "Tables".is_occupied is not a colour. It is the flag the
+// table_session_track trigger watches, and a seating row is what a COVER is
+// counted from, and covers are the denominator of APC — so they are the
+// denominator of the APC traffic-light, the analytics, the MIS reports and the
+// simulator baseline. Delay the flag and you delay the seating, which changes
+// what a cover is, retrospectively and silently.
+//
+// So the flag is untouched and the SCREEN gains the state it was missing:
+//
+//   Free      nobody is sitting there.
+//   Seated    a party is seated — counted, timed, waiter assigned, OTP minted —
+//             and has not ordered yet. This is the state that used to be
+//             painted as Occupied and was the actual complaint.
+//   Occupied  seated AND food is on the bill.
+//
+// Everything money-adjacent on this card still keys on SEATED, never on the
+// display state: the covers chip, the OTP, the bill line, and every action in
+// the sheet. The only things the new state changes are the chip, the tint and
+// the legend.
+
+/// Is a party physically at this table? The seating fact — `is_occupied` —
+/// under whichever name this backend sends it.
+bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
+
+/// Has anything been ordered at this table yet?
+///
+/// A backend that does not send `has_order` at all (anything before 1.8.7)
+/// answers TRUE, so a seated table keeps reading Occupied exactly as it did
+/// rather than every table in the restaurant suddenly claiming nobody has
+/// ordered. Missing data must degrade to the old behaviour, never to a new
+/// claim about the floor.
+bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
+
+/// The three-state floor status. `reserved` covers both an active booking
+/// window and an upcoming one, and never outranks a party who is actually
+/// sitting there.
+({String label, Color color}) _tableState(Map t) {
+  final seated = _tableSeated(t);
+  if (seated && _tableHasOrder(t)) return (label: 'Occupied', color: AppColors.copper);
+  // Amber, not copper: a party sitting with nothing ordered is the one state on
+  // this floor plan that is asking somebody to go over. It is deliberately NOT
+  // the reserved blue either — a reserved table is a promise, this is a guest.
+  if (seated) return (label: 'Seated', color: AppColors.warning);
+  if (t['reserved'] == true || t['booked'] == true) return (label: 'Reserved', color: AppColors.info);
+  return (label: 'Free', color: AppColors.neutral);
+}
+
+/// A one-line description of an order, for a picker that has to let somebody
+/// tell two tickets on the same table apart: how many lines and what it is
+/// worth. Falls back to the id only when the payload carries neither, so a row
+/// is never blank.
+String _kotSummary(Map order) {
+  final food = order['food'];
+  final items = food is Map ? (food['items'] as List?) ?? const [] : const [];
+  final total = food is Map ? (food['total'] ?? food['subtotal']) : null;
+  final n = items.length;
+  final money = total == null ? '' : ' \u00b7 ${_money(total)}';
+  if (n == 0 && money.isEmpty) return 'Order ${_s(order, 'id')}';
+  return '$n item${n == 1 ? '' : 's'}$money';
+}
+
 /// Card width for one floor-plan tile inside a zone [available] px wide.
 ///
 /// 168 is the design width and every desktop column keeps it. A portrait phone
@@ -6995,14 +7298,17 @@ class _TableBox extends StatelessWidget {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final name = _s(table, 'table_name');
-    // Only a physically seated table (is_occupied) is "Occupied". A table inside
-    // an active booking window (`booked`) or with an upcoming booking (`reserved`)
-    // reads "Reserved" — distinct from Occupied — and stays orderable/occupiable.
-    final occupied = table['occupied'] == true;
+    // `occupied` here is the SEATING — a party is physically at this table —
+    // and it is what every money-adjacent line below keys on. What the card
+    // SAYS is a separate decision with three answers; see _tableState.
+    final occupied = _tableSeated(table);
     final reserved = table['reserved'] == true || table['booked'] == true;
-    final status = occupied ? 'Occupied' : (reserved ? 'Reserved' : 'Free');
-    // Design-system table states: Occupied = copper, Reserved = info, Free = neutral.
-    final stateColor = occupied ? AppColors.copper : (reserved ? AppColors.info : AppColors.neutral);
+    final state = _tableState(table);
+    final status = state.label;
+    final stateColor = state.color;
+    // A seated party who has not ordered is tinted like the state they are in,
+    // so the floor reads at a glance without anyone parsing a chip.
+    final awaitingOrder = occupied && !_tableHasOrder(table);
     final apcStatus = _s(table, 'apc_status', 'neutral');
     final covers = table['covers'];
     // Per-table ordering OTP: only meaningful (and only sent) while require_table_otp
@@ -7011,7 +7317,12 @@ class _TableBox extends StatelessWidget {
     final paymentPending = table['payment_pending'] == true;
     final waiter = _s(table, 'waiter_name', '');
     final hasWaiter = waiter.isNotEmpty && waiter != '—';
-    final hasTotal = occupied && (table['table_total'] ?? 0) != 0;
+    // ITEM 19 ON THE FLOOR PLAN. `hasTotal` guards the two money-carrying
+    // affordances on this tile — the "₹1,200 · bill · apc ₹300" line and the APC
+    // traffic-light — so scoping it here takes BOTH off a waiter's grid in one
+    // place, rather than leaving one of them to be found later.
+    final showsMoney = RoleScope.showsMoney(profile);
+    final hasTotal = showsMoney && occupied && (table['table_total'] ?? 0) != 0;
     // Seat guide + the most it can take with extra chairs.
     final seats = _seatsLabel(table);
     // Part of a clubbed booking — the partner tables it is joined to.
@@ -7051,25 +7362,32 @@ class _TableBox extends StatelessWidget {
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           gradient: occupied || reserved ? null : AppColors.cardGradient,
-          color: occupied
-              ? Color.alphaBlend(AppColors.copper.withValues(alpha: 0.07), AppColors.card)
-              : reserved
-                  ? Color.alphaBlend(AppColors.info.withValues(alpha: 0.06), AppColors.card)
-                  : null,
+          color: awaitingOrder
+              ? Color.alphaBlend(AppColors.warning.withValues(alpha: 0.07), AppColors.card)
+              : occupied
+                  ? Color.alphaBlend(AppColors.copper.withValues(alpha: 0.07), AppColors.card)
+                  : reserved
+                      ? Color.alphaBlend(AppColors.info.withValues(alpha: 0.06), AppColors.card)
+                      : null,
           borderRadius: AppRadius.cardAll,
           border: Border.all(
             color: focused
                 ? AppColors.copperHi
-                : occupied
-                    ? AppColors.copper.withValues(alpha: 0.55)
-                    : reserved
-                        ? AppColors.edge(AppColors.info)
-                        : AppColors.border,
+                : awaitingOrder
+                    ? AppColors.edge(AppColors.warning)
+                    : occupied
+                        ? AppColors.copper.withValues(alpha: 0.55)
+                        : reserved
+                            ? AppColors.edge(AppColors.info)
+                            : AppColors.border,
             width: focused ? 2 : 1,
           ),
+          // The copper glow is the "this table is earning" signal, so it belongs
+          // to Occupied alone. A seated table with no order gets the tint and
+          // the border but not the glow.
           boxShadow: focused
               ? [BoxShadow(color: AppColors.copperHi.withValues(alpha: 0.22), blurRadius: 26, spreadRadius: 1)]
-              : occupied
+              : occupied && !awaitingOrder
                   ? [BoxShadow(color: AppColors.copper.withValues(alpha: 0.10), blurRadius: 24)]
                   : null,
         ),
@@ -7174,10 +7492,20 @@ class _TableBox extends StatelessWidget {
             ],
             const SizedBox(height: 10),
             if (paymentPending)
-              Text('Tap to approve payment',
+              // Approving a guest's payment CLOSES the table, so it is a settle
+              // by another name and a waiter no longer has it (item 18). The
+              // tile still says the table is waiting — hiding the state as well
+              // as the control would leave a paid table looking ordinary — it
+              // just stops promising an action this reader cannot take.
+              Text(FloorScope.of(profile).settle ? 'Tap to approve payment' : 'Paid — a manager must approve',
                   style: text.bodySmall!.copyWith(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.warning))
             else if (hasTotal)
               MicroStat(value: _money(table['table_total']), label: 'bill · apc ${_money(table['table_apc'])}')
+            else if (awaitingOrder)
+              // The actionable half of the new state: somebody is sitting there
+              // waiting, and this is the line that says so.
+              Text('Seated — no order yet',
+                  style: text.bodySmall!.copyWith(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.warning))
             else
               Text('Tap to manage', style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
           ],
@@ -7203,6 +7531,11 @@ class _TableSheet extends StatefulWidget {
 class _TableSheetState extends State<_TableSheet> {
   Map? _bill;
 
+  /// What this reader may do on this table, and whether they may see what it is
+  /// worth. ONE object asked at every affordance below — see [FloorScope] for
+  /// why it is a record of flags rather than a role check per control.
+  late final FloorScope _scope = FloorScope.of(widget.profile);
+
   String get _name => _s(widget.table, 'table_name');
   // "4 seats · max 6" — the guide seat count and the most it takes with extra
   // chairs (what the seating suggester sizes parties against).
@@ -7211,11 +7544,16 @@ class _TableSheetState extends State<_TableSheet> {
   List<String> get _clubbedWith => _strList(widget.table['clubbed_with']);
   // The ordering code to read out, or '' when the OTP gate is off.
   String get _otp => _tableOtp(widget.table);
-  // Occupied == physically seated (is_occupied). A `booked` (active window) or
-  // `reserved` (upcoming) table is NOT occupied — it stays orderable, so the
-  // seat/occupy action still shows and the header labels it "Reserved".
-  bool get _occupied => widget.table['occupied'] == true;
-  bool get _reserved => widget.table['reserved'] == true || widget.table['booked'] == true;
+  // Occupied == physically SEATED (is_occupied), and every action below keys on
+  // it: a party who has not ordered yet still needs Add order, Settle, Release
+  // and Edit seating. Only the header CHIP uses the three-state reading (see
+  // _tableState), because only the chip is a description rather than a decision.
+  bool get _occupied => _tableSeated(widget.table);
+  /// The three-state floor status for the header chip — the only place in this
+  /// sheet that describes rather than decides. Every ACTION below reads
+  /// [_occupied], the seating, because a party who has not ordered yet still
+  /// needs Add order, Settle, Release and Edit seating.
+  ({String label, Color color}) get _state => _tableState(widget.table);
   String get _orderUrl {
     final root = '${AppConfig.orderBaseUrl}/order/${widget.profile.restaurantUsername}';
     // Opaque token hides + locks the table in the URL (preferred).
@@ -7531,6 +7869,53 @@ class _TableSheetState extends State<_TableSheet> {
     }
   }
 
+  /// Print the table's bill WITHOUT putting it on screen first.
+  ///
+  /// The two items pull against each other here and this is the seam between
+  /// them: item 17 keeps "Print bill" as one of a waiter's two big controls, and
+  /// item 19 takes every rupee off their screen — but [_previewBill] renders the
+  /// whole receipt, line prices and grand total included, which is the money
+  /// item 19 removes, drawn larger than anywhere else in the app.
+  ///
+  /// So the ACTION survives intact and only the on-screen rehearsal of it goes.
+  /// The paper is unchanged: the same POST /print/bill, the same ESC/POS
+  /// receipt, priced in full for the guest who is about to pay it. A waiter
+  /// still hands over a real bill; they just do not read the restaurant's
+  /// takings off their own screen to do it.
+  ///
+  /// The emptiness check is kept — printing a blank bill wastes a walk to the
+  /// printer — but it reports only WHETHER there are lines, never what they are
+  /// worth.
+  Future<void> _printBillWithoutPreview(ScaffoldMessengerState messenger) async {
+    Map? bill;
+    try {
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) bill = r;
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
+    }
+    final lines = (bill?['items'] as List?) ?? const [];
+    if (lines.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No open bill to print for this table.')));
+      return;
+    }
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Print the bill for $_name?'),
+        content: Text('${lines.length} item(s) on this table. The printed bill goes to the guest.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Print')),
+        ],
+      ),
+    );
+    if (ok == true) await _thermalPrint(messenger);
+  }
+
   Future<void> _removeBillItem(ScaffoldMessengerState messenger, String name, double price) async {
     final ok = await showDialog<bool>(
       context: context,
@@ -7794,6 +8179,212 @@ class _TableSheetState extends State<_TableSheet> {
     }
   }
 
+  /// MOVE THE WHOLE PARTY to another table — items 10/21.
+  ///
+  /// One call, `POST /tables/move`, because a party half-moved is worse than a
+  /// party not moved: their orders on one table and their seating on another
+  /// means the bill splits, the floor lies about who is sitting where, and the
+  /// covers behind APC are counted against a table nobody is at. The server does
+  /// the whole thing in one transaction (MoveTableParty) and this screen never
+  /// issues a partial sequence of its own.
+  ///
+  /// The destination list is FREE tables only. An occupied destination is what
+  /// Merge is for — putting two parties on one bill — and the server refuses it
+  /// by name, but offering it here and then explaining the refusal would be a
+  /// worse way to teach the same thing than not offering it.
+  Future<void> _moveTable(ScaffoldMessengerState messenger) async {
+    List rows = const [];
+    try {
+      rows = await widget.rest.getList('/get-tables');
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not read the floor plan — $e')));
+      return;
+    }
+    final covers = _int(widget.table['covers']) ?? 1;
+    final free = rows.where((t) {
+      final m = t as Map;
+      final n = _s(m, 'table_name');
+      if (n.isEmpty || n == _name) return false;
+      if (_tableSeated(m)) return false;
+      // The server enforces this too (assertCoversFitTable, the same rule
+      // seating uses). Filtering here means the list only ever offers tables the
+      // party actually fits in, rather than teaching capacity through a refusal.
+      final max = _int(m['max_capacity']) ?? _int(m['capacity']) ?? 1;
+      return max >= covers;
+    }).toList();
+    if (free.isEmpty) {
+      messenger.showSnackBar(SnackBar(
+          content: Text('No free table seats $covers right now. Free one up, or raise its max seats.')));
+      return;
+    }
+    if (!mounted) return;
+    final dest = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('Move the party at $_name to…'),
+        children: [
+          for (final t in free)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, _s(t as Map, 'table_name')),
+              child: ListTile(
+                dense: true,
+                leading: const Icon(Icons.table_restaurant),
+                title: Text('Table ${_s(t, 'table_name')}'),
+                subtitle: Text(_seatsLabel(t)),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (dest == null || dest.isEmpty || !mounted) return;
+    // Named consequences, because this moves money as well as people.
+    final ok = await _confirm(
+      context,
+      'Move everything from $_name to $dest?',
+      'The guests, their $covers cover${covers == 1 ? '' : 's'}, every order and the '
+      'running bill move together. $_name becomes free.',
+    );
+    if (!ok) return;
+    try {
+      final res = await widget.rest.post('/tables/move', {'from_table': _name, 'to_table': dest});
+      final moved = res is Map ? (_int(res['moved_orders']) ?? 0) : 0;
+      messenger.showSnackBar(SnackBar(
+          content: Text('Moved $_name to $dest — $moved order${moved == 1 ? '' : 's'} came with them.')));
+      _popAndReload();
+    } catch (e) {
+      // The server refuses rather than half-applying, so the floor is exactly as
+      // it was and the message is the whole story.
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  /// MOVE ONE KOT to the table it should have been rung in on — item 22.
+  ///
+  /// This is the mis-key correction, and it is NOT [_moveTable]: the party at
+  /// this table stays exactly where they are, and only the ticket leaves.
+  ///
+  /// WHAT THE KITCHEN SEES is the half that makes this safe, so the confirm says
+  /// it before anything happens. If the docket has already printed, the pass is
+  /// holding paper for the wrong table — so the server prints a CORRECTION
+  /// carrying the same KOT number, and the snackbar reports which number, so
+  /// whoever pressed the button can go and say it. If it was never printed there
+  /// is nothing on the pass to correct and nothing prints; the ordinary trigger
+  /// will print it at the right table when it fires.
+  Future<void> _moveKot(ScaffoldMessengerState messenger) async {
+    List all = const [];
+    try {
+      all = await widget.rest.getList('/orders');
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not read this table\'s orders — $e')));
+      return;
+    }
+    // This table's LIVE tickets. A settled or cancelled order is not a kitchen
+    // ticket any more and the server refuses to move one.
+    final mine = all.where((o) {
+      final m = o as Map;
+      return _s(m, 'table_name') == _name && _orderSection(_s(m, 'status')) != 2;
+    }).toList();
+    if (mine.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No live order on this table to move.')));
+      return;
+    }
+    if (!mounted) return;
+    // One ticket needs no picker; several do, and each row has to say enough to
+    // tell them apart — what is on it, what it is worth, and whether the kitchen
+    // has already been told.
+    var order = mine.length == 1 ? mine.first as Map : null;
+    order ??= await showDialog<Map>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: Text('Which order on $_name?'),
+          children: [
+            for (final o in mine)
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, o as Map),
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(_orderBarked(o) ? Icons.receipt_long : Icons.hourglass_empty),
+                  title: Text(_kotSummary(o)),
+                  subtitle: Text(_orderBarked(o)
+                      ? 'The kitchen has this one'
+                      : 'Not sent to the kitchen yet'),
+                ),
+              ),
+          ],
+        ),
+      );
+    if (order == null || !mounted) return;
+
+    List rows = const [];
+    try {
+      rows = await widget.rest.getList('/get-tables');
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not read the floor plan — $e')));
+      return;
+    }
+    // ANY other real table, seated or not. Unlike a party move, an occupied
+    // destination is the ordinary case here: the guests this food belongs to are
+    // usually already sitting somewhere with a bill of their own.
+    final others = rows.where((t) {
+      final m = t as Map;
+      final n = _s(m, 'table_name');
+      return n.isNotEmpty && n != _name;
+    }).toList();
+    if (others.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('There is no other table to move it to.')));
+      return;
+    }
+    if (!mounted) return;
+    final dest = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Move this order to…'),
+        children: [
+          for (final t in others)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, _s(t as Map, 'table_name')),
+              child: ListTile(
+                dense: true,
+                leading: Icon(_tableSeated(t) ? Icons.people : Icons.table_restaurant),
+                title: Text('Table ${_s(t, 'table_name')}'),
+                subtitle: Text(_tableSeated(t) ? 'Seated' : 'Free — this will seat it'),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (dest == null || dest.isEmpty || !mounted) return;
+    final barked = _orderBarked(order);
+    final ok = await _confirm(
+      context,
+      'Move this order to $dest?',
+      barked
+          ? 'The kitchen already has a docket for $_name, so a correction docket '
+            'prints for $dest with the same KOT number. $_name keeps its guests '
+            'and its other orders.'
+          : 'The kitchen has not been sent this order yet, so nothing prints now — '
+            'it will print for $dest when it is sent.',
+    );
+    if (!ok) return;
+    try {
+      final res = await widget.rest.post(
+        '/tables/move-order',
+        {'order_id': _s(order, 'id'), 'to_table': dest},
+      );
+      final print = res is Map ? res['print'] : null;
+      final kotNo = print is Map ? print['kot_no'] : null;
+      final printed = print is Map && print['printed'] == true;
+      messenger.showSnackBar(SnackBar(
+        content: Text(printed
+            ? 'Moved to $dest. Correction docket KOT-$kotNo is printing — tell the pass.'
+            : 'Moved to $dest. Nothing was on the pass for it, so no docket printed.'),
+      ));
+      _popAndReload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
   // Refund the most recent settled bill for this table (admin only).
   Future<void> _refundBill(ScaffoldMessengerState messenger) async {
     final reasonCtrl = TextEditingController();
@@ -7882,10 +8473,7 @@ class _TableSheetState extends State<_TableSheet> {
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Row(children: [
               Expanded(child: Text('Table $_name', style: text.headlineMedium)),
-              StatusChip(
-                label: _occupied ? 'Occupied' : (_reserved ? 'Reserved' : 'Free'),
-                color: _occupied ? AppColors.copper : (_reserved ? AppColors.info : AppColors.neutral),
-              ),
+              StatusChip(label: _state.label, color: _state.color),
             ]),
             const SizedBox(height: 10),
             Wrap(spacing: 6, runSpacing: 6, children: [
@@ -7894,6 +8482,13 @@ class _TableSheetState extends State<_TableSheet> {
                 InfoChip(icon: Icons.link, label: 'Clubbed with ${_clubbedWith.join(' + ')}'),
             ]),
             const SizedBox(height: 16),
+            // ITEM 17: THE GUEST QR IS GONE FOR A WAITER, and this is the whole
+            // of why the two controls they came here for can be at the top —
+            // the code, its URL and "Print QR" were 250-odd vertical pixels of
+            // setup artefact sitting between the table's name and its actions.
+            // The printed sheet is already on the table; nobody scans a phone
+            // held by a waiter.
+            if (_scope.guestQr)
             Center(
               child: Column(children: [
                 // Deliberately paper-white: the QR mirrors the printed sheet and
@@ -7946,8 +8541,12 @@ class _TableSheetState extends State<_TableSheet> {
                 ),
               ]),
             ),
-            const SizedBox(height: 20),
-            _waiterRow(messenger),
+            if (_scope.guestQr) const SizedBox(height: 20),
+            // ITEM 14: the "No waiter assigned / Waiter: X" row, with its
+            // Assign / Change / Remove controls. Who covers a table is a
+            // floor-manager decision, and the row's own answer to a waiter was
+            // always either their own name or somebody else's.
+            if (_scope.assignWaiter) _waiterRow(messenger),
             if (_occupied && _bill != null) ...[
               if (items.isNotEmpty) ...[
                 const SizedBox(height: 20),
@@ -7983,8 +8582,14 @@ class _TableSheetState extends State<_TableSheet> {
                               ),
                           ]),
                         ),
-                        const SizedBox(width: 10),
-                        Text(_money(price * qty), style: text.titleSmall),
+                        // ITEM 19: the per-dish amounts down the right of an
+                        // open order. The line itself stays — "2 x Paneer Tikka"
+                        // with its kitchen note is the ticket, and a waiter who
+                        // cannot read the ticket cannot work the table.
+                        if (_scope.money) ...[
+                          const SizedBox(width: 10),
+                          Text(_money(price * qty), style: text.titleSmall),
+                        ],
                         // Any staff can add/edit a kitchen note on an item, anytime.
                         IconButton(
                           icon: Icon(Icons.sticky_note_2_outlined, size: 18,
@@ -8013,6 +8618,20 @@ class _TableSheetState extends State<_TableSheet> {
                 }),
               ],
               const SizedBox(height: 12),
+              // ITEM 19: THE RUNNING BILL AND THE PER-TABLE APC.
+              //
+              // The whole block goes for a waiter, not the total alone. Subtotal,
+              // comps, discount, service charge, tax, TOTAL PAYABLE, covers, APC
+              // and target APC are the same figure said seven ways, and the APC
+              // insight card underneath it ("Below target - push to upsell") is
+              // that figure again as an instruction. Leaving any one of them is
+              // leaving the number.
+              //
+              // COVERS GO WITH IT, and that is deliberate rather than sloppy:
+              // covers only appear here as the divisor beside the APC they
+              // produce, so a lone "4 covers" under a heading called Bill reads
+              // as a fragment of a bill the reader cannot see.
+              if (_scope.money) ...[
               const SectionHeader(title: 'Bill'),
               ForkCard(
                 inset: true,
@@ -8055,15 +8674,25 @@ class _TableSheetState extends State<_TableSheet> {
                 ]),
               ),
               _apcInsight(),
-              // The live service-charge waiver, or the control to take the
-              // charge off. Renders nothing at all on an outlet that charges no
-              // service charge — see misServiceChargeBlock.
+              ],
+              // NOT INSIDE EITHER GATE, AND THAT IS ON PURPOSE.
+              //
+              // The service-charge waiver is a CONTROL, and 1.8.6 shipped it
+              // deliberately visible-but-inert to a waiter: "a waiter needs to
+              // know the control EXISTS so they fetch a manager, instead of
+              // arguing with a guest about a screen that appears to have no such
+              // option". None of items 12-20 asks for that to change, so it does
+              // not. What DOES change is the one part of it that is a figure:
+              // the already-waived card prints what came off the charge and off
+              // the total, so `showsMoney` drops those two lines for a waiter and
+              // leaves the reason, the names and the reverse control standing.
               misServiceChargeBlock(
                 context,
                 rest: widget.rest,
                 profile: widget.profile,
                 bill: _bill!,
                 tableName: _name,
+                showsMoney: _scope.money,
                 onChanged: () async {
                   await _loadBill();
                   widget.reload();
@@ -8071,6 +8700,15 @@ class _TableSheetState extends State<_TableSheet> {
               ),
               const SizedBox(height: 14),
               Wrap(spacing: 8, runSpacing: 8, children: [
+                // ITEM 18: merge, split, discount, coupon and the
+                // reprint-without-service-charge, plus the admin refund that
+                // already sat beside them. Every one of them changes or
+                // re-presents what the guest owes.
+                //
+                // "Print bill" is in this list for the same reason it is NOT in
+                // it for a waiter: item 17 promotes theirs to the top of the
+                // sheet at full size. Nobody loses the action.
+                if (_scope.billOps)
                 ForkButton.ghost(
                   // Preview the receipt first, then print via the server (unified
                   // ESC/POS format → thermal printer agent), matching the web bill.
@@ -8086,17 +8724,24 @@ class _TableSheetState extends State<_TableSheet> {
                 // the control. Never an enabled button that 403s under a guest's
                 // nose, and never an absent one that leaves a waiter arguing
                 // that the screen has no such option.
+                //
+                // IT SURVIVES THE WAITER SCOPING for exactly that reason — it is
+                // the sentence "fetch a manager", not a rupee figure — and
+                // `mis_capture_test` pins it. The only thing scoped here is the
+                // one branch of the label that IS a figure: what has already
+                // been comped off this bill.
                 ForkButton.ghost(
                   key: const ValueKey('table-comps'),
                   label: !_holdsAction(widget.profile, _permNonChargeable)
                       ? 'Comp an item — manager only'
-                      : _bn('nc_total') > 0
+                      : _bn('nc_total') > 0 && _scope.money
                           ? 'Comps · ${_money(_bill!['nc_total'])}'
                           : 'Comp an item',
                   icon: Icons.card_giftcard,
                   dense: true,
                   onPressed: _holdsAction(widget.profile, _permNonChargeable) ? _comps : null,
                 ),
+                if (_scope.billOps) ...[
                 ForkButton.ghost(
                   label: 'Reprint (no service charge)',
                   icon: Icons.money_off,
@@ -8134,13 +8779,62 @@ class _TableSheetState extends State<_TableSheet> {
                     dense: true,
                     onPressed: () => _refundBill(messenger),
                   ),
+                ],
               ]),
               const SizedBox(height: 12),
-              if (_bill!['payment_status'] == 'pending_approval') _paymentReview(messenger),
+              // ITEM 18 AGAIN, WEARING A DIFFERENT HAT. "Approve payment &
+              // close" runs admin-approve-payment AND close — it settles the
+              // bill and frees the table — so it goes where Settle went. It also
+              // prints the amount and the guest's payment screenshot, which item
+              // 19 would take off the screen anyway.
+              if (_scope.settle && _bill!['payment_status'] == 'pending_approval')
+                _paymentReview(messenger),
             ],
             const SizedBox(height: 20),
             const SectionHeader(title: 'Actions'),
-            if (!_occupied)
+
+            // ---- ITEM 17: THE TWO CONTROLS A WAITER CAME HERE FOR ----------
+            //
+            // This is the busiest screen in the app, and for a waiter it now
+            // opens on the two things they do at a table: take the order, and
+            // print the bill. Full width, full size, first — where the QR block
+            // used to be. Everything a waiter has lost from this sheet (the QR,
+            // the assign-waiter row, the bill card, the eight bill controls, the
+            // seat/settle/release/edit/delete row) is what makes room for them.
+            //
+            // ADD ORDER SHOWS WHETHER OR NOT THE TABLE IS OCCUPIED — item 16.
+            // A waiter has no "seat guests" button any more, so placing the
+            // order is how a table starts. POST /orders provisions the seating
+            // server-side; nothing here has to be pressed first.
+            if (!_scope.seat) ...[
+              SizedBox(
+                width: double.infinity,
+                child: ForkButton(
+                  key: const ValueKey('table-add-order'),
+                  label: 'Add order',
+                  icon: Icons.add,
+                  onPressed: _addOrder,
+                ),
+              ),
+              // Nothing to print until something has been ordered — an empty
+              // table has no bill, and a button that answers "No open bill to
+              // print for this table" is a button that wasted a walk.
+              if (_occupied) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: ForkButton.ghost(
+                    key: const ValueKey('table-print-bill'),
+                    label: 'Print bill',
+                    icon: Icons.receipt_long,
+                    onPressed: () => _printBillWithoutPreview(messenger),
+                  ),
+                ),
+              ],
+            ],
+
+            // ---- everyone else: the sheet exactly as it shipped -------------
+            if (_scope.seat && !_occupied)
               // Scaled down rather than clipped: this sheet is now opened from a
               // phone-width floor plan, where a full-size label of this length
               // overflows its own button by ~20px.
@@ -8153,50 +8847,88 @@ class _TableSheetState extends State<_TableSheet> {
                     onPressed: () => _seat(messenger),
                   ),
                 ),
-              )
-            else ...[
+              ),
+            if (_scope.seat && _occupied) ...[
               Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
                 ForkButton.ghost(
                   label: 'Add order',
                   icon: Icons.add,
                   onPressed: _addOrder,
                 ),
-                ForkButton(
-                  label: 'Settle bill',
-                  icon: Icons.payments,
-                  onPressed: () => _settle(messenger),
-                ),
+                if (_scope.settle)
+                  ForkButton(
+                    label: 'Settle bill',
+                    icon: Icons.payments,
+                    onPressed: () => _settle(messenger),
+                  ),
               ]),
+              // THE TWO MOVES — items 10/21 and 22. Side by side because they are
+              // two answers to the same "this is on the wrong table", and
+              // choosing between them IS the decision: Move table takes the
+              // guests and everything of theirs; Move an order takes one ticket
+              // and leaves the guests where they are.
+              //
+              // Gated with Merge and the rest of billOps, and for Merge's exact
+              // reason: both of these carry a running bill from one table to
+              // another, which is a change to what a guest owes and where it is
+              // owed. A waiter who mis-keys a ticket asks the same person they
+              // would ask to split or discount one.
+              if (_scope.billOps) ...[
+                const SizedBox(height: 10),
+                Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
+                  ForkButton.ghost(
+                    label: 'Move table',
+                    icon: Icons.swap_horiz,
+                    onPressed: () => _moveTable(messenger),
+                  ),
+                  ForkButton.ghost(
+                    label: 'Move an order',
+                    icon: Icons.move_down,
+                    onPressed: () => _moveKot(messenger),
+                  ),
+                ]),
+              ],
+              // ITEM 20. Freeing an occupied table without taking the money is a
+              // write-off however it is labelled, and it is one tap with no
+              // confirmation.
+              if (_scope.release) ...[
+                const SizedBox(height: 10),
+                Center(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: ForkButton.ghost(
+                      label: 'Release without payment',
+                      icon: Icons.logout,
+                      onPressed: () => _release(messenger),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+            // ITEM 15: edit seating (PATCH capacity/max_capacity) and delete
+            // table (DELETE /table/:name). Floor layout, not service.
+            if (_scope.editSeating) ...[
               const SizedBox(height: 10),
               Center(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: ForkButton.ghost(
-                    label: 'Release without payment',
-                    icon: Icons.logout,
-                    onPressed: () => _release(messenger),
-                  ),
+                child: ForkButton.ghost(
+                  label: 'Edit seating',
+                  icon: Icons.event_seat_outlined,
+                  dense: true,
+                  onPressed: () => _editSeating(messenger),
                 ),
               ),
             ],
-            const SizedBox(height: 10),
-            Center(
-              child: ForkButton.ghost(
-                label: 'Edit seating',
-                icon: Icons.event_seat_outlined,
-                dense: true,
-                onPressed: () => _editSeating(messenger),
+            if (_scope.deleteTable) ...[
+              const SizedBox(height: 10),
+              Center(
+                child: TextButton.icon(
+                  onPressed: () => _delete(messenger),
+                  icon: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger),
+                  label: const Text('Delete table',
+                      style: TextStyle(color: AppColors.danger, fontSize: 12.5, fontWeight: FontWeight.w600)),
+                ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Center(
-              child: TextButton.icon(
-                onPressed: () => _delete(messenger),
-                icon: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger),
-                label: const Text('Delete table',
-                    style: TextStyle(color: AppColors.danger, fontSize: 12.5, fontWeight: FontWeight.w600)),
-              ),
-            ),
+            ],
           ]),
         ),
       ),
@@ -8263,9 +8995,21 @@ class _TableSheetState extends State<_TableSheet> {
   }
 
   Future<void> _addOrder() async {
+    // ITEM 16. A reader with no seating control opening the pad on a FREE table
+    // is the case "occupancy follows the order" describes: the send occupies it
+    // (and records its covers), so nothing here has to be pressed first. For
+    // everyone else this is false and the flow is the shipped one — they seat,
+    // then order.
+    final occupyOnSend = !_scope.seat && !_occupied;
     Navigator.of(context).pop();
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => OrderEntryScreen(rest: widget.rest, tableName: _name)),
+      MaterialPageRoute(
+        builder: (_) => OrderEntryScreen(
+          rest: widget.rest,
+          tableName: _name,
+          occupyOnSend: occupyOnSend,
+        ),
+      ),
     );
     widget.reload();
   }
@@ -10568,10 +11312,53 @@ Future<void> _reprintKot(
 /// whole running order set — another reason not to stamp it with a series
 /// number that means "the nth ticket this outlet sent to the kitchen today".
 Future<void> _printKot(String table, List items) async {
-  int totalQty = 0;
+  // HELD LINES ARE LIFTED OUT, exactly as escpos.ts lifts them out of the
+  // thermal docket. The whole point of this local copy is that a chef reads the
+  // same shape whichever piece of paper reached them, and the one shape that
+  // matters most is which lines they are allowed to cook: a held course listed
+  // among the rest gets cooked, which is the defeat the hold feature was fixed
+  // to stop. `_itemHeld` is the same predicate the on-screen ticket dims by, so
+  // the card, the docket and this copy cannot disagree.
+  final fire = <Map>[];
+  final held = <Map>[];
   for (final it in items) {
-    totalQty += ((it as Map)['quantity'] as num?)?.round() ?? 1;
+    final m = it as Map;
+    (_itemHeld(m) ? held : fire).add(m);
   }
+  int qtyOf(Iterable<Map> rows) =>
+      rows.fold(0, (sum, m) => sum + ((m['quantity'] as num?)?.round() ?? 1));
+  final totalQty = qtyOf(fire);
+  final holdQty = qtyOf(held);
+  // One line of the item list. `label` is "1" for a line to cook now and "H1"
+  // for one on hold, so the pass can call either out without collision.
+  pw.Widget row(String label, Map m) {
+    final note = (m['note'] ?? '').toString().trim();
+    return pw.Padding(
+      padding: const pw.EdgeInsets.symmetric(vertical: 2),
+      child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+        pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+          pw.SizedBox(width: 28, child: pw.Text(label, style: const pw.TextStyle(fontSize: 14))),
+          pw.Expanded(child: pw.Text('${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14))),
+          pw.SizedBox(
+            width: 34,
+            // "x3", bold — the same treatment the thermal docket gives it, and
+            // for the same reason: a bare digit at the end of a row reads as a
+            // line number as easily as a quantity.
+            child: pw.Text('x${m['quantity'] ?? 1}',
+                style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold),
+                textAlign: pw.TextAlign.right),
+          ),
+        ]),
+        // The one thing on a KOT more important than the dish name.
+        if (note.isNotEmpty)
+          pw.Padding(
+            padding: const pw.EdgeInsets.only(left: 28, top: 1),
+            child: pw.Text('* $note', style: const pw.TextStyle(fontSize: 11)),
+          ),
+      ]),
+    );
+  }
+
   final doc = pw.Document();
   doc.addPage(
     pw.Page(
@@ -10591,31 +11378,24 @@ Future<void> _printKot(String table, List items) async {
           pw.SizedBox(width: 34, child: pw.Text('Qty', style: const pw.TextStyle(fontSize: 9), textAlign: pw.TextAlign.right)),
         ]),
         pw.Divider(),
-        ...items.asMap().entries.map((e) {
-          final m = e.value as Map;
-          final note = (m['note'] ?? '').toString().trim();
-          return pw.Padding(
-            padding: const pw.EdgeInsets.symmetric(vertical: 2),
-            child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-              pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-                pw.SizedBox(width: 28, child: pw.Text('${e.key + 1}', style: const pw.TextStyle(fontSize: 14))),
-                pw.Expanded(child: pw.Text('${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14))),
-                pw.SizedBox(
-                  width: 34,
-                  child: pw.Text('${m['quantity'] ?? 1}', style: const pw.TextStyle(fontSize: 14), textAlign: pw.TextAlign.right),
-                ),
-              ]),
-              // The one thing on a KOT more important than the dish name.
-              if (note.isNotEmpty)
-                pw.Padding(
-                  padding: const pw.EdgeInsets.only(left: 28, top: 1),
-                  child: pw.Text('* $note', style: const pw.TextStyle(fontSize: 11)),
-                ),
-            ]),
-          );
-        }),
-        pw.Divider(),
-        pw.Text('Total Qty: $totalQty', style: const pw.TextStyle(fontSize: 12)),
+        ...fire.asMap().entries.map((e) => row('${e.key + 1}', e.value)),
+        // A wholly held docket has nothing to total, and "Total Qty: 0" above a
+        // full hold block reads as "there is nothing on this ticket".
+        if (fire.isNotEmpty || held.isEmpty) ...[
+          pw.Divider(),
+          pw.Text('Total Qty: $totalQty', style: const pw.TextStyle(fontSize: 12)),
+        ],
+        if (held.isNotEmpty) ...[
+          pw.Divider(),
+          // Loud, because a docket is read at a glance: a line that has to be
+          // READ to be excluded gets cooked by the third ticket of a service.
+          pw.Text('** HOLD **', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+          pw.Text('DO NOT COOK UNTIL FIRED', style: const pw.TextStyle(fontSize: 11)),
+          pw.SizedBox(height: 4),
+          ...held.asMap().entries.map((e) => row('H${e.key + 1}', e.value)),
+          pw.Divider(),
+          pw.Text('Hold Qty: $holdQty', style: const pw.TextStyle(fontSize: 12)),
+        ],
       ]),
     ),
   );

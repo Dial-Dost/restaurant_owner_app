@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../models/profile.dart';
+import '../models/role_scope.dart';
 import '../services/rest_client.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
@@ -20,6 +22,17 @@ import '../ui/widgets/skeleton.dart';
 ///
 /// Read-only by design: editing the bill stays in the Tables module, behind the
 /// table permission.
+///
+/// WHO MAY SEE THE FIGURES. Both widgets here take a [Profile] and ask
+/// [RoleScope.showsMoney]: for a waiter this strip loses the running bill, the
+/// APC, the target APC and the projection, and the sheet loses the line prices
+/// and the totals card. What survives is what the person at the table needs and
+/// is not money — how many orders and items are on it, how many covers, the
+/// kitchen notes, and the server's own upsell lines.
+///
+/// The profile is NULLABLE and null means "show everything". That is the same
+/// direction of failure the rest of the scoping takes: an unknown identity keeps
+/// the screen it has today rather than silently losing half of it.
 String _money(dynamic v) {
   final n = v is num ? v : num.tryParse('${v ?? ''}');
   return n == null ? '—' : '₹${n.toStringAsFixed(2)}';
@@ -67,11 +80,15 @@ class TableApcStrip extends StatelessWidget {
   const TableApcStrip({
     super.key,
     required this.bill,
+    this.profile,
     this.pendingTotal = 0,
     this.onTap,
   });
 
   final Map<String, dynamic> bill;
+
+  /// Whose screen this is. Null = show every figure (see the file header).
+  final Profile? profile;
   final double pendingTotal;
   final VoidCallback? onTap;
 
@@ -87,7 +104,10 @@ class TableApcStrip extends StatelessWidget {
     // Projected APC once the cart in hand is sent. Covers is the divisor the
     // backend uses (counted once per table), so mirror it rather than invent one.
     final projected = covers > 0 ? (running + pendingTotal) / covers : 0.0;
-    final showProjection = pendingTotal > 0 && covers > 0;
+    final money = profile == null || RoleScope.showsMoney(profile!);
+    // The projection is the APC card in motion — "with this cart: ₹1,840 · APC
+    // ₹460 of ₹500" — so it goes wherever the APC goes.
+    final showProjection = money && pendingTotal > 0 && covers > 0;
 
     return ForkCard(
       inset: true,
@@ -107,14 +127,18 @@ class TableApcStrip extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          if (status != 'neutral') TickTag(_apcLabel(status), color: _apcColor(status)),
+          // The traffic light is the APC said in one word, so it is money too.
+          if (money && status != 'neutral') TickTag(_apcLabel(status), color: _apcColor(status)),
         ]),
         const SizedBox(height: 12),
         Wrap(spacing: 22, runSpacing: 10, children: [
-          MicroStat(value: _money(running), label: 'running bill'),
-          MicroStat(value: covers == 0 ? '—' : covers.toStringAsFixed(0), label: 'covers'),
-          MicroStat(value: _money(bill['apc']), label: 'apc'),
-          if (target != 0) MicroStat(value: _money(target), label: 'target apc'),
+          if (money) ...[
+            MicroStat(value: _money(running), label: 'running bill'),
+            MicroStat(value: covers == 0 ? '—' : covers.toStringAsFixed(0), label: 'covers'),
+            MicroStat(value: _money(bill['apc']), label: 'apc'),
+            if (target != 0) MicroStat(value: _money(target), label: 'target apc'),
+          ] else
+            MicroStat(value: '$items', label: items == 1 ? 'item on the table' : 'items on the table'),
         ]),
         if (showProjection) ...[
           const SizedBox(height: 10),
@@ -153,21 +177,23 @@ Future<void> showTableBillSheet(
   BuildContext context, {
   required RestClient rest,
   required String tableName,
+  Profile? profile,
 }) {
   return showModalBottomSheet<void>(
     context: context,
     showDragHandle: true,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
-    builder: (_) => _TableBillSheet(rest: rest, tableName: tableName),
+    builder: (_) => _TableBillSheet(rest: rest, tableName: tableName, profile: profile),
   );
 }
 
 class _TableBillSheet extends StatefulWidget {
-  const _TableBillSheet({required this.rest, required this.tableName});
+  const _TableBillSheet({required this.rest, required this.tableName, this.profile});
 
   final RestClient rest;
   final String tableName;
+  final Profile? profile;
 
   @override
   State<_TableBillSheet> createState() => _TableBillSheetState();
@@ -176,6 +202,14 @@ class _TableBillSheet extends StatefulWidget {
 class _TableBillSheetState extends State<_TableBillSheet> {
   Map<String, dynamic>? _bill;
   bool _loading = true;
+
+  /// Whether this reader may be shown what the table is worth.
+  ///
+  /// NOT called `_money`: that name is already the top-level rupee formatter in
+  /// this file, and a getter of the same name inside the State shadows it — so
+  /// every `_money(x)` in the sheet stops compiling, which is exactly the kind
+  /// of collision a one-word name earns.
+  bool get _showsMoney => widget.profile == null || RoleScope.showsMoney(widget.profile!);
 
   @override
   void initState() {
@@ -226,12 +260,17 @@ class _TableBillSheetState extends State<_TableBillSheet> {
                     ]),
                   ),
                 ] else ...[
-                  TableApcStrip(bill: bill),
+                  TableApcStrip(bill: bill, profile: widget.profile),
                   const SizedBox(height: AppSpacing.xl),
                   const SectionHeader(title: 'On this table'),
                   _items(bill),
-                  const SizedBox(height: AppSpacing.lg),
-                  _totals(bill),
+                  // ITEM 19: the totals card is Subtotal / Discount / Service
+                  // charge / Tax / TOTAL PAYABLE and nothing else, so for a
+                  // waiter there is no half of it worth keeping.
+                  if (_showsMoney) ...[
+                    const SizedBox(height: AppSpacing.lg),
+                    _totals(bill),
+                  ],
                   _suggestions(bill),
                 ],
               ]),
@@ -267,8 +306,12 @@ class _TableBillSheetState extends State<_TableBillSheet> {
                     ),
                 ]),
               ),
-              const SizedBox(width: 10),
-              Text(_money(_num(it['price']) * _num(it['quantity'] ?? 1)), style: text.titleSmall),
+              // ITEM 19: the per-dish amounts down the right. The dish, its
+              // quantity and its kitchen note all stay — that is the ticket.
+              if (_showsMoney) ...[
+                const SizedBox(width: 10),
+                Text(_money(_num(it['price']) * _num(it['quantity'] ?? 1)), style: text.titleSmall),
+              ],
             ]),
           ),
       ]),

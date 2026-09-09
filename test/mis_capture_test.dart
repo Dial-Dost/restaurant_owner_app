@@ -975,7 +975,16 @@ void main() {
       // Neither the ledger nor the tills are readable without the record-payment
       // action. Not asking is the difference between opening in the degraded
       // mode on purpose and opening there because two requests quietly 403'd.
-      final api = await openPayment(tester, actions: const ['x'], role: 'waiter');
+      //
+      // THE ROLE IS 'cashier', NOT 'waiter', AND THE SUBJECT IS UNCHANGED. What
+      // this case is about is a session that lacks the record-payment action —
+      // `actions: ['x']` is what says so, and it says it for any role. A waiter
+      // can no longer reach the payment screen at all (item 18 took Settle off
+      // their table sheet), so leaving the role as 'waiter' would have this test
+      // failing on the way IN and never reaching the degradation it exists to
+      // pin. A cashier without the action is the same session, still able to
+      // open the screen.
+      final api = await openPayment(tester, actions: const ['x'], role: 'cashier');
       expect(find.text('Single payment only'), findsOneWidget);
       expect(find.byKey(const ValueKey('pay-amount')), findsNothing);
       expect(find.byKey(const ValueKey('pay-add-tip')), findsNothing);
