@@ -282,6 +282,8 @@ class FloorScope {
     required this.guestQr,
     required this.assignWaiter,
     required this.money,
+    required this.floorSummary,
+    required this.managerOnlyAsks,
   });
 
   /// "Seat guests & take order" — POST /occupy-table.
@@ -336,6 +338,43 @@ class FloorScope {
   /// card, and the bill/apc line on the floor tile.
   final bool money;
 
+  /// The "Floor plan" header above the table grid — its title, its table count
+  /// and the Occupied / Reserved / Free chips beside it.
+  ///
+  /// IT IS A HOUSE-WIDE SUMMARY ON A SCREEN THAT IS OTHERWISE ABOUT ONE WAITER'S
+  /// TABLES. "23 Free" is a fact about the restaurant, not about the section
+  /// this waiter is working, and it is the first thing on their landing screen —
+  /// Tables is where a waiter opens (see [RoleScope.landingModule]). It also
+  /// reads as a control: it is a header, it carries a count, and it sits exactly
+  /// where the floor-plan editing controls live for everyone else, which is the
+  /// opposite of what item D5 wants a waiter's Tables view to be.
+  ///
+  /// Managers and owners keep it, because for them the same strip is the point
+  /// of the screen: how full is the floor right now.
+  final bool floorSummary;
+
+  /// "Comp an item" and "Waive service charge" — the two controls a waiter may
+  /// not operate but which, until now, they could SEE.
+  ///
+  /// THIS FLAG REVERSES A DELIBERATE DECISION AND THE REVERSAL IS THE CLIENT'S,
+  /// so it is recorded here rather than argued in the code it removes. 1.8.6
+  /// shipped both visible-but-inert on purpose: a waiter needs to know the
+  /// control EXISTS so they fetch a manager, instead of arguing with a guest
+  /// about a screen that appears to have no such option. The comp button even
+  /// said "manager only" in its own label, because a dimmed control in a wrap of
+  /// eight cannot carry a sentence beside it.
+  ///
+  /// The V3 requirements ask for the opposite in as many words — "completely
+  /// hidden", "including its accompanying text" — so both go. What is traded
+  /// away is the discoverability: a waiter who does not already know a comp is
+  /// possible now has nothing on screen to tell them. If that turns out to cost
+  /// more at the pass than the clutter did, this one flag is the thing to flip.
+  ///
+  /// Gated on the ROLE, not on the permission, and that is the point: a tenant
+  /// that has granted its waiters the non-chargeable UUID would otherwise get an
+  /// ENABLED comp button, which the requirement forbids regardless of grant.
+  final bool managerOnlyAsks;
+
   factory FloorScope.of(Profile p) {
     final waiterOnly = RoleScope.isWaiterOnly(p);
     return FloorScope(
@@ -349,6 +388,8 @@ class FloorScope {
       guestQr: !waiterOnly,
       assignWaiter: !waiterOnly,
       money: RoleScope.showsMoney(p),
+      floorSummary: !waiterOnly,
+      managerOnlyAsks: !waiterOnly,
     );
   }
 }

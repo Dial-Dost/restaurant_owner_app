@@ -394,7 +394,7 @@ void main() {
     // a waiter, so they fetch a manager instead of arguing with a guest about a
     // screen that appears to have no such option. None of items 12-20 asks for
     // that to change — only for the FIGURE on it to go.
-    testWidgets('the waiver control stays; only its amounts go', (tester) async {
+    testWidgets('the whole waiver block goes, amounts and all', (tester) async {
       final waived = _bill()
         ..['service_charge'] = 0.0
         ..['service_charge_waived'] = true
@@ -407,16 +407,29 @@ void main() {
           'waived_by_username': 'asha',
           'authorised_by_username': 'manager01',
         };
+      // ITEM 19 SCOPED THE FIGURES; V3 REMOVED THE BLOCK. Item 19 left this
+      // card standing for a waiter and dropped only the two rupee lines inside
+      // it, so the reason and the reverse control survived. The V3 requirements
+      // ask for the control and its accompanying text to be completely hidden
+      // from a waiter, which takes the card with them — so a waiter now sees no
+      // waiver surface at all, not even the reason a charge is already off.
       await _mountFloor(tester, role: 'waiter', bill: waived);
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
 
+      expect(find.byKey(const ValueKey('sc-waiver-reverse')), findsNothing);
+      expect(find.textContaining('Long wait for the mains'), findsNothing);
+      expect(find.textContaining('charge off'), findsNothing);
+      expect(find.byKey(const ValueKey('table-comps')), findsNothing);
+
+      // AN OWNER LOSES NOTHING — the promise this whole file runs on. Same bill,
+      // same screen: the card, its reason and both figures are all still there.
+      await _mountFloor(tester, role: 'admin', bill: waived);
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
       expect(find.byKey(const ValueKey('sc-waiver-reverse')), findsOneWidget);
       expect(find.textContaining('Long wait for the mains'), findsOneWidget);
-      expect(find.textContaining('charge off'), findsNothing);
-      // And the comp control, for the same reason, still says why it is inert.
-      await _reveal(tester, find.byKey(const ValueKey('table-comps')));
-      expect(find.text('Comp an item — manager only'), findsOneWidget);
+      expect(find.textContaining('charge off'), findsOneWidget);
     });
   });
 
@@ -658,6 +671,7 @@ void main() {
       expect([
         s.seat, s.settle, s.release, s.editSeating, s.deleteTable,
         s.billOps, s.guestQr, s.assignWaiter, s.addTable, s.money,
+        s.floorSummary,
       ], everyElement(isFalse));
     });
 
@@ -675,6 +689,7 @@ void main() {
         expect([
           s.seat, s.settle, s.release, s.editSeating, s.deleteTable,
           s.billOps, s.guestQr, s.assignWaiter, s.addTable, s.money,
+          s.floorSummary,
         ], everyElement(isTrue), reason: '$role lost something it had');
       }
     });
@@ -689,6 +704,53 @@ void main() {
         });
         expect(FloorScope.of(p).settle, isTrue, reason: 'waiter + $other works the till');
       }
+    });
+  });
+
+  // ======================================================== the floor summary
+
+  // THE "FLOOR PLAN" STRIP AT THE TOP OF TABLES.
+  //
+  // "27 tables · 4 Occupied · 0 Reserved · 23 Free" is a fact about the
+  // RESTAURANT, sitting at the top of the screen a waiter lands on, above a grid
+  // that is otherwise about their own tables. It also reads as a control: a
+  // header, with a count, in exactly the place the floor-layout controls live
+  // for everyone else.
+  //
+  // Asserted on the PAINTED GLYPHS rather than on the widget, so it cannot pass
+  // by the header being present-but-empty, and run for an owner too — the
+  // failure this pins against is not "a waiter saw a chip", it is "the fix took
+  // the floor read-out away from the person who runs the floor".
+  group('the floor-plan summary strip', () {
+    // The SUMMARY chips are count-prefixed — '4 Occupied', '23 Free' — while an
+    // individual table tile carries a bare 'Occupied'. Matching the count is
+    // what separates "the house read-out is gone" from "the waiter can no longer
+    // tell whether their own table is taken", which would be a far worse bug
+    // than the one being fixed.
+    final summaryChip = RegExp(r'\d+\s+(Occupied|Reserved|Free)');
+
+    testWidgets('a waiter does not get it', (tester) async {
+      await _mountFloor(tester, role: 'waiter');
+      final painted = _painted(tester).join(' | ');
+      expect(painted, isNot(contains('Floor plan')));
+      expect(summaryChip.hasMatch(painted), isFalse,
+          reason: 'a house-wide occupancy count reached a waiter: $painted');
+    });
+
+    testWidgets('an owner keeps it, unchanged', (tester) async {
+      await _mountFloor(tester, role: 'admin');
+      final painted = _painted(tester).join(' | ');
+      expect(painted, contains('Floor plan'));
+      expect(summaryChip.hasMatch(painted), isTrue,
+          reason: 'the floor read-out went missing for the person who runs the floor');
+    });
+
+    testWidgets('and the tables themselves are still there for the waiter',
+        (tester) async {
+      // The strip goes; the screen does not. A waiter still lands on Tables and
+      // still sees the floor they are working.
+      await _mountFloor(tester, role: 'waiter');
+      expect(find.text('T1'), findsWidgets);
     });
   });
 }

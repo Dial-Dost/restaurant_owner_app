@@ -329,24 +329,30 @@ void main() {
   // ==========================================================================
 
   group('034 · comp a dish', () {
-    testWidgets('a manager is offered it on the table; a waiter sees it disabled, not missing',
+    testWidgets('a manager is offered it; a waiter does not see it at all',
         (tester) async {
       await _mount(tester, m.tablesModule, _tableRoutes());
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('table-comps')));
       expect(_pressOf(tester, const ValueKey('table-comps')), isNotNull);
 
-      // A waiter: the control STAYS ON THE SCREEN and is inert. Hiding it would
-      // leave them arguing with a guest about a screen with no such option;
-      // enabling it would 403 under the guest's nose.
+      // THIS REVERSED IN V3 AND THE REVERSAL IS THE CLIENT'S. Until then a
+      // waiter saw the control dimmed, labelled "manager only", on the argument
+      // that they need to know a comp EXISTS so they fetch a manager rather than
+      // arguing with a guest about a screen with no such option. The V3
+      // requirements say "completely hidden", so it is gone — and the thing
+      // traded away is exactly that discoverability. See
+      // FloorScope.managerOnlyAsks, which is the single flag to flip if the pass
+      // finds it costs more than the clutter did.
       await _mount(tester, m.tablesModule, _tableRoutes(),
           actions: const ['x'], role: 'waiter');
       await _openTable(tester);
-      await _reveal(tester, find.byKey(const ValueKey('table-comps')));
-      expect(_pressOf(tester, const ValueKey('table-comps')), isNull);
-      // …and it SAYS why in its own label, because the button sits in a wrap of
-      // eight where a sentence beside it would read as belonging to the row.
-      expect(find.text('Comp an item — manager only'), findsOneWidget);
+      // No _reveal: that helper scrolls UNTIL VISIBLE and throws when the target
+      // does not exist, which is precisely what is being asserted here. The
+      // sheet is fully built by _openTable, so an absent control is absent from
+      // the tree whether or not anything scrolls.
+      expect(find.byKey(const ValueKey('table-comps')), findsNothing);
+      expect(find.textContaining('Comp an item'), findsNothing);
     });
 
     testWidgets('a disabled control LOOKS disabled — no click cursor, no hover lift',
@@ -354,8 +360,13 @@ void main() {
       // The dead-looking control is a known bug class here, and every gated
       // affordance in the product rides on this one widget: before this, a null
       // onPressed rendered identically to a live button.
+      //
+      // DRIVEN WITH A CASHIER, NOT A WAITER, since V3 removed the control from a
+      // waiter entirely — there would be no disabled button left to inspect. The
+      // property under test is about the WIDGET and not about waiters: somebody
+      // who may see a control but not operate it must be able to tell.
       await _mount(tester, m.tablesModule, _tableRoutes(),
-          actions: const ['x'], role: 'waiter');
+          actions: const ['x'], role: 'cashier');
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('table-comps')));
 
@@ -643,9 +654,23 @@ void main() {
       expect(body['authorised_by'], 'manager01');
     });
 
-    testWidgets('a waiter sees it inert, with the reason beside it', (tester) async {
+    testWidgets('a waiter sees neither the control nor its explanation', (tester) async {
+      // V3: "completely hidden ... including its accompanying text". 1.8.6
+      // shipped the opposite deliberately — inert, with the reason beside it —
+      // and the sentence went with the control when the client asked for both.
       await _mount(tester, m.tablesModule, _tableRoutes(),
           actions: const ['x'], role: 'waiter');
+      await _openTable(tester);
+      // See the note on the comp case: _reveal throws on a missing target.
+      expect(find.byKey(const ValueKey('sc-waiver-apply')), findsNothing);
+      expect(find.textContaining('Only a manager can waive a service charge'), findsNothing);
+    });
+
+    testWidgets('a cashier still sees it inert, with the reason beside it', (tester) async {
+      // The visible-but-inert treatment survives for everyone who is not a
+      // waiter, which is what keeps "fetch a manager" discoverable at the till.
+      await _mount(tester, m.tablesModule, _tableRoutes(),
+          actions: const ['x'], role: 'cashier');
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('sc-waiver-apply')));
       expect(_pressOf(tester, const ValueKey('sc-waiver-apply')), isNull);

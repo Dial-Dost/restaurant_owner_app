@@ -603,21 +603,42 @@ class PrinterService extends ChangeNotifier {
 
     if (jobId != null) {
       await _ensureSettledLoaded();
-      final previous = _settled[jobId];
-      if (previous != null) {
-        // ALREADY DEALT WITH HERE. The server only re-sends what it has no ack
-        // for, so arriving here means our ack never landed — not that the job
-        // needs printing. Print it again and the customer gets a second copy of
-        // a bill they have already been handed.
-        _log('Skipped $billId — job already $previous on this till');
-        unawaited(_ack(jobId, previous));
-        return;
-      }
+      // STILL IN THE QUEUE IS CHECKED FIRST, AND THE ORDER IS THE WHOLE POINT.
+      //
+      // These two sets OVERLAP, which is not obvious and is what the original
+      // order got wrong. `_remember(jobId, 'printed')` is written just before
+      // the FIRST `_send` (see the block at the send site and its reasoning), so
+      // from that moment until the job leaves the queue it is in `_settled` AND
+      // in `_queue` at the same time — for as long as the retries run, which for
+      // a network target is around a minute.
+      //
+      // Re-delivered inside that window — a socket flap, a replay crossing a
+      // live emit — the settled test would fire first and ack 'printed' for
+      // paper that has not come out. First-ack-wins makes that PERMANENT: the
+      // truthful 'failed' that the retries eventually produce is discarded as a
+      // duplicate, and the job is never re-offered to anybody.
+      //
+      // This does not contradict the optimism at the `_remember` site. That
+      // optimism is about PROCESS DEATH, where the outcome is unknowable and
+      // guessing "printed" risks only a reprint. A live retry is a different
+      // state: the outcome is knowable, just not yet known, and the queue that
+      // owns it will ack the truth in a moment. Nothing is lost by waiting —
+      // and nothing prints twice, because we return without queueing.
       if (_queue.any((j) => j.jobId == jobId)) {
         // In flight: a live emit and a replay of the same job crossing, or two
         // deliveries on a flapping socket. It has not printed yet, so there is
         // nothing to re-confirm — just don't queue it twice.
         _log('Skipped $billId — job already queued');
+        return;
+      }
+      final previous = _settled[jobId];
+      if (previous != null) {
+        // ALREADY DEALT WITH HERE, and no longer in flight. The server only
+        // re-sends what it has no ack for, so arriving here means our ack never
+        // landed — not that the job needs printing. Print it again and the
+        // customer gets a second copy of a bill they have already been handed.
+        _log('Skipped $billId — job already $previous on this till');
+        unawaited(_ack(jobId, previous));
         return;
       }
     }

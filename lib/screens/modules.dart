@@ -6057,17 +6057,23 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                     // never colour alone. On a phone it moves to its own line:
                     // three chips do not fit beside the title, and in the header
                     // row they overflowed it by ~215px.
-                    SectionHeader(
-                      title: 'Floor plan',
-                      count: rows.length,
-                      padding: EdgeInsets.only(bottom: legendBelow ? 8 : 14),
-                      trailing: legendBelow ? null : Wrap(spacing: 6, runSpacing: 6, children: legend),
-                    ),
-                    if (legendBelow)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
-                        child: Wrap(spacing: 6, runSpacing: 6, children: legend),
+                    // NOT FOR A WAITER — see [FloorScope.floorSummary]. "23 Free"
+                    // is a fact about the restaurant on a screen that is
+                    // otherwise about this waiter's own tables, and it is the
+                    // first thing they see, because Tables is where they land.
+                    if (FloorScope.of(p).floorSummary) ...[
+                      SectionHeader(
+                        title: 'Floor plan',
+                        count: rows.length,
+                        padding: EdgeInsets.only(bottom: legendBelow ? 8 : 14),
+                        trailing: legendBelow ? null : Wrap(spacing: 6, runSpacing: 6, children: legend),
                       ),
+                      if (legendBelow)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Wrap(spacing: 6, runSpacing: 6, children: legend),
+                        ),
+                    ],
                     // Floor SECTIONS — create / rename / un-label, and drag a
                     // table from one zone to another. See [_FloorSections].
                     _FloorSections(
@@ -8677,15 +8683,19 @@ class _TableSheetState extends State<_TableSheet> {
               ],
               // NOT INSIDE EITHER GATE, AND THAT IS ON PURPOSE.
               //
-              // The service-charge waiver is a CONTROL, and 1.8.6 shipped it
-              // deliberately visible-but-inert to a waiter: "a waiter needs to
-              // know the control EXISTS so they fetch a manager, instead of
-              // arguing with a guest about a screen that appears to have no such
-              // option". None of items 12-20 asks for that to change, so it does
-              // not. What DOES change is the one part of it that is a figure:
-              // the already-waived card prints what came off the charge and off
-              // the total, so `showsMoney` drops those two lines for a waiter and
-              // leaves the reason, the names and the reverse control standing.
+              // GONE FOR A WAITER — see [FloorScope.managerOnlyAsks], which also
+              // records what that costs. 1.8.6 shipped this visible-but-inert on
+              // purpose so a waiter would fetch a manager rather than argue with
+              // a guest about a screen with no such option; the V3 requirements
+              // ask for it to be completely hidden, accompanying text included,
+              // and that is the client's call to make.
+              //
+              // For everyone else it is unchanged, including the money scoping
+              // inside it: the already-waived card prints what came off the
+              // charge and off the total, and `showsMoney` still drops those two
+              // lines while leaving the reason, the names and the reverse
+              // control standing.
+              if (_scope.managerOnlyAsks)
               misServiceChargeBlock(
                 context,
                 rest: widget.rest,
@@ -8717,19 +8727,23 @@ class _TableSheetState extends State<_TableSheet> {
                   dense: true,
                   onPressed: () => _previewBill(messenger),
                 ),
-                // Comping is a MANAGER act (migration 034's own permission). A
-                // waiter sees it dimmed AND SAYING SO IN ITS OWN LABEL — this
-                // button sits in a wrap of eight, where a separate sentence
-                // beside it would read as belonging to the row rather than to
-                // the control. Never an enabled button that 403s under a guest's
-                // nose, and never an absent one that leaves a waiter arguing
-                // that the screen has no such option.
+                // Comping is a MANAGER act (migration 034's own permission), and
+                // for a manager this is unchanged: dimmed and SAYING SO IN ITS
+                // OWN LABEL when they lack the permission, because this button
+                // sits in a wrap of eight where a separate sentence beside it
+                // would read as belonging to the row rather than to the control.
+                // Never an enabled button that 403s under a guest's nose.
                 //
-                // IT SURVIVES THE WAITER SCOPING for exactly that reason — it is
-                // the sentence "fetch a manager", not a rupee figure — and
-                // `mis_capture_test` pins it. The only thing scoped here is the
-                // one branch of the label that IS a figure: what has already
-                // been comped off this bill.
+                // A WAITER NO LONGER SEES IT AT ALL — see
+                // [FloorScope.managerOnlyAsks] for what that reverses and what
+                // it costs. Note the gate is the ROLE and not the permission: a
+                // tenant that granted its waiters the non-chargeable UUID would
+                // otherwise get an ENABLED comp button, which is the one outcome
+                // the requirement rules out however the grants are configured.
+                //
+                // The only thing scoped inside the label is the branch that IS a
+                // figure: what has already been comped off this bill.
+                if (_scope.managerOnlyAsks)
                 ForkButton.ghost(
                   key: const ValueKey('table-comps'),
                   label: !_holdsAction(widget.profile, _permNonChargeable)
@@ -9214,21 +9228,31 @@ class _BillPreviewDialog extends StatelessWidget {
                               textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: inkFaint))),
                     _paperRule,
                     // Item lines: "name ×qty" on the left, line amount on the right.
+                    // THE KITCHEN NOTE IS NOT DRAWN HERE, and this dialog is the
+                    // reason the rule needs restating on the client at all.
+                    //
+                    // The thermal renderer stopped printing it on the bill in
+                    // 1.9.0 (escpos.ts, the block in its bill item loop): a note
+                    // is an instruction to the chef — "no salt", "allergy:
+                    // peanuts" — and on a guest's copy it is at best noise on a
+                    // tax document and at worst a medical detail handed across a
+                    // table. This sheet is the LAST THING SOMEONE SEES BEFORE
+                    // TAPPING PRINT, is styled as paper on purpose, and is
+                    // routinely turned toward the guest to confirm the total. It
+                    // showing a line the slip does not is the same disclosure
+                    // through a different surface, plus a preview that lies
+                    // about what is about to come out.
+                    //
+                    // The note is NOT lost: it still prints on the kitchen
+                    // docket, and the waiter's running-bill sheet
+                    // (widgets/table_bill.dart) still shows it, because there
+                    // the reader is staff and the allergy is the point.
                     ...items.map((it) {
                       final m = it as Map;
                       final qty = _n(m['quantity'] ?? 1);
                       final price = _n(m['price']);
                       final name = _s(m, 'name');
-                      final note = _s(m, 'note', '');
-                      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        _row('$name  ×${qty % 1 == 0 ? qty.toInt() : qty}', _money(_round2(price * qty))),
-                        if (note.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(left: 8, bottom: 2),
-                            child: Text(note,
-                                style: const TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: inkFaint)),
-                          ),
-                      ]);
+                      return _row('$name  ×${qty % 1 == 0 ? qty.toInt() : qty}', _money(_round2(price * qty)));
                     }),
                     _paperRule,
                     _row('Subtotal', _money(subtotal)),

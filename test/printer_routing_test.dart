@@ -637,4 +637,77 @@ void main() {
           'The device at 192.168.1.50 answered but refused port 9100.');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // 7. THE TWO DEDUP SETS OVERLAP.
+  //
+  //    `_settled` and the live queue are not disjoint, which is easy to miss
+  //    and was: `_remember(jobId, 'printed')` is written just BEFORE the first
+  //    send, so from that instant until the job leaves the queue it is in both.
+  //    For a network target that window is about a minute of retries.
+  //
+  //    Re-delivered inside it — a socket flap, a replay crossing a live emit —
+  //    a settled-first check acks 'printed' for paper that has not come out, and
+  //    first-ack-wins makes that permanent: the truthful 'failed' the retries
+  //    produce is discarded as a duplicate and the job is never re-offered to
+  //    anyone.
+  // -------------------------------------------------------------------------
+
+  group('a job that is still being retried', () {
+    test('is not acked as printed when the same job is delivered again', () async {
+      final api = _FakeApi();
+      final net = _Net(error: 'No answer from 192.168.1.50:9100');
+      final svc = PrinterService.forTest(
+        auth: await _signIn(api),
+        write: (_, _) => false,
+        netWrite: net.call,
+        spooler: false,
+        printer: 'tcp://192.168.1.50:9100',
+        networkPrinters: const <String>['tcp://192.168.1.50:9100'],
+        // Long enough to observe the job BETWEEN attempts — the whole window
+        // this test is about.
+        retryDelay: const Duration(seconds: 5),
+      );
+
+      unawaited(svc.onPrintEvent(_event(billId: 'B-90', jobId: 'j90')));
+      await pumpEventQueue();
+
+      // Mid-flight: one attempt made and failed, still queued, still trying.
+      expect(svc.queue.single.attempts, 1);
+
+      // The replay arrives. The job HAS been optimistically remembered, so a
+      // settled-first check would fire here.
+      await svc.onPrintEvent(_event(billId: 'B-90', jobId: 'j90'));
+      await pumpEventQueue();
+
+      // Nothing was told to the server, because nothing is yet known — the
+      // queue that owns this job will ack the truth when its retries finish.
+      expect(api.acks, isEmpty);
+      // And it was not queued twice: one job, one paper.
+      expect(svc.queue.length, 1);
+    });
+
+    test('is still acked from the settled set once it is no longer in flight', () async {
+      // The other half of the rule, and the reason the settled check is kept
+      // rather than removed: after the job leaves the queue, a replay means our
+      // ack never landed, and re-sending it is exactly right. This is also the
+      // process-death case the optimistic remember exists for.
+      final api = _FakeApi();
+      final spooler = _Spooler();
+      final svc = PrinterService.forTest(auth: await _signIn(api), write: spooler.call);
+
+      await svc.onPrintEvent(_event(billId: 'B-91', jobId: 'j91'));
+      await pumpEventQueue();
+      expect(svc.queue, isEmpty);
+      expect(spooler.printers.single, 'Test Printer');
+      api.acks.clear();
+
+      await svc.onPrintEvent(_event(billId: 'B-91', jobId: 'j91'));
+      await pumpEventQueue();
+
+      // Re-confirmed, NOT reprinted.
+      expect(api.acks.single['result'], 'printed');
+      expect(spooler.printers.length, 1);
+    });
+  });
 }
