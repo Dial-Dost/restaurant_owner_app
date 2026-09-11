@@ -143,6 +143,44 @@ String _tableOtp(Map table) =>
 List<String> _strList(dynamic v) =>
     ((v as List?) ?? const []).map((e) => '$e').where((e) => e.isNotEmpty).toList();
 
+// KOT numbers attached to an order row. The backend surfaces these as `kot_nos`
+// (the distinct `kot_no` of the order's "PrintJobs" rows, in allocation order);
+// before that column existed there was NO way to get from an order back to the
+// number the kitchen calls its ticket by.
+//
+// ABSENT means "this backend cannot tell us", NOT "this order has no KOT" — a
+// tenant whose migration has not applied, or an app talking to an older server,
+// sends no field at all. Every caller must then render EXACTLY as it did before
+// this existed: no chip, no dash, no reserved gap. That is why this returns an
+// empty list for both cases and the call sites test `isNotEmpty` rather than
+// branching on null.
+//
+// Duplicates are collapsed: one docket fanned out to several stations enqueues
+// several "PrintJobs" rows under a SINGLE allocated number, and a cook reading
+// "KOTs 214, 214" would reasonably conclude two tickets were fired.
+List<int> _kotNos(Map o) {
+  final raw = o['kot_nos'];
+  if (raw is! List) return const [];
+  final out = <int>[];
+  for (final v in raw) {
+    final n = _int(v);
+    // KOT numbers are 1-based and gapless; 0/negative/unparseable can only be
+    // corrupt, and printing "KOT 0" on a board would send staff hunting for a
+    // ticket that was never allocated.
+    if (n != null && n > 0 && !out.contains(n)) out.add(n);
+  }
+  return out;
+}
+
+// "KOT 214" / "KOTs 214, 218, 236" — the handle staff quote when they reprint,
+// cancel or move a ticket. Empty string when the backend sent nothing, which is
+// the signal to draw no chip at all.
+String _kotLabel(Map o) {
+  final nos = _kotNos(o);
+  if (nos.isEmpty) return '';
+  return nos.length == 1 ? 'KOT ${nos.first}' : 'KOTs ${nos.join(', ')}';
+}
+
 // Timestamp rendering. All four delegate to the ONE shared formatter
 // (RestaurantTime), which renders in the RESTAURANT's timezone — the per-tenant
 // `timezone` setting — not the device's. These wrappers stay so the ~40 call
@@ -2639,6 +2677,13 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             // elapsed minutes since the bark, this is the wall-clock instant the
             // order entered the books — the one the tally is reconciled against.
             final placedLabel = _fmtTime(_s(o, 'created_at'));
+            // The number the KITCHEN knows this order by. Staff reprint, cancel
+            // and move tickets by KOT number, not by our internal order id, so
+            // without it on the tile they had to read the number off a printed
+            // docket (or guess) before they could act on the right ticket.
+            // Empty on a backend that does not send `kot_nos` — the tile then
+            // carries no extra chip and reads exactly as it did before.
+            final kotLabel = _kotLabel(o);
             // Past the live window but still owing money, so it was deliberately
             // NOT cleared. Flagged so the owner knows why yesterday's ticket is
             // still on today's page.
@@ -2651,6 +2696,10 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   dense: true,
                 ),
               if (focused) const InfoChip(icon: Icons.notifications_active, label: 'From your notification'),
+              // Leads the quiet metadata: it is the one chip staff act ON rather
+              // than merely read, so it must not end up wrapped onto a second
+              // line behind the waiter's name on a narrow tile.
+              if (kotLabel.isNotEmpty) InfoChip(icon: Icons.receipt_long_outlined, label: kotLabel),
               if (placedLabel.isNotEmpty) InfoChip(icon: Icons.access_time, label: 'Placed $placedLabel'),
               InfoChip(icon: Icons.room_service_outlined, label: _s(o, 'taken_by_employee_name')),
               if (timeLabel.isNotEmpty) InfoChip(icon: Icons.schedule, label: timeLabel),
@@ -2696,6 +2745,10 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                 title: '${_s(o, 'customer', 'Guest')} \u00b7 ${_money(o['total'])}',
                 children: [
                   _kv('Stage', stageLabel),
+                  // Only when the backend actually sent numbers: a row with
+                  // no `kot_nos` must not grow a "KOT —" line implying the
+                  // ticket was never sent to the kitchen.
+                  if (kotLabel.isNotEmpty) _kv('KOT', kotLabel),
                   _kv('Placed', placedLabel.isEmpty ? '\u2014' : placedLabel),
                   _kv('Taken by', _s(o, 'taken_by_employee_name', '\u2014')),
                   if (timeLabel.isNotEmpty) _kv('Timing', timeLabel),
@@ -10928,6 +10981,21 @@ class _KdsCardState extends State<_KdsCard> {
             : orderMin > 10
                 ? AppColors.warning
                 : AppColors.neutral;
+    // B1 — the number the kitchen calls this ticket by. It is the handle for a
+    // reprint, a cancellation and a move, and until now the board never showed
+    // it: a cook holding a docket that says "KOT 218" had no way to find the
+    // matching card. Empty when the backend sends no `kot_nos` (tenant without
+    // the migration, or an older server), and the identity line below is then
+    // omitted entirely rather than drawn blank.
+    final kotLabel = _kotLabel(o);
+    // A3 — the wall-clock instant the ticket was PLACED. The chip in the header
+    // counts elapsed minutes, which answers "how late is this" but never "when
+    // did this land": at a shift handover, or when the pass is reconciling
+    // against a stack of printed dockets, elapsed time is useless and the clock
+    // time is the only thing that matches the paper. Deliberately the SAME
+    // formatter the Orders module uses for the same field, so one ticket reads
+    // identically on both screens.
+    final placedLabel = _fmtTime(_s(o, 'created_at', ''));
     // Ticket lines read at arm's length across the pass.
     final lineStyle = text.bodyLarge!.copyWith(fontSize: 15, height: 1.35);
     final qtyStyle = text.bodyLarge!.copyWith(fontSize: 15, fontWeight: FontWeight.w600, color: AppColors.copperHi);
@@ -10966,6 +11034,28 @@ class _KdsCardState extends State<_KdsCard> {
             ),
           ),
         ]),
+        // Ticket identity: which KOT this is, and when it was placed. Sits on
+        // its own line under the header because the header row already gives
+        // way to the timer and the stage, and a fourth chip there would start
+        // eating the table name — the one thing on a kitchen card that must
+        // never truncate.
+        //
+        // Each half appears only when its data does, so a card whose order
+        // carries neither gains nothing at all and renders exactly as before.
+        if (kotLabel.isNotEmpty || placedLabel.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: 6,
+              children: [
+                if (kotLabel.isNotEmpty)
+                  InfoChip(icon: Icons.receipt_long_outlined, label: kotLabel),
+                if (placedLabel.isNotEmpty)
+                  InfoChip(icon: Icons.access_time, label: 'Placed $placedLabel'),
+              ],
+            ),
+          ),
         const SizedBox(height: AppSpacing.md),
         if (_s(o, 'order_type', 'dine_in') != 'dine_in')
           Padding(
