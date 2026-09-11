@@ -301,12 +301,32 @@ void main() {
       }
     });
 
-    test('a tenant custom role (a UUID in role_all) is never narrowed on a guess', () {
+    // THIS TEST USED TO ASSERT THE OPPOSITE, AND THE OPPOSITE WAS A LIVE BUG.
+    //
+    // The original rule was "never narrow on a guess": a role this build cannot
+    // read must not cost anybody a screen. That is a good instinct pointed in
+    // the wrong direction, because the thing on the other side of this predicate
+    // is MONEY — showsMoney is `!isWaiterOnly`, so "do not narrow" does not mean
+    // "leave them alone", it means SHOW THEM THE DAY'S TAKINGS.
+    //
+    // And it did not fire on an exotic edge case. A custom role is stored as a
+    // UUID in role_all, so the rule un-scoped every waiter at every tenant that
+    // used the granular RBAC feature — the exact population it was written to
+    // protect. It was reported from production: a waiter at csrorganics with the
+    // full unscoped app.
+    //
+    // The rule is now "a waiter is scoped unless they also hold a role that
+    // OUTRANKS a waiter", and outranking is a closed list. A custom role is a
+    // permission bundle, not a rank, so it no longer lifts anything — and the
+    // server decides this anyway (scope.waiter_only); this is only the fallback.
+    test('a tenant custom role (a UUID in role_all) does NOT lift the scoping', () {
       final p = Profile.fromJson(_profileJson(
         role: 'waiter',
         roleAll: const ['waiter', '3f2b7c10-9b1e-4a55-9c4e-2c0f6a1d77aa'],
       ));
-      expect(RoleScope.isWaiterOnly(p), isFalse);
+      expect(RoleScope.isWaiterOnly(p), isTrue);
+      expect(RoleScope.showsMoney(p), isFalse,
+          reason: 'granting a custom role must never be how a waiter starts seeing revenue');
     });
 
     test('nobody else is narrowed, and neither is an empty role set', () {

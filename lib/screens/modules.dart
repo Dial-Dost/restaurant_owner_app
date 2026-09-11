@@ -7893,7 +7893,7 @@ class _TableSheetState extends State<_TableSheet> {
     }
   }
 
-  Future<void> _previewBill(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
+  Future<void> _previewBill(ScaffoldMessengerState messenger) async {
     Map? bill;
     try {
       final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
@@ -7920,12 +7920,66 @@ class _TableSheetState extends State<_TableSheet> {
         restaurantName: widget.profile.restaurantName,
         headerLines: headerLines,
         tableName: _name,
-        noServiceCharge: noServiceCharge,
       ),
     );
     if (confirmed == true) {
-      await _thermalPrint(messenger, noServiceCharge: noServiceCharge);
+      await _thermalPrint(messenger);
     }
+  }
+
+  /// Reprint the bill WITHOUT the service charge — the older, print-only route.
+  ///
+  /// DELIBERATELY NOT THE RECEIPT PREVIEW, and the reason is a money bug.
+  /// `no_service_charge` is a flag on POST /print/bill: it changes the PAPER and
+  /// nothing else. No settle path reads it, so the guest is still charged the
+  /// full amount. Showing a receipt-shaped sheet full of the smaller ladder —
+  /// which is what this button used to do, and which [_BillPreviewDialog] used
+  /// to derive in Dart, wrongly, on exactly the tenants that ship by default —
+  /// hands the till a rehearsal of a total nobody is going to pay, styled as
+  /// paper and routinely turned toward the guest.
+  ///
+  /// So this path shows NO FIGURES AT ALL. It confirms the action, names the
+  /// consequence, and points at the mechanism that actually takes the charge
+  /// off: the recorded waiver (migration 036), which sits on this same sheet,
+  /// records who allowed it, and reduces the printed bill AND the settled one
+  /// because openBillChargeConfig is read by both.
+  ///
+  /// The POST is unchanged — whether that flag survives at all is the server's
+  /// call, not this screen's.
+  Future<void> _reprintWithoutServiceCharge(ScaffoldMessengerState messenger) async {
+    Map? bill;
+    try {
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) bill = r;
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
+    }
+    final lines = (bill?['items'] as List?) ?? const [];
+    if (lines.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('No open bill to print for this table.')));
+      return;
+    }
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Reprint without the service charge?'),
+        content: const Text(
+          'This changes the printed bill only — the guest is still charged the '
+          'service charge when this table is settled.\n\n'
+          'To take the charge off the bill itself, use “Waive service charge” on '
+          'this sheet: it is recorded against the bill and the total drops on the '
+          'paper, on screen and in the till.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Reprint')),
+        ],
+      ),
+    );
+    if (ok == true) await _thermalPrint(messenger, noServiceCharge: true);
   }
 
   /// Print the table's bill WITHOUT putting it on screen first.
@@ -8813,7 +8867,7 @@ class _TableSheetState extends State<_TableSheet> {
                   label: 'Reprint (no service charge)',
                   icon: Icons.money_off,
                   dense: true,
-                  onPressed: () => _previewBill(messenger, noServiceCharge: true),
+                  onPressed: () => _reprintWithoutServiceCharge(messenger),
                 ),
                 ForkButton.ghost(
                   label: _bn('discount') > 0 ? 'Edit discount' : 'Discount',
@@ -9153,6 +9207,14 @@ class _TableSheetState extends State<_TableSheet> {
 /// Receipt-style preview of a table's bill, shown before it is sent to the
 /// thermal printer. Renders the same data web/Flutter already display
 /// (/bill-for-table). Returns `true` from the dialog when the user taps Print.
+///
+/// THIS DIALOG DOES NO MONEY ARITHMETIC. It renders the ladder the billing layer
+/// computed, rung for rung, exactly as the thermal renderer does with a supplied
+/// `grandTotal` (escpos.ts: "the renderer's job is to show the number the guest
+/// is actually charged, and a second rounding in the renderer is how a printed
+/// total comes to disagree with the settled one"). A second implementation of
+/// the totals ladder, in a second language, is how the paper and the till come
+/// to disagree — and this one already had. See [build].
 class _BillPreviewDialog extends StatelessWidget {
   final Map bill;
   final String restaurantName;
@@ -9161,13 +9223,11 @@ class _BillPreviewDialog extends StatelessWidget {
   // the header is just the trading name — same as before these fields existed.
   final List<String> headerLines;
   final String tableName;
-  final bool noServiceCharge;
   const _BillPreviewDialog({
     required this.bill,
     required this.restaurantName,
     this.headerLines = const <String>[],
     required this.tableName,
-    required this.noServiceCharge,
   });
 
   static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
@@ -9202,26 +9262,34 @@ class _BillPreviewDialog extends StatelessWidget {
     // chrome around it is dark.
     const inkFaint = Colors.black54;
     final items = (bill['items'] as List?) ?? const [];
+    // EVERY RUNG BELOW IS THE SERVER'S NUMBER, RENDERED VERBATIM. Nothing here
+    // is derived, re-based or re-rounded.
+    //
+    // WHAT THIS USED TO DO, AND WHY IT WAS THE F2 BUG WRITTEN A SECOND TIME. For
+    // a "reprint without service charge" the dialog rebuilt the ladder itself:
+    // it zeroed `service_charge` — the restaurant_percent leg — and then
+    // recomputed every tax line at its own percentage on the smaller base. On a
+    // tenant carrying the charge as a LINE IN Outlets.default_tax (the tax_line
+    // shape, which is the shipped seed and therefore most tenants) that charge
+    // IS one of the tax lines, so it was faithfully recomputed and kept, and the
+    // "without" preview came out to the same paisa as the "with" one. Once the
+    // server math was fixed the paper showed less than this sheet did — a
+    // receipt-shaped artifact, routinely turned toward a guest, contradicting
+    // the slip it claims to preview.
+    //
+    // THE CHARGE COMING OFF IS THE SERVER'S ANSWER NOW, IN BOTH SHAPES: a
+    // recorded service-charge waiver (migration 036), which openBillChargeConfig
+    // applies to this very read, to the print and to settle alike — so screen,
+    // paper and drawer are one number, and the bill can say who allowed it.
     final subtotal = _n(bill['subtotal'] ?? bill['total_amt']);
     final discount = _n(bill['discount']);
-    final discountedBase = _round2((subtotal - discount).clamp(0, double.infinity).toDouble());
-    // When reprinting without service charge, recompute the charges the way the
-    // backend does (taxes are levied on discounted base + service charge) so the
-    // preview matches what the printer will produce.
-    final serviceCharge = noServiceCharge ? 0.0 : _n(bill['service_charge']);
-    final rawTaxes = (bill['taxes'] as List?) ?? const [];
-    final taxBase = _round2(discountedBase + serviceCharge);
-    final taxes = noServiceCharge
-        ? rawTaxes.map((t) {
-            final m = t as Map;
-            final pct = _n(m['percentage']);
-            return {'name': _s(m, 'name', 'Tax'), 'percentage': pct, 'amount': _round2(taxBase * pct / 100)};
-          }).toList()
-        : rawTaxes;
-    final taxTotal = taxes.fold<double>(0, (s, t) => s + _n((t as Map)['amount']));
-    final grandTotal = noServiceCharge
-        ? _round2(taxBase + taxTotal)
-        : _n(bill['grand_total'] ?? bill['total_amt']);
+    final serviceCharge = _n(bill['service_charge']);
+    // Zero on a tax_line tenant even when a charge IS levied (it rides in
+    // `taxes`), so this boolean — not the absence of a charge line — is the only
+    // truthful way to say the charge was taken off.
+    final serviceChargeWaived = bill['service_charge_waived'] == true;
+    final taxes = (bill['taxes'] as List?) ?? const [];
+    final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
     final covers = bill['covers'];
     final billNo = _s(bill, 'bill_no', '');
     final customer = _s(bill, 'customer', '');
@@ -9311,6 +9379,14 @@ class _BillPreviewDialog extends StatelessWidget {
                     _row('Subtotal', _money(subtotal)),
                     if (discount > 0) _row('Discount', '− ${_money(discount)}'),
                     if (serviceCharge > 0) _row('Service charge', _money(serviceCharge)),
+                    // WHY THE CHARGE IS ZERO, rather than leaving the guest and
+                    // the waiter to work it out from a line that is simply
+                    // absent — the same line the bill block on the table sheet
+                    // prints, and the same one escpos.ts prints as "Opted out".
+                    // Never a figure: on a tax_line tenant the amount that came
+                    // off is a difference between two ladders, not a rung, and
+                    // this sheet does not compute differences.
+                    if (serviceChargeWaived) _row('Service charge', 'waived'),
                     ...taxes.map((t) {
                       final m = t as Map;
                       final pct = _n(m['percentage']);
@@ -9319,10 +9395,10 @@ class _BillPreviewDialog extends StatelessWidget {
                     }),
                     _paperRule,
                     _row('Grand total', _money(grandTotal), bold: true),
-                    if (noServiceCharge)
+                    if (serviceChargeWaived)
                       const Padding(
                         padding: EdgeInsets.only(top: 8),
-                        child: Text('Service charge excluded from this reprint.',
+                        child: Text('Service charge waived on this bill.',
                             style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: inkFaint)),
                       ),
                   ]),

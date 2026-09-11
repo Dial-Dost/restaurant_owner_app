@@ -8,6 +8,23 @@ class Profile {
   final String outletId;
   final String role;
   final List<String> roleAll;
+
+  /// THE SERVER'S ANSWER to "is this a scoped floor role", or null when the
+  /// backend is older than the field.
+  ///
+  /// The clients used to DERIVE this from [roleAll] by asking whether every
+  /// entry was literally the word "waiter". That is a test on spelling, not on
+  /// authority, and it was wrong on any tenant whose waiters carried a custom
+  /// role — those are stored as UUIDs, so `every` failed and every restriction
+  /// lifted, money included. See role_scope.ts on the server for the whole
+  /// story; the rule now lives there, once, for every client.
+  ///
+  /// NULLABLE ON PURPOSE. An app pointed at a backend that predates the field
+  /// must keep working, so null means "the server did not say" and the local
+  /// heuristic answers instead. It is not defaulted to false: that would silently
+  /// un-scope every waiter the moment the app ran ahead of the backend.
+  final bool? waiterOnly;
+
   final String firstName;
 
   /// The LOGIN identity, as stored. Served by /auth/employee-login and /auth/me.
@@ -32,6 +49,7 @@ class Profile {
     required this.outletId,
     required this.role,
     required this.roleAll,
+    this.waiterOnly,
     required this.firstName,
     this.employeeUsername = '',
     required this.actionNames,
@@ -75,6 +93,7 @@ class Profile {
       outletId: (j['outlet_id'] ?? '').toString(),
       role: (j['role'] ?? '').toString(),
       roleAll: _stringList(j['role_all']),
+      waiterOnly: _scopeFlag(j['scope'], 'waiter_only'),
       firstName: (j['emp_Fname'] ?? '').toString(),
       employeeUsername: (j['employeeUsername'] ?? '').toString(),
       actionNames: _stringList(j['action_names']),
@@ -100,6 +119,10 @@ class Profile {
         'outlet_id': outletId,
         'role': role,
         'role_all': roleAll,
+        // Written back in the WIRE's shape so the disk copy and /auth/me parse
+        // identically. Omitted entirely when the server never said, so a restore
+        // cannot invent an answer the server did not give.
+        if (waiterOnly != null) 'scope': <String, dynamic>{'waiter_only': waiterOnly},
         'emp_Fname': firstName,
         'employeeUsername': employeeUsername,
         'action_names': actionNames,
@@ -107,6 +130,15 @@ class Profile {
         'features': features,
         'limits': limits,
       };
+
+  /// One flag out of the server's `scope` block, or null when it is absent or
+  /// unreadable. Anything that is not a real boolean reads as "not said" rather
+  /// than as false — see [waiterOnly] for why that direction matters.
+  static bool? _scopeFlag(dynamic scope, String key) {
+    if (scope is! Map) return null;
+    final v = scope[key];
+    return v is bool ? v : null;
+  }
 
   static List<String> _stringList(dynamic v) =>
       v is List ? v.map((e) => e.toString()).toList() : const <String>[];

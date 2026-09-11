@@ -100,14 +100,47 @@ class RoleScope {
   /// An admin — by role or by the `*` action wildcard — is never narrowed, which
   /// is belt and braces rather than logic: a wildcard identity is by definition
   /// not a scoped floor role.
+  /// Roles that OUTRANK a waiter. Mirrors ROLES_OUTRANKING_WAITER in the
+  /// server's role_scope.ts, which is the authority; this copy exists only for
+  /// the fallback below.
+  static const Set<String> _outranksWaiter = {'admin', 'manager', 'cashier', 'captain'};
+
   static bool isWaiterOnly(Profile p) {
     if (p.isAdmin || p.actions.contains('*')) return false;
+
+    // THE SERVER DECIDES. It holds the whole picture — the roles, what the
+    // custom ones grant, the resolved action set — and there is one of it. When
+    // it has said, we obey; deriving a second answer here is what produced the
+    // bug described below.
+    final fromServer = p.waiterOnly;
+    if (fromServer != null) return fromServer;
+
+    // FALLBACK, for an app pointed at a backend older than the `scope` block.
+    //
+    // THIS USED TO BE `roles.every((r) => r == waiter)` AND IT WAS LIVE AND
+    // WRONG. That is a test on SPELLING rather than on authority, and two
+    // ordinary configurations defeated it:
+    //
+    //   * a waiter granted any CUSTOM ROLE carries its UUID in role_all — not
+    //     the word "waiter" — so `every` failed and every restriction lifted,
+    //     including the money gate, since showsMoney is `!isWaiterOnly`. Using
+    //     the granular RBAC feature silently un-scoped the role it was most
+    //     likely to be used on;
+    //   * "employee" is the SERVER'S FALLBACK for an unset primary and is always
+    //     folded into role_all, so a half-configured record un-scoped itself.
+    //
+    // Both were invisible: correct on a tenant whose waiters happened to carry
+    // one clean role, wrong on the tenant next door. The rule is now "a waiter
+    // is scoped unless they also hold a role that OUTRANKS a waiter" — a closed
+    // list, so a custom role, a placeholder or an unrecognised string cannot
+    // lift the scoping by accident.
     final roles = <String>{
       p.role.trim().toLowerCase(),
       for (final r in p.roleAll) r.trim().toLowerCase(),
     }..removeWhere((r) => r.isEmpty);
     if (roles.isEmpty) return false;
-    return roles.every((r) => r == waiter);
+    if (!roles.contains(waiter)) return false;
+    return !roles.any(_outranksWaiter.contains);
   }
 
   /// True when [label] must be kept out of this user's nav on role grounds
