@@ -501,7 +501,9 @@ class _MenuBadgeTagDialogState extends State<MenuBadgeTagDialog> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = e is ApiException && e.status == 403 ? 'Only someone who can edit the menu may tag dishes.' : '$e';
+        _error = e is ApiException && e.status == 403
+            ? e.sentenceOr('Only someone who can edit the menu may tag dishes.')
+            : '$e';
         _busy = false;
       });
     }

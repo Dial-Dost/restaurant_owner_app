@@ -18,9 +18,11 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../config.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
+import '../models/service_clock.dart';
 import '../models/table_assignment.dart';
 import '../services/api_client.dart';
 import '../services/outbox.dart';
+import '../services/printed_bills.dart';
 import '../services/rest_client.dart';
 import '../services/printer_service.dart';
 import '../services/date_range.dart';
@@ -2419,21 +2421,264 @@ const int _ordersLiveWindowHours = 24;
 // Null when the row carries no parseable created_at — and a row we cannot date
 // is never aged out.
 double? _orderAgeHours(Map o, {DateTime? now}) {
-  final iso = _s(o, 'created_at', '').trim();
+  final ms = _elapsedSinceMs(_s(o, 'created_at', ''), now: now);
+  return ms == null ? null : ms / 3600000.0;
+}
+
+/// HOW LONG AGO [iso] WAS — the one implementation of the basis rule described
+/// above, and the engine behind requirements D1 and D2 as well as the 24h live
+/// window.
+///
+/// It is ONE function because it is one rule, and the whole of this release is
+/// about rules that were stated twice. A screen that measured "how long has the
+/// kitchen had this" on the device clock while the list beside it aged tickets
+/// on the restaurant's would disagree with itself by the offset between them —
+/// which, across a DST change, is an hour, on a chip a waiter is using to decide
+/// whether to chase the pass.
+///
+/// Null when [iso] is empty or unparseable: a row we cannot date is never given
+/// a duration, because "0s" is a claim and "—" is the truth.
+///
+/// Never negative. A server clock a few seconds ahead of the tablet's is
+/// ordinary, and a chip that reads "-3s" reads as a bug in front of a guest.
+int? _elapsedSinceMs(String raw, {DateTime? now}) {
+  final iso = raw.trim();
   if (iso.isEmpty) return null;
   if (_isoCarriesZone.hasMatch(iso)) {
-    final placed = DateTime.tryParse(iso);
-    if (placed == null) return null;
-    return (now ?? DateTime.now()).toUtc().difference(placed.toUtc()).inMinutes / 60.0;
+    final at = DateTime.tryParse(iso);
+    if (at == null) return null;
+    final ms = (now ?? DateTime.now()).toUtc().difference(at.toUtc()).inMilliseconds;
+    return ms < 0 ? 0 : ms;
   }
-  final placed = RestaurantTime.wallOf(iso);
-  if (placed == null) return null;
+  final at = RestaurantTime.wallOf(iso);
+  if (at == null) return null;
   final instant = now ?? DateTime.now();
   final off = RestaurantTime.offsetMinutesAt(instant.toUtc());
   // RestaurantTime.nowWall(), with the clock passed in: device time is the only
   // honest fallback when this build's table cannot render the zone.
   final wallNow = off == null ? instant.toLocal() : instant.toUtc().add(Duration(minutes: off));
-  return wallNow.difference(placed).inMinutes / 60.0;
+  final ms = wallNow.difference(at).inMilliseconds;
+  return ms < 0 ? 0 : ms;
+}
+
+/// The span between two server timestamps, or — when [toIso] is empty — from
+/// [fromIso] until now.
+///
+/// REQUIREMENT D2 IS EXACTLY THIS SHAPE: "duration from order to bill
+/// settlement". While the bill is open there is no settlement yet, so the span
+/// runs to now and ticks; once it is settled the span is fixed and stops. One
+/// function answers both, so a table cannot read one way at 21:59 and a
+/// different way at 22:00 because a different code path took over.
+int? _elapsedBetweenMs(String fromIso, String toIso, {DateTime? now}) {
+  final from = fromIso.trim();
+  if (from.isEmpty) return null;
+  final to = toIso.trim();
+  if (to.isEmpty) return _elapsedSinceMs(from, now: now);
+  // Both ends carried by the server: the difference is an instant difference and
+  // no wall clock is involved at either end.
+  if (_isoCarriesZone.hasMatch(from) && _isoCarriesZone.hasMatch(to)) {
+    final a = DateTime.tryParse(from);
+    final b = DateTime.tryParse(to);
+    if (a == null || b == null) return null;
+    final ms = b.toUtc().difference(a.toUtc()).inMilliseconds;
+    return ms < 0 ? 0 : ms;
+  }
+  // Mixed or zone-less: measure both ends against the restaurant's clock the
+  // same way, then subtract. Never one end on each basis — see [_orderAgeHours].
+  final startAgo = _elapsedSinceMs(from, now: now);
+  final endAgo = _elapsedSinceMs(to, now: now);
+  if (startAgo == null || endAgo == null) return null;
+  final ms = startAgo - endAgo;
+  return ms < 0 ? 0 : ms;
+}
+
+/// [_elapsedSinceMs] and [_elapsedBetweenMs] with an injectable clock. Durations
+/// that tick cannot be asserted against the real `DateTime.now()`.
+@visibleForTesting
+int? elapsedSinceMsAt(String iso, DateTime now) => _elapsedSinceMs(iso, now: now);
+
+@visibleForTesting
+int? elapsedBetweenMsAt(String fromIso, String toIso, DateTime now) =>
+    _elapsedBetweenMs(fromIso, toIso, now: now);
+
+/// THE ESCALATION THE KITCHEN PAINTS ON AN ELAPSED TIMER: quiet under ten
+/// minutes, warning past ten, danger past fifteen.
+///
+/// Extracted because requirement D2 asks for the table's tracking to be
+/// "identical to the kitchen section display", and identical has to mean one
+/// function rather than two lists of thresholds that agree today. A floor timer
+/// that turned red at twelve minutes while the pass's turned red at fifteen
+/// would have staff chasing a kitchen that is not late.
+///
+/// [idle] is the kitchen's un-barked / paused case: nothing is cooking, so
+/// nothing is late, and the timer stays neutral however long it reads.
+Color _elapsedColor(int ms, {bool idle = false}) {
+  if (idle) return AppColors.neutral;
+  final mins = ms ~/ 60000;
+  if (mins > 15) return AppColors.danger;
+  if (mins > 10) return AppColors.warning;
+  return AppColors.neutral;
+}
+
+/// A DURATION THAT TICKS — requirements D1 and D2.
+///
+/// D1 asks for a waiter to be shown how long since an order was placed, so they
+/// know how long the kitchen has had it. D2 asks for the table's own KOT time to
+/// be replaced by the live duration from order to settlement, displayed the same
+/// way the kitchen displays its timers.
+///
+/// BOTH ARE THE SAME WIDGET because they are the same sentence measured between
+/// different pairs of instants, and the one thing neither may do is invent its
+/// own arithmetic. The number is [_elapsedBetweenMs] (one basis rule, shared
+/// with the 24h live window), the text is `_fmtDur` (the kitchen's own
+/// formatter, character for character) and the colour is [_elapsedColor] (the
+/// kitchen's own thresholds).
+///
+/// WHY IT TICKS AT ALL. A chip that says "12m" and then says "12m" for the next
+/// four minutes until something else reloads the page is not real-time tracking;
+/// it is a stale figure that looks live, which is worse than a clock time. One
+/// second, like `_KdsCardState`, and the ticker stops the moment the span does —
+/// a settled bill's duration is a fact, not a countdown, so it costs nothing.
+///
+/// IT IS NOT MONEY. Deliberately shown to waiters: knowing the kitchen has had a
+/// ticket nineteen minutes is the whole of D1, and it prices nothing.
+class _LiveElapsed extends StatefulWidget {
+  const _LiveElapsed({
+    super.key,
+    required this.label,
+    this.clock,
+    this.fromIso = '',
+    this.toIso = '',
+    this.icon = Icons.timer_outlined,
+    this.escalates = true,
+  });
+
+  /// THE SERVER'S OWN MEASUREMENT, and the first thing this widget looks at.
+  ///
+  /// When it is here, [fromIso]/[toIso] are not consulted at all: the number is
+  /// the server's `elapsed_ms` plus this device's MONOTONIC delta since the
+  /// response arrived, so a till whose clock is ten minutes fast cannot invent a
+  /// ten-minute-old order, and this app and the dashboard cannot disagree about
+  /// the same table. Null on a backend that does not send `service` yet, which
+  /// is the only reason the local subtraction below still exists.
+  final ServiceClock? clock;
+
+  /// FALLBACK ONLY — the server instant the span starts at (an order's
+  /// `created_at`, a bill's `first_order_at`), used when [clock] is null because
+  /// the backend predates `service`. Nothing renders when it is missing or
+  /// unparseable.
+  final String fromIso;
+
+  /// The instant it STOPPED, empty while it is still running. For D2 this is the
+  /// settlement.
+  final String toIso;
+
+  /// Read before the duration: "Placed", "In kitchen", "On table".
+  final String label;
+
+  final IconData icon;
+
+  /// Whether the chip takes the kitchen's warning/danger colours as it ages.
+  /// False for spans where age is a fact rather than a problem (a settled
+  /// table's total time), which must not read as an alarm on a closed bill.
+  final bool escalates;
+
+  @override
+  State<_LiveElapsed> createState() => _LiveElapsedState();
+}
+
+class _LiveElapsedState extends State<_LiveElapsed> {
+  Timer? _ticker;
+
+  /// TIME SINCE THE SERVER'S READING ARRIVED, on a MONOTONIC source.
+  ///
+  /// A `Stopwatch` measures a LENGTH, which every clock in the building agrees
+  /// on; `DateTime.now()` reports a POSITION, which is only as good as the
+  /// device it is read from. That difference is the whole of requirement D2's
+  /// second half: the till in the corner is eleven minutes fast, and the chip
+  /// beside the table must still say how long the guests have been sitting there
+  /// rather than how wrong the till is. Started when a reading is taken and
+  /// thrown away when the next one lands.
+  Stopwatch? _sinceReading;
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveElapsed old) {
+    super.didUpdateWidget(old);
+    // A reload that brings back a settlement instant must stop the clock, and one
+    // that swaps this chip onto another order must restart it. A reload that
+    // returns the IDENTICAL reading must do neither — [ServiceClock] compares by
+    // value precisely so the seconds counted since the last poll are not thrown
+    // away on every refresh.
+    if (old.clock != widget.clock ||
+        old.toIso != widget.toIso ||
+        old.fromIso != widget.fromIso) {
+      _sync();
+    }
+  }
+
+  /// Runs the ticker only while there is something left to count.
+  void _sync() {
+    _ticker?.cancel();
+    _ticker = null;
+    _sinceReading = null;
+    final clock = widget.clock;
+    if (clock != null) {
+      if (!clock.hasStart || !clock.running) return;
+      _sinceReading = Stopwatch()..start();
+    } else if (widget.toIso.trim().isNotEmpty) {
+      return;
+    }
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// The number on screen. One place, so the chip and its colour cannot be
+  /// computed off two different readings.
+  int? _ms() {
+    final clock = widget.clock;
+    if (clock == null) return _elapsedBetweenMs(widget.fromIso, widget.toIso);
+    if (!clock.hasStart) return null;
+    // THE ONLY ARITHMETIC ALLOWED HERE: the server's figure, plus a length of
+    // time this device has genuinely observed passing. The rule itself lives in
+    // [ServiceClock.tickedBy] so it can be stated once and tested.
+    return clock.tickedBy(_sinceReading?.elapsedMilliseconds ?? 0);
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ms = _ms();
+    // A row we cannot date gets no chip at all. "0s" would be a claim about the
+    // kitchen that nobody made.
+    if (ms == null) return const SizedBox.shrink();
+    // WHETHER THIS IS STILL RUNNING IS THE SERVER'S CALL TOO. It stops the clock
+    // at the bill's CLOSE, not at the waiter's payment confirmation or the
+    // admin's approval — a bill whose payment method has been recorded is not a
+    // bill that has been paid, and freezing it there would report a table as
+    // finished while the money is outstanding and the guests are still sitting
+    // at it.
+    final running = widget.clock?.running ?? widget.toIso.trim().isEmpty;
+    final label = '${widget.label} ${_fmtDur(ms)}';
+    // Neutral reads as the quiet InfoChip the rest of these rows use; only an
+    // actual escalation earns a StatusChip's tint.
+    final color = widget.escalates && running ? _elapsedColor(ms) : AppColors.neutral;
+    if (color == AppColors.neutral) {
+      return InfoChip(icon: widget.icon, label: label);
+    }
+    return StatusChip(label: label, color: color, dense: true);
+  }
 }
 
 // Mirrors RestaurantTime's own zone test: a timestamp ending in Z/±hh:mm is an
@@ -2661,10 +2906,44 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             final stageLabel = unbarked ? 'Not barked' : status;
             final text = Theme.of(c).textTheme;
             const narrow = true; // a tile is always the dense layout
-            final ot = ((o['timing'] as Map?)?['order'] as Map?) ?? const {};
-            final timeLabel = ot['started_at'] == null
-                ? ''
-                : (ot['ended_at'] != null ? 'Prep ${_fmtDur(_elapsedMs(ot))}' : '${_fmtDur(_elapsedMs(ot))} elapsed');
+            // REQUIREMENTS D1 AND D2 — THE CHIP THAT REPLACED THE KOT TIMER.
+            //
+            // WHAT WAS HERE. `timing.order` is the KITCHEN's timer, and it starts
+            // at the BARK, not at the order. So a ticket the expo had not barked
+            // read "Idle timer" — nothing at all — however long it had been
+            // sitting, and a ticket already served read a frozen prep figure. On
+            // the one screen a waiter uses to answer "where is table six's food",
+            // neither of those is the question.
+            //
+            // WHAT IS HERE NOW is D2's span, verbatim: from when the order was
+            // PLACED (`created_at`) to when its bill was SETTLED
+            // (`bill_closed_at`), live while it is open and frozen once it is
+            // closed. Both instants come from the server, so this is not a second
+            // answer derived on the device — it is the server's two timestamps,
+            // subtracted once, in the kitchen's own formatter and the kitchen's
+            // own colours (see [_LiveElapsed]).
+            //
+            // That also answers D1 on this screen: for an unbarked or preparing
+            // ticket, "how long since it was placed" IS "how long the kitchen has
+            // had it", and unlike the bark timer it cannot read zero for an order
+            // the pass has been sitting on for twenty minutes.
+            //
+            // The prep-since-bark figure has not been deleted from the app; it is
+            // on the Kitchen board, beside the pause/serve controls it belongs to.
+            final placedIso = _s(o, 'created_at', '');
+            final settledIso = _s(o, 'bill_closed_at', '');
+            // THE SERVER'S OWN MEASUREMENT of that same span (service_clock.ts),
+            // shipped on every order row. Read rather than re-derived: this
+            // screen used to subtract `bill_closed_at` from `created_at` itself
+            // and the dashboard subtracted its own pair, which is one rule
+            // implemented twice and drifting — the csrorganics shape wearing a
+            // different hat. Null on a backend that predates the field, and the
+            // two ISO strings below then answer exactly as they did before.
+            final orderClock = ServiceClock.fromJson(o['service']);
+            // Whether the money is still owed is the SERVER's call as well: it
+            // stops this clock at the bill's CLOSE, not at a recorded payment
+            // method. Falls back to the presence of `bill_closed_at`.
+            final orderRunning = orderClock?.running ?? settledIso.trim().isEmpty;
             final contact = [
               if (_s(o, 'customer_phone').isNotEmpty) _s(o, 'customer_phone'),
               if (_s(o, 'delivery_address').isNotEmpty) _s(o, 'delivery_address'),
@@ -2702,7 +2981,20 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
               if (kotLabel.isNotEmpty) InfoChip(icon: Icons.receipt_long_outlined, label: kotLabel),
               if (placedLabel.isNotEmpty) InfoChip(icon: Icons.access_time, label: 'Placed $placedLabel'),
               InfoChip(icon: Icons.room_service_outlined, label: _s(o, 'taken_by_employee_name')),
-              if (timeLabel.isNotEmpty) InfoChip(icon: Icons.schedule, label: timeLabel),
+              _LiveElapsed(
+                key: ValueKey('order-elapsed-${o['id']}'),
+                clock: orderClock,
+                fromIso: placedIso,
+                toIso: settledIso,
+                // "Open 18m 04s" while the money is still owed; "Took 42m 11s"
+                // once it is settled, because at that point the span is a fact
+                // about a finished table rather than a clock anybody is watching.
+                label: orderRunning ? 'Open' : 'Took',
+                icon: Icons.schedule,
+                // A settled ticket must not wear the kitchen's red: the table is
+                // gone, and "this took 40 minutes" is history, not an alarm.
+                escalates: orderRunning,
+              ),
               if (orderType != 'dine_in')
                 InfoChip(
                   icon: orderType == 'delivery' ? Icons.delivery_dining : Icons.takeout_dining,
@@ -2751,7 +3043,18 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   if (kotLabel.isNotEmpty) _kv('KOT', kotLabel),
                   _kv('Placed', placedLabel.isEmpty ? '\u2014' : placedLabel),
                   _kv('Taken by', _s(o, 'taken_by_employee_name', '\u2014')),
-                  if (timeLabel.isNotEmpty) _kv('Timing', timeLabel),
+                  // D2's span as a line rather than a chip. Not live here — a
+                  // detail sheet is read once and dismissed, and a ticking figure
+                  // in a key/value list reads as a fault.
+                  // The SERVER's figure where there is one; the local
+                  // subtraction only on a backend that has none. Not live here —
+                  // a detail sheet is read once and dismissed — so the reading is
+                  // printed exactly as it arrived, with no tick added.
+                  if ((orderClock != null && orderClock.hasStart
+                          ? orderClock.elapsedMs
+                          : _elapsedBetweenMs(placedIso, settledIso))
+                      case final ms?)
+                    _kv(orderRunning ? 'Open for' : 'Order to settle', _fmtDur(ms)),
                   _kv('Items', '${items.length}'),
                   const SizedBox(height: 10),
                   // The chip set moves here rather than being dropped: it carries
@@ -2824,7 +3127,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                     // A comp is taken on the LINE, and this sheet is where the
                     // lines of one ticket are. Offered only to whoever holds the
                     // permission \u2014 never as a control that would 403 on tap.
-                    if (!cancelled && _holdsAction(p, _permNonChargeable))
+                    if (!cancelled && _mayDo(p, Capability.compItem, _permNonChargeable))
                       ForkButton.ghost(
                         label: 'Comp an item',
                         icon: Icons.card_giftcard,
@@ -2869,12 +3172,10 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   Expanded(
                     child: Text(
                       [
-                        // Keep the "Placed" prefix: the tile shows two different
-                        // clocks (when it was placed, how long it has been
-                        // cooking) and a bare timestamp beside a duration reads
-                        // as neither.
+                        // Keep the "Placed" prefix: the tile carries a clock AND
+                        // a duration (D2's live "Open 18m" chip above), and a
+                        // bare timestamp beside a duration reads as neither.
                         if (placedLabel.isNotEmpty) 'Placed $placedLabel',
-                        if (timeLabel.isNotEmpty) timeLabel,
                       ].join(' \u00b7 '),
                       style: text.bodySmall!.copyWith(fontSize: 11),
                       maxLines: 1,
@@ -2927,17 +3228,18 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                         label: 'Decline',
                         icon: Icons.close,
                         dense: true,
-                        // Same rule as the stage sheet: whoever can give a reason
-                        // is asked for one, everybody else keeps the fast path.
+                        // A2: the reason is asked for HERE TOO, and for
+                        // everybody. Declining a pending ticket is a cancel —
+                        // it is the same transition, on the same order, and it
+                        // used to be the quiet way round the prompt.
                         onPressed: () async {
-                          if (_holdsAction(p, _permVoidOrder)) {
-                            final voided = await misVoidOrder(c, rest: rest, profile: p,
-                                orderId: '${o['id']}', what: 'this order',
-                                value: voidValue(o['total']));
-                            if (voided) reload();
-                            return;
+                          if (await _cancelOrder(c,
+                              rest: rest,
+                              profile: p,
+                              orderId: '${o['id']}',
+                              value: voidValue(o['total']))) {
+                            reload();
                           }
-                          await _advanceOrder(messenger, rest, '${o['id']}', 'Cancelled', reload);
                         },
                       ),
                     ),
@@ -4255,7 +4557,7 @@ class _KitchenSectionsDialogState extends State<_KitchenSectionsDialog> {
   // Turn any backend/permission error into a short, human line (403 = not admin).
   String _friendly(Object e) {
     if (e is ApiException && e.status == 403) {
-      return 'Only an admin can change kitchen sections.';
+      return e.sentenceOr('Only an admin can change kitchen sections.');
     }
     return '$e';
   }
@@ -4460,7 +4762,7 @@ class _InventoryCategoriesDialogState extends State<_InventoryCategoriesDialog> 
   // Turn any backend/permission error into a short, human line (403 = not admin).
   String _friendly(Object e) {
     if (e is ApiException && e.status == 403) {
-      return 'Only an admin can change inventory categories.';
+      return e.sentenceOr('Only an admin can change inventory categories.');
     }
     return '$e';
   }
@@ -4875,6 +5177,19 @@ const String _analyticsPermissionId = 'df75119b-e5f1-4f38-aba5-78a1cf182f56';
 // a boundary. Mirrors the check `_mayUndo` has always used.
 bool _holdsAction(Profile p, String actionId) =>
     p.isAdmin || p.actions.contains('*') || p.actions.contains(actionId);
+
+/// MAY THIS PROFILE DO [c] — THE SERVER'S ANSWER, with the uuid test this call
+/// site used to make as the fallback for an older backend.
+///
+/// Every gate below that has a capability goes through here rather than through
+/// [_holdsAction] directly, and the difference is not cosmetic. `_holdsAction`
+/// asks "is this uuid in the token", which means the uuid is written down twice
+/// — once in the server's route guard and once here — and the two are free to
+/// drift the next time a permission is split, renamed or re-registered. The
+/// server already resolved the question and ships the ANSWER on `scope`; the
+/// uuid stays only as the answer for a backend too old to have said.
+bool _mayDo(Profile p, Capability c, String fallbackActionId) =>
+    RoleScope.may(p, c, fallback: _holdsAction(p, fallbackActionId));
 
 /// The UTC instant at which the restaurant-local day [dayKey] ("YYYY-MM-DD")
 /// begins, or ends when [end] is set.
@@ -5922,7 +6237,32 @@ class _ConcernsBoardState extends State<_ConcernsBoard> {
 // Tables are uniform, tappable boxes (not organised by seat count — any table
 // can seat a flexible number of people). Tap a free table to seat guests; tap
 // an occupied one to see its single consolidated bill + APC, or release it.
-Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
+/// THE TABLES SCREEN — service. See [FloorSurface] for the split, which is
+/// requirement D5.
+///
+/// Read the floor, open a table, take the order, print, settle. It moves,
+/// re-labels and deletes NOTHING: no "Add table", no drag between sections, no
+/// section create / rename / dissolve / arrange, and no "Edit seating" or
+/// "Delete table" on the sheet it opens. Those are all still there, for everyone
+/// who had them, on [floorPlanModule].
+Widget tablesModule(RestClient rest, Profile p) => _floorModule(rest, p, FloorSurface.service);
+
+/// THE FLOOR PLAN SCREEN — layout. The other half of D5, and the one place
+/// 'Delete table' now lives (C7 / H8).
+///
+/// Everything the Tables screen used to carry and no longer does: the "Add
+/// table" button, the section groups with their drag-and-drop, Arrange / New
+/// section / Rename / Remove, "Edit seating", and the delete control in this
+/// screen's own header.
+///
+/// It is the SAME widget as Tables with the surface flipped, deliberately.
+/// Two screens that render one floor out of two code paths is how the zone order
+/// on one comes to disagree with the zone order on the other — and the floor
+/// plan is the screen where that disagreement would be invisible until somebody
+/// dragged a table into a section that is not where they are looking.
+Widget floorPlanModule(RestClient rest, Profile p) => _floorModule(rest, p, FloorSurface.plan);
+
+Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncView<Map<String, dynamic>>(
       load: () async {
         final tables = await rest.getList('/get-tables');
         List assignments = const [];
@@ -6023,10 +6363,57 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
         // Only the NAMES and their positions are kept. Table and seat counts are
         // derived from the rows rendered below, so a group header can never
         // disagree with the tiles inside it.
+        // REQUIREMENT C3'S BOOKKEEPING, done off a read that has already happened.
+        //
+        // A table this device printed stops being "printed" the moment its
+        // sitting ends, however it ends — settled, released, merged away. The
+        // floor read above is the only thing that knows that, so it is what
+        // clears the record; asking the server a second question would be a
+        // second answer to one the list in hand has just given.
+        try {
+          await PrintedBills.instance.load(p.resId, p.outletId);
+          await PrintedBills.instance.reconcile(
+            p.resId,
+            p.outletId,
+            [for (final t in tables) if (_tableSeated(t as Map)) _s(t, 'table_name')],
+          );
+        } catch (_) {/* a device memory must never fail a floor read */}
         return {'tables': tables, 'zones': zones, 'zone_error': zoneError, 'order': order, 'born': born};
       },
       builder: (context, data, reload) {
-        final rows = (data['tables'] as List?) ?? const [];
+        final scope = FloorScope.of(p, surface: surface);
+        final allRows = (data['tables'] as List?) ?? const [];
+        // REQUIREMENT C3 — "the table should clear/reset from their view".
+        //
+        // THEIR VIEW, and nothing else. The row leaves this one grid on this one
+        // device; the table is still occupied, still owes the money, still on
+        // every manager's screen and still on the Floor plan. Nothing is written
+        // — see [BillPrintScope] for why "clear the table" could not be what was
+        // meant, given C2 says the same waiter may not settle.
+        //
+        // Only on the SERVICE surface. The floor plan is a picture of the room,
+        // and a room with a table missing out of it is not a floor plan.
+        final rows = surface != FloorSurface.service
+            ? allRows
+            : [
+                for (final r in allRows)
+                  if (!BillPrintScope.of(p,
+                          // THE SERVER DECIDES, AND THE `??` IS THE WHOLE POINT.
+                          // When the row carries print state at all, that state
+                          // is the answer — including when it says "not printed"
+                          // and this tablet remembers otherwise. The per-device
+                          // memory is reached ONLY on the null, which means the
+                          // backend shipped no print state on this payload; see
+                          // [serverBillPrintState] for the exact keys and
+                          // [PrintedBills] for what that fallback is worth (it
+                          // survives a restart, not a reinstall and not a second
+                          // tablet).
+                          printed: serverBillPrintState(r as Map) ??
+                              PrintedBills.instance
+                                  .printed(p.resId, p.outletId, _s(r, 'table_name')))
+                      .retiresTable)
+                    r,
+              ];
         final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
         final zoneError = _s(data, 'zone_error', '');
         final zoneOrder = (data['order'] as Map?)?.cast<String, int>() ?? const <String, int>{};
@@ -6052,11 +6439,31 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
           StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
         ];
         final legendBelow = MediaQuery.sizeOf(context).width < 620;
+        // REQUIREMENTS C7 AND H8 — 'Delete table' lives HERE and nowhere else.
+        //
+        // It used to sit at the bottom of the per-table sheet, which is the sheet
+        // a waiter opens to take an order and a manager opens to settle a bill:
+        // the two busiest taps of a service, with an irreversible floor edit
+        // parked one scroll under them. H8 asks for it in the Floor header and
+        // for the UI to be explicit about what the action does — so it is a
+        // named control on the layout screen, it makes you pick the table by
+        // name, and the confirmation spells out what survives (see
+        // [_deleteTableFromHeader]).
+        final headerActions = <Widget>[
+          if (scope.deleteTable && allRows.isNotEmpty)
+            ForkButton.ghost(
+              key: const ValueKey('floor-delete-table'),
+              label: 'Delete a table',
+              icon: Icons.delete_outline,
+              dense: true,
+              onPressed: () => _deleteTableFromHeader(context, rest, allRows, reload),
+            ),
+        ];
         return Scaffold(
           backgroundColor: Colors.transparent,
           // See [FloorScope.addTable]: the floor's layout controls travel
           // together, and a waiter has none of them.
-          floatingActionButton: !FloorScope.of(p).addTable
+          floatingActionButton: !scope.addTable
               ? null
               : FloatingActionButton.extended(
             onPressed: () => _addTable(
@@ -6093,8 +6500,16 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
           ),
           // A restaurant with zones but no tables yet is a real state now that a
           // zone can exist on its own — don't hide the roster behind "no tables".
-          body: rows.isEmpty && zones.isEmpty
-              ? _empty('No tables yet — add one with the button below.')
+          body: rows.isEmpty && allRows.isNotEmpty
+              // C3: every table this waiter had is printed and off their list.
+              // Said in words, because a blank grid on the screen they land on
+              // reads as an outage rather than as a finished section.
+              ? _empty('Nothing open for you right now — every table you printed '
+                  'has gone to a manager to settle.')
+              : rows.isEmpty && zones.isEmpty
+              ? _empty(scope.addTable
+                  ? 'No tables yet — add one with the button below.'
+                  : 'No tables on the floor yet.')
               : SingleChildScrollView(
                   padding: AppSpacing.pageNarrow,
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -6114,22 +6529,43 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                     // is a fact about the restaurant on a screen that is
                     // otherwise about this waiter's own tables, and it is the
                     // first thing they see, because Tables is where they land.
-                    if (FloorScope.of(p).floorSummary) ...[
+                    if (scope.floorSummary) ...[
                       SectionHeader(
-                        title: 'Floor plan',
+                        title: surface == FloorSurface.plan ? 'Floor plan' : 'Tables',
                         count: rows.length,
                         padding: EdgeInsets.only(bottom: legendBelow ? 8 : 14),
-                        trailing: legendBelow ? null : Wrap(spacing: 6, runSpacing: 6, children: legend),
+                        trailing: legendBelow
+                            ? null
+                            : Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                children: [...legend, ...headerActions]),
                       ),
                       if (legendBelow)
                         Padding(
                           padding: const EdgeInsets.only(bottom: 10),
-                          child: Wrap(spacing: 6, runSpacing: 6, children: legend),
+                          child: Wrap(
+                              spacing: 6,
+                              runSpacing: 6,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [...legend, ...headerActions]),
                         ),
-                    ],
+                    ]
+                    // The header carries the delete control (H8) and a waiter has
+                    // no summary strip to hang it off. They also have no delete —
+                    // but if that ever changes, the control must not vanish with
+                    // the strip, so it gets its own row rather than living inside
+                    // an `if` about something else.
+                    else if (headerActions.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Wrap(spacing: 6, runSpacing: 6, children: headerActions),
+                      ),
                     // Floor SECTIONS — create / rename / un-label, and drag a
                     // table from one zone to another. See [_FloorSections].
                     _FloorSections(
+                      surface: surface,
                       rows: rows,
                       zones: zones,
                       zoneError: zoneError,
@@ -6169,13 +6605,102 @@ Widget tablesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
 // The optimistic value is kept until the reloaded data agrees with it, so a
 // successful write never flickers back while the refresh is still in flight.
 
+// C3 — HAS THE SERVER SAID THIS TABLE'S CURRENT BILL IS ALREADY PRINTED?
+//
+// THE FIELDS THIS CLIENT READS, WHICH IS THE CONTRACT THE BACKEND LANE OWES:
+//
+//   * `bill_printed_at` — ISO instant of the FIRST print of the CURRENT bill,
+//     cleared whenever the seating ends (settled, released, merged away), so
+//     the next party at T4 starts clean. The preferred field: an instant can
+//     also be shown to the waiter ("printed 18:42"), which a bare count cannot.
+//   * `printed_at` / `last_printed_at` — the same thing under the names the
+//     bill reader might more naturally use. Accepted so the backend lane is not
+//     forced into one spelling.
+//   * `print_count` — an integer, for a server that counts rather than stamps.
+//     ZERO IS AN ANSWER, not a silence; see [serverBillPrintState].
+//
+// AND IT IS NEEDED IN TWO PLACES, not one: on `/bill-for-table` (the sheet,
+// which decides whether to draw the button) AND on the `/get-tables` row (the
+// floor grid, which decides whether the table is still on this waiter's
+// screen). Without the second, C3's "clear from their view" survives a
+// back-navigation on the device that printed and nowhere else. Both halves are
+// pinned against the backend's own source in
+// test/bill_print_authority_test.dart, so the day either payload stops carrying
+// print state is the day a test goes red rather than the day this app silently
+// starts answering from a tablet's memory again.
+
+/// The keys that carry print state, in preference order. A row that contains
+/// ANY of them is a server that has answered; a row that contains NONE of them
+/// is a backend too old to have been asked.
+const List<String> billPrintStateKeys = [
+  'bill_printed_at',
+  'printed_at',
+  'last_printed_at',
+  'print_count',
+];
+
+/// THREE ANSWERS, NOT TWO: printed, not printed, and NOBODY ASKED.
+///
+/// THE DEFECT THIS CLOSES. The grid used to fold the server's answer and this
+/// device's memory together with `||`, which quietly made the DEVICE the
+/// authority in the one case that matters: the server says `print_count: 0`
+/// (this seating's bill has not been printed — the last one was, and the table
+/// has since turned over) and a stale local record says it has. An `||` keeps
+/// the table off that waiter's screen forever, on that tablet only. Whoever the
+/// server is describing, it is describing the CURRENT bill, and it is describing
+/// it identically to every device in the building.
+///
+/// So: `true`/`false` when the payload carries print state, and `null` — "no
+/// answer" — only when it carries none of [billPrintStateKeys] at all. The
+/// `null` is what the per-device fallback is allowed to fill, and nothing else
+/// is.
+///
+/// PRESENCE OF THE KEY IS THE SIGNAL, not truthiness of its value. `print_count:
+/// 0` and `bill_printed_at: null` are the server SAYING "not printed" for an
+/// unprinted table — that is the ordinary case, not silence — and reading them
+/// as silence would hand the answer straight back to the device memory this
+/// exists to demote.
+///
+/// IT STILL FAILS SAFE. Silence means the waiter keeps their button and can bill
+/// the table in front of them; a guest waiting with no way to get a bill is a
+/// worse outage than a second copy of one.
+@visibleForTesting
+bool? serverBillPrintState(Map? row) {
+  if (row == null) return null;
+  var answered = false;
+  for (final k in const ['bill_printed_at', 'printed_at', 'last_printed_at']) {
+    if (!row.containsKey(k)) continue;
+    answered = true;
+    if ('${row[k] ?? ''}'.trim().isNotEmpty) return true;
+  }
+  if (row.containsKey('print_count')) {
+    answered = true;
+    if ((num.tryParse('${row['print_count'] ?? ''}') ?? 0) > 0) return true;
+  }
+  return answered ? false : null;
+}
+
+/// "Did the server say printed?" — [serverBillPrintState] with no answer read as
+/// no. Kept for readers that genuinely have nothing to fall back to; anything
+/// that HAS a fallback must use the tri-state, or it re-introduces the `||`.
+@visibleForTesting
+bool serverSaysBillPrinted(Map? row) => serverBillPrintState(row) ?? false;
+
 /// Re-seating is ordinary floor work — the backend keeps a move onto an
 /// EXISTING label on the same `Table Added` gate the floor already holds.
-bool _canMoveTables(Profile p) => p.can(['table']);
+///
+/// THE SERVER'S `edit_table` DECIDES IT. The keyword test below is the fallback
+/// for a backend that predates the flag, and it was never more than a guess:
+/// `p.can(['table'])` substring-matches permitted ACTION NAMES, so it says yes
+/// to anybody holding any action with "table" in its name — "Table Sections",
+/// "View Table" — whether or not the server would accept the write.
+bool _canMoveTables(Profile p) =>
+    RoleScope.may(p, Capability.editTable, fallback: p.can(['table']));
 
 /// Minting, renaming or dissolving a zone is administration ("Manage Table
 /// Sections"). Admins keep everything, as everywhere else in this app.
-bool _canManageSections(Profile p) => p.isAdmin || p.can(['table section']);
+bool _canManageSections(Profile p) => RoleScope.may(p, Capability.manageTableSections,
+    fallback: p.isAdmin || p.can(['table section']));
 
 /// The floor grouped by section: a header per group with its table and seat
 /// counts, drag-and-drop between groups, and (for admins) create / rename /
@@ -6183,6 +6708,13 @@ bool _canManageSections(Profile p) => p.isAdmin || p.can(['table section']);
 /// "Unassigned" always renders LAST so no table is hidden behind a section it
 /// hasn't been given yet.
 class _FloorSections extends StatefulWidget {
+  /// WHICH FLOOR SCREEN THIS IS — requirement D5. On [FloorSurface.service] the
+  /// groups are a READ: no drag, no drop target, no Arrange / New section /
+  /// Rename / Remove. The zones, the counts and the tiles are identical, because
+  /// "you may not re-layout the floor here" is not the same sentence as "you may
+  /// not see how the floor is laid out".
+  final FloorSurface surface;
+
   final List rows;
 
   /// Zone names off `GET /table-sections`. Empty for a user without the
@@ -6214,6 +6746,7 @@ class _FloorSections extends StatefulWidget {
   final VoidCallback reload;
   final String? focusTable;
   const _FloorSections({
+    required this.surface,
     required this.rows,
     required this.zones,
     required this.zoneError,
@@ -6681,6 +7214,7 @@ class _FloorSectionsState extends State<_FloorSections> {
           rest: widget.rest,
           profile: widget.profile,
           reload: widget.reload,
+          surface: widget.surface,
           focused: focus,
           width: width,
         );
@@ -6855,8 +7389,14 @@ class _FloorSectionsState extends State<_FloorSections> {
     // renders last, so no table can hide behind a section it hasn't been given.
     final named = groups.keys.where((k) => k.isNotEmpty).toList()..sort(_compareZoneKeys);
     final ordered = <String>[...named, if (groups.containsKey('')) ''];
-    final canMove = _canMoveTables(widget.profile);
-    final canManage = _canManageSections(widget.profile);
+    // BOTH GATES, ANDed. The permission is what the server enforces on the
+    // writes; the surface is D5. Neither can stand in for the other — moving
+    // these controls to the layout screen must not hand them to somebody the
+    // permission refused, and holding the permission must not put them back on
+    // the service screen.
+    final arrange = FloorScope.of(widget.profile, surface: widget.surface).arrangeFloor;
+    final canMove = arrange && _canMoveTables(widget.profile);
+    final canManage = arrange && _canManageSections(widget.profile);
     final touch = switch (Theme.of(context).platform) {
       TargetPlatform.android || TargetPlatform.iOS => true,
       _ => false,
@@ -7338,6 +7878,10 @@ class _TableBox extends StatelessWidget {
   final RestClient rest;
   final Profile profile;
   final VoidCallback reload;
+
+  /// Which floor screen this tile was drawn on — carried through to the sheet it
+  /// opens so the sheet's layout controls answer D5 as well. See [FloorSurface].
+  final FloorSurface surface;
   // True when a caller (e.g. a notification's "Open T4") asked for this table —
   // draws the copper focus ring so the eye finds it in a full floor plan.
   final bool focused;
@@ -7349,6 +7893,7 @@ class _TableBox extends StatelessWidget {
     required this.rest,
     required this.profile,
     required this.reload,
+    required this.surface,
     this.focused = false,
     this.width = 168,
   });
@@ -7408,7 +7953,8 @@ class _TableBox extends StatelessWidget {
         showDragHandle: true,
         isScrollControlled: true,
         backgroundColor: AppColors.surface,
-        builder: (_) => _TableSheet(rest: rest, profile: profile, table: table, reload: reload),
+        builder: (_) => _TableSheet(
+            rest: rest, profile: profile, table: table, reload: reload, surface: surface),
       ),
       borderRadius: AppRadius.cardAll,
       child: AnimatedContainer(
@@ -7575,13 +8121,29 @@ class _TableBox extends StatelessWidget {
 }
 
 /// Bottom sheet for a table: its customer QR (printable) + seat / order /
-/// settle / release / delete actions.
+/// settle / release actions.
+///
+/// NO LONGER DELETES ANYTHING — requirements C7 and H8. 'Delete table' lived at
+/// the bottom of this sheet, which is the surface a waiter opens to take an
+/// order and a manager opens to settle a bill; it is now a named control in the
+/// Floor plan header (see [_deleteTableFromHeader]) and this sheet has no code
+/// path that reaches DELETE /table/:name, for any role, on either surface.
 class _TableSheet extends StatefulWidget {
   final RestClient rest;
   final Profile profile;
   final Map table;
   final VoidCallback reload;
-  const _TableSheet({required this.rest, required this.profile, required this.table, required this.reload});
+
+  /// Which floor screen opened this sheet — requirement D5. The sheet carried
+  /// two layout controls ("Edit seating", "Delete table"); on
+  /// [FloorSurface.service] it now carries neither, for anybody.
+  final FloorSurface surface;
+  const _TableSheet(
+      {required this.rest,
+      required this.profile,
+      required this.table,
+      required this.reload,
+      required this.surface});
 
   @override
   State<_TableSheet> createState() => _TableSheetState();
@@ -7593,7 +8155,7 @@ class _TableSheetState extends State<_TableSheet> {
   /// What this reader may do on this table, and whether they may see what it is
   /// worth. ONE object asked at every affordance below — see [FloorScope] for
   /// why it is a record of flags rather than a role check per control.
-  late final FloorScope _scope = FloorScope.of(widget.profile);
+  late final FloorScope _scope = FloorScope.of(widget.profile, surface: widget.surface);
 
   String get _name => _s(widget.table, 'table_name');
   // "4 seats · max 6" — the guide seat count and the most it takes with extra
@@ -7853,13 +8415,75 @@ class _TableSheetState extends State<_TableSheet> {
   bool get _isAdmin => widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin');
 
   // Server-side thermal reprint (optionally without service charge).
-  Future<void> _thermalPrint(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
+  //
+  // RETURNS WHETHER THE SERVER TOOK IT, because requirement C3 hangs a one-shot
+  // rule off this call: a print that was refused (no printer, a 400, the line
+  // down) is a print the waiter still has to make, and burning their single
+  // attempt on it would leave them holding a table they cannot bill.
+  Future<bool> _thermalPrint(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
     try {
       await widget.rest.post('/print/bill', {'table_name': _name, if (noServiceCharge) 'no_service_charge': true});
       messenger.showSnackBar(SnackBar(content: Text(noServiceCharge ? 'Reprinting without service charge…' : 'Printing bill…')));
+      return true;
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return false;
     }
+  }
+
+  /// C3 — HAS THIS TABLE'S BILL ALREADY BEEN PRINTED?
+  ///
+  /// THE SERVER'S ANSWER DECIDES, exactly as [Profile.waiterOnly] is taken from
+  /// the server rather than re-derived: there is one restaurant and several
+  /// devices, and a rule about "once" that each device answers privately is a
+  /// rule that means something different on each of them. `/bill-for-table`
+  /// carries `print_count` / `bill_printed_at` / `printed_at`, so on any current
+  /// backend the `??` below never fires.
+  ///
+  /// THE FALLBACK IS FOR AN OLDER BACKEND AND NOTHING ELSE — reached only when
+  /// [serverBillPrintState] returns null, i.e. the payload carried none of
+  /// [billPrintStateKeys]. It is NOT a second opinion: a server that says "not
+  /// printed" is not overruled by this tablet's memory, because the server is
+  /// describing the bill the guest is actually sitting in front of.
+  bool get _billPrinted =>
+      serverBillPrintState(_bill) ??
+      PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name);
+
+  /// Whether this reader may print this bill, and what happens to the table on
+  /// their screen once they have. One object asked at every affordance, for the
+  /// same reason [FloorScope] is.
+  BillPrintScope get _printScope => BillPrintScope.of(widget.profile, printed: _billPrinted);
+
+  /// THE SERVER'S SERVICE CLOCK FOR THIS SEATING — requirement D2, measured
+  /// once, on the machine that has the whole picture.
+  ///
+  /// Its start is the EARLIEST order on the bill (a guest ordering another round
+  /// must not reset how long they have been sitting there, which is the exact
+  /// behaviour D2 replaces) and its end is the SETTLEMENT. Null on a backend
+  /// that predates `service`, which is the only reason [_settledAt] below still
+  /// exists.
+  ServiceClock? get _tableClock =>
+      _bill == null ? null : ServiceClock.fromJson(_bill!['service']);
+
+  /// WHEN THIS TABLE'S MONEY WAS CONFIRMED, or '' while it still owes — the
+  /// FALLBACK closing end of requirement D2's span, for a backend with no
+  /// service clock. Where [_tableClock] exists it decides instead, and it may
+  /// legitimately still be RUNNING when this is set: the server does not treat a
+  /// recorded payment method as a settled bill.
+  ///
+  /// The admin approval is preferred over the waiter's confirmation because on
+  /// an outlet that reviews guest payments the waiter's is the REQUEST and the
+  /// admin's is the settlement; on an outlet that does not, only the waiter's is
+  /// ever written and it IS the settlement. Taking whichever exists, approval
+  /// first, gives one answer on both.
+  String get _settledAt {
+    final b = _bill;
+    if (b == null) return '';
+    for (final k in const ['admin_approved_at', 'waiter_confirmed_at']) {
+      final v = '${b[k] ?? ''}'.trim();
+      if (v.isNotEmpty) return v;
+    }
+    return '';
   }
 
   // Fetch the current bill and show a receipt-style preview before anything is
@@ -8026,7 +8650,27 @@ class _TableSheetState extends State<_TableSheet> {
         ],
       ),
     );
-    if (ok == true) await _thermalPrint(messenger);
+    if (ok != true) return;
+    if (!await _thermalPrint(messenger)) return;
+    // ---- REQUIREMENT C3: the one print, and what it costs the waiter --------
+    //
+    // Asked as the state the print PUTS this reader in — "printed: true" — so
+    // the one rule in [BillPrintScope] answers here too rather than a second
+    // role test being written at the call site. It comes back false for every
+    // identity that is not waiter-only, so a manager's print marks nothing,
+    // retires nothing, and reads exactly as it did.
+    if (!BillPrintScope.of(widget.profile, printed: true).retiresTable) return;
+    await PrintedBills.instance.mark(widget.profile.resId, widget.profile.outletId, _name);
+    if (!mounted) return;
+    messenger.showSnackBar(SnackBar(
+        content: Text('$_name is printed and with a manager to settle. '
+            'It has come off your tables.')));
+    // The sheet closes and the floor reloads WITHOUT this table — that is the
+    // whole of "clear/reset from their view". NOTHING IS WRITTEN to the table:
+    // it is still occupied, still owes the money, and is still on every
+    // manager's screen. See [BillPrintScope] for why it cannot mean more than
+    // that without becoming the settle C2 forbids.
+    _popAndReload();
   }
 
   Future<void> _removeBillItem(ScaffoldMessengerState messenger, String name, double price) async {
@@ -8593,6 +9237,66 @@ class _TableSheetState extends State<_TableSheet> {
               if (_seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: _seats),
               if (_clubbedWith.isNotEmpty)
                 InfoChip(icon: Icons.link, label: 'Clubbed with ${_clubbedWith.join(' + ')}'),
+              // ---- REQUIREMENTS D2 AND D1, in that order -------------------
+              //
+              // D2 first because it is the table's headline: how long this party
+              // has been running, from their FIRST order to the moment the bill
+              // is settled. `first_order_at` and the settlement instants are all
+              // read off /bill-for-table — the server's own timestamps, not a
+              // duration this screen inferred from anything.
+              //
+              // WHY THE END IS THE APPROVAL AND NOT THE CLOSE. A bill's
+              // `admin_approved_at` / `waiter_confirmed_at` is the moment the
+              // money is confirmed, which is what "bill settlement" means to the
+              // person reading this chip. It is also the last instant this sheet
+              // can see: a settled table stops having an open bill, so the sheet
+              // stops being opened for it at all. Falling through to nothing —
+              // an empty `toIso` — simply leaves the chip ticking, which is the
+              // correct reading of a table that has not been settled yet.
+              if (_occupied && _bill != null) ...[
+                _LiveElapsed(
+                  key: const ValueKey('table-open-for'),
+                  // THE SERVER'S CLOCK, not this sheet's subtraction — and the
+                  // two did not agree. This screen stopped the span at
+                  // `admin_approved_at` / `waiter_confirmed_at`; the server stops
+                  // it at the bill's CLOSE, on the stated grounds that a bill
+                  // whose payment method has been recorded is not a bill that has
+                  // been paid. One table, one manager, two figures, until one of
+                  // us gave way — and the one that holds the whole picture and
+                  // exists exactly once is the one that should not have.
+                  clock: _tableClock,
+                  fromIso: _s(_bill!, 'first_order_at', ''),
+                  toIso: _settledAt,
+                  label: (_tableClock?.running ?? _settledAt.isEmpty) ? 'On table' : 'Took',
+                  icon: Icons.timelapse_outlined,
+                  escalates: false,
+                ),
+                // D1 — THE KITCHEN PREP TIMER, and the one a waiter is actually
+                // standing there asking about: how long has the kitchen had the
+                // LATEST ticket for this table. It escalates on the kitchen's own
+                // thresholds (see [_elapsedColor]), so "the pass is late" reads
+                // the same here as it does on the pass.
+                //
+                // Only when it differs from the D2 chip. On a table that has
+                // ordered once the two spans are the same span, and two chips
+                // saying "14m" with different words in front of them is how a
+                // screen teaches people to stop reading it.
+                if (_s(_bill!, 'last_order_at', '') != _s(_bill!, 'first_order_at', ''))
+                  _LiveElapsed(
+                    key: const ValueKey('table-latest-order'),
+                    // The same server reading, restarted at the latest ticket.
+                    // /bill-for-table carries ONE clock for the seating, so this
+                    // shortens it by the gap between the bill's own
+                    // `first_order_at` and `last_order_at` — two of the server's
+                    // timestamps, differenced against each other. No device clock
+                    // enters it, which is the only property this has to keep.
+                    clock: _tableClock?.rebasedTo(_s(_bill!, 'last_order_at', '')),
+                    fromIso: _s(_bill!, 'last_order_at', ''),
+                    toIso: _settledAt,
+                    label: 'Latest order',
+                    icon: Icons.soup_kitchen_outlined,
+                  ),
+              ],
             ]),
             const SizedBox(height: 16),
             // ITEM 17: THE GUEST QR IS GONE FOR A WAITER, and this is the whole
@@ -8853,14 +9557,16 @@ class _TableSheetState extends State<_TableSheet> {
                 if (_scope.managerOnlyAsks)
                 ForkButton.ghost(
                   key: const ValueKey('table-comps'),
-                  label: !_holdsAction(widget.profile, _permNonChargeable)
+                  label: !_mayDo(widget.profile, Capability.compItem, _permNonChargeable)
                       ? 'Comp an item — manager only'
                       : _bn('nc_total') > 0 && _scope.money
                           ? 'Comps · ${_money(_bill!['nc_total'])}'
                           : 'Comp an item',
                   icon: Icons.card_giftcard,
                   dense: true,
-                  onPressed: _holdsAction(widget.profile, _permNonChargeable) ? _comps : null,
+                  onPressed: _mayDo(widget.profile, Capability.compItem, _permNonChargeable)
+                      ? _comps
+                      : null,
                 ),
                 if (_scope.billOps) ...[
                 ForkButton.ghost(
@@ -8940,17 +9646,42 @@ class _TableSheetState extends State<_TableSheet> {
               // Nothing to print until something has been ordered — an empty
               // table has no bill, and a button that answers "No open bill to
               // print for this table" is a button that wasted a walk.
+              //
+              // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME. Once this
+              // waiter has printed, the control is gone and a sentence stands
+              // where it was. The sentence is not decoration — a waiter handed a
+              // blank space where a button was will go and press it on the next
+              // tablet, and a guest asking for their bill again needs to hear
+              // what happens next rather than watch somebody prod a dead screen.
               if (_occupied) ...[
                 const SizedBox(height: 10),
-                SizedBox(
-                  width: double.infinity,
-                  child: ForkButton.ghost(
-                    key: const ValueKey('table-print-bill'),
-                    label: 'Print bill',
-                    icon: Icons.receipt_long,
-                    onPressed: () => _printBillWithoutPreview(messenger),
+                if (_printScope.print)
+                  SizedBox(
+                    width: double.infinity,
+                    child: ForkButton.ghost(
+                      key: const ValueKey('table-print-bill'),
+                      label: 'Print bill',
+                      icon: Icons.receipt_long,
+                      onPressed: () => _printBillWithoutPreview(messenger),
+                    ),
+                  )
+                else
+                  ForkCard(
+                    key: const ValueKey('table-print-spent'),
+                    inset: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                    child: Row(children: [
+                      Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.textSecondary),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Bill printed. A manager reprints it and settles the table '
+                          'from here — ask one if the guest needs another copy.',
+                          style: text.bodySmall,
+                        ),
+                      ),
+                    ]),
                   ),
-                ),
               ],
             ],
 
@@ -9026,8 +9757,12 @@ class _TableSheetState extends State<_TableSheet> {
                 ),
               ],
             ],
-            // ITEM 15: edit seating (PATCH capacity/max_capacity) and delete
-            // table (DELETE /table/:name). Floor layout, not service.
+            // ITEM 15 AND REQUIREMENT D5: editing the seat count is a change to
+            // the SHAPE of the room (PATCH /table/:name {capacity,max_capacity}),
+            // so it is a floor-plan act and [FloorScope.editSeating] is now false
+            // on the service surface for everyone, not only for a waiter. Delete
+            // used to sit directly below this and has gone to the Floor header —
+            // see this class's own header.
             if (_scope.editSeating) ...[
               const SizedBox(height: 10),
               Center(
@@ -9036,17 +9771,6 @@ class _TableSheetState extends State<_TableSheet> {
                   icon: Icons.event_seat_outlined,
                   dense: true,
                   onPressed: () => _editSeating(messenger),
-                ),
-              ),
-            ],
-            if (_scope.deleteTable) ...[
-              const SizedBox(height: 10),
-              Center(
-                child: TextButton.icon(
-                  onPressed: () => _delete(messenger),
-                  icon: const Icon(Icons.delete_outline, size: 16, color: AppColors.danger),
-                  label: const Text('Delete table',
-                      style: TextStyle(color: AppColors.danger, fontSize: 12.5, fontWeight: FontWeight.w600)),
                 ),
               ),
             ],
@@ -9182,26 +9906,6 @@ class _TableSheetState extends State<_TableSheet> {
     }
   }
 
-  Future<void> _delete(ScaffoldMessengerState messenger) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Delete table $_name?'),
-        content: const Text('This removes the table from the floor.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Delete')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    try {
-      await widget.rest.delete('/table/${Uri.encodeComponent(_name)}');
-      _popAndReload();
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
-  }
 }
 
 /// Receipt-style preview of a table's bill, shown before it is sent to the
@@ -10091,6 +10795,133 @@ TableNameRun allocateTableNames(String seed, int count, Iterable<String> existin
 
 /// Adds one table, or a numbered run of them. [existing] is every table name on
 /// the floor — it drives both the live preview in the dialog and the allocator,
+/// DELETING A TABLE, FROM THE ONE PLACE IT NOW LIVES — requirements C7 and H8.
+///
+/// WHERE IT WAS AND WHY IT MOVED. The control was a small red "Delete table" at
+/// the bottom of the per-table sheet: the same sheet a waiter opens to add an
+/// order and a manager opens to settle a bill, which makes it the most-opened
+/// surface in the app, with an irreversible floor edit parked one scroll below
+/// the things people actually came for. H8 asks for it out of the ubiquitous
+/// views and into the Floor header; C7 asks for it to be restricted by role.
+/// Both are now true, and the role half is [FloorScope.deleteTable] ANDed with
+/// [FloorSurface.plan], so it is not merely off the sheet — the sheet no longer
+/// has a code path that reaches it, for anybody.
+///
+/// "THE UI MUST BE EXPLICIT ABOUT WHAT THE ACTION DOES" (H8, verbatim). The old
+/// confirmation said "This removes the table from the floor", which is true and
+/// tells the reader nothing they were worried about. This one answers the three
+/// questions somebody hovering over a red button is actually asking, and every
+/// answer below is a fact about RemoveTable rather than reassurance:
+///
+///   * WHAT SURVIVES — past orders and bills do. A table carrying history is
+///     soft-deleted precisely so those records keep their table, so the day's
+///     takings and every report built on them are untouched.
+///   * WHAT GOES — the tile, on every device; the waiter assignment on it; and
+///     the ordering QR printed for it stops resolving.
+///   * WHAT IT WILL REFUSE — an occupied table, or one with an open bill. The
+///     server blocks both ("Settle or release the table before deleting it"),
+///     which is the answer a manager needs BEFORE they walk to the table, not
+///     after. So the picker says which tables are busy and does not offer them.
+Future<void> _deleteTableFromHeader(
+    BuildContext context, RestClient rest, List rows, VoidCallback reload) async {
+  final messenger = ScaffoldMessenger.of(context);
+  // Deliberately only the ones the server would accept. Offering a busy table
+  // and collecting a 400 teaches staff that this screen guesses.
+  final deletable = <Map>[
+    for (final r in rows)
+      if (!_tableSeated(r as Map) && _s(r, 'table_name').isNotEmpty) r,
+  ];
+  final busy = rows.length - deletable.length;
+  if (deletable.isEmpty) {
+    messenger.showSnackBar(SnackBar(
+        content: Text(busy == 0
+            ? 'There are no tables to delete.'
+            : 'Every table is in use. A table can only be deleted once it has been '
+                'settled or released.')));
+    return;
+  }
+  final name = await showDialog<String>(
+    context: context,
+    builder: (ctx) {
+      final text = Theme.of(ctx).textTheme;
+      return AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Delete which table?'),
+        content: SizedBox(
+          width: 360,
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(
+                busy == 0
+                    ? 'Pick the table to remove from the floor plan.'
+                    : 'Pick the table to remove from the floor plan. '
+                        '$busy in use ${busy == 1 ? 'is' : 'are'} not listed — a table '
+                        'can only be deleted once it has been settled or released.',
+                style: text.bodySmall),
+            const SizedBox(height: AppSpacing.md),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(children: [
+                  for (final t in deletable)
+                    ListTile(
+                      key: ValueKey('delete-pick-${_s(t, 'table_name')}'),
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.table_restaurant, size: 18),
+                      title: Text(_s(t, 'table_name'), style: text.titleSmall),
+                      subtitle: Text(
+                        [
+                          if (_seatsLabel(t).isNotEmpty) _seatsLabel(t),
+                          if (_s(t, 'section', '').trim().isNotEmpty) 'in ${_s(t, 'section')}',
+                        ].join(' · '),
+                        style: text.bodySmall,
+                      ),
+                      onTap: () => Navigator.pop(ctx, _s(t, 'table_name')),
+                    ),
+                ]),
+              ),
+            ),
+          ]),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel'))],
+      );
+    },
+  );
+  if (name == null || name.isEmpty || !context.mounted) return;
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: Text('Delete table $name permanently?'),
+      content: Text(
+        '$name disappears from the floor plan on every device, for everyone. '
+        'Any waiter assigned to it is unassigned, and the ordering QR code '
+        'printed for $name stops working.\n\n'
+        'Its past orders and bills are NOT deleted — they stay in your history, '
+        'your reports and the takings for the day, exactly as they are.\n\n'
+        'This cannot be undone from this screen. Creating a table called $name '
+        'again does not bring the old one back.',
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Keep it')),
+        FilledButton(
+          key: const ValueKey('floor-delete-confirm'),
+          onPressed: () => Navigator.pop(ctx, true),
+          style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
+          child: Text('Delete $name'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  try {
+    await rest.delete('/table/${Uri.encodeComponent(name)}');
+    messenger.showSnackBar(SnackBar(content: Text('$name removed from the floor plan.')));
+    reload();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+  }
+}
+
 /// so a run never asks the server for a name that is already taken.
 ///
 /// The permission is the backend's `Table Added` gate on POST /add-table, which
@@ -10621,28 +11452,17 @@ Future<void> _changeOrderStatus(
     },
   );
   if (picked == null || picked == current) return;
-  // A CANCEL BY SOMEBODY WHO CAN GIVE A REASON GOES THROUGH THE VOID ROUTE.
-  //
-  // `PATCH /orders/:id/status → Cancelled` records no reason anywhere, which is
-  // why the Void KOT report has always counted those cancels with the reason
-  // "unknown". Migration 035's route fixes that, and it is offered by
-  // PERMISSION rather than by screen: the person holding "Void Orders With
-  // Reason" is exactly the person a control report needs a reason from, while a
-  // waiter keeps the fast path (which is also the only one the offline queue
-  // accepts) instead of being stopped mid-service by a form.
-  if (picked == 'Cancelled' && profile != null && _holdsAction(profile, _permVoidOrder)) {
-    // The stage sheet above was awaited, so the screen may be gone; a void form
-    // opened against a dead context is a form nobody can dismiss.
+  // A2 — EVERY CANCEL IS PROMPTED FOR A REASON, whoever is making it. Which
+  // ROUTE it then travels on still depends on what this user holds, and
+  // [_cancelOrder] is the one place that decides; see [misCancelReason] for why
+  // the prompt and the route are deliberately two different questions.
+  if (picked == 'Cancelled') {
+    // The stage sheet above was awaited, so the screen may be gone; a reason
+    // form opened against a dead context is a form nobody can dismiss.
     if (!context.mounted) return;
-    final voided = await misVoidOrder(
-      context,
-      rest: rest,
-      profile: profile,
-      orderId: orderId,
-      what: 'this order',
-      value: value,
-    );
-    if (voided) reload();
+    if (await _cancelOrder(context, rest: rest, profile: profile, orderId: orderId, value: value)) {
+      reload();
+    }
     return;
   }
   try {
@@ -11049,14 +11869,10 @@ class _KdsCardState extends State<_KdsCard> {
     final text = Theme.of(context).textTheme;
     // Elapsed escalation: quiet under 10 minutes, warning past 10, danger past
     // 15 — idle (un-barked / paused) timers stay neutral.
-    final orderMin = orderMs ~/ 60000;
-    final timerColor = (!barked || orderPaused)
-        ? AppColors.neutral
-        : orderMin > 15
-            ? AppColors.danger
-            : orderMin > 10
-                ? AppColors.warning
-                : AppColors.neutral;
+    // The thresholds moved to [_elapsedColor] so the floor's D2 timers and this
+    // one cannot drift apart; the rule itself is unchanged, including the
+    // un-barked / paused case staying neutral.
+    final timerColor = _elapsedColor(orderMs, idle: !barked || orderPaused);
     // B1 — the number the kitchen calls this ticket by. It is the handle for a
     // reprint, a cancellation and a move, and until now the board never showed
     // it: a cook holding a docket that says "KOT 218" had no way to find the
@@ -11407,6 +12223,59 @@ class _KdsCardState extends State<_KdsCard> {
       ),
       child: card,
     );
+  }
+}
+
+/// CANCEL AN ORDER — requirement A2's single entry point.
+///
+/// THE ONE RULE, WRITTEN ONCE. Every way of cancelling an order in this app
+/// comes through here: the Decline on a pending ticket, and the stage sheet's
+/// "Cancelled". There used to be two paths with the permission test written out
+/// at each of them, which is precisely the shape that let a cancel escape
+/// without a reason — a second call site added later would have inherited "no
+/// prompt" by omission, the same way the fifteen controls on the table sheet
+/// inherited "visible".
+///
+/// THE PROMPT IS UNCONDITIONAL; THE ROUTE IS NOT. See [misCancelReason] for why
+/// those are two different questions and why routing every cancel through the
+/// strict void would break cancelling on a floor with no wifi.
+///
+/// Returns true when the order was cancelled, false when the user backed out or
+/// the write failed — so the caller reloads only when something changed.
+Future<bool> _cancelOrder(
+  BuildContext context, {
+  required RestClient rest,
+  required Profile? profile,
+  required String orderId,
+  String what = 'this order',
+  String value = '',
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  // WHOEVER CAN GIVE THE FULLER ANSWER IS ASKED FOR IT. The void form records a
+  // kind, a reason AND an authoriser against the order in one transaction, which
+  // is what the Void KOT report is built to read.
+  if (profile != null && _mayDo(profile, Capability.voidOrder, _permVoidOrder)) {
+    return misVoidOrder(context, rest: rest, profile: profile, orderId: orderId,
+        what: what, value: value);
+  }
+  final why = await misCancelReason(context, what: what, value: value);
+  // BACKING OUT CANCELS NOTHING. "Mandatory" has to cut both ways: a dialog that
+  // cancelled the order anyway when it was dismissed would be a prompt in name.
+  if (why == null) return false;
+  try {
+    // `reason` and `cancel_kind` are ADDITIVE on a route that is on the offline
+    // allowlist and stays there. A server that does not read them behaves
+    // exactly as it does today; one that does gets the banner text for the
+    // cancellation slip and the reason for the control report.
+    await rest.patch('/orders/$orderId/status', {
+      'status': 'Cancelled',
+      'reason': why.reason,
+      'cancel_kind': why.kind,
+    });
+    return true;
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+    return false;
   }
 }
 
@@ -29336,7 +30205,7 @@ class _RequireTableOtpCardState extends State<_RequireTableOtpCard> {
       if (mounted) {
         setState(() => _on = !v); // revert on failure
         final msg = (e is ApiException && e.status == 403)
-            ? 'Only an admin can change this setting.'
+            ? e.sentenceOr('Only an admin can change this setting.')
             : '$e';
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
@@ -29413,7 +30282,7 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
       if (mounted) {
         setState(() => _on = !v); // revert on failure
         final msg = (e is ApiException && e.status == 403)
-            ? 'Only an admin can change this setting.'
+            ? e.sentenceOr('Only an admin can change this setting.')
             : '$e';
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
@@ -29514,7 +30383,7 @@ class _TimezoneCardState extends State<_TimezoneCard> {
       // 403 = not an admin; 400 = the backend rejected the id (its message
       // names the offending zone, so show it verbatim).
       final msg = (e is ApiException && e.status == 403)
-          ? 'Only an admin can change the restaurant timezone.'
+          ? e.sentenceOr('Only an admin can change the restaurant timezone.')
           : '$e';
       messenger.showSnackBar(SnackBar(content: Text(msg)));
     } finally {
@@ -32652,18 +33521,86 @@ Widget _roleChip(String role, {VoidCallback? onRemove}) {
   );
 }
 
+/// THE ACTION IDS THE SERVER ACTUALLY VALIDATES ON THE RBAC ROUTES, copied from
+/// routes/roles.ts. Requirement C5 is "permissions … distinct and customizable;
+/// Super Admins and Managers can view and edit custom roles", and the only
+/// honest way to say who that is, is to ask the SAME question the server asks.
+///
+/// NOT ONE OF THESE IS NEW. Migration 025's rule is that minting a fresh uuid
+/// for a capability that already has one silently strips it from every role
+/// holding the old id — so a tenant who granted their managers role editing
+/// would wake up unable to edit roles. These are the existing ids, reused.
+///
+/// `Profile.actions` carries `*` for an admin, so a Super Admin passes all three
+/// without any of them being listed against their role.
+// (GET /roles and GET /core-roles are gated on 17ba6407-…, which every reader
+// who can open this screen already holds — the module would not be in their nav
+// otherwise — so there is nothing for this file to decide about reading.)
+const String _permCreateRole = 'c0135d18-68b4-45e9-9b51-849158df6efd';
+const String _permDeleteRole = '53d0927d-00f4-48cc-a40c-51edb09826d8';
+
 Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () async {
         final r = await Future.wait([rest.getList('/roles'), rest.getList('/actions')]);
-        return {'roles': r[0], 'actions': r[1]};
+        // REQUIREMENT C6 — what a core role actually grants, from the ONE place
+        // that knows: GET /core-roles serves the server's own CORE_ROLES table.
+        //
+        // Read here rather than hard-coded beside _coreRoles, and that is the
+        // whole fix rather than a detail of it. The core sets change — the
+        // manager role gained the three MIS-capture acts, the waiter and captain
+        // roles gained "View Bill" — and a copy in this file would have gone on
+        // showing a restaurant the permissions their staff had two releases ago,
+        // which is worse than showing nothing.
+        //
+        // BEST-EFFORT: the route carries the same view-roles gate as /roles, so a
+        // build pointed at an older backend (or a user without it) gets an empty
+        // map and the chips below say so, instead of the screen failing to load.
+        var core = const <String, List<String>>{};
+        // C6's SECOND half, and the one that produced the actual symptom: a role
+        // that opened onto a COLUMN OF UUIDS. The ids alone are unreadable, and
+        // the names live in GET /actions — which is gated on a DIFFERENT
+        // permission (2b6f7948…), so any manager holding "Get Roles" and not
+        // "Get Actions" loaded the role, joined against an empty catalogue and
+        // was shown a hex dump. The server now ships `permissions` beside
+        // `actions`: the same ids, same order, same length, with the name,
+        // description and group already attached. Read it, and the second call
+        // stops mattering.
+        var corePerms = const <String, List<dynamic>>{};
+        try {
+          final rows = await rest.getList('/core-roles');
+          core = {
+            for (final row in rows.whereType<Map>())
+              _s(row, 'role').toLowerCase(): [
+                for (final a in (row['actions'] as List?) ?? const []) '$a',
+              ],
+          };
+          corePerms = {
+            for (final row in rows.whereType<Map>())
+              if (row['permissions'] is List)
+                _s(row, 'role').toLowerCase(): row['permissions'] as List,
+          };
+        } catch (_) {/* the chips explain themselves when this is empty */}
+        return {'roles': r[0], 'actions': r[1], 'core': core, 'core_permissions': corePerms};
       },
       builder: (context, data, reload) {
         final roles = (data['roles'] as List?) ?? [];
         final actions = (data['actions'] as List?) ?? [];
+        final core = (data['core'] as Map?)?.cast<String, List<String>>() ?? const {};
+        final corePerms =
+            (data['core_permissions'] as Map?)?.cast<String, List<dynamic>>() ?? const {};
         final text = Theme.of(context).textTheme;
+        // C5. Each gate is the action the SERVER enforces on that exact route, so
+        // a control that is drawn will work and one that is hidden would have
+        // 403'd. Nothing here widens anything: a manager sees the editor only
+        // because their tenant granted them the create-role action, which is
+        // precisely what "customizable" means.
+        final mayEdit = _mayDo(p, Capability.manageRoles, _permCreateRole);
+        final mayDelete = _holdsAction(p, _permDeleteRole);
         return Scaffold(
           backgroundColor: Colors.transparent,
-          floatingActionButton: FloatingActionButton.extended(
+          floatingActionButton: !mayEdit
+              ? null
+              : FloatingActionButton.extended(
             onPressed: () async {
               final created = await showDialog<bool>(
                 context: context,
@@ -32678,16 +33615,51 @@ Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
             Padding(
               padding: const EdgeInsets.only(bottom: AppSpacing.lg),
               child: Text(
-                  'Custom roles are built from permissions and can be assigned to staff '
-                  '(tap an employee in the Employees tab).',
+                  mayEdit
+                      ? 'Custom roles are built from permissions and can be assigned to staff '
+                          '(tap an employee in the Employees tab).'
+                      : 'Custom roles are built from permissions. You can see what each one '
+                          'grants; changing them needs the role-editing permission.',
                   style: text.bodySmall),
             ),
             // Built-in roles (always available — Admin grants everything and can
             // only be given or taken away by the owner/super-admin).
             const SectionHeader(title: 'Core roles', padding: EdgeInsets.only(bottom: 10)),
+            // ---- REQUIREMENT C6 --------------------------------------------
+            //
+            // "Fix the issue preventing users from clicking and viewing core
+            // roles." There was no issue to fix in the sense of a bug: these were
+            // StatusChips — a label and a tint, with no gesture on them at all —
+            // so a restaurant could see that a role called "cashier" existed and
+            // had no way whatever to find out what a cashier is allowed to do.
+            // The only thing the screen invited you to open was a CUSTOM role,
+            // which is the half a restaurant already understands because they
+            // built it.
+            //
+            // They are buttons now, and what opens is the server's own answer:
+            // see [_coreRolePermissions].
+            Text(
+                core.isEmpty
+                    ? 'Built in and always available. Their permissions are set by the system.'
+                    : 'Built in and always available — tap one to see exactly what it grants.',
+                style: text.bodySmall),
+            const SizedBox(height: 10),
             Wrap(spacing: 8, runSpacing: 8, children: [
               for (final r in _coreRoles)
-                StatusChip(label: r == 'admin' ? 'admin (owner-grantable)' : r, color: _roleColor(r)),
+                _CoreRoleChip(
+                  key: ValueKey('core-role-$r'),
+                  role: r,
+                  // A chip with nothing behind it stays inert rather than opening
+                  // an empty sheet: an older backend has no /core-roles, and a
+                  // dialog that says nothing is a worse answer than a label.
+                  onTap: core.containsKey(r)
+                      ? () => _showCoreRole(context,
+                          role: r,
+                          actionIds: core[r] ?? const [],
+                          permissions: corePerms[r],
+                          actions: actions)
+                      : null,
+                ),
             ]),
             const SizedBox(height: AppSpacing.xxl),
             SectionHeader(title: 'Custom roles', count: roles.length, padding: const EdgeInsets.only(bottom: 10)),
@@ -32704,10 +33676,18 @@ Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                   padding: const EdgeInsets.only(bottom: 10),
                   child: ForkCard(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    // C5 — "Super Admins and Managers can VIEW and edit custom
+                    // roles". Two verbs, and they are gated separately: anyone
+                    // who can open this screen at all holds the view-roles
+                    // action, so the card always opens; whether the tick boxes
+                    // can be CHANGED is the create-role action, which is what
+                    // POST /roles enforces. A read-only pass is what makes "view"
+                    // real for a role that may look but not rewrite.
                     onTap: () async {
                       final saved = await showDialog<bool>(
                         context: context,
-                        builder: (_) => _CreateRoleDialog(rest: rest, actions: actions, existing: role),
+                        builder: (_) => _CreateRoleDialog(
+                            rest: rest, actions: actions, existing: role, readOnly: !mayEdit),
                       );
                       if (saved == true) reload();
                     },
@@ -32727,10 +33707,12 @@ Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
                         child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
                           Text(roleName, style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
                           const SizedBox(height: 3),
-                          Text('$count permission(s) · tap to edit', style: text.bodySmall),
+                          Text('$count permission(s) · tap to ${mayEdit ? 'edit' : 'view'}',
+                              style: text.bodySmall),
                         ]),
                       ),
                       const SizedBox(width: AppSpacing.md),
+                      if (mayDelete)
                       ForkIconButton(
                         icon: Icons.delete_outline,
                         tooltip: 'Delete role',
@@ -32754,11 +33736,191 @@ Widget rolesModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>
       },
     );
 
+/// A CORE ROLE, AS A CONTROL — requirement C6.
+///
+/// It reads exactly like the StatusChip it replaces (tint, dot, label — colour
+/// never travels alone) and adds the one thing that was missing: it is
+/// pressable, and it says so. [onTap] is null for a build that could not read
+/// /core-roles, and an inert chip is then visibly inert rather than a button
+/// that does nothing when pressed.
+class _CoreRoleChip extends StatelessWidget {
+  const _CoreRoleChip({super.key, required this.role, this.onTap});
+
+  final String role;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = role == 'admin' ? 'admin (owner-grantable)' : role;
+    final chip = StatusChip(label: label, color: _roleColor(role));
+    if (onTap == null) return chip;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(AppRadius.chip),
+      // Named for a screen reader, because the chip's own text is a bare role
+      // name and "waiter" alone does not announce that it opens anything.
+      child: Semantics(button: true, label: 'View what the $role role can do', child: chip),
+    );
+  }
+}
+
+/// WHAT A CORE ROLE GRANTS — the sheet requirement C6 asks for.
+///
+/// [permissions] IS THE SERVER'S OWN NAMED LIST and is read FIRST — the same
+/// ids, in the same order, with `action_name`, `action_desc` and `group`
+/// already attached (GET /core-roles). It exists because the join this function
+/// used to do could not be relied on: the names live in GET /actions, which is
+/// gated on a DIFFERENT permission, so a manager holding "Get Roles" and not
+/// "Get Actions" opened a core role and was shown a column of uuids. That is the
+/// C6 symptom, and reading the field the server added is the whole of the fix —
+/// an answer shipped and not consumed is not a fix, it is a claim.
+///
+/// [actionIds] and [actions] are the FALLBACK for a backend that predates
+/// `permissions`: the raw id list joined against the catalogue, exactly as
+/// before. An id with no name in EITHER path keeps its place in the count rather
+/// than being dropped — a role that under-reports what it grants is how a
+/// reviewer concludes it is safe when it is not.
+///
+/// READ-ONLY, AND IT SAYS WHY. A core role is not editable — CORE_ROLES is code,
+/// not a per-tenant row — and a restaurant that wants a cashier who can comp a
+/// dish makes a custom role. Saying that on the sheet is the difference between
+/// a screen that refuses and a screen that tells you what to do instead.
+void _showCoreRole(
+  BuildContext context, {
+  required String role,
+  required List<String> actionIds,
+  List<dynamic>? permissions,
+  required List<dynamic> actions,
+}) {
+  // The admin wildcard. Listing it as one permission called "*" would be true and
+  // useless; what an owner needs to read is that it is everything.
+  final wildcard = actionIds.contains('*') ||
+      (permissions ?? const []).whereType<Map>().any((p) => '${p['id']}' == '*');
+  final byId = <String, Map>{
+    for (final a in actions.whereType<Map>()) '${a['id']}': a,
+  };
+  // Grouped the same way the custom-role editor groups them, so one permission
+  // reads identically whichever screen you met it on.
+  final groups = <String, List<String>>{};
+  final unknown = <String>[];
+  // THE SERVER'S ROWS WHERE IT SENT THEM, the local join only where it did not.
+  final rows = <Map>[
+    if (permissions != null)
+      for (final p in permissions.whereType<Map>()) p
+    else
+      for (final id in actionIds) byId[id] ?? <String, dynamic>{'id': id},
+  ];
+  for (final a in rows) {
+    // '' AND NOT `_s`'s DEFAULT EM-DASH: an id with no name must fall into
+    // `unknown` and be COUNTED, not rendered as a tick beside a dash.
+    final name = _s(a, 'action_name', '');
+    if (name.isEmpty) {
+      // An id with no name in the server's projection either (`action_name:
+      // null`), or one this build's /actions does not carry. Counted honestly
+      // rather than dropped, so the list cannot quietly under-report what a role
+      // can do.
+      unknown.add(_s(a, 'id', ''));
+      continue;
+    }
+    (groups[_s(a, 'group', 'Other')] ??= []).add(name);
+  }
+  final groupNames = groups.keys.toList()..sort();
+  for (final g in groupNames) {
+    groups[g]!.sort();
+  }
+  showDialog<void>(
+    context: context,
+    builder: (ctx) {
+      final text = Theme.of(ctx).textTheme;
+      final c = _roleColor(role);
+      return Dialog(
+        backgroundColor: Colors.transparent,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+              maxWidth: 460, maxHeight: MediaQuery.sizeOf(ctx).height * 0.8),
+          child: Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              gradient: AppColors.cardGradient,
+              borderRadius: AppRadius.cardAll,
+              border: Border.all(color: AppColors.borderStrong),
+            ),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('CORE ROLE', style: text.labelSmall),
+              const SizedBox(height: 6),
+              Row(children: [
+                Container(width: 8, height: 8, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
+                const SizedBox(width: 8),
+                Expanded(child: Text(role, style: text.titleMedium)),
+              ]),
+              const SizedBox(height: AppSpacing.md),
+              Text(
+                  wildcard
+                      ? 'Every permission in the system, including ones added by future '
+                          'updates. Built in and not editable — it is the owner role.'
+                      : 'Built in and not editable. To give someone this plus something '
+                          'extra, create a custom role with the permissions you want and '
+                          'assign it alongside.',
+                  style: text.bodySmall),
+              const SizedBox(height: AppSpacing.lg),
+              if (!wildcard) ...[
+                Text('${rows.length} PERMISSION(S)', style: text.labelSmall),
+                const SizedBox(height: AppSpacing.sm),
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      if (rows.isEmpty)
+                        Text('This role grants no permissions of its own.', style: text.bodySmall),
+                      for (final g in groupNames) ...[
+                        SectionHeader(title: g, padding: const EdgeInsets.only(top: 10, bottom: 4)),
+                        for (final name in groups[g]!)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              const Icon(Icons.check, size: 14, color: AppColors.success),
+                              const SizedBox(width: 8),
+                              Expanded(child: Text(name, style: text.bodyLarge!.copyWith(fontSize: 13))),
+                            ]),
+                          ),
+                      ],
+                      if (unknown.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Text(
+                              '${unknown.length} further permission(s) this app does not have a '
+                              'name for yet — update the app to see them listed.',
+                              style: text.bodySmall!.copyWith(color: AppColors.warning)),
+                        ),
+                    ]),
+                  ),
+                ),
+              ],
+              const SizedBox(height: AppSpacing.lg),
+              Align(
+                alignment: Alignment.centerRight,
+                child: ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+              ),
+            ]),
+          ),
+        ),
+      );
+    },
+  );
+}
+
 class _CreateRoleDialog extends StatefulWidget {
   final RestClient rest;
   final List<dynamic> actions;
   final Map? existing; // when set, edit this role's permissions (name is locked)
-  const _CreateRoleDialog({required this.rest, required this.actions, this.existing});
+
+  /// C5's "VIEW and edit": true for a reader who may open a custom role but not
+  /// rewrite it. The tick boxes still show what is granted — that is the whole
+  /// point of viewing — and are simply not operable, with a line saying so and
+  /// no Save button to press. An enabled Save that 403s at the server is how a
+  /// manager learns their permissions from a red toast.
+  final bool readOnly;
+  const _CreateRoleDialog(
+      {required this.rest, required this.actions, this.existing, this.readOnly = false});
 
   @override
   State<_CreateRoleDialog> createState() => _CreateRoleDialogState();
@@ -32833,7 +33995,18 @@ class _CreateRoleDialogState extends State<_CreateRoleDialog> {
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('RBAC', style: text.labelSmall),
           const SizedBox(height: 6),
-          Text(_isEdit ? 'Edit role · ${_name.text}' : 'Create role', style: text.titleMedium),
+          Text(
+              _isEdit
+                  ? '${widget.readOnly ? 'Role' : 'Edit role'} · ${_name.text}'
+                  : 'Create role',
+              style: text.titleMedium),
+          if (widget.readOnly) ...[
+            const SizedBox(height: 6),
+            Text(
+                'What this role grants. Changing it needs the role-editing '
+                'permission — ask an owner or a manager who has it.',
+                style: text.bodySmall),
+          ],
           const SizedBox(height: AppSpacing.lg),
           TextField(
             controller: _name,
@@ -32868,27 +34041,35 @@ class _CreateRoleDialogState extends State<_CreateRoleDialog> {
                     value: _selected.contains('${a['id']}'),
                     title: Text(_s(a, 'action_name'),
                         style: text.bodyLarge!.copyWith(fontSize: 13)),
-                    onChanged: (v) => setState(() {
-                      final id = '${a['id']}';
-                      if (v == true) {
-                        _selected.add(id);
-                      } else {
-                        _selected.remove(id);
-                      }
-                    }),
+                    // null disables the box while leaving its VALUE visible —
+                    // which is exactly "view".
+                    onChanged: widget.readOnly
+                        ? null
+                        : (v) => setState(() {
+                              final id = '${a['id']}';
+                              if (v == true) {
+                                _selected.add(id);
+                              } else {
+                                _selected.remove(id);
+                              }
+                            }),
                   ),
               ],
             ]),
           ),
           const SizedBox(height: AppSpacing.lg),
           Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-            ForkButton.ghost(label: 'Cancel', onPressed: _saving ? null : () => Navigator.pop(context, false)),
-            const SizedBox(width: AppSpacing.sm),
-            ForkButton(
-              label: _saving ? 'Saving…' : (_isEdit ? 'Save' : 'Create'),
-              icon: Icons.check,
-              onPressed: _saving ? null : _save,
-            ),
+            ForkButton.ghost(
+                label: widget.readOnly ? 'Close' : 'Cancel',
+                onPressed: _saving ? null : () => Navigator.pop(context, false)),
+            if (!widget.readOnly) ...[
+              const SizedBox(width: AppSpacing.sm),
+              ForkButton(
+                label: _saving ? 'Saving…' : (_isEdit ? 'Save' : 'Create'),
+                icon: Icons.check,
+                onPressed: _saving ? null : _save,
+              ),
+            ],
           ]),
         ]),
       ),

@@ -550,7 +550,7 @@ class _NonChargeableSheetState extends State<_NonChargeableSheet> {
   bool _busy = false;
   String? _error;
 
-  bool get _may => _holdsAction(widget.profile, _permNonChargeable);
+  bool get _may => _mayDo(widget.profile, Capability.compItem, _permNonChargeable);
 
   @override
   void initState() {
@@ -966,6 +966,72 @@ Future<bool> misVoidOrder(
   }
 }
 
+/// REQUIREMENT A2 — THE CANCELLATION PROMPT, FOR EVERYBODY ELSE.
+///
+/// WHAT WAS WRONG. A2 asks for "a mandatory confirmation prompt before
+/// cancelling a KOT, requiring a cancellation reason before the action can be
+/// processed". [misVoidOrder] above does exactly that — and only for the people
+/// holding "Void Orders With Reason". Everybody else's cancel went out as a bare
+/// `PATCH /orders/:id/status {status: 'Cancelled'}` with no prompt, no reason
+/// and, until the slip existed, no paper. So the requirement was met for the one
+/// role least likely to be the person standing at the table when a guest changes
+/// their mind, and unmet for the role that does most of the cancelling.
+///
+/// WHY NOT SIMPLY SEND EVERY CANCEL THROUGH THE VOID ROUTE. Because POST
+/// /orders/:id/void is deliberately outside the offline queue — it carries no
+/// `idempotent()` guard on the server and is not on the outbox's 27-route
+/// allowlist, for the reasons this file's rule 2 sets out. Routing every cancel
+/// through it would mean that on a floor whose wifi has dropped, a cancellation
+/// becomes impossible: the food keeps cooking, the line keeps growing, and the
+/// only way out is to settle a bill for a dish nobody wants. A prompt that makes
+/// the app unusable in the one situation it is most needed is not a control.
+///
+/// SO THE PROMPT IS UNCONDITIONAL AND THE ROUTE IS NOT. Everyone is asked, in
+/// the same words, with the same closed vocabulary, before anything is sent. The
+/// reason then travels on whichever route this user is entitled to use — the
+/// strict void for those who hold it, the queueable status patch for everyone
+/// else, which stays exactly as reliable as it is today.
+///
+/// WHAT THE WEAKER ROUTE CAN AND CANNOT PROMISE. `reason` and `cancel_kind` ride
+/// on the PATCH body as additive fields. A server that has not been taught about
+/// them ignores them and behaves precisely as it does now — the cancel still
+/// works, the prompt is still mandatory in front of the waiter, and the Void KOT
+/// report goes on recording "unknown" for it. A server that HAS been taught has
+/// the reason for the cancellation slip's banner (dispatchCancellationKot
+/// already takes one) and for the report. Neither state can make the cancel
+/// fail, which is the property that lets this ship in front of the change.
+///
+/// Returns null when the user backed out — and backing out must cancel nothing.
+Future<({String kind, String reason})?> misCancelReason(
+  BuildContext context, {
+  required String what,
+  String value = '',
+}) async {
+  final answer = await showDialog<_CaptureReason>(
+    context: context,
+    builder: (_) => _CaptureReasonDialog(
+      title: 'Cancel order',
+      headline: value.isEmpty ? null : value,
+      danger: true,
+      subtitle: 'Cancelling $what stops the kitchen and takes it off the bill. '
+          'A reason is required before it can be processed, and it is printed on '
+          'the cancellation slip that goes to the pass.',
+      confirmLabel: 'Cancel it',
+      kinds: _voidKinds,
+      // NO SECOND NAME HERE, and that is the difference between this and
+      // [misVoidOrder]. An authoriser is a CONTROL on a privileged act; this is
+      // the ordinary act a waiter performs at the table, and demanding a manager
+      // for every changed mind would either stop service or train staff to type
+      // their own name into a box that then means nothing. The reason is what A2
+      // asked for; the second name is what the void permission is for.
+      needsAuthoriser: false,
+      suggestedAuthoriser: '',
+    ),
+  );
+  if (answer == null) return null;
+  return (kind: answer.kind, reason: answer.reason);
+}
+
 // ============================================================================
 // 036 — SERVICE CHARGE WAIVER: take the charge off an open bill
 // ============================================================================
@@ -994,7 +1060,7 @@ Widget misServiceChargeBlock(
   bool showsMoney = true,
 }) {
   final text = Theme.of(context).textTheme;
-  final may = _holdsAction(profile, _permServiceChargeWaiver);
+  final may = _mayDo(profile, Capability.waiveServiceCharge, _permServiceChargeWaiver);
   final waiver = bill['service_charge_waiver'];
   final waived = bill['service_charge_waived'] == true && waiver is Map;
 

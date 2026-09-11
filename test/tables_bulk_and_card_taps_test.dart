@@ -248,10 +248,14 @@ void main() {
 
   // --- 2. The run, end to end ------------------------------------------------
 
+  // D5: 'Add table' is a LAYOUT control and moved to the Floor plan screen with
+  // the rest of them. The run itself — the numbering, the preview, the POSTs,
+  // the report — is unchanged, so these tests are unchanged except for which of
+  // the two screens they open.
   testWidgets('Add table: the dialog previews the run and POSTs only the free names',
       (tester) async {
     _size(tester, 1400, 1000);
-    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!),
+    final api = await _mount(tester, (r) => m.floorPlanModule(r, r.auth.profile!),
         _tableRoutes([_table('T1'), _table('T3')]));
 
     await tester.tap(find.text('Add table'));
@@ -276,7 +280,7 @@ void main() {
 
   testWidgets('Add table: one table still creates exactly the name typed', (tester) async {
     _size(tester, 1400, 1000);
-    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
+    final api = await _mount(tester, (r) => m.floorPlanModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
 
     await tester.tap(find.text('Add table'));
     await tester.pumpAndSettle();
@@ -292,7 +296,7 @@ void main() {
   testWidgets('Add table: a batch the server rejects midway says what got through',
       (tester) async {
     _size(tester, 1400, 1000);
-    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
+    final api = await _mount(tester, (r) => m.floorPlanModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
     api.failOnTable = 'T4';
 
     await tester.tap(find.text('Add table'));
@@ -315,7 +319,7 @@ void main() {
   testWidgets('Add table: a seed that cannot be numbered never reports silent success',
       (tester) async {
     _size(tester, 1400, 1000);
-    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
+    final api = await _mount(tester, (r) => m.floorPlanModule(r, r.auth.profile!), _tableRoutes([_table('T1')]));
 
     await tester.tap(find.text('Add table'));
     await tester.pumpAndSettle();
@@ -343,7 +347,7 @@ void main() {
       (tester) async {
     _size(tester, 1400, 1000);
     // Far more consecutive taken names than the scan will examine for a run of 3.
-    final api = await _mount(tester, (r) => m.tablesModule(r, r.auth.profile!),
+    final api = await _mount(tester, (r) => m.floorPlanModule(r, r.auth.profile!),
         _tableRoutes([for (var i = 1; i <= 2000; i++) _table('T$i')]));
 
     await tester.tap(find.text('Add table'));
@@ -387,7 +391,10 @@ void main() {
     // And the card's actions are still reachable — the tap opens the table sheet.
     await tester.tap(find.text('T1'));
     await tester.pumpAndSettle();
-    expect(find.text('Delete table'), findsOneWidget);
+    expect(find.text('Table T1'), findsOneWidget);
+    // C7/H8: and the sheet it opens carries no delete, on EITHER screen and for
+    // ANY role. The control is a named button in the Floor plan header now.
+    expect(find.text('Delete table'), findsNothing);
   });
 
   testWidgets('Tables: a desktop window keeps the 168px design width', (tester) async {

@@ -348,7 +348,10 @@ void main() {
   group('the nav a role is given', () {
     test('an owner still sees every module, Feedback directly under Valet', () {
       expect(visibleModuleLabelsFor(_admin), const [
-        'Overview', 'Concerns', 'Orders', 'Kitchen', 'Tables', 'Waitlist', 'Bookings', 'Menu',
+        // 'Floor plan' is D5's layout half of what used to be the Tables
+        // module, and it sits directly under Tables — where somebody will look
+        // for the controls that left it.
+        'Overview', 'Concerns', 'Orders', 'Kitchen', 'Tables', 'Floor plan', 'Waitlist', 'Bookings', 'Menu',
         'Inventory', 'Purchase Orders',
         'Attendance', 'Employees', 'Roles', 'Valet',
         'Feedback', 'Customers',
@@ -358,9 +361,12 @@ void main() {
       ]);
     });
 
-    test('a waiter loses Menu, Kitchen, Waitlist and Bookings — and keeps the floor', () {
+    test('a waiter loses Menu, Kitchen, Waitlist, Bookings and the layout editor', () {
       final nav = visibleModuleLabelsFor(_waiter);
-      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings']) {
+      // D5 — 'Floor plan' is the layout EDITOR, and every control on it is
+      // already false for this role. Left in the nav it would be a second copy
+      // of the floor with every button removed.
+      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings', 'Floor plan']) {
         expect(nav, isNot(contains(gone)));
       }
       // What the shift is actually made of.
@@ -370,9 +376,11 @@ void main() {
     // The scouted hole: Waitlist's keywords are ['table', 'order', 'waitlist']
     // and Kitchen's are ['order','kitchen','kot','kds'] — every waiter holds an
     // order action, so no grant could ever have hidden either of them.
-    test('the four stay hidden even for a waiter granted the analytics action', () {
+    test('they stay hidden even for a waiter granted the analytics action', () {
       final nav = visibleModuleLabelsFor(_waiterWithApc);
-      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings']) {
+      // 'Floor plan' carries ['table'] — the keyword EVERY waiter matches — so
+      // like Waitlist and Kitchen it could never have been hidden by a grant.
+      for (final gone in const ['Menu', 'Kitchen', 'Waitlist', 'Bookings', 'Floor plan']) {
         expect(nav, isNot(contains(gone)));
       }
     });

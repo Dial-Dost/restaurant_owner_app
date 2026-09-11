@@ -8,6 +8,7 @@ import 'package:restaurant_owner_app/screens/modules.dart' as m;
 import 'package:restaurant_owner_app/screens/order_entry.dart';
 import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
+import 'package:restaurant_owner_app/services/printed_bills.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
@@ -187,6 +188,10 @@ Future<_FakeApi> _mountFloor(
   bool occupied = true,
   Map<String, dynamic>? bill,
   DesignSystem system = DesignSystem.rustic,
+  /// REQUIREMENT D5 — which of the two floor screens to open. Defaults to the
+  /// service one (Tables), because that is where a waiter lives and what every
+  /// test in this file was written about; the layout assertions pass `plan`.
+  bool plan = false,
 }) async {
   await tester.pumpWidget(const SizedBox());
   tester.view.physicalSize = const Size(1400, 1600);
@@ -194,8 +199,9 @@ Future<_FakeApi> _mountFloor(
   addTearDown(tester.view.reset);
   final api = _FakeApi(_routes(occupied: occupied, bill: bill), actions: actions, role: role);
   final rest = await _signIn(api);
-  await tester.pumpWidget(
-      _host(m.tablesModule(rest, rest.auth.profile!), system: system));
+  await tester.pumpWidget(_host(
+      plan ? m.floorPlanModule(rest, rest.auth.profile!) : m.tablesModule(rest, rest.auth.profile!),
+      system: system));
   await tester.pumpAndSettle();
   return api;
 }
@@ -227,6 +233,13 @@ List<String> _buttons(WidgetTester tester) =>
     [for (final b in tester.widgetList<ForkButton>(find.byType(ForkButton))) b.label];
 
 void main() {
+  // [PrintedBills] is a process-wide singleton — the floor grid and the table
+  // sheet have to agree the instant one of them prints — so a waiter who printed
+  // in one test would still have that table retired in the next. Reset between
+  // tests; requirement C3's own group is what exercises it deliberately.
+  setUp(PrintedBills.instance.resetForTest);
+  tearDown(PrintedBills.instance.resetForTest);
+
   // ======================================================== the sheet's shape
 
   group('the table sheet a waiter is given', () {
@@ -269,15 +282,15 @@ void main() {
       expect(addOrder.width, closeTo(printBill.width, 1));
     });
 
-    testWidgets('an admin loses NOTHING — every control is still on the sheet',
+    testWidgets('an admin loses NOTHING — every service control is still there',
         (tester) async {
       await _mountFloor(tester, role: 'admin', actions: const ['*']);
       await _openTable(tester);
-      await _reveal(tester, find.text('Delete table'));
+      await _reveal(tester, find.text('Refund'));
 
       final labels = _buttons(tester);
       for (final kept in const [
-        'Settle bill', 'Release without payment', 'Edit seating',
+        'Settle bill', 'Release without payment',
         'Merge', 'Split', 'Discount',
         'Reprint (no service charge)', 'Refund', 'Print bill', 'Print QR',
       ]) {
@@ -285,12 +298,60 @@ void main() {
       }
       // The coupon button names the code when there is one, so match its stem.
       expect(labels.any((l) => l.startsWith('Coupon')), isTrue);
-      expect(find.text('Delete table'), findsOneWidget);
       expect(find.text('Waiter: Ravi K'), findsOneWidget);
       // The two waiter-only keys never appear for anyone else: their sheet keeps
       // the wrapped row it shipped with.
       expect(find.byKey(const ValueKey('table-add-order')), findsNothing);
       expect(find.byKey(const ValueKey('table-print-bill')), findsNothing);
+    });
+
+    // ---- REQUIREMENT D5, AND C7/H8 ---------------------------------------
+    //
+    // The layout controls did not GO, they MOVED, and that difference is the
+    // whole of "an admin must lose nothing". These are a pair: one pins that the
+    // service sheet no longer offers them to ANYBODY, the other that an owner
+    // still has every one of them on the screen they moved to.
+    testWidgets('the SERVICE sheet offers an owner no layout control at all',
+        (tester) async {
+      final api = await _mountFloor(tester, role: 'admin', actions: const ['*']);
+      await _openTable(tester);
+      await _reveal(tester, find.text('Refund'));
+
+      expect(_buttons(tester), isNot(contains('Edit seating')));
+      // C7 + H8: delete is off this sheet for every role and on both surfaces.
+      expect(find.text('Delete table'), findsNothing);
+
+      // AND IT IS UNREACHABLE, NOT MERELY UNDRAWN. Drive every control the sheet
+      // still offers and assert neither layout write ever leaves.
+      for (final b in find.byType(ForkButton).evaluate().toList()) {
+        final w = b.widget as ForkButton;
+        if (w.onPressed == null || w.label == 'Add order') continue;
+        w.onPressed!();
+        await tester.pumpAndSettle();
+      }
+      expect(api.writes.where((w) => w.method == 'DELETE' && w.path.startsWith('/table/')), isEmpty);
+      expect(api.writes.where((w) => w.method == 'PATCH' && w.path.startsWith('/table/')), isEmpty);
+    });
+
+    testWidgets('an owner keeps every layout control on the Floor plan screen',
+        (tester) async {
+      await _mountFloor(tester, role: 'admin', actions: const ['*'], plan: true);
+      expect(find.text('Add table'), findsOneWidget);
+      expect(find.byKey(const ValueKey('floor-delete-table')), findsOneWidget);
+      expect(find.text('New section'), findsOneWidget);
+      // ...and the per-table one, on the sheet this screen opens.
+      await _openTable(tester);
+      await _reveal(tester, find.text('Edit seating'));
+      expect(find.text('Edit seating'), findsOneWidget);
+    });
+
+    testWidgets('a waiter is offered no layout control on either screen',
+        (tester) async {
+      await _mountFloor(tester, role: 'waiter', plan: true);
+      expect(find.text('Add table'), findsNothing);
+      expect(find.byKey(const ValueKey('floor-delete-table')), findsNothing);
+      expect(find.text('New section'), findsNothing);
+      expect(find.text('Arrange'), findsNothing);
     });
 
     // ITEM 16, on a FREE table. There is no seat button, and "Add order" is
@@ -509,10 +570,13 @@ void main() {
     // the same family as editing and deleting one; leaving it while removing the
     // other two produces a waiter who can create a table and not remove it.
     testWidgets('the floor plan offers a waiter no "Add table"', (tester) async {
-      await _mountFloor(tester, role: 'waiter');
+      await _mountFloor(tester, role: 'waiter', plan: true);
       expect(find.text('Add table'), findsNothing);
-      await _mountFloor(tester, role: 'admin', actions: const ['*']);
+      await _mountFloor(tester, role: 'admin', actions: const ['*'], plan: true);
       expect(find.text('Add table'), findsOneWidget);
+      // D5: and it is not on the SERVICE screen for anybody, owner included.
+      await _mountFloor(tester, role: 'admin', actions: const ['*']);
+      expect(find.text('Add table'), findsNothing);
     });
   });
 
@@ -667,7 +731,10 @@ void main() {
         });
 
     test('a waiter loses every control and every figure', () {
-      final s = FloorScope.of(who('waiter'));
+      // On the LAYOUT surface, which is the strictly harder case: the flags the
+      // surface alone would have turned off are on, so every `false` below is
+      // the ROLE's answer and not D5's.
+      final s = FloorScope.of(who('waiter'), surface: FloorSurface.plan);
       expect([
         s.seat, s.settle, s.release, s.editSeating, s.deleteTable,
         s.billOps, s.guestQr, s.assignWaiter, s.addTable, s.money,
@@ -685,7 +752,7 @@ void main() {
 
     test('nobody else is narrowed — not one flag', () {
       for (final role in ['admin', 'manager', 'cashier', 'captain', 'employee', 'valet']) {
-        final s = FloorScope.of(who(role));
+        final s = FloorScope.of(who(role), surface: FloorSurface.plan);
         expect([
           s.seat, s.settle, s.release, s.editSeating, s.deleteTable,
           s.billOps, s.guestQr, s.assignWaiter, s.addTable, s.money,
@@ -703,6 +770,42 @@ void main() {
           'action_names': const <String>[],
         });
         expect(FloorScope.of(p).settle, isTrue, reason: 'waiter + $other works the till');
+      }
+    });
+
+    // REQUIREMENT D5 AS A PROPOSITION, stated where it can be argued with.
+    test('the service surface refuses every layout flag, to everybody', () {
+      for (final role in ['admin', 'manager', 'cashier', 'captain', 'waiter']) {
+        final s = FloorScope.of(who(role), surface: FloorSurface.service);
+        expect([s.editSeating, s.deleteTable, s.addTable, s.arrangeFloor],
+            everyElement(isFalse),
+            reason: '$role can still re-lay-out the floor from the service screen');
+      }
+    });
+
+    test('and the plan surface cannot hand a waiter one back', () {
+      final s = FloorScope.of(who('waiter'), surface: FloorSurface.plan);
+      expect([s.editSeating, s.deleteTable, s.addTable, s.arrangeFloor],
+          everyElement(isFalse),
+          reason: 'the surface overruled the role, which is exactly backwards');
+    });
+
+    // The default is the RESTRICTIVE one: a call site written later and missing
+    // the argument must lose a layout control, never gain one.
+    test('the default surface is service', () {
+      final s = FloorScope.of(who('admin', actions: const ['*']));
+      expect([s.editSeating, s.deleteTable, s.addTable, s.arrangeFloor],
+          everyElement(isFalse));
+    });
+
+    // AND THE SURFACE TOUCHES NOTHING ELSE. D5 is about the layout controls; it
+    // must not quietly take the till off the service screen.
+    test('the surface changes nothing else at all', () {
+      for (final surface in FloorSurface.values) {
+        final a = FloorScope.of(who('admin', actions: const ['*']), surface: surface);
+        expect([a.seat, a.settle, a.release, a.billOps, a.guestQr, a.assignWaiter,
+                a.money, a.floorSummary, a.managerOnlyAsks],
+            everyElement(isTrue), reason: 'an owner lost a service control on ${surface.name}');
       }
     });
   });
@@ -738,11 +841,19 @@ void main() {
     });
 
     testWidgets('an owner keeps it, unchanged', (tester) async {
+      // D5 renamed the header per surface — the Tables screen says Tables, the
+      // Floor plan screen says Floor plan — but the READ-OUT, which is what this
+      // group exists to protect, is on both.
       await _mountFloor(tester, role: 'admin');
-      final painted = _painted(tester).join(' | ');
-      expect(painted, contains('Floor plan'));
+      var painted = _painted(tester).join(' | ');
+      expect(painted, contains('Tables'));
       expect(summaryChip.hasMatch(painted), isTrue,
           reason: 'the floor read-out went missing for the person who runs the floor');
+
+      await _mountFloor(tester, role: 'admin', plan: true);
+      painted = _painted(tester).join(' | ');
+      expect(painted, contains('Floor plan'));
+      expect(summaryChip.hasMatch(painted), isTrue);
     });
 
     testWidgets('and the tables themselves are still there for the waiter',

@@ -73,6 +73,17 @@ class RoleScope {
   /// over-hiding is the failure mode this file's header warns about.
   static const Set<String> hiddenModules = {
     // the floor modules
+    //
+    // FLOOR PLAN is the newest of them and the plainest case. It is the layout
+    // EDITOR that requirement D5 split out of Tables — add a table, delete one,
+    // re-seat it, drag it between zones, mint and dissolve the zones themselves
+    // — and every control on it is already false for this role
+    // ([FloorScope.arrangeFloor], .addTable, .deleteTable, .editSeating). Left
+    // in the nav it would be a second copy of the floor plan with every button
+    // removed: a screen that exists to answer a question this role is not being
+    // asked. Its keyword is ['table'], which every waiter matches, so the
+    // keyword gate would never have excluded it.
+    'Floor plan',
     'Menu',
     'Kitchen',
     'Waitlist',
@@ -141,6 +152,32 @@ class RoleScope {
     if (roles.isEmpty) return false;
     if (!roles.contains(waiter)) return false;
     return !roles.any(_outranksWaiter.contains);
+  }
+
+  /// MAY THIS IDENTITY DO [c] — the server's answer, obeyed.
+  ///
+  /// THE TEST THAT MATTERS: give this a profile whose ROLE STRINGS say one thing
+  /// and whose server flag says another, and the FLAG wins. That is the test
+  /// that would have caught csrorganics, where a client derived an authority
+  /// answer from `role_all` and got it wrong on every tenant using custom roles.
+  ///
+  /// [fallback] IS WHAT THIS CALL SITE DID BEFORE THE FLAG EXISTED, and it is
+  /// required rather than defaulted so nobody can add a gate here without
+  /// stating what an older backend should do about it. It is consulted ONLY when
+  /// the server said nothing at all. Defaulting these to false instead would
+  /// empty the till the first day the app shipped ahead of the backend — see
+  /// [Profile.said].
+  ///
+  /// THE ONE SHORT-CIRCUIT: the `*` wildcard. That is not a role string and not
+  /// a guess — it is the server's own admin marker out of `actions_set`, and
+  /// `sessionCapabilities` returns true for every flag when it is present, so
+  /// this can never disagree with a correctly built server. It is here so a
+  /// malformed or half-migrated payload cannot take the floor away from the
+  /// person who owns the restaurant, which is the failure this codebase fears
+  /// more than any control drawn one release too long.
+  static bool may(Profile p, Capability c, {required bool fallback}) {
+    if (p.actions.contains('*')) return true;
+    return p.said(c) ?? fallback;
   }
 
   /// True when [label] must be kept out of this user's nav on role grounds
@@ -290,6 +327,42 @@ class OverviewScope {
   }
 }
 
+/// WHICH OF THE TWO FLOOR SCREENS IS ASKING — requirement D5.
+///
+/// The app used to fuse them. One module called "Tables" drew the floor plan,
+/// the section groups, the drag-and-drop that re-labels a table's zone, the
+/// "Add table" button, and — through the per-table sheet — "Edit seating" and
+/// "Delete table". So the screen a waiter stands in front of all service was
+/// also the screen the floor gets rebuilt on, and the only thing between a
+/// mis-aimed long-press and a table changing section was the length of the
+/// gesture.
+///
+/// D5 splits the JOB in two and this enum is the seam:
+///
+///   * [service] — the TABLES screen. Read the floor, open a table, take an
+///     order, print, settle. It may not move, re-layout, reformat or delete
+///     anything. Not "may not, if you are a waiter" — MAY NOT, full stop: an
+///     owner working the floor at eight o'clock is doing service, and the
+///     layout controls are not what they reached for.
+///   * [plan] — the FLOOR PLAN screen. Rearrange, group, add, re-seat, delete.
+///     Everything that writes the shape of the room rather than what is
+///     happening in it.
+///
+/// IT IS A SURFACE, NOT A PERMISSION, and the two are ANDed rather than
+/// substituted (see [FloorScope.of]). Moving a control to the layout screen
+/// cannot hand it to somebody the role gate already refused, and the role gate
+/// cannot put a delete button back on the service screen. Both have to say yes.
+///
+/// AN ADMIN LOSES NOTHING: every layout control an owner had is still theirs,
+/// one tab away, on the screen that is now named after the job.
+enum FloorSurface {
+  /// The Tables screen — service. Deny-by-default for every layout write.
+  service,
+
+  /// The Floor plan screen — the layout editor.
+  plan,
+}
+
 /// What a signed-in user may DO on a table, and whether they may see what it is
 /// worth.
 ///
@@ -311,6 +384,7 @@ class FloorScope {
     required this.editSeating,
     required this.deleteTable,
     required this.addTable,
+    required this.arrangeFloor,
     required this.billOps,
     required this.guestQr,
     required this.assignWaiter,
@@ -328,11 +402,19 @@ class FloorScope {
   final bool seat;
 
   /// "Settle bill", and the approve-a-guest-payment card that also closes the
-  /// table. Taking money is a cashier/manager act.
+  /// table. Taking money is a cashier/manager act, and the server says who may:
+  /// [Capability.settleBill].
   final bool settle;
 
   /// "Release without payment" — POST /release-table. Freeing an occupied table
   /// with an open bill on it is a write-off, whatever it is called.
+  ///
+  /// SO IT TAKES [Capability.settleBill], THE SAME FLAG SETTLING TAKES, and the
+  /// reason is worth stating where somebody might otherwise relax it. The route
+  /// voids every active order on the table AND closes its open bill at
+  /// total_amt = 0. Gated on an ordinary floor permission, that left the bill
+  /// impossible to take for its true value and trivial to make vanish for
+  /// nothing — a restriction that looks like one from the outside and is not.
   final bool release;
 
   /// "Edit seating" — PATCH /table/:name {capacity, max_capacity}. Floor layout,
@@ -351,6 +433,21 @@ class FloorScope {
   /// live floor plan and then cannot remove the one they mistyped. Adding a
   /// table writes the layout every other screen reads.
   final bool addTable;
+
+  /// RE-LAYING OUT THE ROOM: dragging a table from one zone into another, and
+  /// creating, renaming, dissolving or re-ordering the zones themselves.
+  ///
+  /// REQUIREMENT D5, AND IT IS THE SURFACE THAT DECIDES IT, not the role. These
+  /// controls answered to a permission alone ("Table Added" for a move, "Manage
+  /// Table Sections" for the roster) and lived on the same screen as the service
+  /// floor, so an owner reading their tables during a rush was one long-press
+  /// away from re-sectioning one. They are now [FloorSurface.plan] only — the
+  /// permission gates underneath are untouched and still have to say yes too.
+  ///
+  /// Deliberately ONE flag for the move and the roster rather than two. They are
+  /// the same act seen at two scales, and splitting them is how you get a screen
+  /// that lets you drag a table into a section you cannot name.
+  final bool arrangeFloor;
 
   /// Merge, split, discount, coupon, reprint-without-service-charge and refund:
   /// every control that changes or re-presents what the guest owes.
@@ -408,21 +505,154 @@ class FloorScope {
   /// ENABLED comp button, which the requirement forbids regardless of grant.
   final bool managerOnlyAsks;
 
-  factory FloorScope.of(Profile p) {
+  /// [surface] says WHICH floor screen is asking — see [FloorSurface].
+  ///
+  /// IT DEFAULTS TO [FloorSurface.service], THE RESTRICTIVE ONE, and that
+  /// direction is the point. Both modules pass it explicitly, so the default is
+  /// only ever reached by a call site written later — and the failure mode of a
+  /// forgotten argument then is "somebody has to switch tabs to delete a table",
+  /// never "a delete button reappeared on the service floor". The role gates are
+  /// the other way round for the reason stated at the top of this file: an
+  /// unreadable ROLE keeps every screen it has, because a floor that cannot take
+  /// an order is a worse outage than a control in the wrong place.
+  ///
+  /// The three layout flags are the role answer AND the surface answer. Neither
+  /// can overrule the other: this cannot grant a waiter a delete button by
+  /// putting them on the plan screen, and it cannot take an owner's away
+  /// permanently — theirs moved, it did not go.
+  factory FloorScope.of(Profile p, {FloorSurface surface = FloorSurface.service}) {
     final waiterOnly = RoleScope.isWaiterOnly(p);
+    final layout = surface == FloorSurface.plan;
+    // THE SERVER'S ANSWERS, not this class's arithmetic on role strings. Each
+    // fallback is what this flag meant before the capability shipped, so an app
+    // pointed at an older backend behaves exactly as it did — see [RoleScope.may].
+    final mayClose = RoleScope.may(p, Capability.settleBill, fallback: !waiterOnly);
+    final mayEditTable = RoleScope.may(p, Capability.editTable, fallback: !waiterOnly);
+    final mayDeleteTable = RoleScope.may(p, Capability.deleteTable, fallback: !waiterOnly);
     return FloorScope(
       seat: !waiterOnly,
-      settle: !waiterOnly,
-      release: !waiterOnly,
-      editSeating: !waiterOnly,
-      deleteTable: !waiterOnly,
-      addTable: !waiterOnly,
+      settle: !waiterOnly && mayClose,
+      // THE SIDE DOOR, AND IT WAS STANDING OPEN. Every settle path went behind
+      // "Close Bill", and POST /release-table did not — it voids every active
+      // order on the table and closes the open bill at zero, on a permission the
+      // core waiter role holds. So the bill could not be taken for what it was
+      // worth and could still be made to vanish for nothing, which is worse than
+      // never having restricted settling at all, because it LOOKS restricted.
+      //
+      // Releasing a table that owes money is a WRITE-OFF, so it takes the
+      // write-off authority: the same flag settling takes. The server gate is the
+      // control (POST /release-table now requires Close Bill when the table has an
+      // open bill); this is the courtesy that stops drawing a button that 403s.
+      release: !waiterOnly && mayClose,
+      editSeating: !waiterOnly && layout && mayEditTable,
+      deleteTable: !waiterOnly && layout && mayDeleteTable,
+      addTable: !waiterOnly && layout && mayEditTable,
+      // NOT gated here, and deliberately: the two writes behind it answer to two
+      // different capabilities (moving a table is `edit_table`, minting a zone is
+      // `manage_table_sections`) and the call site already ANDs each control with
+      // its own — see `_canMoveTables` / `_canManageSections` in modules.dart.
+      // Collapsing both into one flag here would either hand a zone editor to
+      // somebody who may only drag a table, or take the drag away from somebody
+      // who may not rename a zone.
+      arrangeFloor: !waiterOnly && layout,
       billOps: !waiterOnly,
       guestQr: !waiterOnly,
       assignWaiter: !waiterOnly,
       money: RoleScope.showsMoney(p),
       floorSummary: !waiterOnly,
+      // The ROLE half only. Each of the two controls behind it is ANDed with its
+      // own capability at its own call site (`comp_item`, `waive_service_charge`),
+      // for the reason stated on this field: a tenant that granted its waiters the
+      // non-chargeable uuid must still not get an enabled comp button, so the role
+      // gate cannot be replaced by the capability — only added to.
       managerOnlyAsks: !waiterOnly,
+    );
+  }
+}
+
+/// PRINTING A TABLE'S BILL — requirement C3, which is the one item in this block
+/// that had to be interpreted rather than merely implemented.
+///
+/// WHAT WAS ASKED, VERBATIM: "Waiters can only execute Print Bill ONCE. After
+/// clicking, the button must disappear and the table should clear/reset from
+/// their view. Any subsequent actions (reprinting, overrides) must be restricted
+/// to Super Admins."
+///
+/// WHY IT CANNOT BE TAKEN LITERALLY, AND WHAT IT WAS READ AS INSTEAD.
+///
+/// Read literally, "the table should clear/reset" collides head-on with C2, the
+/// requirement immediately above it: a waiter may not settle. If printing
+/// RELEASED the table, then printing would be the settle — a table with an open
+/// bill on it would go free, unpaid, on the one action C2 says a waiter still
+/// has. That is a write-off dressed as a print, and it is the money bug this
+/// whole block exists to stop, not a feature.
+///
+/// So "clear from their view" is read as exactly what it says — THEIR VIEW. The
+/// table stays OPEN, the bill stays owing, and a manager settles it. What
+/// changes is the waiter's own screen: the Print bill button goes, and the table
+/// drops off their floor, because for them the job at that table is finished.
+/// The bill remains fully reprintable — by somebody senior, on the unchanged
+/// control they already have.
+///
+/// WHO KEEPS THE REPRINT. Waiter-only identities lose it; NOBODY ELSE DOES. The
+/// requirement names "Super Admins", but a manager, cashier or captain who can
+/// reprint today would lose it on a literal reading, and this codebase's
+/// standing rule is that a fix must not take the till away from the people who
+/// run the floor. "Super Admin" is read as naming who a WAITER escalates to, not
+/// as a new ceiling on everyone else.
+///
+/// WHERE THE "ONCE" IS REMEMBERED, AND WHAT EACH ANSWER IS WORTH.
+/// The server now records it: `/bill-for-table` carries `print_count`,
+/// `bill_printed_at` and `printed_at`, and POST /print/bill itself REFUSES a
+/// waiter-only identity's second print with a 403 that says who to ask. So the
+/// hidden control has a gate behind it and this class is the courtesy in front
+/// of it, which is the right way round.
+///
+/// [printed] is therefore the SERVER'S answer wherever the payload carries one —
+/// including when that answer is "not printed" and this tablet remembers
+/// otherwise (see `serverBillPrintState`). The per-device memory in
+/// `PrintedBills` is reached ONLY when the payload carries no print state at
+/// all, i.e. a backend older than those fields. It is a courtesy, not a control:
+/// it survives a back-navigation and an app restart, and it does not survive a
+/// reinstall or a second tablet.
+class BillPrintScope {
+  const BillPrintScope({
+    required this.print,
+    required this.reprintNeedsSenior,
+    required this.retiresTable,
+  });
+
+  /// Whether the Print bill control may be drawn and pressed at all right now.
+  final bool print;
+
+  /// True when this reader has used up their one print and a second one is
+  /// somebody else's to make. Drives the sentence the sheet shows in the
+  /// button's place — a waiter who is simply given a blank space where a control
+  /// was will press it again on the next device they find.
+  final bool reprintNeedsSenior;
+
+  /// Whether this table now leaves THIS reader's floor grid.
+  ///
+  /// Never a release, never a settle, never a write of any kind — the row is
+  /// filtered out of one list on one device. The table is still occupied, still
+  /// owes money, and is still on every manager's screen, which is the whole
+  /// difference between "clear from their view" and "clear the table".
+  final bool retiresTable;
+
+  /// [printed] is "this table's current bill has already been printed by this
+  /// reader", resolved by the caller from the server's answer where there is one
+  /// and from the device memory otherwise.
+  factory BillPrintScope.of(Profile p, {required bool printed}) {
+    final waiterOnly = RoleScope.isWaiterOnly(p);
+    // Everyone else is untouched — same control, same number of presses, same
+    // receipt preview in front of it.
+    if (!waiterOnly) {
+      return const BillPrintScope(print: true, reprintNeedsSenior: false, retiresTable: false);
+    }
+    return BillPrintScope(
+      print: !printed,
+      reprintNeedsSenior: printed,
+      retiresTable: printed,
     );
   }
 }

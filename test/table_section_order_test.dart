@@ -112,7 +112,12 @@ Future<_FakeApi> _mount(
   final auth = AuthController(api: api);
   await auth.login('CSR Organics', 'admin', 'admin123');
   final rest = RestClient(auth);
-  await tester.pumpWidget(_host(m.tablesModule(rest, profile ?? _admin), system));
+  // REQUIREMENT D5 SPLIT THIS SCREEN IN TWO, and everything below is the LAYOUT
+  // half — arranging zones, dragging a table between them, adding and deleting
+  // tables. Those controls left `tablesModule` (which is now service only: read
+  // the floor, open a table, order, print, settle) and live on `floorPlanModule`.
+  // Same widget, same data, same assertions — the surface flag is what moved.
+  await tester.pumpWidget(_host(m.floorPlanModule(rest, profile ?? _admin), system));
   await tester.pumpAndSettle();
   return api;
 }

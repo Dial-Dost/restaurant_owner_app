@@ -596,7 +596,24 @@ void main() {
       expect(api.wrote('PATCH', '/orders/order-1/status'), isFalse);
     });
 
-    testWidgets('a waiter keeps the fast path — the one the offline queue accepts',
+    // ---- REQUIREMENT A2 CHANGED THIS TEST, AND THE CHANGE IS THE POINT ----
+    //
+    // WHAT IT USED TO SAY. "A waiter keeps the fast path" was written as "no
+    // form at all", on the reasoning that demanding a reason AND an authoriser
+    // from somebody who holds neither permission would stop a live floor
+    // cancelling anything. Half of that reasoning was right and half was a
+    // conflation: the thing that cannot be demanded of a waiter is the SECOND
+    // NAME, and the thing that cannot be demanded of the network is the STRICT
+    // VOID ROUTE, which is outside the offline queue. Neither of those is a
+    // reason to let a cancellation through with no explanation at all — and A2
+    // asks, in as many words, for a mandatory reason before any cancel is
+    // processed.
+    //
+    // WHAT IT SAYS NOW. The prompt is unconditional; the ROUTE still is not. A
+    // waiter is asked why, in the same words as everybody else, and their answer
+    // then travels on the queueable PATCH — no authoriser, no /void, nothing
+    // that could fail when the wifi drops mid-service.
+    testWidgets('a waiter is asked WHY, and still travels the fast path',
         (tester) async {
       final api = await _mount(
         tester,
@@ -608,10 +625,47 @@ void main() {
       await tester.tap(find.text('Decline'));
       await tester.pumpAndSettle();
 
-      // No form: requiring a reason and an authoriser from someone who holds
-      // neither permission would stop a live floor cancelling anything.
-      expect(find.byKey(const ValueKey('capture-reason')), findsNothing);
+      // A2: THE PROMPT IS THERE, and nothing has been written yet.
+      expect(find.byKey(const ValueKey('capture-reason')), findsOneWidget);
+      expect(api.wrote('PATCH', '/orders/order-1/status'), isFalse);
+      // …and no second name is demanded of somebody who cannot be their own
+      // authoriser. That is what "keeps the fast path" actually protected.
+      expect(find.byKey(const ValueKey('capture-authoriser')), findsNothing);
+
+      await _fillReason(tester, kind: 'guest_changed_mind', reason: 'Guest left');
+
       expect(api.wrote('PATCH', '/orders/order-1/status'), isTrue);
+      expect(api.wrote('POST', '/orders/order-1/void'), isFalse);
+      final body = api.bodyOf('/orders/order-1/status') as Map?;
+      expect(body, isNotNull);
+      expect(body!['status'], 'Cancelled');
+      // The reason rides along on the queueable route. A server that has not
+      // been taught the field ignores it and the cancel behaves exactly as it
+      // does today — which is what lets this ship ahead of the server change.
+      expect(body['reason'], 'Guest left');
+      expect(body['cancel_kind'], 'guest_changed_mind');
+    });
+
+    // A2's other half: MANDATORY means backing out cancels nothing.
+    testWidgets('dismissing the reason prompt cancels nothing at all',
+        (tester) async {
+      final api = await _mount(
+        tester,
+        m.ordersModule,
+        _tableRoutes(orders: _orders(status: 'Pending')),
+        actions: const ['x'],
+        role: 'waiter',
+      );
+      await tester.tap(find.text('Decline'));
+      await tester.pumpAndSettle();
+      // The confirm is inert until a reason is typed — the prompt cannot be
+      // satisfied by pressing through it.
+      final confirm = tester.widget<ForkButton>(find.byKey(const ValueKey('capture-confirm')));
+      expect(confirm.onPressed, isNull);
+
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(api.wrote('PATCH', '/orders/order-1/status'), isFalse);
       expect(api.wrote('POST', '/orders/order-1/void'), isFalse);
     });
   });
@@ -1330,6 +1384,12 @@ void main() {
       (tester) async {
     final api = await _mount(tester, m.ordersModule, _tableRoutes());
     await tester.tap(find.text('Table T1').first);
+    await tester.pumpAndSettle();
+    // The detail sheet grew a line — D2's "Open for 12m 04s" — so the comp
+    // button can sit below the fold on a short test viewport. Scroll to it
+    // rather than widening the window: the button being reachable by scrolling
+    // is the real behaviour, and a tap that silently misses is how this started.
+    await tester.ensureVisible(find.text('Comp an item'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Comp an item'));
     await tester.pumpAndSettle();

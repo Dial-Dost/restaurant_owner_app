@@ -6,12 +6,113 @@ import '../config.dart';
 import '../models/profile.dart';
 import 'idempotency.dart';
 
+/// A refusal (or failure) the server answered with.
+///
+/// [message] IS THE SENTENCE A HUMAN IS SHOWN. Every module in this app renders
+/// a caught error as `'$e'`, which is [toString], which is this — so the ONE
+/// place a refusal can be made to read like an instruction instead of a status
+/// code is where the message is built, and that is [ApiException.fromBody].
 class ApiException implements Exception {
+  /// What to show a person. See [ApiException.fromBody] for where it comes from.
   final String message;
   final int? status;
-  ApiException(this.message, [this.status]);
+
+  /// The server's own `details` sentence, verbatim, when it wrote one — the
+  /// rupee value a release would destroy, who may reprint, the permission a
+  /// settle needs. Null when the body carried none.
+  final String? details;
+
+  /// The server's short `error` token ("Forbidden", "Action not permitted").
+  /// Kept SEPARATE from [message] so nothing has to parse the sentence to find
+  /// out which refusal it was, and so a caller that wants the machine-readable
+  /// half never has to reach for the human-readable one.
+  final String? serverError;
+
+  ApiException(this.message, [this.status, this.details, this.serverError]);
+
+  /// THE ONE PLACE A NON-2xx BODY BECOMES WORDS.
+  ///
+  /// THE DEFECT THIS CLOSES. The backend answers a refusal with
+  /// `{error: "Forbidden", details: "<a sentence>"}` — "This table has ₹6,351
+  /// unpaid…", "A reprint has to be made by a manager, admin — ask one of
+  /// them", "Settling a bill requires the 'Close Bill' permission". This client
+  /// read `error` and threw the rest away, so a waiter was shown the word
+  /// "Forbidden" and walked off to fetch a manager to find out what it meant.
+  /// The sentence is the whole point; the status is not.
+  ///
+  /// THE ORDER, and why each rung is where it is:
+  ///
+  ///   1. `details` — the sentence the server wrote for this exact refusal.
+  ///   2. `error`, but only when it is itself a sentence. A bare HTTP title
+  ///      ("Forbidden", "Unauthorized") is a STATUS wearing a word; showing it
+  ///      is the defect. "Action not permitted", "Only an admin can …" and
+  ///      every other real message still comes through untouched.
+  ///   3. the caller's [fallback] ("Sign-in failed."), then a default written
+  ///      for the status.
+  ///
+  /// WHAT IS DELIBERATELY NOT RENDERED. `requiredPermission` is an Action UUID
+  /// and `requiredRoles` is a machine list; neither is language. They stay on
+  /// the exception (read `details`/`serverError`, or the raw fields server-side)
+  /// and never reach a snackbar. The server already names the permission in
+  /// WORDS inside `details` where a human needs it.
+  factory ApiException.fromBody(Object? decoded, int status, {String? fallback}) {
+    final body = decoded is Map ? decoded : const <dynamic, dynamic>{};
+    final rawDetails = body['details'];
+    final details =
+        rawDetails is String && rawDetails.trim().isNotEmpty ? rawDetails.trim() : null;
+    final rawError = body['error'];
+    final serverError =
+        rawError is String && rawError.trim().isNotEmpty ? rawError.trim() : null;
+    return ApiException(
+      details ??
+          (serverError != null && !_isBareHttpTitle(serverError) ? serverError : null) ??
+          fallback ??
+          _defaultFor(status),
+      status,
+      details,
+      serverError,
+    );
+  }
+
+  /// The SERVER'S sentence when it wrote one, else this screen's own line.
+  ///
+  /// For the handful of places that replace a refusal with bespoke wording
+  /// because the generic answer ("You do not have permission for this action")
+  /// was useless on that screen. Those lines are still right and still shown —
+  /// they just stop overwriting a server that had something more specific to
+  /// say, which is the whole defect this class was changed to fix, one level
+  /// down.
+  String sentenceOr(String fallback) => details ?? fallback;
+
   @override
   String toString() => message;
+}
+
+/// Words that are only ever a restatement of the status line. A body whose
+/// `error` is one of these has told a person nothing, so it does not get to be
+/// the message when something better exists — and when nothing better exists,
+/// [_defaultFor] writes a sentence instead.
+bool _isBareHttpTitle(String s) => const {
+      'forbidden',
+      'unauthorized',
+      'bad request',
+      'not found',
+      'conflict',
+      'internal server error',
+      'error',
+    }.contains(s.toLowerCase());
+
+/// The sane default for a refusal that carried no body at all — a proxy's bare
+/// 403, an older backend, a gateway page. Still not "Forbidden".
+String _defaultFor(int status) {
+  switch (status) {
+    case 401:
+      return 'Your session is no longer valid. Please sign in again.';
+    case 403:
+      return 'You do not have permission for this action. Ask an admin to grant it to your role.';
+    default:
+      return 'Request failed ($status).';
+  }
 }
 
 class LoginResult {
@@ -77,7 +178,7 @@ class ApiClient {
     );
     final data = _decode(res);
     if (res.statusCode != 200) {
-      throw ApiException(_errMsg(data, 'Sign-in failed.'), res.statusCode);
+      throw ApiException.fromBody(data, res.statusCode, fallback: 'Sign-in failed.');
     }
     final token = (data['token'] ?? '').toString();
     if (token.isEmpty) {
@@ -106,7 +207,7 @@ class ApiClient {
       headers: {'Authorization': 'Bearer $token'},
     );
     if (res.statusCode != 200) {
-      throw ApiException(_errMsg(_decode(res), 'Session expired.'), res.statusCode);
+      throw ApiException.fromBody(_decode(res), res.statusCode, fallback: 'Session expired.');
     }
     return Profile.fromJson(_decode(res));
   }
@@ -158,10 +259,9 @@ class ApiClient {
     }
     final decoded = res.body.isEmpty ? null : _tryJson(res.body);
     if (res.statusCode >= 200 && res.statusCode < 300) return decoded;
-    final msg = (decoded is Map && decoded['error'] is String)
-        ? decoded['error'] as String
-        : 'Request failed (${res.statusCode}).';
-    throw ApiException(msg, res.statusCode);
+    // The server's own sentence, where it wrote one. This is the seam every
+    // module's error text crosses — see [ApiException.fromBody].
+    throw ApiException.fromBody(decoded, res.statusCode);
   }
 
   /// Authenticated GET that returns the raw response body (for non-JSON
@@ -174,10 +274,7 @@ class ApiClient {
     final res = await http.get(_u(path), headers: headers);
     if (res.statusCode >= 200 && res.statusCode < 300) return res.body;
     final decoded = res.body.isEmpty ? null : _tryJson(res.body);
-    final msg = (decoded is Map && decoded['error'] is String)
-        ? decoded['error'] as String
-        : 'Request failed (${res.statusCode}).';
-    throw ApiException(msg, res.statusCode);
+    throw ApiException.fromBody(decoded, res.statusCode);
   }
 
   dynamic _tryJson(String s) {
@@ -198,8 +295,4 @@ class ApiClient {
     }
   }
 
-  String _errMsg(Map<String, dynamic> data, String fallback) {
-    final e = data['error'];
-    return (e is String && e.isNotEmpty) ? e : fallback;
-  }
 }

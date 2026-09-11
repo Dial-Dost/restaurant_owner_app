@@ -31,7 +31,21 @@ class _Module {
   final Widget Function(RestClient rest, Profile p) build;
   final String? feature; // subscription-plan feature flag (null = always allowed)
   final bool adminOnly; // hard admin gate, regardless of keywords
-  const _Module(this.label, this.icon, this.keywords, this.build, {this.feature, this.adminOnly = false});
+
+  /// THE SERVER'S OWN ANSWER for "may this identity open this module", where
+  /// there is one.
+  ///
+  /// The keyword gate beside it is a substring match on permitted ACTION NAMES,
+  /// which is a guess and has been wrong before (see the Simulation entry
+  /// below): it says yes to anybody holding any action whose name happens to
+  /// contain the word. Where the session's `scope` block carries a real answer
+  /// — because the route behind the module is gated on one known permission —
+  /// this is that answer, and it is ANDed with the keyword gate rather than
+  /// replacing it, so a module can only ever be NARROWED by adding one.
+  final Capability? capability;
+
+  const _Module(this.label, this.icon, this.keywords, this.build,
+      {this.feature, this.adminOnly = false, this.capability});
 }
 
 /// A titled group of sidebar modules. The title renders as a small muted
@@ -73,6 +87,19 @@ const _navSections = <_NavSection>[
     _Module('Orders', Icons.receipt_long, ['order', 'bill', 'payment'], m.ordersModule),
     _Module('Kitchen', Icons.soup_kitchen, ['order', 'kitchen', 'kot', 'kds'], m.kdsModule),
     _Module('Tables', Icons.table_restaurant, ['table'], m.tablesModule),
+    // REQUIREMENT D5 — the layout half of what used to be one screen.
+    //
+    // Same permission keywords as Tables (['table']) and deliberately so: the
+    // writes behind it are the ones the floor already gated — POST /add-table
+    // and PATCH /table/:name are "Table Added", the roster is "Manage Table
+    // Sections", DELETE /table/:name its own action — and every one of them is
+    // re-checked by the server whatever this nav decides. Inventing a keyword
+    // here would hide the screen from somebody the server would have served,
+    // which is the failure the Simulation entry below already records.
+    //
+    // It sits directly under Tables because that is where people will look for
+    // the controls that left it.
+    _Module('Floor plan', Icons.grid_view, ['table'], m.floorPlanModule),
     _Module('Waitlist', Icons.hourglass_top, ['table', 'order', 'waitlist'], m.waitlistModule),
     _Module('Bookings', Icons.event_seat, ['booking'], m.bookingsModule),
     _Module('Menu', Icons.menu_book, ['menu'], m.menuModule),
@@ -84,7 +111,14 @@ const _navSections = <_NavSection>[
   _NavSection('TEAM', [
     _Module('Attendance', Icons.schedule, [], m.attendanceModule),
     _Module('Employees', Icons.badge, ['employee', 'role', 'user'], m.employeesModule),
-    _Module('Roles', Icons.shield, ['role', 'permission'], m.rolesModule),
+    // GET /roles and GET /core-roles are both gated on "Get Roles", and the
+    // server now says on the session whether this identity holds it. Without
+    // that, the keyword gate let anybody with a "role"-named action — every
+    // employee editor — onto a screen whose two reads would 403, which renders
+    // as an access-control page with no roles on it and no error: precisely the
+    // C6 symptom. Falls back to the keywords on an older backend.
+    _Module('Roles', Icons.shield, ['role', 'permission'], m.rolesModule,
+        capability: Capability.viewRoles),
     _Module('Valet', Icons.local_parking, ['valet', 'parking'], m.valetModule, feature: 'valet'),
   ]),
   // GUESTS SITS AFTER TEAM, AND FEEDBACK LEADS IT, so Feedback reads directly
@@ -196,6 +230,10 @@ List<_Module> _visibleModulesFor(Profile p) => _allModulesFor(p)
     .where((mod) =>
         (!mod.adminOnly || p.isAdmin) &&
         p.can(mod.keywords) &&
+        // The server's answer where it gave one; `true` where it did not, so the
+        // keyword gate above stays the whole rule on an older backend.
+        (mod.capability == null ||
+            RoleScope.may(p, mod.capability!, fallback: true)) &&
         p.featureEnabled(mod.feature) &&
         !RoleScope.hidesModule(p, mod.label))
     .toList();
