@@ -10,7 +10,12 @@
 import 'dart:convert';
 import 'dart:io';
 
-import '../lib/services/tz_offsets.dart';
+// package:, not '../lib/...'. A relative path into lib/ gives the same library
+// two identities — one via the relative path, one via package: — and Dart then
+// treats their types as unrelated. It also fails outright the moment this script
+// is run from anywhere but the repo root. Same file, addressed the one way that
+// always resolves.
+import 'package:restaurant_owner_app/services/tz_offsets.dart';
 
 void main(List<String> args) {
   final path = args.isEmpty ? 'tool/tz_cases.json' : args.first;
