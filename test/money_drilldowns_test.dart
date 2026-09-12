@@ -240,6 +240,13 @@ Map<String, dynamic> _accountingRoutes({
       '/expenses': {'expenses': expenses},
       '/payroll': {'total_due': 45000.00, 'total_paid': 90000.00, 'rows': payrollRows},
       '/bills/closed': {'bills': closedBills, 'total': closedBills.length, 'has_more': false},
+      // The null-aware element the lint asks for cannot express this one. `?`
+      // guards the VALUE, and the KEY dereferences `billDetail` too — so
+      // `'/bills/closed/${billDetail['id']}': ?billDetail` would still throw on
+      // the key before the marker ever applied. The `if` element is the only
+      // form that guards both halves, so the rule is silenced here rather than
+      // the entry rewritten into something that would break.
+      // ignore: use_null_aware_elements
       if (billDetail != null) '/bills/closed/${billDetail['id']}': billDetail,
     };
 
