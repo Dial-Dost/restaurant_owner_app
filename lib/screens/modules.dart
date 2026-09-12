@@ -1169,6 +1169,191 @@ Color _stageColor(String status) {
   return AppColors.neutral;
 }
 
+/// THE SIX FIGURES, IN ONE BOX AT THE TOP OF THE OVERVIEW — requirement V3 H1:
+/// "Combine the most important and primary statistics into a single distinct box
+/// at the top of the overview section containing the following metrics: Today's
+/// net sale, Today's gross sale, Online sale net, Online sale gross, Cash
+/// collection, Month-to-date sales."
+///
+/// Read from `GET /analytics/headline`. The web dashboard's
+/// `headline-stats.tsx` is the reference this mirrors — the same tile order, the
+/// same sentence an empty day gets instead of a grid — because an owner
+/// comparing the till against the browser must not be shown two different
+/// headline numbers.
+///
+/// THE LABELS AND THE DEFINITIONS ARE THE SERVER'S, PRINTED VERBATIM.
+/// Four of these six words are ambiguous. "Net" is post-discount-pre-tax to an
+/// accountant and "after everything" to everyone else; "online" is aggregator
+/// trade in one restaurant and card payments in the next. A headline figure an
+/// owner cannot reconcile against their own MIS report is worse than no figure
+/// at all, so the server ships `label` and `hint` beside every `value` — the
+/// same sentences those reports are computed from — and this function prints
+/// them rather than writing its own. That is also what keeps the two clients
+/// from drifting: there is exactly one place these definitions live, and it is
+/// the place that computes the numbers.
+///
+/// THREE STATES, AND ONLY ONE OF THEM IS A GRID OF NUMBERS:
+///
+///  * [headline] null — not fetched. Either `scope.money` refused the read (a
+///    waiter must never be shown the house's takings) or it failed. NOTHING is
+///    drawn. An empty box on a till is a question the owner cannot answer, and
+///    ₹0.00 is a number they would act on.
+///  * `today_bills == 0` — nothing has been settled yet. Six ₹0.00 tiles are a
+///    CLAIM ABOUT TRADE: a kitchen that opens at six has taken nothing at four
+///    in the afternoon and is not having a catastrophic day. The sentence says
+///    so, and month-to-date still prints, because every earlier day of the
+///    month is still inside it.
+///  * anything else — the six figures, in the order the requirement lists them.
+///
+/// [columns] lays the figures out; the call site owns the breakpoints.
+List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2}) {
+  // State one. "Not fetched" — which is not "fetched and empty", and is why the
+  // Overview's load() keeps this entry's raw null instead of coalescing it.
+  if (headline == null) return const [];
+  // Fetched, and the server sent nothing renderable. A header with an empty
+  // body under it is the hollow card the rest of this page refuses to draw, and
+  // unlike `today_bills == 0` there is no payload here that would justify a
+  // sentence about the day's trade. Same rule as _overviewInsights' empty read.
+  if (headline.isEmpty) return const [];
+  // Re-bound to a fresh local rather than leaning on the parameter staying
+  // promoted: `figure` below reads it from inside a closure, and the rules
+  // about which captured variables keep their promotion are not something a
+  // reader of this file should have to recall. `h` is a plain non-nullable Map
+  // from here down.
+  final h = headline;
+
+  final text = Theme.of(context).textTheme;
+
+  /// One figure: the server's label, the money, the server's definition under
+  /// it. Null when the server did not send this metric — an unnamed money
+  /// figure is worse than an absent one, because the reader has to guess which
+  /// of the six it is and the guess is what ends up in the books.
+  Widget? figure(String key) {
+    final f = h[key];
+    if (f is! Map) return null;
+    final label = '${f['label'] ?? ''}'.trim();
+    if (label.isEmpty) return null;
+    final hint = '${f['hint'] ?? ''}'.trim();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        const SizedBox(height: AppSpacing.xs),
+        // Scaled down, never clipped. A six-figure total cut off mid-number is
+        // the one thing on this card nobody can work around — there is no hover
+        // on a till screen, and the digits that go missing are the expensive
+        // ones. Same treatment the week-on-week delta gets in the stat cards.
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(
+            // _money prints an em dash for a value the server omitted, which is
+            // the whole point: a figure that never arrived must not read as
+            // zero takings.
+            _money(f['value']),
+            maxLines: 1,
+            softWrap: false,
+            style: text.displaySmall!.copyWith(fontSize: 22, color: AppColors.textPrimary),
+          ),
+        ),
+        if (hint.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(hint,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+        ],
+      ],
+    );
+  }
+
+  // The order the requirement lists them in, which is also the order they read
+  // in: today's pair, the online pair beside it, what is in the drawer, then
+  // the month standing behind all of it.
+  const order = ['today_net', 'today_gross', 'online_net', 'online_gross', 'cash_collection', 'month_to_date'];
+
+  // Built with a plain loop rather than a collection-if: `figure` returns null
+  // for a metric the payload did not carry, and dropping it is the only honest
+  // option left — there is no label to print it under.
+  final figures = <Widget>[];
+  for (final key in order) {
+    final tile = figure(key);
+    if (tile != null) figures.add(tile);
+  }
+  // null, not 0, when the key is absent: "the server did not say how many
+  // bills" is not "no bills were settled", and only the second of those adds
+  // the sentence above the grid.
+  final bills = _int(h['today_bills']);
+  final nothingSettled = bills == 0;
+
+  final today = '${h['today'] ?? ''}';
+  final monthFrom = '${h['month_from'] ?? ''}';
+  final zone = '${h['timezone'] ?? ''}'.trim();
+  // The RESTAURANT's zone, never the device's. A Windows till in one state and
+  // an Android phone in another must not disagree about which day these takings
+  // belong to, and printing the offset is what lets an owner check that for
+  // themselves. offsetLabelOf answers 'unsupported' for a zone this build's
+  // table does not carry, which is not a word to put in front of an owner.
+  final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
+  final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone · $offset');
+
+  return [
+    // ONE box, as the requirement words it. The figures inside are bare columns
+    // and not tiles for the same reason: six cards in a row is six boxes, which
+    // is the layout this requirement exists to replace.
+    ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SectionHeader(
+          title: 'Today at a glance',
+          padding: const EdgeInsets.only(bottom: AppSpacing.md),
+          // Only when there is something to count. "0 bills settled" sitting
+          // beside the sentence below would say the same thing twice, in two
+          // voices, and one of them in a tag that normally means good news.
+          trailing: (bills != null && bills > 0) ? TickTag('$bills bill(s) settled') : null,
+        ),
+        // The day, the zone and the month window these figures were cut on.
+        // Printed because the owner is being asked to trust six numbers against
+        // their own reports: without the boundaries, a disagreement about which
+        // day it is looks exactly like a disagreement about the money.
+        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty) ...[
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+            if (today.isNotEmpty) InfoChip(icon: Icons.today, label: _fmtDay(today)),
+            if (zoneCaption.isNotEmpty) InfoChip(icon: Icons.public, label: zoneCaption),
+            if (monthFrom.isNotEmpty)
+              InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
+          ]),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (nothingSettled) ...[
+          // ABOVE the grid, and the grid still renders — deliberately the same
+          // shape as the web dashboard's card, whose own comment gives the
+          // reason: "Said ABOVE the tiles, because the tiles are all zero and an
+          // owner reading them first has already drawn the wrong conclusion."
+          //
+          // An earlier draft of this card showed the sentence INSTEAD of the
+          // six figures. That reads better in isolation and is the wrong call
+          // here: the same owner looks at this on a till and at the browser on
+          // a laptop, and a figure that is present on one screen and absent on
+          // the other is indistinguishable from a bug in whichever one they
+          // checked second. Matching the web exactly is worth more than the
+          // marginally tidier layout, so the divergence was removed.
+          Text(
+            monthFrom.isEmpty
+                ? 'Nothing has been settled yet today. Month to date still counts every earlier day.'
+                : 'Nothing has been settled yet today. Month to date still counts every day since '
+                    '${_fmtDay(monthFrom)}.',
+            style: text.bodySmall!.copyWith(color: AppColors.textSecondary),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+        ],
+        if (figures.isNotEmpty) _dashGrid(figures, columns),
+      ]),
+    ),
+    const SizedBox(height: 28),
+  ];
+}
+
 /// Quick-insight cards for the Overview tab, built from ONE server read
 /// (`GET /analytics/overview`). Empty sections are simply omitted rather than
 /// rendering hollow cards, so a brand-new restaurant reads as intentional.
@@ -1499,6 +1684,21 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // exists: /analytics/staff-performance would answer this question and
           // would 403 for the only role that asks it.
           maybe(scope.scorecard, () => rest.getMap('/me/scorecard')),
+          // THE SIX HEADLINE FIGURES — V3 H1. Appended at the END of this list
+          // on purpose: every unpack below reads `r` by INDEX, so slotting this
+          // in anywhere else shifts every key after it by one and does it
+          // SILENTLY — 'openBills' would start reading the waitlist and
+          // 'scorecard' the open bills, both of which are Maps that parse
+          // cleanly and render the wrong restaurant back at the owner.
+          //
+          // `scope.money` and not a gate of its own. These are the house's
+          // takings — today's net and gross, the online split, what is in the
+          // cash drawer — and it is the same action ("View Order APC") that
+          // already gates /orders/apc two reads above. A waiter reaching this
+          // endpoint would collect a 403 and, before `maybe` existed, six
+          // tiles all reading zero; asking the question one request earlier is
+          // what stops the till from ever painting that answer.
+          maybe(scope.money, () => rest.getMap('/analytics/headline')),
         ]);
         return {
           // `?? {}` / `?? []` rather than the raw null: every consumer below
@@ -1517,6 +1717,14 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           'waitlist': r[8],
           'openBills': r[9],
           'scorecard': r[10],
+          // Raw null, deliberately — this is one of the optional reads the
+          // comment above is about. null means "not fetched": either
+          // `scope.money` refused it or the request failed, and neither of
+          // those is "fetched and empty". The headline card draws NOTHING for
+          // null and a sentence about the day for an empty one, so coalescing
+          // to {} here would turn a permission refusal into a claim that the
+          // restaurant has taken no money.
+          'headline': r[11],
         };
       },
       builder: (context, data, reload) {
@@ -1540,6 +1748,17 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
         final cols = width >= 1100 ? 4 : (width >= 900 ? 3 : (width >= 620 ? 2 : 1));
         // The single-figure tiles pack far tighter than the charted stat cards.
         final metricCols = _metricCols(width);
+        // The headline box's own grid, and the only one on this page whose
+        // breakpoints all DIVIDE SIX. _metricCols would answer 5 on a 1200px
+        // window, which lays the six figures out as a row of five and an orphan
+        // — and the orphan is month-to-date, the one figure that is not about
+        // today and least survives being read as a continuation of the row
+        // above it. 6 / 3 / 2 keeps the pairs the requirement names (net beside
+        // gross, online net beside online gross) on the same line at every
+        // width, and never drops to 1: a phone shows two columns, because these
+        // are the six numbers the page exists for and scrolling past five of
+        // them to find the sixth is not "at the top of the overview".
+        final headlineCols = width >= 1180 ? 6 : (width >= 760 ? 3 : 2);
 
         // Daily revenue series (already fetched) feeds the stat-card chart.
         final dailyValues = [for (final d in daily) num0((d as Map)['revenue'])];
@@ -2276,6 +2495,18 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
             Text('${p.restaurantName} · ${p.role}', style: text.bodyMedium),
             const SizedBox(height: AppSpacing.xxl),
           ],
+
+          // ---- THE SIX HEADLINE FIGURES ---------------------------------------
+          // V3 H1: one distinct box at the TOP of the overview, before the
+          // stat cards. It sits under the greeting for the same reason the web
+          // dashboard puts it under its own <h1> rather than above it — the
+          // masthead names the restaurant and the reader, it is not a figure —
+          // but nothing that IS a figure comes before it.
+          //
+          // Renders nothing at all when the read was refused or failed. See
+          // [_overviewHeadline]: the three states are the whole of this card's
+          // correctness, and "no box" is one of them.
+          ..._overviewHeadline(context, data['headline'] as Map?, columns: headlineCols),
 
           if (statCards.isNotEmpty) ...[
             _dashGrid(statCards, cols),
@@ -21606,6 +21837,83 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
   }
 }
 
+/// REPRINT A SETTLED BILL — E5, and the control this app was missing.
+///
+/// The web dashboard has had this on its accounting screen since V3 shipped;
+/// this app read closed bills and could not reprint one. So the same person
+/// looking at the same bill had a button on a laptop and no button on the till,
+/// which reads as a broken till rather than as a decision anybody made.
+///
+/// THE SERVER DOES THE WORK, INCLUDING SAYING "REPRINT". POST /print/bill/settled
+/// re-renders the receipt from the stored bill and stamps `** REPRINT **` at the
+/// top itself (escpos.ts). Nothing here composes a receipt, because a second
+/// renderer is how two copies of one bill end up disagreeing about the total.
+///
+/// FAILURES ARE THE SERVER'S SENTENCE, VERBATIM. ApiException carries `details`
+/// precisely for this — who may reprint, why a bill cannot be. Rewriting it here
+/// would put a worse sentence in front of the person who has to act on it.
+class _ReprintSettledBillButton extends StatefulWidget {
+  final RestClient rest;
+  final String billId;
+
+  /// Null on a read-only surface (the Reports drill-down), where no write
+  /// control belongs at all.
+  final Profile? profile;
+
+  const _ReprintSettledBillButton({
+    required this.rest,
+    required this.billId,
+    this.profile,
+  });
+
+  @override
+  State<_ReprintSettledBillButton> createState() => _ReprintSettledBillButtonState();
+}
+
+class _ReprintSettledBillButtonState extends State<_ReprintSettledBillButton> {
+  bool _sending = false;
+
+  Future<void> _send() async {
+    // Captured BEFORE the await: reading it off `context` afterwards is the
+    // use-after-dispose this sheet can actually hit, because a reprint is
+    // exactly the moment somebody swipes the sheet away.
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _sending = true);
+    try {
+      final res = await widget.rest.post('/print/bill/settled', {'bill_id': widget.billId});
+      // `destination` is additive and null on an unrouted outlet, so the
+      // message degrades to the general one rather than saying "Printing at ".
+      final dest = res is Map ? '${res['destination'] ?? ''}'.trim() : '';
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(dest.isEmpty ? 'Reprint sent to the printer.' : 'Reprinting at $dest.'),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      // Guarded: the finally runs even when the widget went away mid-flight.
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = widget.profile;
+    // A UI convenience only — /print/bill/settled re-checks ACCOUNTING_PERM
+    // itself, so a wrong answer here costs an affordance, never a boundary.
+    if (p == null || !_holdsAction(p, _analyticsPermissionId)) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: AppSpacing.lg),
+      child: OutlinedButton.icon(
+        onPressed: _sending ? null : _send,
+        icon: const Icon(Icons.print_outlined, size: 18),
+        label: Text(_sending ? 'Sending…' : 'Reprint bill'),
+      ),
+    );
+  }
+}
+
 /// Full detail of one settled bill: every line item, the money breakdown, the
 /// payment (and its split parts), and who handled it when.
 class _ClosedBillSheet extends StatelessWidget {
@@ -21639,7 +21947,16 @@ class _ClosedBillSheet extends StatelessWidget {
                 // same body is what a Reports drill-down renders, and the
                 // reports pack must stay read-only. A control added in there
                 // would put a write inside a fraud-control document.
-                if (profile != null)
+                //
+                // The reprint joins them here for the same reason: it puts
+                // paper in somebody's hand, which is a write in every sense that
+                // matters to an auditor reading the pack.
+                if (profile != null) ...[
+                  _ReprintSettledBillButton(
+                    rest: rest,
+                    billId: billId,
+                    profile: profile,
+                  ),
                   misBillCounterAction(
                     context,
                     rest: rest,
@@ -21647,6 +21964,7 @@ class _ClosedBillSheet extends StatelessWidget {
                     billId: billId,
                     onChanged: reload,
                   ),
+                ],
               ]),
             ),
           ),
