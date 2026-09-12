@@ -331,7 +331,36 @@ jobs:
       #
       # If this ever legitimately changes, the update is a REINSTALL for every
       # user; do not edit this line to make a red build go green.
-      EXPECTED_SIGNER_SHA256: 0e7fe2a45c1c0ff77157a8629a5b54291ffb9d3d6fbf7064bb009c34ae2ebbf3
+      #
+      # ROTATED 2026-09-12 — THIS IS THAT LEGITIMATE CHANGE, AND IT IS A REINSTALL.
+      #
+      # The original upload keystore could not be found on any machine we have
+      # access to: it was never in the repo, never in the deployment handover,
+      # and is not with the person who cut 1.8.x. Without it no APK could be
+      # built at all — the Android job refused before compiling, which in turn
+      # blocked every release until `publish` was decoupled.
+      #
+      # So the key was rotated deliberately rather than left broken. A new
+      # 2048-bit RSA upload key was generated on 2026-09-12 (PKCS12, valid to
+      # 2054, same CN=Restaurant Dash, O=Restaurant Dash as before) and this
+      # constant now pins ITS certificate.
+      #
+      # WHAT THAT COSTS, so nobody rediscovers it in the field: Android refuses
+      # an update signed by a different key. Every existing Android install must
+      # be UNINSTALLED and reinstalled — an in-place update will fail with
+      # INSTALL_FAILED_UPDATE_INCOMPATIBLE. Uninstalling clears the app's
+      # SharedPreferences, which is where outbox.dart persists the OFFLINE WRITE
+      # QUEUE, so any order taken during an outage that has not synced is lost.
+      # Get each device online and its outbox empty BEFORE uninstalling.
+      #
+      # This was judged acceptable because the Android devices in the field are
+      # test devices. It would not have been on a fleet of live tills.
+      #
+      # Windows is untouched: a different signing model entirely.
+      #
+      # The previous value, kept so an old artifact can still be identified:
+      #   0e7fe2a45c1c0ff77157a8629a5b54291ffb9d3d6fbf7064bb009c34ae2ebbf3
+      EXPECTED_SIGNER_SHA256: 6d4aa8a19d3ab27c1e632fab589c00eadc4a8e412155c186107d580a70f5c7c8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 

@@ -40,12 +40,19 @@ gh auth status >/dev/null 2>&1 || fail "gh is not authenticated. Run: gh auth lo
 [ -f "$KEYSTORE" ] || fail "$KEYSTORE not found. It is gitignored on purpose — copy it in from wherever you keep it."
 [ -f "$PROPS" ]    || fail "$PROPS not found. Copy android/key.properties.example and fill it in."
 
-# base64 -w0 is GNU; macOS needs -i and wraps by default. Normalise to one line,
-# because a newline inside the secret becomes a newline inside the decoded file.
+# base64 -w0 is GNU; macOS needs -i. Normalise to one line, because a newline
+# inside the secret becomes a newline inside the decoded file.
+#
+# THE MACOS BRANCH USED TO PASS THE PATH POSITIONALLY and failed on the only
+# platform it existed for: macOS base64 rejects a bare file argument with
+# "invalid argument <file>" and prints its usage, so the script died before
+# setting a single secret. Both branches now name the input the way their own
+# implementation expects. Detection reads the usage text rather than uname,
+# since the distinction that matters is GNU-vs-BSD coreutils, not the OS.
 if base64 --help 2>&1 | grep -q -- "-w"; then
 	B64="$(base64 -w0 "$KEYSTORE")"
 else
-	B64="$(base64 "$KEYSTORE" | tr -d '\n')"
+	B64="$(base64 -i "$KEYSTORE" | tr -d '\n')"
 fi
 
 # Read the passwords out of key.properties rather than prompting: they are
@@ -75,10 +82,16 @@ echo "keystore ${raw_size} bytes -> ${b64_size} base64 chars"
 echo "alias    ${KEY_ALIAS}"
 echo
 
-# --body-file - so the value arrives on stdin and never appears in the process
-# list, where `ps` would show it to every user on the machine.
+# The value arrives on STDIN and is never an argument, so it never appears in the
+# process list where `ps` would show it to every user on the machine. That was
+# always the intent; the mechanism was wrong.
+#
+# `--body-file` IS NOT A FLAG on `gh secret set` — it was rejected outright, and
+# gh printed its usage instead of storing anything. The documented behaviour is
+# simpler than the flag we were reaching for: with `--body` omitted, gh reads the
+# value from standard input on its own. Same secrecy property, one fewer flag.
 set_secret() {
-	printf '%s' "$2" | gh secret set "$1" --body-file - >/dev/null
+	printf '%s' "$2" | gh secret set "$1" >/dev/null
 	echo "  set $1"
 }
 
