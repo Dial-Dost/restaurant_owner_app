@@ -535,10 +535,40 @@ jobs:
   # outside the object store, need only this repo's GITHUB_TOKEN, and give a
   # stable public URL per tag.
   # ---------------------------------------------------------------------------
+  # ONE BROKEN CLIENT MUST NOT HOLD THE OTHER HOSTAGE.
+  #
+  # This job used to be `needs: [gate, windows, android]` with no condition on
+  # the results, which is GitHub's default "all three must succeed". That was
+  # right while both clients could build. It stopped being right the moment the
+  # Android signing secrets went missing: the Android job now fails before it
+  # compiles anything, `publish` is skipped, and the WINDOWS zip — which built
+  # and passed every one of its guards — never reaches a single till. A Windows
+  # fix was being withheld by an Android credential problem it has nothing to do
+  # with.
+  #
+  # WHAT IS STILL HARD-REQUIRED, and why each one:
+  #   * gate    — analyze, test, and the tag/pubspec agreement. If this is red we
+  #               do not know the code is sound, so nothing ships. Non-negotiable.
+  #   * windows — this job exists to publish the Windows zip. If that failed
+  #               there is nothing to publish and skipping is correct.
+  #   * android — NO LONGER REQUIRED. Its own guards (signing material present,
+  #               production URLs baked, signer SHA-256 matches the field) are
+  #               unchanged and still absolute: a bad APK cannot be produced, and
+  #               an APK that was not produced simply is not uploaded. Nothing
+  #               about Android's safety is relaxed here — only its veto over a
+  #               sibling job.
+  #
+  # The run as a whole still goes RED when Android fails. That is deliberate and
+  # must stay: a partial release should be visible as a partial release, not
+  # quietly reported as a good one.
   publish:
     name: Publish the release
     needs: [gate, windows, android]
-    if: github.ref_type == 'tag' || inputs.publish
+    if: >-
+      always()
+      && needs.gate.result == 'success'
+      && needs.windows.result == 'success'
+      && (github.ref_type == 'tag' || inputs.publish)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -559,29 +589,69 @@ jobs:
           TAG: ${{ needs.gate.outputs.tag }}
           VERSION: ${{ needs.gate.outputs.version }}
           REPO: ${{ github.repository }}
+          ANDROID_RESULT: ${{ needs.android.result }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # THE ASSET LIST IS WHAT EXISTS, NOT WHAT WE HOPED FOR. Naming a file
+          # that was never produced makes `gh release create` fail on a missing
+          # path and take the Windows zip down with it — the exact coupling this
+          # change exists to remove. The Windows zip is still mandatory: if it is
+          # absent something is wrong that a partial release must not paper over.
+          assets=()
+          [ -f "dist/${WINDOWS_ASSET}" ] || { echo "::error::${WINDOWS_ASSET} missing though the windows job passed"; exit 1; }
+          assets+=("dist/${WINDOWS_ASSET}")
+
+          if [ -f "dist/${ANDROID_ASSET}" ]; then
+            assets+=("dist/${ANDROID_ASSET}")
+            partial=""
+          else
+            partial="yes"
+            echo "::warning::No ${ANDROID_ASSET} in this release (android job: ${ANDROID_RESULT}). Publishing Windows only."
+          fi
+
           # --clobber so a re-run replaces assets instead of failing on a name
           # collision; the asset FILENAMES are part of the manifest contract and
           # must not gain a "-1" suffix.
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              "dist/${WINDOWS_ASSET}" "dist/${ANDROID_ASSET}" \
-              --repo "$REPO" --clobber
+            gh release upload "$TAG" "${assets[@]}" --repo "$REPO" --clobber
           else
-            gh release create "$TAG" \
-              "dist/${WINDOWS_ASSET}" "dist/${ANDROID_ASSET}" \
+            gh release create "$TAG" "${assets[@]}" \
               --repo "$REPO" \
               --title "Restaurant Dash $VERSION" \
               --generate-notes
           fi
 
           base="https://github.com/$REPO/releases/download/$TAG"
-          echo "### Published $TAG" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`$base/${WINDOWS_ASSET}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`$base/${ANDROID_ASSET}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Clients do not see these until \`APP_RELEASE.latest\` in" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`Restaurant_Backend/app_release.ts\` is bumped to \`$VERSION\` and deployed." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Published $TAG"
+            echo ""
+            echo "- \`$base/${WINDOWS_ASSET}\`"
+            if [ -z "$partial" ]; then
+              echo "- \`$base/${ANDROID_ASSET}\`"
+            else
+              echo "- ~~\`$base/${ANDROID_ASSET}\`~~ — **NOT PUBLISHED** (android job: ${ANDROID_RESULT})"
+            fi
+            echo ""
+            echo "Clients do not see these until \`APP_RELEASE.latest\` in"
+            echo "\`Restaurant_Backend/app_release.ts\` is bumped to \`$VERSION\` and deployed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # THE TRAP A WINDOWS-ONLY RELEASE SETS, spelled out where the person
+          # about to bump the manifest will read it. app_release.ts serves ONE
+          # manifest with a download URL per platform. Bump `latest` to a version
+          # whose APK was never uploaded and every Android client is told to
+          # update, follows the android URL, and gets a 404 — an update loop on
+          # the clients that can least afford one, because the app holds an
+          # offline write queue.
+          if [ -n "$partial" ]; then
+            {
+              echo ""
+              echo "> [!WARNING]"
+              echo "> **This release has NO Android APK.** Before bumping"
+              echo "> \`APP_RELEASE.latest\` to \`$VERSION\`, pin Android to the previous"
+              echo "> release with \`APP_RELEASE_PIN_ANDROID\` on the backend, or every"
+              echo "> Android client will be offered an update whose download 404s."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
