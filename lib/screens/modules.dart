@@ -7827,6 +7827,20 @@ bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
 /// claim about the floor.
 bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
 
+/// How strongly a table tile is washed with its state colour.
+///
+/// One place to tune the floor's readability, because these three numbers are
+/// the whole difference between "I can see which tables are busy" and "I have to
+/// read every card". They are alphas composited over `AppColors.card`
+/// (0xFF1B1716), so they behave the same way under every shell scheme rather
+/// than being hand-picked hexes that only work against one background.
+///
+/// Ordered by how much the state wants attention, and deliberately NOT equal:
+/// Occupied is the state the floor is scanned for, so it is the loudest.
+const double _kOccupiedWash = 0.20;
+const double _kSeatedWash = 0.16;
+const double _kReservedWash = 0.13;
+
 /// The three-state floor status. `reserved` covers both an active booking
 /// window and an upcoming one, and never outranks a party who is actually
 /// sitting there.
@@ -7967,25 +7981,44 @@ class _TableBox extends StatelessWidget {
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           gradient: occupied || reserved ? null : AppColors.cardGradient,
+          // OCCUPIED AND FREE MUST BE TELLABLE APART ACROSS THE ROOM.
+          //
+          // These washes used to be 0.07 / 0.07 / 0.06 over AppColors.card,
+          // which is 0xFF1B1716 — very nearly black. Seven per cent of copper
+          // over that is a difference you can find if you already know which
+          // card you are looking at, and cannot find if you do not. On a phone,
+          // at arm's length, in a dim dining room, an occupied table and a free
+          // one read as the same dark rectangle and the only real signal was the
+          // small status pill. Somebody walking the floor should not have to
+          // READ the card to know whether there is a party at it.
+          //
+          // The fills below are strong enough to carry the state on their own,
+          // and the status pill now confirms what the colour already said rather
+          // than being the only thing that says it. Each state keeps its own hue
+          // — copper earns, amber wants attention, blue is a promise — so this is
+          // more contrast, not a new vocabulary.
           color: awaitingOrder
-              ? Color.alphaBlend(AppColors.warning.withValues(alpha: 0.07), AppColors.card)
+              ? Color.alphaBlend(AppColors.warning.withValues(alpha: _kSeatedWash), AppColors.card)
               : occupied
-                  ? Color.alphaBlend(AppColors.copper.withValues(alpha: 0.07), AppColors.card)
+                  ? Color.alphaBlend(AppColors.copper.withValues(alpha: _kOccupiedWash), AppColors.card)
                   : reserved
-                      ? Color.alphaBlend(AppColors.info.withValues(alpha: 0.06), AppColors.card)
+                      ? Color.alphaBlend(AppColors.info.withValues(alpha: _kReservedWash), AppColors.card)
                       : null,
           borderRadius: AppRadius.cardAll,
           border: Border.all(
             color: focused
                 ? AppColors.copperHi
                 : awaitingOrder
-                    ? AppColors.edge(AppColors.warning)
+                    ? AppColors.warning.withValues(alpha: 0.60)
                     : occupied
-                        ? AppColors.copper.withValues(alpha: 0.55)
+                        ? AppColors.copper.withValues(alpha: 0.85)
                         : reserved
-                            ? AppColors.edge(AppColors.info)
+                            ? AppColors.info.withValues(alpha: 0.50)
                             : AppColors.border,
-            width: focused ? 2 : 1,
+            // A busy table is outlined, not hairlined. At 1px against a 7%-white
+            // border the occupied edge was the same weight as every free card's;
+            // 2px is what makes the distinction survive being glanced at.
+            width: focused ? 2 : (occupied || awaitingOrder ? 2 : 1),
           ),
           // The copper glow is the "this table is earning" signal, so it belongs
           // to Occupied alone. A seated table with no order gets the tint and

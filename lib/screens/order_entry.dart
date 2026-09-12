@@ -14,6 +14,16 @@ import '../ui/widgets/status_chip.dart';
 import '../widgets/async_view.dart';
 import '../widgets/table_bill.dart';
 
+/// How far ABOVE the system navigation bar the "Send order" button sits.
+///
+/// This is deliberately a named constant rather than a literal buried in a
+/// padding expression: it is the one number to change if the button still reads
+/// as cramped on a particular handset. Clearing the nav bar is handled
+/// separately and exactly, by `MediaQuery.padding.bottom` at the call site —
+/// this is only the comfort margin on top of that, so raising it can never be
+/// the thing that stops the button being reachable.
+const double _kSendOrderLift = 16;
+
 /// Staff POS order entry for a table: pick menu items into a cart and send the
 /// order. The order is attributed to the signed-in employee (for APC) and
 /// appends to the table's single consolidated bill on the backend.
@@ -455,6 +465,27 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
           ),
         ),
       ])),
+      // THE ANDROID NAVIGATION BAR IS NOT THE KEYBOARD.
+      //
+      // This padding used to be `12 + viewInsets.bottom`, and that is the whole
+      // defect. `viewInsets` is the KEYBOARD inset: it is ZERO whenever the
+      // keyboard is closed. So with the keyboard down — which is the normal state
+      // while a waiter is tapping dishes — "Send order" sat 12dp from the
+      // PHYSICAL bottom of the screen, underneath the home/back/recents bar that
+      // older Androids and current Samsungs still draw there. Waiters were
+      // hitting the system nav bar instead of sending the order, on the one
+      // control that ends the whole flow.
+      //
+      // `padding.bottom` is the piece that was missing: the system navigation bar
+      // (viewPadding minus whatever an inset has already consumed). It is the nav
+      // bar height with the keyboard DOWN and zero with the keyboard UP, because
+      // an open keyboard already covers the nav bar. Adding both is therefore
+      // correct in both states and double-counts in neither — which is why this
+      // is a sum rather than a max.
+      //
+      // _kSendOrderLift is the extra breathing room asked for on top of merely
+      // clearing the bar, so the button is comfortably reachable with a thumb
+      // rather than sitting flush against it.
       bottomNavigationBar: _count == 0
           ? null
           : Padding(
@@ -462,7 +493,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 left: 12,
                 right: 12,
                 top: 8,
-                bottom: 12 + MediaQuery.of(context).viewInsets.bottom,
+                bottom: 12 +
+                    _kSendOrderLift +
+                    MediaQuery.of(context).viewInsets.bottom +
+                    MediaQuery.of(context).padding.bottom,
               ),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 if (!widget.isDineIn) ...[
