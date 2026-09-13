@@ -8058,6 +8058,47 @@ bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
 /// claim about the floor.
 bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
 
+/// WHAT TO TELL SOMEBODY AFTER A THERMAL PRINT, given what the server did.
+///
+/// Pulled out of the widget so it can be tested, because the bug it fixes was
+/// not visible in any figure — the numbers were right everywhere and the
+/// SENTENCE was wrong, which is the kind of defect a screenshot does not catch
+/// and a person holding a receipt does.
+///
+/// `no_service_charge` no longer moves the printed total by itself: the server
+/// takes the charge off only where a waiver has been recorded against the bill,
+/// because a printed total lower than the settled one is a receipt the guest
+/// can hold up against a till that disagrees with it. The caller used to
+/// announce "Reprinting without service charge…" whatever came back, so the
+/// screen promised one total and the paper carried another.
+({String message, Duration shown}) thermalPrintOutcome({
+  required bool askedWithoutServiceCharge,
+  required bool removed,
+  required bool waiverRequired,
+}) {
+  if (!askedWithoutServiceCharge) {
+    return (message: 'Printing bill…', shown: const Duration(seconds: 3));
+  }
+  if (removed) {
+    return (message: 'Reprinting without the service charge…', shown: const Duration(seconds: 3));
+  }
+  if (waiverRequired) {
+    // Longer on screen than the others on purpose: this one asks the reader to
+    // go and do something, and it is competing with a printer that has already
+    // started. The mechanism is named because "it didn't work" leaves a waiter
+    // pressing the same button again.
+    return (
+      message: 'Printed WITH the service charge. Removing it needs a recorded '
+          'waiver — use “Waive service charge” on this sheet.',
+      shown: const Duration(seconds: 8),
+    );
+  }
+  // Neither removed nor a waiver asked for: there was no charge to take off.
+  // Say the ordinary thing rather than implying one came off a bill that never
+  // carried it.
+  return (message: 'Printing bill…', shown: const Duration(seconds: 3));
+}
+
 /// How strongly a table tile is washed with its state colour.
 ///
 /// One place to tune the floor's readability, because these three numbers are
@@ -8686,8 +8727,40 @@ class _TableSheetState extends State<_TableSheet> {
   // attempt on it would leave them holding a table they cannot bill.
   Future<bool> _thermalPrint(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
     try {
-      await widget.rest.post('/print/bill', {'table_name': _name, if (noServiceCharge) 'no_service_charge': true});
-      messenger.showSnackBar(SnackBar(content: Text(noServiceCharge ? 'Reprinting without service charge…' : 'Printing bill…')));
+      final res = await widget.rest.post(
+          '/print/bill', {'table_name': _name, if (noServiceCharge) 'no_service_charge': true});
+
+      // WHETHER THE CHARGE CAME OFF IS THE SERVER'S ANSWER, NOT THIS BUTTON'S.
+      //
+      // THE BUG THIS CLOSES, reported from a live floor: "bills printed without
+      // a service charge show the same total as bills with one — correct in the
+      // preview, wrong on the paper."
+      //
+      // `no_service_charge` used to move the printed total on its own. It no
+      // longer does: the server takes the charge off only where a WAIVER has
+      // been recorded against the bill, because a printed total that is lower
+      // than the settled one is a receipt the guest can hold up against a till
+      // that disagrees with it. When there is no waiver it prints the full
+      // amount and says so in the response —
+      //
+      //     service_charge_removed: false
+      //     service_charge_waiver_required: true
+      //
+      // — and this method DISCARDED that answer and announced "Reprinting
+      // without service charge…" regardless. So the screen promised one total
+      // and the paper carried another, which is the worst shape this class of
+      // bug can take: the person reading the snackbar is the person handing
+      // over the receipt, and they have already stopped looking.
+      //
+      // Now the message is whatever actually happened, and when the charge
+      // stayed on it names the mechanism that takes it off rather than leaving
+      // the waiter to discover the button did nothing.
+      final outcome = thermalPrintOutcome(
+        askedWithoutServiceCharge: noServiceCharge,
+        removed: res is Map && res['service_charge_removed'] == true,
+        waiverRequired: res is Map && res['service_charge_waiver_required'] == true,
+      );
+      messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
       return true;
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -8854,12 +8927,23 @@ class _TableSheetState extends State<_TableSheet> {
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.surface,
         title: const Text('Reprint without the service charge?'),
+        // WHAT THIS PROMISED WAS NO LONGER TRUE. It said "this changes the
+        // printed bill only", which described the flag before the server
+        // stopped honouring it on an un-waived bill. On a table with no
+        // recorded waiver the charge now stays on the paper too, so the dialog
+        // was promising a reprint the server would decline — and the snackbar
+        // afterwards said it had worked.
+        //
+        // Stated as a condition rather than a promise, because which of the two
+        // happens depends on something the person tapping this can check and
+        // change: whether a waiver has been recorded.
         content: const Text(
-          'This changes the printed bill only — the guest is still charged the '
-          'service charge when this table is settled.\n\n'
-          'To take the charge off the bill itself, use “Waive service charge” on '
-          'this sheet: it is recorded against the bill and the total drops on the '
-          'paper, on screen and in the till.',
+          'If a waiver has been recorded against this bill, the charge comes off '
+          'the reprint. If it has not, the bill prints WITH the service charge '
+          'and nothing changes.\n\n'
+          'To actually take the charge off, use “Waive service charge” on this '
+          'sheet: it is recorded against the bill, names who allowed it, and the '
+          'total drops on the paper, on screen and in the till.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
