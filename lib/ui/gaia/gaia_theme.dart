@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../theme/app_scrollbar.dart';
 import 'gaia_colors.dart';
 import 'gaia_spacing.dart';
 import 'gaia_type.dart';
@@ -176,10 +177,12 @@ abstract final class GaiaTheme {
         textStyle: GaiaType.sans(size: 12.5, color: GaiaColors.text),
         waitDuration: const Duration(milliseconds: 400),
       ),
-      scrollbarTheme: ScrollbarThemeData(
-        thumbColor: WidgetStateProperty.all(ground.line2),
+      // 6.2 — the same grabbable bar as Rustic Fork (see [AppScrollbar]), in
+      // Gaia's inks: `--text-2` for the handle over a `--line` lane, square.
+      scrollbarTheme: AppScrollbar.theme(
+        ink: GaiaColors.text2,
+        track: ground.line,
         radius: const Radius.circular(GaiaRadius.edge),
-        thickness: WidgetStateProperty.all(4),
       ),
       // `.search` / `.deno input`: transparent over the ground, hairline
       // outline, square. Not a filled pill.

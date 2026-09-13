@@ -47,6 +47,7 @@ import '../ui/widgets/status_chip.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
 import '../widgets/async_view.dart';
+import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
 import '../widgets/outbox_chip.dart';
@@ -6504,6 +6505,18 @@ Widget floorPlanModule(RestClient rest, Profile p) => _floorModule(rest, p, Floo
 
 Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncView<Map<String, dynamic>>(
       load: () async {
+        // 6.4 — the live gross above the grid, read ALONGSIDE the floor rather
+        // than after it: started first so it costs no extra wait, and read in
+        // this loader so the box refreshes exactly when the tiles do and can
+        // never describe a different moment from them. Service surface only —
+        // the floor plan is a layout editor, and 2.1 keeps the live floor off
+        // it. limit=1: only the envelope's totals are wanted, and
+        // `running_total` spans every running table whatever the page size.
+        // Never throws: a failure is filed as a word for the builder (see
+        // [liveGrossFailure]), because the floor must still render without it.
+        final liveGross = surface != FloorSurface.service
+            ? null
+            : rest.getMap('/bills/open?limit=1').then<Object>((page) => page, onError: (Object e) => liveGrossFailure(e));
         final tables = await rest.getList('/get-tables');
         // 2.1 — "WHAT IS SEEN IN TABLES IS NOT SHOWN IN THE FLOOR PLAN." Who is
         // waiting on a table and which booking it is clubbed into are the live
@@ -6627,7 +6640,14 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
             [for (final t in tables) if (_tableSeated(t as Map)) _s(t, 'table_name')],
           );
         } catch (_) {/* a device memory must never fail a floor read */}
-        return {'tables': tables, 'zones': zones, 'zone_error': zoneError, 'order': order, 'born': born};
+        return {
+          'tables': tables,
+          'zones': zones,
+          'zone_error': zoneError,
+          'order': order,
+          'born': born,
+          'live_gross': await liveGross,
+        };
       },
       builder: (context, data, reload) {
         final scope = FloorScope.of(p, surface: surface);
@@ -6784,6 +6804,18 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                         message: focusFound
                             ? 'Highlighted $focusTable — tap it to manage the bill.'
                             : '${focusTable ?? 'That table'} is not on this floor plan — it may have been removed, or belong to another outlet.',
+                      ),
+                    // 6.4 — what is on the floor right now, ABOVE the tables:
+                    // "what is out there" before "which table". For a waiter it
+                    // is the count alone ([FloorScope.money], and the server
+                    // strips the amount as well); a user refused /bills/open
+                    // does not get a box at all.
+                    if (surface == FloorSurface.service && data['live_gross'] != liveGrossRefused)
+                      LiveGrossBox(
+                        view: readLiveGross(
+                          data['live_gross'] is Map ? data['live_gross'] as Map : null,
+                          showMoney: scope.money,
+                        ),
                       ),
                     // Legend doubles as the occupancy read-out — tint + label,
                     // never colour alone. On a phone it moves to its own line:

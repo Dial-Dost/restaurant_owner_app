@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'app_colors.dart';
+import 'app_scrollbar.dart';
 import 'app_spacing.dart';
 
 /// Material 3 dark theme tuned to the reference design language:
@@ -158,13 +159,14 @@ abstract final class AppTheme {
         textStyle: text.bodySmall!.copyWith(color: AppColors.textPrimary),
         waitDuration: const Duration(milliseconds: 400),
       ),
-      scrollbarTheme: ScrollbarThemeData(
-        // 15% of the page's opposite ink: white on dark (as shipped), black
-        // on a light palette.
-        thumbColor: WidgetStateProperty.all(
-            isLight ? const Color(0x26000000) : const Color(0x26FFFFFF)),
+      // 6.2 — a 14px lane with a handle you can hit, the web's H3 sizing. The
+      // old 5px thumb at 15% ink was the thing being complained about. Ink and
+      // lane are the palette's own tokens, so dark schemes and the light
+      // palettes each get a bar that reads on them; see [AppScrollbar].
+      scrollbarTheme: AppScrollbar.theme(
+        ink: AppColors.textSecondary,
+        track: AppColors.border,
         radius: const Radius.circular(8),
-        thickness: WidgetStateProperty.all(5),
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
