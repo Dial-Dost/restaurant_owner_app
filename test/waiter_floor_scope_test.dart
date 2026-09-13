@@ -850,10 +850,16 @@ void main() {
       expect(summaryChip.hasMatch(painted), isTrue,
           reason: 'the floor read-out went missing for the person who runs the floor');
 
+      // REQUIREMENT 2.1 — "what is seen in Tables is not shown in the Floor
+      // Plan". The occupancy read-out is the Tables screen's; the Floor plan's
+      // header counts what it edits instead.
       await _mountFloor(tester, role: 'admin', plan: true);
       painted = _painted(tester).join(' | ');
       expect(painted, contains('Floor plan'));
-      expect(summaryChip.hasMatch(painted), isTrue);
+      expect(summaryChip.hasMatch(painted), isFalse,
+          reason: 'the layout editor repeated the Tables occupancy read-out: $painted');
+      expect(painted, contains('1 table'));
+      expect(painted, contains('4 seats'));
     });
 
     testWidgets('and the tables themselves are still there for the waiter',
