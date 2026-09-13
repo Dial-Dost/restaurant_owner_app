@@ -579,7 +579,7 @@ void main() {
     });
 
     testWidgets('several live orders on the real /orders shape open a picker that says what each holds', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T4', occupied: true, hasOrder: true, covers: 2, total: 760),
