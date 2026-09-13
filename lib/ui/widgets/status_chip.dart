@@ -88,7 +88,7 @@ class StatusChip extends StatelessWidget {
               fontSize: dense ? 10.5 : 11.5,
               fontWeight: FontWeight.w600,
               letterSpacing: 0.3,
-              color: Color.lerp(color, Colors.white, 0.25),
+              color: AppColors.lift(color, 0.25),
             ),
           ),
         ],

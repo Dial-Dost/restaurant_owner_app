@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../gaia/gaia_colors.dart';
 import 'app_colors.dart';
 import 'backdrop_style.dart';
+import 'contrast.dart';
 
 /// Which complete visual language the app wears.
 ///
@@ -163,6 +164,180 @@ abstract final class AppSchemes {
       all.firstWhere((s) => s.id == id, orElse: () => rustic);
 }
 
+/// 6.6 — the colour of light mode: which GROUND the interface wears while the
+/// device is in light mode. Mirrors the web dashboard's `LIGHT_TONES`
+/// (src/lib/light-tone.ts) id for id, label for label, so the till and the
+/// browser offer the same three and say the same thing about them.
+///
+/// A separate axis from dark/light on purpose, as on the web: picking a tone
+/// switches to light; picking Dark keeps the tone, so the next switch back to
+/// light returns the colour somebody chose rather than resetting to white.
+///
+/// And a separate axis from [AppSchemes]: the five shell schemes are all DARK
+/// re-tilts, so while light is on they are remembered but not applied —
+/// exactly how Gaia treats them — and Dark returns the device's scheme.
+enum LightTone {
+  white('white', 'White', 'Plain white — light mode as it has always been.'),
+  beige('beige', 'Beige', 'Warm cream — softer under warm restaurant lighting.'),
+  grey('grey', 'Soft grey', 'A quiet grey — less glare than white, cooler than beige.');
+
+  const LightTone(this.id, this.label, this.hint);
+
+  final String id;
+  final String label;
+  final String hint;
+
+  /// White, as on the web: it is what light mode already looked like there.
+  static const LightTone defaultTone = white;
+
+  static LightTone byId(String? id) =>
+      LightTone.values.firstWhere((t) => t.id == id, orElse: () => defaultTone);
+}
+
+/// 6.6 — the light palettes, in ONE place. The named values are the web
+/// dashboard's light tokens, verbatim (globals.css `:root` for White, the
+/// `[data-light-tone]` blocks for Beige and Soft grey):
+///
+///   token (web)          -> AppShellScheme field
+///   --background         -> bg
+///   --card / --popover   -> surface, card, cardTop/Bottom, cardRaised
+///   --secondary/--muted  -> inset, bgDeep
+///   --foreground         -> textPrimary
+///   --muted-foreground   -> textSecondary
+///   --accent (hover)     -> divider
+///   --border             -> border
+///   --input              -> borderStrong
+///   --destructive        -> danger
+///
+/// What the web does not name (the tertiary ink, and the success / warning /
+/// info / neutral inks the app's floor and reports use) is filled in on the
+/// same temperature. light_theme_test.dart holds body inks, status inks, the
+/// derived accent and the table-state washes to WCAG AA 4.5:1 on these
+/// grounds, so a retune that makes anything unreadable fails CI.
+abstract final class AppLightPalettes {
+  // White — the web's plain light mode (globals.css `:root`). Two app-side
+  // departures, both for AA: secondary ink is gray-600, one step darker than
+  // the web's gray-500 --muted-foreground (which drops to 3.6:1 under the
+  // table-state washes and 4.4:1 on --muted; gray-500 is kept as the tertiary
+  // ink), and danger is the tones' #C32222 because the web's #EF4444 is 3.8:1
+  // as text on white.
+  static const white = AppShellScheme(
+    id: 'light-white', label: 'White',
+    brightness: Brightness.light,
+    bg: Color(0xFFFFFFFF), bgDeep: Color(0xFFF3F4F6),
+    surface: Color(0xFFFFFFFF), card: Color(0xFFFFFFFF),
+    cardTop: Color(0xFFFFFFFF), cardBottom: Color(0xFFFFFFFF),
+    cardRaised: Color(0xFFFFFFFF), inset: Color(0xFFF3F4F6),
+    textPrimary: Color(0xFF030712), textSecondary: Color(0xFF4B5563),
+    textTertiary: Color(0xFF6B7280),
+    border: Color(0xFFE5E7EB), borderStrong: Color(0xFFD1D5DB),
+    divider: Color(0xFFF3F4F6),
+    success: Color(0xFF2B6326), warning: Color(0xFF8A5A00),
+    danger: Color(0xFFC32222), info: Color(0xFF36648A),
+    neutral: Color(0xFF5F6670),
+  );
+
+  // Beige — warm cream.
+  static const beige = AppShellScheme(
+    id: 'light-beige', label: 'Beige',
+    brightness: Brightness.light,
+    bg: Color(0xFFF5EFE3), bgDeep: Color(0xFFECE3D2),
+    surface: Color(0xFFFBF7EF), card: Color(0xFFFBF7EF),
+    cardTop: Color(0xFFFBF7EF), cardBottom: Color(0xFFFBF7EF),
+    cardRaised: Color(0xFFFBF7EF), inset: Color(0xFFECE3D2),
+    textPrimary: Color(0xFF2B2219), textSecondary: Color(0xFF6A5B4B),
+    textTertiary: Color(0xFF8C7B69),
+    border: Color(0xFFE0D3BE), borderStrong: Color(0xFFD4C4AA),
+    divider: Color(0xFFE6DCC9),
+    success: Color(0xFF2B6326), warning: Color(0xFF805300),
+    danger: Color(0xFFC32222), info: Color(0xFF36648A),
+    neutral: Color(0xFF625649),
+  );
+
+  // Soft grey — a neutral with less glare than white.
+  static const grey = AppShellScheme(
+    id: 'light-grey', label: 'Soft grey',
+    brightness: Brightness.light,
+    bg: Color(0xFFEEEFF1), bgDeep: Color(0xFFE3E5E8),
+    surface: Color(0xFFF8F9FA), card: Color(0xFFF8F9FA),
+    cardTop: Color(0xFFF8F9FA), cardBottom: Color(0xFFF8F9FA),
+    cardRaised: Color(0xFFF8F9FA), inset: Color(0xFFE3E5E8),
+    textPrimary: Color(0xFF1D2025), textSecondary: Color(0xFF575D66),
+    textTertiary: Color(0xFF7D838C),
+    border: Color(0xFFD9DCE1), borderStrong: Color(0xFFC9CDD4),
+    divider: Color(0xFFE8E9EC),
+    success: Color(0xFF2B6326), warning: Color(0xFF805300),
+    danger: Color(0xFFC32222), info: Color(0xFF36648A),
+    neutral: Color(0xFF575D66),
+  );
+
+  /// The palette a [LightTone] paints.
+  static AppShellScheme of(LightTone t) => switch (t) {
+        LightTone.white => white,
+        LightTone.beige => beige,
+        LightTone.grey => grey,
+      };
+
+  /// Every accent ramp is tuned for a near-black ground: its `hi` stop is the
+  /// BRIGHT end, which on a white page is the unreadable end. Rather than hand
+  /// a second catalogue of eight ramps, the light ramp is DERIVED from the
+  /// owner's accent — same hue, lightness walked until each stop clears its
+  /// contrast target against the darkest ground of [palette] — so the accent
+  /// the device already wears carries into light mode, and every stop passes
+  /// by construction instead of by hand-tuning.
+  ///
+  /// The ramp keeps its meaning ("hi" = the most emphatic ink, "mid" = the
+  /// bottom of a filled control) and flips its direction: hi is the darkest.
+  /// A filled control's ink becomes white, which clears AA on base and mid
+  /// because both are held to 4.5:1 against grounds no brighter than white.
+  /// The glow trio becomes pale tints of the hue, so the backdrop reads as a
+  /// warm wash on paper rather than a brown stain.
+  static AppAccent accentFor(AppAccent accent, AppShellScheme palette) {
+    final grounds = [
+      palette.bg, palette.bgDeep, palette.surface, palette.card,
+      palette.cardTop, palette.cardBottom, palette.cardRaised, palette.inset,
+    ];
+    final darkest = grounds.reduce(
+        (a, b) => relativeLuminance(a) <= relativeLuminance(b) ? a : b);
+    final hsl = HSLColor.fromColor(accent.base);
+    final sat = (hsl.saturation * 1.15).clamp(0.30, 0.70);
+
+    // Largest lightness whose colour still clears [target] on the darkest
+    // ground. Contrast against a light ground falls as lightness rises, so the
+    // search converges from the passing side.
+    Color stop(double target) {
+      Color at(double l) => hsl.withSaturation(sat).withLightness(l).toColor();
+      var lo = 0.0, hi = 1.0;
+      for (var i = 0; i < 24; i++) {
+        final mid = (lo + hi) / 2;
+        if (contrastRatio(at(mid), darkest) >= target) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      return at(lo);
+    }
+
+    Color tint(double l, double s) =>
+        hsl.withSaturation(s).withLightness(l).toColor();
+
+    return AppAccent(
+      id: accent.id,
+      label: accent.label,
+      hi: stop(7.0),
+      base: stop(5.2),
+      mid: stop(4.6),
+      deep: stop(3.0),
+      shadow: stop(1.6),
+      on: const Color(0xFFFFFFFF),
+      glowBright: tint(0.74, 0.80),
+      glowMid: tint(0.82, 0.70),
+      glowDeep: tint(0.88, 0.60),
+    );
+  }
+}
+
 /// Per-DEVICE appearance for the owner app: which accent the Rustic Fork shell
 /// wears. Persisted in SharedPreferences, NOT on the server, on purpose:
 ///
@@ -190,6 +365,8 @@ class AppearanceController extends ChangeNotifier {
   static const String _prefsKey = 'appearance.accent';
   static const String _schemePrefsKey = 'appearance.scheme';
   static const String _designPrefsKey = 'appearance.designSystem';
+  static const String _uiModePrefsKey = 'appearance.uiMode';
+  static const String _lightTonePrefsKey = 'appearance.lightTone';
   static const String _washPrefsKey = 'appearance.backdrop.wash';
   static const String _bloomPrefsKey = 'appearance.backdrop.bloom';
   static const String _anglePrefsKey = 'appearance.backdrop.angle';
@@ -211,6 +388,22 @@ class AppearanceController extends ChangeNotifier {
   DesignSystem _designSystem = DesignSystem.rustic;
   DesignSystem get designSystem => _designSystem;
 
+  /// 6.6 — light mode on/off. Off (Dark, the shipped look) by default.
+  bool _lightMode = false;
+  bool get lightMode => _lightMode;
+
+  /// 6.6 — the ground light mode wears. Kept while Dark is on.
+  LightTone _lightTone = LightTone.defaultTone;
+  LightTone get lightTone => _lightTone;
+
+  /// The menu row that carries the tick — `'dark'` or a [LightTone] id — the
+  /// same value space as the web's `activeAppearance`.
+  String get themePick => _lightMode ? _lightTone.id : 'dark';
+
+  /// True when light mode is chosen AND actually painted. Gaia brings its own
+  /// dark palette, so under Gaia the choice is remembered, not applied.
+  bool get lightActive => _lightMode && _designSystem != DesignSystem.gaia;
+
   /// The single place the AppColors ladder is set, so accent/scheme/design
   /// can never disagree about what is currently painted.
   ///
@@ -223,6 +416,13 @@ class AppearanceController extends ChangeNotifier {
     if (_designSystem == DesignSystem.gaia) {
       AppColors.applyShell(GaiaColors.shellBridge);
       AppColors.applyAccent(GaiaColors.accentBridge);
+    } else if (_lightMode) {
+      final light = AppLightPalettes.of(_lightTone);
+      // 6.6 — a light palette pins the shell (the schemes are all dark) and
+      // re-derives the owner's accent for a light ground.
+      AppColors.applyShell(light);
+      AppColors.applyAccent(
+          AppLightPalettes.accentFor(AppAccents.byId(_accentId), light));
     } else {
       AppColors.applyShell(AppSchemes.byId(_schemeId));
       AppColors.applyAccent(AppAccents.byId(_accentId));
@@ -249,6 +449,8 @@ class AppearanceController extends ChangeNotifier {
       _accentId = AppAccents.byId(prefs.getString(_prefsKey)).id;
       _schemeId = AppSchemes.byId(prefs.getString(_schemePrefsKey)).id;
       _designSystem = DesignSystem.byId(prefs.getString(_designPrefsKey));
+      _lightMode = prefs.getString(_uiModePrefsKey) == 'light';
+      _lightTone = LightTone.byId(prefs.getString(_lightTonePrefsKey));
       _backdrop = BackdropStyle(
         wash: _colorOf(prefs.getString(_washPrefsKey)),
         bloom: _colorOf(prefs.getString(_bloomPrefsKey)),
@@ -259,6 +461,8 @@ class AppearanceController extends ChangeNotifier {
       _accentId = AppAccents.defaultId;
       _schemeId = AppSchemes.defaultId;
       _designSystem = DesignSystem.rustic;
+      _lightMode = false;
+      _lightTone = LightTone.defaultTone;
       _backdrop = const BackdropStyle();
     }
     _applyPalette();
@@ -297,6 +501,29 @@ class AppearanceController extends ChangeNotifier {
     _applyPalette();
     notifyListeners();
     await _persist(_designPrefsKey, system.id);
+  }
+
+  /// 6.6 — what picking a row of the theme menu does: [pick] is `'dark'` or a
+  /// [LightTone] id (the web's `applyAppearancePick`, same rules):
+  ///
+  ///  * picking a TONE also switches to light — somebody in dark mode who taps
+  ///    "Beige" wants to see beige, not a menu that seemed to do nothing;
+  ///  * picking DARK leaves the tone alone, so light comes back in the colour
+  ///    they chose.
+  ///
+  /// Live, like [setDesignSystem]: the app root rebuilds MaterialApp with the
+  /// matching ThemeData. Persisted per device and restored by [load] before
+  /// the first frame, so a light till never flashes dark on a cold start.
+  Future<void> applyThemePick(String pick) async {
+    final toLight = pick != 'dark';
+    final tone = toLight ? LightTone.byId(pick) : _lightTone;
+    if (toLight == _lightMode && tone == _lightTone) return;
+    _lightMode = toLight;
+    _lightTone = tone;
+    _applyPalette();
+    notifyListeners();
+    await _persist(_uiModePrefsKey, toLight ? 'light' : 'dark');
+    if (toLight) await _persist(_lightTonePrefsKey, tone.id);
   }
 
   /// One entry point for every backdrop knob (stops, angle, intensity), so the
@@ -344,6 +571,8 @@ class AppearanceController extends ChangeNotifier {
     _accentId = AppAccents.defaultId;
     _schemeId = AppSchemes.defaultId;
     _designSystem = DesignSystem.rustic;
+    _lightMode = false;
+    _lightTone = LightTone.defaultTone;
     _backdrop = const BackdropStyle();
     _applyPalette();
     notifyListeners();

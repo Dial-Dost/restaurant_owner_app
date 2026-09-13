@@ -3205,7 +3205,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
             final stale = _orderStale(o);
             final chips = <Widget>[
               if (stale)
-                const StatusChip(
+                StatusChip(
                   label: 'Over 24h · unsettled',
                   color: AppColors.warning,
                   dense: true,
@@ -3320,7 +3320,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   if (cancelled) ...[
                     const SizedBox(height: 12),
                     Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      const Icon(Icons.lock_outline, size: 13, color: AppColors.danger),
+                      Icon(Icons.lock_outline, size: 13, color: AppColors.danger),
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(_cancelledCaption,
@@ -3427,7 +3427,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   const SizedBox(height: 8),
                   Wrap(spacing: 6, runSpacing: 6, children: [
                     if (stale)
-                      const StatusChip(
+                      StatusChip(
                         label: 'Over 24h · unsettled',
                         color: AppColors.warning,
                         dense: true,
@@ -3493,7 +3493,7 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                 if (cancelled) ...[
                   const SizedBox(height: 8),
                   Row(children: [
-                    const Icon(Icons.lock_outline, size: 12, color: AppColors.danger),
+                    Icon(Icons.lock_outline, size: 12, color: AppColors.danger),
                     const SizedBox(width: 5),
                     Expanded(
                       child: Text('Cancelled',
@@ -6068,11 +6068,11 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
         // that did the reversing reads "Undo", so the pair is legible in
         // sequence.
         if (undone) ...[
-          const StatusChip(label: 'Undone', color: AppColors.neutral, dense: true),
+          StatusChip(label: 'Undone', color: AppColors.neutral, dense: true),
           const SizedBox(width: AppSpacing.md),
         ],
         if (isUndoEntry) ...[
-          const TickTag('Undo', color: AppColors.info),
+          TickTag('Undo', color: AppColors.info),
           const SizedBox(width: AppSpacing.md),
         ],
         if (emp.isNotEmpty && emp != '—') ...[
@@ -7566,7 +7566,7 @@ class _FloorSectionsState extends State<_FloorSections> {
                       // An empty zone is a real, saved zone — say so rather than
                       // letting it read as a rendering accident.
                       if (members.isEmpty && key.isNotEmpty)
-                        const StatusChip(label: 'Empty', color: AppColors.neutral, dense: true)
+                        StatusChip(label: 'Empty', color: AppColors.neutral, dense: true)
                       else ...[
                         InfoChip(
                           icon: Icons.table_restaurant,
@@ -7724,7 +7724,7 @@ class _FloorSectionsState extends State<_FloorSections> {
             border: Border.all(color: AppColors.edge(AppColors.warning)),
           ),
           child: Row(children: [
-            const Icon(Icons.warning_amber_outlined, size: 16, color: AppColors.warning),
+            Icon(Icons.warning_amber_outlined, size: 16, color: AppColors.warning),
             const SizedBox(width: AppSpacing.sm),
             Expanded(
               child: Text(
@@ -8341,7 +8341,7 @@ class _TableBox extends StatelessWidget {
               Expanded(
                 child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
               ),
-              if (paymentPending) const StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
+              if (paymentPending) StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
               // Per-table honesty. An order taken during an outage is saved on
               // this device and the kitchen has NOT seen it — so the table it
               // belongs to says so on the floor plan, not just a global counter
@@ -8838,7 +8838,7 @@ class _TableSheetState extends State<_TableSheet> {
           border: Border.all(color: AppColors.edge(AppColors.success)),
         ),
         child: Row(children: [
-          const Icon(Icons.check_circle_outline, color: AppColors.success, size: 16),
+          Icon(Icons.check_circle_outline, color: AppColors.success, size: 16),
           const SizedBox(width: 8),
           Expanded(
             child: Text('On target — great APC for this table.',
@@ -8897,7 +8897,7 @@ class _TableSheetState extends State<_TableSheet> {
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Row(children: [
-          const Icon(Icons.notifications_active_outlined, color: AppColors.warning, size: 18),
+          Icon(Icons.notifications_active_outlined, color: AppColors.warning, size: 18),
           const SizedBox(width: 8),
           Expanded(
             child: Text('Customer paid via ${method.isEmpty ? 'unknown method' : method} — review & approve',
@@ -9369,7 +9369,7 @@ class _TableSheetState extends State<_TableSheet> {
             if (_bn('discount') > 0)
               TextButton(
                 onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Remove', style: TextStyle(color: AppColors.danger)),
+                child: Text('Remove', style: TextStyle(color: AppColors.danger)),
               ),
             TextButton(onPressed: () => Navigator.pop(ctx, null), child: const Text('Cancel')),
             FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Apply')),
@@ -12005,7 +12005,7 @@ Future<void> _changeOrderStatus(
           backgroundColor: AppColors.surface,
           shape: RoundedRectangleBorder(
             borderRadius: AppRadius.cardAll,
-            side: const BorderSide(color: AppColors.borderStrong),
+            side: BorderSide(color: AppColors.borderStrong),
           ),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 400),
@@ -12035,7 +12035,7 @@ Future<void> _changeOrderStatus(
                       border: Border.all(color: AppColors.edge(AppColors.danger)),
                     ),
                     child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      const Icon(Icons.lock_outline, size: 16, color: AppColors.danger),
+                      Icon(Icons.lock_outline, size: 16, color: AppColors.danger),
                       const SizedBox(width: AppSpacing.sm),
                       Expanded(child: Text(_cancelledNote, style: text.bodySmall)),
                     ]),
@@ -12063,7 +12063,7 @@ Future<void> _changeOrderStatus(
           backgroundColor: AppColors.surface,
           shape: RoundedRectangleBorder(
             borderRadius: AppRadius.cardAll,
-            side: const BorderSide(color: AppColors.borderStrong),
+            side: BorderSide(color: AppColors.borderStrong),
           ),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 400),
@@ -12666,7 +12666,7 @@ class _KdsCardState extends State<_KdsCard> {
               border: Border.all(color: AppColors.warning.withValues(alpha: 0.18)),
             ),
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.warning),
+              Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.warning),
               const SizedBox(width: 7),
               Expanded(
                 child: Text(
@@ -12714,7 +12714,7 @@ class _KdsCardState extends State<_KdsCard> {
                                   color: (served || held) ? AppColors.textSecondary : null,
                                 )),
                             if (stationLabel.isNotEmpty) _stationBadge(stationLabel),
-                            if (held) const StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
+                            if (held) StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
                           ],
                         ),
                       ),
@@ -12753,7 +12753,7 @@ class _KdsCardState extends State<_KdsCard> {
                       ),
                       IconButton(
                         visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.check, size: 18, color: AppColors.success),
+                        icon: Icon(Icons.check, size: 18, color: AppColors.success),
                         tooltip: 'Item served',
                         // `undo=0` states the intent instead of letting the
                         // server infer it from state. This branch only renders
@@ -12789,7 +12789,7 @@ class _KdsCardState extends State<_KdsCard> {
                   Padding(
                     padding: const EdgeInsets.only(left: 8, bottom: 2),
                     child: Row(children: [
-                      const Icon(Icons.sticky_note_2_outlined, size: 13, color: AppColors.warning),
+                      Icon(Icons.sticky_note_2_outlined, size: 13, color: AppColors.warning),
                       const SizedBox(width: 4),
                       Expanded(
                         child: Text(
@@ -12816,7 +12816,7 @@ class _KdsCardState extends State<_KdsCard> {
             // reason travels with it. Printing the KOT stays available (no write).
             Expanded(
               child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Icon(Icons.lock_outline, size: 14, color: AppColors.danger),
+                Icon(Icons.lock_outline, size: 14, color: AppColors.danger),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(_cancelledCaption,
@@ -16435,7 +16435,7 @@ class _SeatingSuggestionDialogState extends State<_SeatingSuggestionDialog> {
                   border: Border.all(color: AppColors.edge(AppColors.warning)),
                 ),
                 child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  const Icon(Icons.info_outline, size: 16, color: AppColors.warning),
+                  Icon(Icons.info_outline, size: 16, color: AppColors.warning),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
@@ -17007,7 +17007,7 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             SectionHeader(
               title: 'Service recovery',
               count: tickets.length,
-              trailing: const StatusChip(label: 'Needs follow-up', color: AppColors.danger, dense: true),
+              trailing: StatusChip(label: 'Needs follow-up', color: AppColors.danger, dense: true),
             ),
             ...tickets.map((t) {
               final m = t as Map;
@@ -17036,7 +17036,7 @@ Widget feedbackModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
                         Text(_fmtTime(_s(m, 'submitted_at')), style: text.bodySmall),
                       ]),
                       trailing: [
-                        const StatusChip(label: 'Low rating', color: AppColors.danger, dense: true),
+                        StatusChip(label: 'Low rating', color: AppColors.danger, dense: true),
                         ForkButton(
                           label: 'Resolve',
                           dense: true,
@@ -18190,7 +18190,7 @@ Widget _sortControl(String section, List<_SortOption> opts, void Function(void F
         color: AppColors.cardRaised,
         shape: RoundedRectangleBorder(
           borderRadius: AppRadius.controlAll,
-          side: const BorderSide(color: AppColors.borderStrong),
+          side: BorderSide(color: AppColors.borderStrong),
         ),
         onSelected: (v) => setLocal(() => _sortField[section] = v),
         itemBuilder: (_) => [
@@ -18443,7 +18443,7 @@ Widget _priceSuggestionExplainer(BuildContext context, Map m) {
           border: Border.all(color: AppColors.edge(AppColors.warning)),
         ),
         child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Icon(Icons.warning_amber_outlined, size: 14, color: AppColors.warning),
+          Icon(Icons.warning_amber_outlined, size: 14, color: AppColors.warning),
           const SizedBox(width: 7),
           Expanded(
             child: Text(caution, style: text.bodySmall!.copyWith(fontSize: 11.5, color: AppColors.textPrimary)),
@@ -19995,7 +19995,7 @@ Widget _analyticsBody(
                             ),
                             if (onShift) ...[
                               const SizedBox(width: 8),
-                              const StatusChip(label: 'On shift', color: AppColors.success, dense: true),
+                              StatusChip(label: 'On shift', color: AppColors.success, dense: true),
                             ],
                           ]),
                           const SizedBox(height: 4),
@@ -23377,7 +23377,7 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
             ],
           ),
         ),
-        const Divider(height: 1, thickness: 1, color: AppColors.divider),
+        Divider(height: 1, thickness: 1, color: AppColors.divider),
         if (_tab == 2)
           _reservationsPanel()
         else if (rows.isEmpty)
@@ -23458,7 +23458,7 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
         color: focused ? AppColors.tint(AppColors.copper) : null,
-        border: last ? null : const Border(bottom: BorderSide(color: AppColors.divider)),
+        border: last ? null : Border(bottom: BorderSide(color: AppColors.divider)),
       ),
       child: child,
     );
@@ -23564,7 +23564,7 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
                 borderRadius: AppRadius.controlAll,
                 border: Border.all(color: AppColors.edge(AppColors.warning)),
               ),
-              child: const Icon(Icons.notifications_active, size: 18, color: AppColors.warning),
+              child: Icon(Icons.notifications_active, size: 18, color: AppColors.warning),
             )
           : Container(
               key: ValueKey('pos-${e['position']}'),
@@ -24073,7 +24073,7 @@ class _WaitlistViewState extends State<_WaitlistView> with CachePrimedScreen {
         Container(
           width: 8,
           height: 8,
-          decoration: const BoxDecoration(color: AppColors.warning, shape: BoxShape.circle),
+          decoration: BoxDecoration(color: AppColors.warning, shape: BoxShape.circle),
         ),
       ]),
       ),
@@ -24534,7 +24534,7 @@ class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
           // milder, true thing — nothing has failed yet.
           footer: overdue
               ? Row(mainAxisSize: MainAxisSize.min, children: [
-                  const StatusChip(label: 'Renewal failed', color: AppColors.danger, dense: true),
+                  StatusChip(label: 'Renewal failed', color: AppColors.danger, dense: true),
                   const SizedBox(width: AppSpacing.sm),
                   Flexible(
                     child: Text('This subscription did not renew. Settle it to keep your plan.',
@@ -24543,7 +24543,7 @@ class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
                 ])
               : renewing
                   ? Row(mainAxisSize: MainAxisSize.min, children: [
-                      const StatusChip(label: 'Renewing', color: AppColors.warning, dense: true),
+                      StatusChip(label: 'Renewing', color: AppColors.warning, dense: true),
                       const SizedBox(width: AppSpacing.sm),
                       Flexible(
                         child: Text('The billing period ended and the payment has not confirmed yet.',
@@ -24553,7 +24553,7 @@ class _BillingViewState extends State<_BillingView> with CachePrimedScreen {
                   : pending == null
                   ? null
                   : Row(mainAxisSize: MainAxisSize.min, children: [
-                      const StatusChip(label: 'Scheduled', color: AppColors.warning, dense: true),
+                      StatusChip(label: 'Scheduled', color: AppColors.warning, dense: true),
                       const SizedBox(width: AppSpacing.sm),
                       Flexible(
                         child: Text('Switches to ${pending['name']} at period end.',
@@ -24971,7 +24971,7 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
           ),
           const SizedBox(width: AppSpacing.md),
           Expanded(child: Text('Open register', style: text.titleMedium)),
-          const StatusChip(label: 'Closed', color: AppColors.neutral, dense: true),
+          StatusChip(label: 'Closed', color: AppColors.neutral, dense: true),
         ]),
         const SizedBox(height: AppSpacing.sm),
         Text('No register is open for this outlet. Enter the starting float to begin.', style: text.bodySmall),
@@ -25121,14 +25121,14 @@ class _CashViewState extends State<_CashView> with CachePrimedScreen {
                 borderRadius: AppRadius.controlAll,
                 border: Border.all(color: AppColors.edge(AppColors.success)),
               ),
-              child: const Icon(Icons.lock_open, size: 16, color: AppColors.success),
+              child: Icon(Icons.lock_open, size: 16, color: AppColors.success),
             ),
             const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Text('Open since ${_fmtTime(_s(cur, 'opened_at', ''))}',
                   style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
             ),
-            const StatusChip(label: 'Open', color: AppColors.success, dense: true),
+            StatusChip(label: 'Open', color: AppColors.success, dense: true),
           ]),
           const SizedBox(height: AppSpacing.md),
           row('Opening float', _money(cur['opening_float'])),
@@ -26260,7 +26260,7 @@ class _AttendanceViewState extends State<_AttendanceView> with CachePrimedScreen
               Padding(
                 padding: const EdgeInsets.only(top: AppSpacing.sm),
                 child: Row(children: [
-                  const Icon(Icons.hourglass_top, size: 13, color: AppColors.warning),
+                  Icon(Icons.hourglass_top, size: 13, color: AppColors.warning),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text('Awaiting admin approval — your clock-in time is already recorded.',
@@ -26708,7 +26708,7 @@ class _OutletsViewState extends State<_OutletsView> with CachePrimedScreen {
             badge: _isCurrentOutlet(o)
                 ? StatusChip(label: 'Viewing', color: AppColors.copper, dense: true)
                 : (o['is_active'] == false
-                    ? const StatusChip(label: 'Inactive', color: AppColors.neutral, dense: true)
+                    ? StatusChip(label: 'Inactive', color: AppColors.neutral, dense: true)
                     : null),
             sub: subOf(roll['${o['id']}']),
             trailing: trailingOf(roll['${o['id']}']),
@@ -27940,7 +27940,7 @@ Widget _perfComponentRow(BuildContext context, String label, Map? c, double? eff
         else
           // Never "0". A measure with nothing behind it is excluded from the
           // score, and saying zero would read as "they scored nothing".
-          const StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
+          StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
       ]),
       if (measured && value != null) ...[
         const SizedBox(height: 3),
@@ -28383,7 +28383,7 @@ void _employeeSheet(
       else ...[
         Row(children: [
           if (score == null)
-            const StatusChip(label: 'Not enough data', color: AppColors.neutral)
+            StatusChip(label: 'Not enough data', color: AppColors.neutral)
           else
             StatusChip(
               label: '${_numOf(score).round()} / 100',
@@ -28639,7 +28639,7 @@ void _metricBoard(
                   children: [
                     Text(m.display,
                         style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
-                    const StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
+                    StatusChip(label: 'Not enough data', color: AppColors.neutral, dense: true),
                   ],
                 ),
                 const SizedBox(height: 3),
@@ -29196,7 +29196,7 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                       ),
                       if (isSuper) ...[
                         const SizedBox(width: 6),
-                        const Tooltip(
+                        Tooltip(
                           message: 'Superadmin (owner)',
                           child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
                         ),
@@ -29234,7 +29234,7 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                     if (p.isAdmin)
                       const PopupMenuItem(value: 'password', child: ListTile(leading: Icon(Icons.password), title: Text('Reset password'), dense: true)),
                     if (p.isAdmin && !isSuper)
-                      const PopupMenuItem(value: 'remove', child: ListTile(leading: Icon(Icons.person_remove, color: AppColors.danger), title: Text('Remove', style: TextStyle(color: AppColors.danger)), dense: true)),
+                      PopupMenuItem(value: 'remove', child: ListTile(leading: Icon(Icons.person_remove, color: AppColors.danger), title: Text('Remove', style: TextStyle(color: AppColors.danger)), dense: true)),
                   ],
                 ),
               ]),
@@ -29255,7 +29255,7 @@ Widget employeesModule(RestClient rest, Profile p) => AsyncView<Map<String, dyna
                 // stated ONCE above the grid rather than repeated on every card.
                 if (perfNote.isEmpty)
                   score == null
-                      ? const StatusChip(
+                      ? StatusChip(
                           label: 'Not enough data', color: AppColors.neutral, dense: true)
                       : StatusChip(
                           label: '${_numOf(score).round()} / 100 score',
@@ -29407,13 +29407,13 @@ class _PasswordRequestsBanner extends StatelessWidget {
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          const Icon(Icons.lock_reset, size: 16, color: AppColors.warning),
+          Icon(Icons.lock_reset, size: 16, color: AppColors.warning),
           const SizedBox(width: 8),
           Expanded(
             child: Text('${requests.length} password reset request${requests.length > 1 ? 's' : ''}',
                 style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis),
           ),
-          const StatusChip(label: 'Action needed', color: AppColors.warning, dense: true),
+          StatusChip(label: 'Action needed', color: AppColors.warning, dense: true),
         ]),
         const SizedBox(height: 6),
         ...requests.map((r) {
@@ -29522,7 +29522,7 @@ Widget printerModule(RestClient rest, Profile p) {
                   overflow: TextOverflow.ellipsis),
             ),
             if (svc.paused) ...[
-              const StatusChip(label: 'Paused', color: AppColors.warning, dense: true),
+              StatusChip(label: 'Paused', color: AppColors.warning, dense: true),
               const SizedBox(width: AppSpacing.sm),
             ],
             ForkIconButton(
@@ -29592,7 +29592,7 @@ Widget printerModule(RestClient rest, Profile p) {
               Padding(
                 padding: const EdgeInsets.only(top: 10),
                 child: Row(children: [
-                  const Icon(Icons.check_circle, size: 14, color: AppColors.success),
+                  Icon(Icons.check_circle, size: 14, color: AppColors.success),
                   const SizedBox(width: 6),
                   Expanded(
                       child: Text('Default: ${PrintTarget.label(svc.selectedPrinter!)}',
@@ -31191,7 +31191,7 @@ class _TimezoneCardState extends State<_TimezoneCard> {
           Padding(
             padding: const EdgeInsets.only(top: AppSpacing.md),
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Icon(Icons.warning_amber, size: 14, color: AppColors.warning),
+              Icon(Icons.warning_amber, size: 14, color: AppColors.warning),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
@@ -31585,7 +31585,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                     visualDensity: VisualDensity.compact,
                     activeColor: AppColors.copper,
                     checkColor: AppColors.onCopper,
-                    side: const BorderSide(color: AppColors.borderStrong),
+                    side: BorderSide(color: AppColors.borderStrong),
                     onChanged: (v) => setState(() => m['requires_screenshot'] = v ?? false),
                   ),
                   Text('Require payment screenshot', style: text.bodySmall),
@@ -33725,7 +33725,7 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                 Text('${widget.initialConfig[k]}',
                     style: TextStyle(fontFamily: 'monospace', fontSize: 10, color: AppColors.textTertiary)),
                 const SizedBox(width: 8),
-                const StatusChip(label: 'Not used', color: AppColors.neutral, dense: true),
+                StatusChip(label: 'Not used', color: AppColors.neutral, dense: true),
               ]),
             ),
         ],
@@ -34648,7 +34648,7 @@ void _showCoreRole(
                           Padding(
                             padding: const EdgeInsets.symmetric(vertical: 2),
                             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                              const Icon(Icons.check, size: 14, color: AppColors.success),
+                              Icon(Icons.check, size: 14, color: AppColors.success),
                               const SizedBox(width: 8),
                               Expanded(child: Text(name, style: text.bodyLarge!.copyWith(fontSize: 13))),
                             ]),
@@ -34808,7 +34808,7 @@ class _CreateRoleDialogState extends State<_CreateRoleDialog> {
                     contentPadding: const EdgeInsets.symmetric(horizontal: 4),
                     activeColor: AppColors.copper,
                     checkColor: AppColors.onCopper,
-                    side: const BorderSide(color: AppColors.borderStrong),
+                    side: BorderSide(color: AppColors.borderStrong),
                     value: _selected.contains('${a['id']}'),
                     title: Text(_s(a, 'action_name'),
                         style: text.bodyLarge!.copyWith(fontSize: 13)),
@@ -34950,7 +34950,7 @@ class _ManageRolesSheetState extends State<_ManageRolesSheet> {
                     ),
                     if (widget.isSuperadmin) ...[
                       const SizedBox(width: 6),
-                      const Tooltip(
+                      Tooltip(
                         message: 'Superadmin (owner)',
                         child: Icon(Icons.workspace_premium, size: 15, color: AppColors.warning),
                       ),

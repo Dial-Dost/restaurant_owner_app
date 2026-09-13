@@ -11,11 +11,13 @@ import '../services/restaurant_time.dart';
 import '../services/update_checker.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/theme/appearance.dart';
 import '../ui/widgets/gradient_backdrop.dart';
 import 'modules.dart' as m;
 import '../widgets/module_navigator.dart';
 import '../widgets/notifications_bell.dart';
 import '../widgets/outbox_chip.dart';
+import '../widgets/theme_toggle.dart';
 
 /// The app-wide phone/narrow breakpoint.
 ///
@@ -453,6 +455,8 @@ class _HomeShellState extends State<HomeShell> {
           widget.auth.logout();
         } else if (value.startsWith('outlet:')) {
           _selectOutlet(value.substring('outlet:'.length));
+        } else if (value.startsWith('theme:')) {
+          AppearanceController.instance.applyThemePick(value.substring('theme:'.length));
         }
       },
       itemBuilder: (_) => [
@@ -475,6 +479,10 @@ class _HomeShellState extends State<HomeShell> {
             ),
           const PopupMenuDivider(),
         ],
+        // 6.6 — the theme toggle folds in here on a phone, same entries as the
+        // wide top bar's ThemeToggleButton.
+        ...themeMenuEntries<String>(context, valueOf: (pick) => 'theme:$pick'),
+        const PopupMenuDivider(),
         PopupMenuItem<String>(value: 'refresh', child: entry(Icons.refresh, 'Refresh')),
         PopupMenuItem<String>(value: 'logout', child: entry(Icons.logout, 'Sign out')),
       ],
@@ -888,7 +896,7 @@ class _HomeShellState extends State<HomeShell> {
                 )),
           ),
         ]),
-        bottom: const PreferredSize(
+        bottom: PreferredSize(
           preferredSize: Size.fromHeight(1),
           child: Divider(height: 1, thickness: 1, color: AppColors.divider),
         ),
@@ -914,6 +922,9 @@ class _HomeShellState extends State<HomeShell> {
           if (compactChrome)
             _chromeOverflow()
           else ...[
+            // 6.6 — Dark, or Light in White / Beige / Soft grey, where the web
+            // dashboard keeps its own theme toggle: the top bar.
+            const ThemeToggleButton(),
             IconButton(
               tooltip: 'Refresh',
               onPressed: () => setState(() => _refreshTick++),
@@ -1103,9 +1114,9 @@ class _NavItemState extends State<_NavItem> {
           ),
           decoration: BoxDecoration(
             color: active
-                ? Colors.white.withValues(alpha: 0.06)
+                ? AppColors.overlay.withValues(alpha: 0.06)
                 : _hovered
-                    ? Colors.white.withValues(alpha: 0.03)
+                    ? AppColors.overlay.withValues(alpha: 0.03)
                     : Colors.transparent,
             borderRadius: BorderRadius.circular(9),
           ),

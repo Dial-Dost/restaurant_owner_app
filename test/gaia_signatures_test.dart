@@ -514,7 +514,7 @@ void main() {
       // A rising cost is BAD (coral) but it still rose, so the glyph points up.
       // The version that pointed the arrow at the verdict rendered this row as
       // "▼ +₹6,150", which is an arrow arguing with its own number.
-      await tester.pumpWidget(_host(const GaiaDeltaRow(
+      await tester.pumpWidget(_host(GaiaDeltaRow(
         first: true,
         metric: 'Labour / day',
         current: '₹6,300',

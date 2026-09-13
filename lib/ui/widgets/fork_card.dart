@@ -77,7 +77,13 @@ class _ForkCardState extends State<ForkCard> {
             ? null
             : [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: _hovered && interactive ? 0.45 : 0.30),
+                  // 6.6 — the ambient shadow is sized for a near-black page;
+                  // at 30% black it smudges a light one, so light palettes keep
+                  // the lift but at a paper-weight shadow.
+                  color: Colors.black.withValues(
+                      alpha: AppColors.isLight
+                          ? (_hovered && interactive ? 0.10 : 0.05)
+                          : (_hovered && interactive ? 0.45 : 0.30)),
                   blurRadius: _hovered && interactive ? 26 : 18,
                   offset: const Offset(0, 10),
                 ),
