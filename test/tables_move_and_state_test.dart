@@ -543,10 +543,15 @@ void main() {
         ], orders: [
           {
             'id': 'o-1',
-            'table_name': 'T4',
+            'table': 'T4',
             'status': 'Preparing',
             'barked_at': '2026-09-09T12:10:00Z',
-            'food': {'total': 450, 'items': [{'name': 'Paneer Tikka', 'quantity': 2}]},
+            // The shape `GET /orders` really returns: `table`, with `items` and
+            // `total` on the row. The fixture used to say `table_name` and nest a
+            // `food` map, so this test passed while the button matched nothing
+            // against the real server.
+            'total': 450,
+            'items': [{'name': 'Paneer Tikka', 'quantity': 2}],
           },
         ]),
       );
@@ -573,6 +578,46 @@ void main() {
       expect(find.textContaining('KOT-26'), findsOneWidget);
     });
 
+    testWidgets('several live orders on the real /orders shape open a picker that says what each holds', (tester) async {
+      await _mount(
+        tester,
+        _routes([
+          _table('T4', occupied: true, hasOrder: true, covers: 2, total: 760),
+          _table('T7'),
+        ], orders: [
+          {
+            'id': 'o-a',
+            'table': 'T4',
+            'status': 'Preparing',
+            'barked_at': '2026-09-13T10:18:00Z',
+            'total': 640,
+            'items': [
+              {'name': 'Paneer Tikka', 'quantity': 2},
+              {'name': 'Masala Chai', 'quantity': 2},
+            ],
+          },
+          {
+            'id': 'o-b',
+            'table': 'T4',
+            'status': 'Preparing',
+            'barked_at': null,
+            'total': 120,
+            'items': [{'name': 'Masala Chai', 'quantity': 2}],
+          },
+          // Another table's order must not leak into T4's picker.
+          {'id': 'o-c', 'table': 'T7', 'status': 'Preparing', 'total': 99, 'items': []},
+        ]),
+      );
+      await _openSheet(tester, 'T4');
+      await tester.tap(_button('Move an order'));
+      await tester.pumpAndSettle();
+      expect(find.text('No live order on this table to move.'), findsNothing);
+      expect(find.text('Which order on T4?'), findsOneWidget);
+      expect(find.textContaining('2 items'), findsOneWidget);
+      expect(find.textContaining('1 item'), findsOneWidget);
+      expect(find.text('Order o-c'), findsNothing);
+    });
+
     testWidgets('an UNBARKED order says nothing will print', (tester) async {
       final api = await _mountTables(
         tester,
@@ -582,7 +627,7 @@ void main() {
         ], orders: [
           {
             'id': 'o-2',
-            'table_name': 'T4',
+            'table': 'T4',
             'status': 'Preparing',
             'barked_at': null,
             'food': {'total': 200, 'items': []},
