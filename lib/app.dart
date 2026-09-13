@@ -47,7 +47,7 @@ class _OwnerAppState extends State<OwnerApp> {
 
   @override
   Widget build(BuildContext context) {
-    // Rebuild the whole tree when the device accent changes: AppTheme.dark()
+    // Rebuild the whole tree when the device accent changes: AppTheme
     // and every module read the accent through AppColors getters, so one
     // rebuild here recolours the app with no per-module wiring.
     //
@@ -67,7 +67,11 @@ class _OwnerAppState extends State<OwnerApp> {
       title: 'Restaurant Dash — Owner',
       debugShowCheckedModeBanner: false,
       scrollBehavior: _DragScrollBehavior(),
-      theme: Gaia.isActive ? GaiaTheme.dark() : AppTheme.dark(),
+      // 6.6 — AppTheme.active() is the light theme while a light palette
+      // (White / Beige) is applied, the shipped dark theme otherwise. The
+      // palette itself was applied by AppearanceController.load() before
+      // runApp, so a light till's first frame is already light.
+      theme: Gaia.isActive ? GaiaTheme.dark() : AppTheme.active(),
       home: AnimatedBuilder(
         animation: auth,
         builder: (context, _) {

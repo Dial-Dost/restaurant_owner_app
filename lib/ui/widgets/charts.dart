@@ -169,7 +169,7 @@ class _BarcodePainter extends CustomPainter {
             Rect.fromLTWH(x - gap / 2, 0, slot, size.height),
             const Radius.circular(2),
           ),
-          Paint()..color = Colors.white.withValues(alpha: 0.07),
+          Paint()..color = AppColors.overlay.withValues(alpha: 0.07),
         );
       }
       canvas.drawRRect(
@@ -400,7 +400,7 @@ class _DonutGaugeState extends State<DonutGauge> {
           painter: _DonutPainter(
             t,
             widget.stroke,
-            _hover ? Color.lerp(ring, Colors.white, 0.28)! : ring,
+            _hover ? AppColors.lift(ring, 0.28) : ring,
             _hover,
           ),
           child: Center(
@@ -470,7 +470,7 @@ class _DonutPainter extends CustomPainter {
     final track = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = stroke
-      ..color = Colors.white.withValues(alpha: hovered ? 0.14 : 0.07);
+      ..color = AppColors.overlay.withValues(alpha: hovered ? 0.14 : 0.07);
     canvas.drawArc(inner, 0, math.pi * 2, false, track);
 
     if (fraction <= 0) return;
@@ -657,7 +657,7 @@ class HBarRow extends StatelessWidget {
               height: 5,
               child: Stack(
                 children: [
-                  Container(color: Colors.white.withValues(alpha: 0.05)),
+                  Container(color: AppColors.overlay.withValues(alpha: 0.05)),
                   TweenAnimationBuilder<double>(
                     tween: Tween(begin: 0, end: fraction.clamp(0.0, 1.0)),
                     duration: const Duration(milliseconds: 600),

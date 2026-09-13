@@ -37,6 +37,41 @@ class AppearanceCard extends StatelessWidget {
               style: text.bodySmall,
             ),
 
+            // ── 6.6 — the interface theme. Same three choices as the top
+            // bar's toggle (and the web dashboard's dark/light switch).
+            const SizedBox(height: AppSpacing.lg),
+            Text('THEME', style: text.labelSmall),
+            const SizedBox(height: 8),
+            Wrap(spacing: 10, runSpacing: 10, children: [
+              _ThemeSwatch(
+                pick: 'dark',
+                label: 'Dark',
+                palette: AppColors.rusticShell,
+                selected: ctl.themePick == 'dark',
+                onTap: () => ctl.applyThemePick('dark'),
+              ),
+              for (final t in LightTone.values)
+                _ThemeSwatch(
+                  pick: t.id,
+                  label: 'Light — ${t.label}',
+                  palette: AppLightPalettes.of(t),
+                  selected: ctl.themePick == t.id,
+                  onTap: () => ctl.applyThemePick(t.id),
+                ),
+            ]),
+            const SizedBox(height: 8),
+            Text(
+              ctl.lightMode && gaiaOn
+                  ? 'Gaia keeps its own dark palette, so light is remembered '
+                      'and applies when Rustic Fork is back on.'
+                  : ctl.lightMode
+                      ? 'Light keeps your accent (deepened so it stays readable on a pale page). '
+                          'The shell schemes below are dark variants — remembered, and back when you pick Dark.'
+                      : 'Picking a light colour switches to light; Dark remembers it for next time. '
+                          'Same choices as the website.',
+              style: text.bodySmall,
+            ),
+
             // ── The design system, first: it is the biggest choice on this
             // card, and the two below it are choices WITHIN the Rustic system.
             const SizedBox(height: AppSpacing.lg),
@@ -70,14 +105,19 @@ class AppearanceCard extends StatelessWidget {
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text('SHELL SCHEME', style: text.labelSmall),
                 const SizedBox(height: 8),
-                Wrap(spacing: 10, runSpacing: 10, children: [
-                  for (final s in AppSchemes.all)
-                    _SchemeSwatch(
-                      scheme: s,
-                      selected: s.id == ctl.schemeId,
-                      onTap: () => ctl.setScheme(s.id),
-                    ),
-                ]),
+                // 6.6 — the schemes are dark shells; under a light theme they
+                // are dimmed the way Gaia dims the whole block.
+                Opacity(
+                  opacity: ctl.lightActive ? 0.45 : 1,
+                  child: Wrap(spacing: 10, runSpacing: 10, children: [
+                    for (final s in AppSchemes.all)
+                      _SchemeSwatch(
+                        scheme: s,
+                        selected: s.id == ctl.schemeId,
+                        onTap: () => ctl.setScheme(s.id),
+                      ),
+                  ]),
+                ),
                 const SizedBox(height: AppSpacing.lg),
                 Text('ACCENT', style: text.labelSmall),
                 const SizedBox(height: 8),
@@ -595,6 +635,97 @@ class _DesignSwatch extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// 6.6 — a miniature of each interface theme: its page ground, a card with the
+/// two body inks, and a stroke of the accent as it would paint there. Each
+/// swatch draws its OWN palette (not the live one), so all four stay truthful
+/// whichever is on.
+class _ThemeSwatch extends StatelessWidget {
+  const _ThemeSwatch({
+    required this.pick,
+    required this.label,
+    required this.palette,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String pick;
+  final String label;
+  final AppShellScheme palette;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final accent = palette.brightness == Brightness.light
+        ? AppLightPalettes.accentFor(AppColors.rusticCopper, palette)
+        : AppColors.rusticCopper;
+    Widget inkBar(Color c, double w) => Container(
+          width: w,
+          height: 3,
+          decoration: BoxDecoration(color: c, borderRadius: BorderRadius.circular(2)),
+        );
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        key: ValueKey('theme-swatch-$pick'),
+        onTap: selected ? null : onTap,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          AnimatedContainer(
+            duration: AppDurations.fast,
+            width: 88,
+            height: 52,
+            padding: const EdgeInsets.all(3),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                color: selected ? AppColors.copperHi : AppColors.border,
+                width: selected ? 2 : 1,
+              ),
+            ),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: palette.bg,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(6),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: palette.card,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: palette.border, width: 0.5),
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      inkBar(palette.textPrimary, 34),
+                      const SizedBox(height: 3),
+                      inkBar(palette.textSecondary, 22),
+                      const SizedBox(height: 3),
+                      inkBar(accent.base, 14),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            label,
+            style: text.labelSmall!.copyWith(
+              color: selected ? AppColors.textPrimary : AppColors.textTertiary,
+              letterSpacing: 0.4,
+            ),
+          ),
+        ]),
       ),
     );
   }

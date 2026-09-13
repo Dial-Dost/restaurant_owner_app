@@ -11,11 +11,26 @@ import 'app_spacing.dart';
 /// dependencies, so the identical type scale is replicated with plain
 /// [TextStyle]s (default fontFamily, same size/weight/letterSpacing/height).
 abstract final class AppTheme {
-  static ThemeData dark() {
+  /// The shipped dark theme. Reads the live AppColors ladder, so it is the
+  /// same ThemeData it always was on every dark scheme.
+  static ThemeData dark() => _build(Brightness.dark);
+
+  /// 6.6 — the light interface theme. Identical structure and type scale; the
+  /// colours come from whichever light palette AppearanceController applied
+  /// (White or Beige), so this needs no palette argument of its own.
+  static ThemeData light() => _build(Brightness.light);
+
+  /// The Rustic Fork ThemeData for whatever the device is painting right now:
+  /// light when a light palette is applied, dark otherwise. The app root calls
+  /// this on every appearance change.
+  static ThemeData active() => AppColors.isLight ? light() : dark();
+
+  static ThemeData _build(Brightness brightness) {
+    final isLight = brightness == Brightness.light;
     final base = ThemeData(
-      brightness: Brightness.dark,
+      brightness: brightness,
       useMaterial3: true,
-      colorScheme: ColorScheme.dark(
+      colorScheme: (isLight ? ColorScheme.light : ColorScheme.dark)(
         primary: AppColors.copper,
         onPrimary: AppColors.onCopper,
         secondary: AppColors.copperHi,
@@ -118,7 +133,7 @@ abstract final class AppTheme {
     return base.copyWith(
       textTheme: text,
       splashFactory: InkSparkle.splashFactory,
-      dividerTheme: const DividerThemeData(
+      dividerTheme: DividerThemeData(
         color: AppColors.divider,
         thickness: 1,
         space: 1,
@@ -144,7 +159,10 @@ abstract final class AppTheme {
         waitDuration: const Duration(milliseconds: 400),
       ),
       scrollbarTheme: ScrollbarThemeData(
-        thumbColor: WidgetStateProperty.all(const Color(0x26FFFFFF)),
+        // 15% of the page's opposite ink: white on dark (as shipped), black
+        // on a light palette.
+        thumbColor: WidgetStateProperty.all(
+            isLight ? const Color(0x26000000) : const Color(0x26FFFFFF)),
         radius: const Radius.circular(8),
         thickness: WidgetStateProperty.all(5),
       ),
@@ -156,11 +174,11 @@ abstract final class AppTheme {
             const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         border: OutlineInputBorder(
           borderRadius: AppRadius.inputAll,
-          borderSide: const BorderSide(color: AppColors.border),
+          borderSide: BorderSide(color: AppColors.border),
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: AppRadius.inputAll,
-          borderSide: const BorderSide(color: AppColors.border),
+          borderSide: BorderSide(color: AppColors.border),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: AppRadius.inputAll,

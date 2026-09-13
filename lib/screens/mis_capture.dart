@@ -763,7 +763,7 @@ class _NonChargeableSheetState extends State<_NonChargeableSheet> {
           ForkCard(
             inset: true,
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Icon(Icons.lock_outline, size: 16, color: AppColors.warning),
+              Icon(Icons.lock_outline, size: 16, color: AppColors.warning),
               const SizedBox(width: AppSpacing.sm),
               Expanded(child: Text(_noPermission('comp a dish'), style: text.bodySmall)),
             ]),
@@ -1075,7 +1075,7 @@ Widget misServiceChargeBlock(
         padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Row(children: [
-            const Icon(Icons.money_off_csred_outlined, size: 16, color: AppColors.warning),
+            Icon(Icons.money_off_csred_outlined, size: 16, color: AppColors.warning),
             const SizedBox(width: AppSpacing.sm),
             Expanded(
               child: Text('Service charge waived — ${_vocabLabel(_scWaiverKinds, _s(w, 'waiver_kind', ''))}',
@@ -2416,7 +2416,7 @@ class _BillingCountersCardState extends State<_BillingCountersCard> {
                     ]),
                   ),
                   if (c['active'] == false)
-                    const StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
+                    StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
                   if (_mayEdit) ...[
                     const SizedBox(width: AppSpacing.sm),
                     ForkIconButton(
@@ -2932,7 +2932,7 @@ class _MenuGroupsDialogState extends State<_MenuGroupsDialog> {
             child: Row(children: [
               Expanded(child: Text(_s(g, 'name'), style: text.titleSmall)),
               if (g['active'] == false)
-                const StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
+                StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
               if (_mayEdit) ...[
                 const SizedBox(width: AppSpacing.sm),
                 ForkIconButton(
@@ -3269,14 +3269,14 @@ class _MenuVariationsDialogState extends State<_MenuVariationsDialog> {
                 ),
                 if (v['is_default'] == true) ...[
                   const SizedBox(width: 6),
-                  const StatusChip(label: 'Default', color: AppColors.info, dense: true),
+                  StatusChip(label: 'Default', color: AppColors.info, dense: true),
                 ],
               ]),
               Text(_money(v['price']), style: text.bodySmall),
             ]),
           ),
           if (v['active'] == false)
-            const StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
+            StatusChip(label: 'Retired', color: AppColors.neutral, dense: true),
           if (_mayEdit) ...[
             const SizedBox(width: AppSpacing.sm),
             ForkIconButton(

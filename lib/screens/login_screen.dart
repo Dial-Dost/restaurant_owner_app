@@ -407,11 +407,11 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.error_outline, size: 16, color: AppColors.danger),
+                    Icon(Icons.error_outline, size: 16, color: AppColors.danger),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(auth.error!,
-                          style: const TextStyle(color: AppColors.danger, fontSize: 12.5)),
+                          style: TextStyle(color: AppColors.danger, fontSize: 12.5)),
                     ),
                   ],
                 ),

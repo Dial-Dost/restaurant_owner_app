@@ -761,7 +761,7 @@ class _SimulationViewState extends State<_SimulationView> {
           child: Row(children: [
             Expanded(child: Text(label.toUpperCase(), style: text.labelSmall)),
             if (est(key)) ...[
-              const StatusChip(label: 'estimated', color: AppColors.warning, dense: true),
+              StatusChip(label: 'estimated', color: AppColors.warning, dense: true),
               const SizedBox(width: AppSpacing.sm),
             ],
             Text(value,
@@ -1199,7 +1199,7 @@ class _PickerRowState extends State<_PickerRow> {
             ),
             if (widget.spec.speculative) ...[
               const SizedBox(width: 6),
-              const StatusChip(label: 'speculative', color: AppColors.warning, dense: true),
+              StatusChip(label: 'speculative', color: AppColors.warning, dense: true),
             ],
           ]),
         ),

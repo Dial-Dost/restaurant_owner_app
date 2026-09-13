@@ -65,10 +65,36 @@ class AppShellScheme {
     required this.textPrimary,
     required this.textSecondary,
     required this.textTertiary,
+    this.brightness = Brightness.dark,
+    this.border = _darkBorder,
+    this.borderStrong = _darkBorderStrong,
+    this.divider = _darkDivider,
+    this.success = _darkSuccess,
+    this.warning = _darkWarning,
+    this.danger = _darkDanger,
+    this.info = _darkInfo,
+    this.neutral = _darkNeutral,
   });
+
+  // The shipped strokes and status inks, as the defaults every DARK scheme
+  // inherits — so the five dark shells (and Gaia's bridge) stay byte-identical
+  // without restating them. Only a light palette (6.6) overrides these.
+  static const Color _darkBorder = Color(0x12FFFFFF); //  7% white
+  static const Color _darkBorderStrong = Color(0x1FFFFFFF); // 12% white
+  static const Color _darkDivider = Color(0x0DFFFFFF); //  5% white
+  static const Color _darkSuccess = Color(0xFF8FB27C);
+  static const Color _darkWarning = Color(0xFFD9A962);
+  static const Color _darkDanger = Color(0xFFC97B6E);
+  static const Color _darkInfo = Color(0xFF8FA3B8);
+  static const Color _darkNeutral = Color(0xFF9A978F);
 
   final String id;
   final String label;
+
+  /// 6.6 — dark for every shipped scheme; light for the White/Beige interface
+  /// palettes. Picks the Material brightness AppTheme builds with and which way
+  /// the few "lift toward the page's opposite" helpers in [AppColors] lean.
+  final Brightness brightness;
   final Color bg;
   final Color bgDeep;
   final Color surface;
@@ -80,6 +106,20 @@ class AppShellScheme {
   final Color textPrimary;
   final Color textSecondary;
   final Color textTertiary;
+
+  // Strokes. Alpha-white hairlines read over any DARK ground; a light ground
+  // needs solid warm/neutral greys instead, so they ride on the scheme too.
+  final Color border;
+  final Color borderStrong;
+  final Color divider;
+
+  // Status inks. The shipped pastels clear AA on near-black but fall to ~2:1
+  // on a white page, so a light palette brings its own deeper set.
+  final Color success;
+  final Color warning;
+  final Color danger;
+  final Color info;
+  final Color neutral;
 }
 
 /// The Rustic Fork palette — a near-black workspace with a single warm
@@ -138,12 +178,30 @@ abstract final class AppColors {
   static Color get cardRaised => _shell.cardRaised;
   static Color get inset => _shell.inset;
 
+  /// 6.6 — true while a light interface palette (White / Beige) is painted.
+  static bool get isLight => _shell.brightness == Brightness.light;
+
   // ── Strokes ─────────────────────────────────────────────────────────
-  // Alpha-white on purpose: a translucent hairline reads correctly over ANY
-  // dark ground, so strokes need no per-scheme variants.
-  static const Color border = Color(0x12FFFFFF); //  7% white
-  static const Color borderStrong = Color(0x1FFFFFFF); // 12% white
-  static const Color divider = Color(0x0DFFFFFF); //  5% white
+  // Alpha-white on every dark scheme: a translucent hairline reads correctly
+  // over ANY dark ground, so the dark schemes share one set. They used to be
+  // consts; 6.6's light palettes need solid greys, so they are read off the
+  // active shell like the surfaces above (dark values byte-identical).
+  static Color get border => _shell.border;
+  static Color get borderStrong => _shell.borderStrong;
+  static Color get divider => _shell.divider;
+
+  /// The ink hover/pressed washes are made of: white over a dark page, black
+  /// over a light one. `overlay.withValues(alpha: 0.06)` is the old
+  /// `Colors.white.withValues(alpha: 0.06)` on every dark scheme.
+  static Color get overlay => isLight ? Colors.black : Colors.white;
+
+  /// "Lift" a tinted ink toward the page's opposite, the way status chips and
+  /// avatars brighten their colour so the label pops off its tint. Dark: toward
+  /// white (the shipped `Color.lerp(c, Colors.white, t)`, unchanged). Light:
+  /// toward the primary ink, because lightening a label on a pale chip is what
+  /// makes it unreadable.
+  static Color lift(Color c, double t) =>
+      Color.lerp(c, isLight ? textPrimary : Colors.white, t)!;
 
   // ── Ink ─────────────────────────────────────────────────────────────
   static Color get textPrimary => _shell.textPrimary;
@@ -254,11 +312,13 @@ abstract final class AppColors {
       );
 
   // ── Status (always shipped with a text label, never color alone) ───
-  static const Color success = Color(0xFF8FB27C);
-  static const Color warning = Color(0xFFD9A962);
-  static const Color danger = Color(0xFFC97B6E);
-  static const Color info = Color(0xFF8FA3B8);
-  static const Color neutral = Color(0xFF9A978F);
+  // Read off the active shell (6.6): the shipped pastels on every dark
+  // scheme, a deeper AA-checked set on the light palettes.
+  static Color get success => _shell.success;
+  static Color get warning => _shell.warning;
+  static Color get danger => _shell.danger;
+  static Color get info => _shell.info;
+  static Color get neutral => _shell.neutral;
 
   /// 12% tint used behind status chips.
   static Color tint(Color c) => c.withValues(alpha: 0.12);
