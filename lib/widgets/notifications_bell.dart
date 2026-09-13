@@ -328,12 +328,12 @@ class _NotificationsBellState extends State<NotificationsBell> {
                           await widget.rest.delete('/notifications');
                           await refreshBoth();
                         }),
-                        child: const Text('Clear all', style: TextStyle(color: AppColors.danger)),
+                        child: Text('Clear all', style: TextStyle(color: AppColors.danger)),
                       ),
                     ],
                   ]),
                 ),
-                const Divider(height: 1, color: AppColors.divider),
+                Divider(height: 1, color: AppColors.divider),
                 Flexible(
                   child: _items.isEmpty
                       ? Padding(
@@ -343,7 +343,7 @@ class _NotificationsBellState extends State<NotificationsBell> {
                       : ListView.separated(
                           shrinkWrap: true,
                           itemCount: _items.length,
-                          separatorBuilder: (_, _) => const Divider(height: 1, color: AppColors.divider),
+                          separatorBuilder: (_, _) => Divider(height: 1, color: AppColors.divider),
                           itemBuilder: (_, i) {
                             final n = _items[i] as Map;
                             final unread = n['read_at'] == null;

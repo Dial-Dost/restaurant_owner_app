@@ -25,10 +25,14 @@ class FoodTile extends StatelessWidget {
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(radius ?? AppRadius.tile),
         border: Border.all(color: AppColors.border),
-        gradient: const LinearGradient(
+        gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [Color(0xFF232326), Color(0xFF121214)],
+          // 6.6 — the charcoal tile on dark; the palette's own card-to-inset
+          // step on a light palette, where a black square would read as a hole.
+          colors: AppColors.isLight
+              ? [AppColors.cardTop, AppColors.inset]
+              : const [Color(0xFF232326), Color(0xFF121214)],
         ),
       ),
       child: Stack(
@@ -86,7 +90,7 @@ class InitialsAvatar extends StatelessWidget {
             fontSize: size * 0.32,
             fontWeight: FontWeight.w600,
             letterSpacing: 0.5,
-            color: Color.lerp(c, Colors.white, 0.35),
+            color: AppColors.lift(c, 0.35),
           ),
         ),
       ),

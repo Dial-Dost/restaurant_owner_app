@@ -83,9 +83,9 @@ class _TabPillState extends State<_TabPill> {
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
           decoration: BoxDecoration(
             color: widget.active
-                ? Colors.white.withValues(alpha: 0.08)
+                ? AppColors.overlay.withValues(alpha: 0.08)
                 : _hovered
-                    ? Colors.white.withValues(alpha: 0.04)
+                    ? AppColors.overlay.withValues(alpha: 0.04)
                     : Colors.transparent,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(

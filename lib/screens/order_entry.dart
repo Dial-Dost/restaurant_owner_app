@@ -697,7 +697,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
               padding: const EdgeInsets.fromLTRB(4, 10, 4, 2),
               child: Row(children: [
                 if (held) ...[
-                  const StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
+                  StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
                   const SizedBox(width: 8),
                 ],
                 if (note.isNotEmpty) ...[

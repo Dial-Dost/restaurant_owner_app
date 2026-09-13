@@ -1530,13 +1530,13 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'item_wise') {
     if (d['category_exact'] == false) {
-      chips.add(const StatusChip(
+      chips.add(StatusChip(
         label: 'Category is matched by dish NAME — a renamed dish shows blank',
         color: AppColors.warning,
         dense: true,
       ));
     }
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'Counted on order time, not settlement — does not tie to Sales Summary',
       color: AppColors.info,
       dense: true,
@@ -1553,14 +1553,14 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
     }
   }
   if (report.key == 'void_kot') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'No KOT number exists for an order — the order id is the ticket identity',
       color: AppColors.info,
       dense: true,
     ));
   }
   if (report.key == 'bill_edit') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'No before/after amounts are recorded anywhere — this shows what changed, never a difference',
       color: AppColors.info,
       dense: true,
@@ -1582,13 +1582,13 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
   if (report.key == 'nc_summary') {
     // The one thing a reader must not get wrong about this page: the money here
     // is NOT missing from the takings — it never entered them.
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'Comped food is in no sales figure — this is revenue given away, not revenue lost from a total',
       color: AppColors.info,
       dense: true,
     ));
     if (d['category_exact'] == false) {
-      chips.add(const StatusChip(
+      chips.add(StatusChip(
         label: 'Category is matched by dish NAME — a renamed dish shows blank',
         color: AppColors.warning,
         dense: true,
@@ -1605,7 +1605,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
   }
 
   if (report.key == 'service_charge_deny') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'A denied charge never entered a sales figure — it is what the house chose not to charge',
       color: AppColors.info,
       dense: true,
@@ -1621,7 +1621,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
   }
 
   if (report.key == 'group_summary') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'Gross ties to Item Wise for the same window — the same lines, re-cut',
       color: AppColors.info,
       dense: true,
@@ -1650,13 +1650,13 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'variation_summary') {
     if (d['no_variations_configured'] == true) {
-      chips.add(const StatusChip(
+      chips.add(StatusChip(
         label: 'No variations are configured — add price points to a dish on the Menu screen and its sizes appear here',
         color: AppColors.warning,
         dense: true,
       ));
     }
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'Only dishes that HAVE sizes appear — a variation is never inferred from a typed name',
       color: AppColors.info,
       dense: true,
@@ -1664,7 +1664,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
   }
 
   if (report.key == 'tip_summary') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'A tip is NOT revenue — it is in no sales figure, no APC and no ABV, and no rung of the money ladder',
       color: AppColors.info,
       dense: true,
@@ -1672,13 +1672,13 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
   }
 
   if (report.key == 'counter_summary') {
-    chips.add(const StatusChip(
+    chips.add(StatusChip(
       label: 'These rows sum to the Sales Summary grand total — the same bills, cut by the till that rang them',
       color: AppColors.info,
       dense: true,
     ));
     if (d['no_counters_configured'] == true) {
-      chips.add(const StatusChip(
+      chips.add(StatusChip(
         label: 'No tills are configured — every bill sits on this outlet’s single till. Add one under Settings → Billing counters.',
         color: AppColors.warning,
         dense: true,

@@ -131,7 +131,7 @@ class _ForkButtonState extends State<ForkButton> {
                 : null,
             color: !primary
                 ? (hovered
-                    ? Colors.white.withValues(alpha: 0.05)
+                    ? AppColors.overlay.withValues(alpha: 0.05)
                     : Colors.transparent)
                 : null,
             borderRadius: AppRadius.controlAll,
@@ -226,7 +226,7 @@ class _ForkIconButtonState extends State<ForkIconButton> {
           height: 34,
           decoration: BoxDecoration(
             color: hovered
-                ? Colors.white.withValues(alpha: 0.06)
+                ? AppColors.overlay.withValues(alpha: 0.06)
                 : Colors.transparent,
             borderRadius: AppRadius.controlAll,
             border: Border.all(
