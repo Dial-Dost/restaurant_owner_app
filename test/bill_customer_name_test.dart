@@ -249,14 +249,14 @@ void main() {
       expect(m.billCustomerGstinInvalidMessage, 'GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5');
     });
 
-    test('the bill lines: Customer (never the placeholder) and Customer GSTIN', () {
+    test('the customer slot: Customer Name (Guest when unnamed), then Customer GSTIN when set', () {
       expect(m.billCustomerLines({'customer': 'Acme Ltd', 'customer_gstin': '29ABCDE1234F1Z5'}),
-          ['Customer: Acme Ltd', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+          ['Customer Name: Acme Ltd', 'Customer GSTIN: 29ABCDE1234F1Z5']);
       expect(m.billCustomerLines({'customer': 'Guest', 'customer_gstin': '29ABCDE1234F1Z5'}),
-          ['Customer GSTIN: 29ABCDE1234F1Z5']);
-      expect(m.billCustomerLines({'customer': 'QR Guest', 'customer_gstin': null}), isEmpty);
-      expect(m.billCustomerLines({'customer': '', 'customer_gstin': ''}), isEmpty);
-      expect(m.billCustomerLines({'customer': 'Mr Sharma'}), ['Customer: Mr Sharma']);
+          ['Customer Name: Guest', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+      expect(m.billCustomerLines({'customer': 'QR Guest', 'customer_gstin': null}), ['Customer Name: Guest']);
+      expect(m.billCustomerLines({'customer': '', 'customer_gstin': ''}), ['Customer Name: Guest']);
+      expect(m.billCustomerLines({'customer': 'Mr Sharma'}), ['Customer Name: Mr Sharma']);
     });
   });
 

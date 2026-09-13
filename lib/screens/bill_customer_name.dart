@@ -74,16 +74,19 @@ String? billCustomerGstinError(String raw) {
   return billCustomerGstinInvalidMessage;
 }
 
-/// CONTRACT D — the two lines a bill carries under its header: `Customer: <name>`
-/// (left off for the Guest / QR Guest placeholders, which are not a name) and
-/// `Customer GSTIN: <gstin>`. The thermal renderer, the web print page, the app
-/// bill preview and the settled-bill sheet all draw exactly these, in this
-/// order, so a corporate party's copy reads the same on every surface.
+/// THE CUSTOMER SLOT — the lines the client's printed bill carries in their own
+/// ruled-off block, directly under the restaurant header (logo, name, legal
+/// entity, address, GSTN) and ABOVE the date / cashier / bill-no block:
+/// `Customer Name: <name>` always — "Guest" when nobody gave one, as the paper
+/// prints it (the QR flow's "QR Guest" placeholder reads as "Guest" too) — and
+/// `Customer GSTIN: <gstin>` directly under it, only when one is set. The
+/// thermal renderer, the app bill preview and the settled-bill sheet all draw
+/// exactly these, in this order.
 List<String> billCustomerLines(Map bill) {
   final name = billCustomerNameSeed(bill['customer']);
   final gstin = '${bill['customer_gstin'] ?? ''}'.trim();
   return [
-    if (name.isNotEmpty) 'Customer: $name',
+    'Customer Name: ${name.isEmpty ? 'Guest' : name}',
     if (gstin.isNotEmpty) 'Customer GSTIN: $gstin',
   ];
 }

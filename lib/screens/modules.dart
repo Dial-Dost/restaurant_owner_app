@@ -10827,7 +10827,7 @@ class _BillPreviewDialog extends StatelessWidget {
     final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
     final covers = bill['covers'];
     final billNo = _s(bill, 'bill_no', '');
-    // Contract D — `Customer: <name>` / `Customer GSTIN: <gstin>`.
+    // The customer slot — `Customer Name:` / `Customer GSTIN:`.
     final customerLines = billCustomerLines(bill);
 
     return Dialog(
@@ -10905,7 +10905,18 @@ class _BillPreviewDialog extends StatelessWidget {
                               style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
                         ),
                     ],
-                    const SizedBox(height: 2),
+                    // ROUND 2 ITEM 1 — THE CUSTOMER SLOT, where the client's real
+                    // bill has it: its own ruled-off block straight under the
+                    // restaurant header and above the table / bill-no block.
+                    // "Customer Name:" always ("Guest" when unnamed, as the paper
+                    // prints it), "Customer GSTIN:" only when set. This replaces
+                    // the bare name line that used to sit under the bill number.
+                    _paperRule,
+                    for (final l in customerLines)
+                      Text(l,
+                          key: ValueKey('bill-preview-customer-${l.startsWith('Customer GSTIN') ? 'gstin' : 'name'}'),
+                          style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
+                    _paperRule,
                     Center(
                       child: Text(
                         [
@@ -10917,14 +10928,6 @@ class _BillPreviewDialog extends StatelessWidget {
                         style: const TextStyle(fontSize: 12, color: inkFaint),
                       ),
                     ),
-                    // ROUND 2 ITEM 1 / contract D — who the bill is for, under the
-                    // header, where the roll prints it. The bare name this drew
-                    // before also drew "Guest", which is a placeholder, not a name.
-                    for (final l in customerLines)
-                      Center(
-                          child: Text(l,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(fontSize: 12.5, color: Colors.black87))),
                     _paperRule,
                     // Item lines: "name ×qty" on the left, line amount on the right.
                     // THE KITCHEN NOTE IS NOT DRAWN HERE, and this dialog is the
@@ -22731,9 +22734,9 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       else
         StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
     ]),
-    // ROUND 2 ITEM 1 / contract D — `Customer:` and `Customer GSTIN:` under the
-    // header, the two lines the printed bill carries there. They replace the
-    // bare name chip, which also showed the "Guest" placeholder as if a name.
+    // ROUND 2 ITEM 1 — `Customer Name:` and `Customer GSTIN:` directly under the
+    // header and above the date, the slot the printed bill carries them in. They
+    // replace the bare name chip.
     for (final l in billCustomerLines(bill)) ...[
       const SizedBox(height: 4),
       Text(l, style: text.bodyMedium),
