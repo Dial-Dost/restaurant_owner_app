@@ -78,6 +78,11 @@ part 'reports.dart';
 // somebody will eventually key wrong.
 part 'mis_capture.dart';
 
+// 1.8 / 1.3 — the table preview's per-KOT blocks and their "Cancel KOT". A part
+// so the KOT number and the cancel go through this library's own `_kotNos` and
+// `_cancelOrder`, not copies of them.
+part 'table_kots.dart';
+
 // Feature modules for the owner app. Each is a builder `(RestClient, Profile) ->
 // Widget` that loads from the live backend via AsyncView and renders the data.
 // Read views for every module; Inventory and Employees also support adding.
@@ -8626,6 +8631,11 @@ class _TableSheet extends StatefulWidget {
 class _TableSheetState extends State<_TableSheet> {
   Map? _bill;
 
+  /// GET /orders, read beside the bill so the preview can split the bill's lines
+  /// by KOT (1.8). Null until read, and left null when the read fails — the
+  /// preview then draws the flat list it always drew. See [tableKotGroups].
+  List? _tableOrders;
+
   /// What this reader may do on this table, and whether they may see what it is
   /// worth. ONE object asked at every affordance below — see [FloorScope] for
   /// why it is a record of flags rather than a role check per control.
@@ -8669,7 +8679,42 @@ class _TableSheetState extends State<_TableSheet> {
     try {
       final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
       if (mounted && r is Map) setState(() => _bill = r);
+    } on ApiException catch (e) {
+      // 1.3 — cancelling a table's LAST KOT leaves it with no open bill, and the
+      // server says so with a 404. Keeping the old bill would leave the
+      // cancelled lines on screen under the button that just removed them.
+      if (mounted && e.status == 404 && _bill != null) setState(() => _bill = null);
     } catch (_) {/* no bill yet */}
+    // 1.8 — the orders the bill is made of, for their KOT numbers. A failure
+    // here costs the split, never the bill: the flat list is still drawn.
+    try {
+      final orders = await widget.rest.getList('/orders');
+      if (mounted) setState(() => _tableOrders = orders);
+    } catch (_) {
+      if (mounted && _tableOrders != null) setState(() => _tableOrders = null);
+    }
+  }
+
+  /// 1.3 — CANCEL ONE KOT from its block in the preview.
+  ///
+  /// Nothing new underneath: [_cancelOrder] is the app's one cancel, so this
+  /// gets the mandatory reason (1.2), the void-vs-plain route decision and the
+  /// server's cancellation slip (1.1) exactly as the Orders screen does. The
+  /// preview and the floor are re-read only when something was cancelled.
+  Future<void> _cancelKot(TableKotGroup group) async {
+    final order = group.order;
+    if (order == null) return;
+    final ok = await _cancelOrder(
+      context,
+      rest: widget.rest,
+      profile: widget.profile,
+      orderId: _s(order, 'id'),
+      what: '${group.label} on Table $_name',
+      value: _scope.money ? _money(order['total']) : '',
+    );
+    if (!ok) return;
+    await _loadBill();
+    widget.reload();
   }
 
   void _popAndReload() {
@@ -9749,6 +9794,78 @@ class _TableSheetState extends State<_TableSheet> {
     final text = Theme.of(context).textTheme;
     final items = _occupied && _bill != null ? ((_bill!['items'] as List?) ?? const []) : const [];
 
+    // 1.8 — the bill's lines split by KOT, or null to draw them flat.
+    final kotGroups = items.isEmpty ? null : tableKotGroups(_bill, _tableOrders);
+    final mayCancelKot = _mayCancelKot(widget.profile);
+
+    // One line of the open order: "2 × Paneer Tikka", its kitchen note, its
+    // amount where this reader may see money, and its note / edit actions.
+    // Shared by the per-KOT blocks and the flat list.
+    Widget itemRow(Map m) {
+      final qty = num.tryParse('${m['quantity'] ?? 1}') ?? 1;
+      final price = num.tryParse('${m['price'] ?? 0}') ?? 0;
+      final name = _s(m, 'name');
+      final note = _s(m, 'note', '');
+      final hasNote = note.isNotEmpty;
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: ForkCard(
+          inset: true,
+          padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
+          child: Row(children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${qty.toInt()} × $name', style: text.titleSmall),
+                if (hasNote)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: Row(children: [
+                      Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
+                      const SizedBox(width: 5),
+                      Expanded(
+                        child: Text(note,
+                            style: text.bodySmall!
+                                .copyWith(fontSize: 11, fontStyle: FontStyle.italic)),
+                      ),
+                    ]),
+                  ),
+              ]),
+            ),
+            // ITEM 19: the per-dish amounts down the right of an
+            // open order. The line itself stays — "2 x Paneer Tikka"
+            // with its kitchen note is the ticket, and a waiter who
+            // cannot read the ticket cannot work the table.
+            if (_scope.money) ...[
+              const SizedBox(width: 10),
+              Text(_money(price * qty), style: text.titleSmall),
+            ],
+            // Any staff can add/edit a kitchen note on an item, anytime.
+            IconButton(
+              icon: Icon(Icons.sticky_note_2_outlined, size: 18,
+                  color: hasNote ? AppColors.copperHi : AppColors.textSecondary),
+              tooltip: hasNote ? 'Edit note' : 'Add note',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _editBillItemNote(messenger, name, price.toDouble(), note),
+            ),
+            // Admin can fix wrongly-added / wrong-table items.
+            if (_isAdmin)
+              PopupMenuButton<String>(
+                icon: const Icon(Icons.more_vert, size: 18),
+                tooltip: 'Edit item',
+                onSelected: (v) {
+                  if (v == 'remove') _removeBillItem(messenger, name, price.toDouble());
+                  if (v == 'move') _moveBillItem(messenger, name, price.toDouble());
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'remove', child: Text('Remove from bill')),
+                  PopupMenuItem(value: 'move', child: Text('Move to another table')),
+                ],
+              ),
+          ]),
+        ),
+      );
+    }
+
     // Bill-math line: quiet label left, right-aligned amount.
     Widget billRow(String k, String v) => Padding(
           padding: const EdgeInsets.symmetric(vertical: 3),
@@ -9903,71 +10020,23 @@ class _TableSheetState extends State<_TableSheet> {
               if (items.isNotEmpty) ...[
                 const SizedBox(height: 20),
                 SectionHeader(title: 'Orders', count: items.length),
-                ...items.map((it) {
-                  final m = it as Map;
-                  final qty = num.tryParse('${m['quantity'] ?? 1}') ?? 1;
-                  final price = num.tryParse('${m['price'] ?? 0}') ?? 0;
-                  final name = _s(m, 'name');
-                  final note = _s(m, 'note', '');
-                  final hasNote = note.isNotEmpty;
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: ForkCard(
-                      inset: true,
-                      padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
-                      child: Row(children: [
-                        Expanded(
-                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            Text('${qty.toInt()} × $name', style: text.titleSmall),
-                            if (hasNote)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 3),
-                                child: Row(children: [
-                                  Icon(Icons.sticky_note_2_outlined, size: 12, color: AppColors.textTertiary),
-                                  const SizedBox(width: 5),
-                                  Expanded(
-                                    child: Text(note,
-                                        style: text.bodySmall!
-                                            .copyWith(fontSize: 11, fontStyle: FontStyle.italic)),
-                                  ),
-                                ]),
-                              ),
-                          ]),
-                        ),
-                        // ITEM 19: the per-dish amounts down the right of an
-                        // open order. The line itself stays — "2 x Paneer Tikka"
-                        // with its kitchen note is the ticket, and a waiter who
-                        // cannot read the ticket cannot work the table.
-                        if (_scope.money) ...[
-                          const SizedBox(width: 10),
-                          Text(_money(price * qty), style: text.titleSmall),
-                        ],
-                        // Any staff can add/edit a kitchen note on an item, anytime.
-                        IconButton(
-                          icon: Icon(Icons.sticky_note_2_outlined, size: 18,
-                              color: hasNote ? AppColors.copperHi : AppColors.textSecondary),
-                          tooltip: hasNote ? 'Edit note' : 'Add note',
-                          visualDensity: VisualDensity.compact,
-                          onPressed: () => _editBillItemNote(messenger, name, price.toDouble(), note),
-                        ),
-                        // Admin can fix wrongly-added / wrong-table items.
-                        if (_isAdmin)
-                          PopupMenuButton<String>(
-                            icon: const Icon(Icons.more_vert, size: 18),
-                            tooltip: 'Edit item',
-                            onSelected: (v) {
-                              if (v == 'remove') _removeBillItem(messenger, name, price.toDouble());
-                              if (v == 'move') _moveBillItem(messenger, name, price.toDouble());
-                            },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(value: 'remove', child: Text('Remove from bill')),
-                              PopupMenuItem(value: 'move', child: Text('Move to another table')),
-                            ],
-                          ),
-                      ]),
-                    ),
-                  );
-                }),
+                // 1.8 — ONE BLOCK PER KOT, each under its own "KOT 5 · 14:57"
+                // header, instead of one long list the kitchen's tickets could
+                // not be found in. [tableKotGroups] answers null when it cannot
+                // account for every order on the bill, and the flat list below
+                // is then drawn exactly as before.
+                if (kotGroups != null)
+                  for (final g in kotGroups)
+                    _TableKotBlock(
+                      group: g,
+                      itemRow: itemRow,
+                      // 1.3 — on a real KOT only, and only for whoever may cancel.
+                      onCancel: g.numbered && mayCancelKot && !_isCancelled(_s(g.order!, 'status', ''))
+                          ? () => _cancelKot(g)
+                          : null,
+                    )
+                else
+                  ...items.map((it) => itemRow(it as Map)),
               ],
               const SizedBox(height: 12),
               // ITEM 19: THE RUNNING BILL AND THE PER-TABLE APC.
