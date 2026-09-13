@@ -14,15 +14,14 @@ import '../ui/widgets/status_chip.dart';
 import '../widgets/async_view.dart';
 import '../widgets/table_bill.dart';
 
-/// How far ABOVE the system navigation bar the "Send order" button sits.
+/// 6.8 — the most of the order pad's body its header (running-bill strip,
+/// search, the order's fields and "Send order") may take.
 ///
-/// This is deliberately a named constant rather than a literal buried in a
-/// padding expression: it is the one number to change if the button still reads
-/// as cramped on a particular handset. Clearing the nav bar is handled
-/// separately and exactly, by `MediaQuery.padding.bottom` at the call site —
-/// this is only the comfort margin on top of that, so raising it can never be
-/// the thing that stops the button being reachable.
-const double _kSendOrderLift = 16;
+/// The header sits at the TOP now, above the menu, so on a short screen (a phone
+/// with the keyboard up, or a takeaway with its three customer fields) it must
+/// leave the menu room to scroll. Past this share the header's fields scroll
+/// inside it, and the Send button itself never does — it is always on screen.
+const double _kHeaderMaxShare = 0.55;
 
 /// Staff POS order entry for a table: pick menu items into a cart and send the
 /// order. The order is attributed to the signed-in employee (for APC) and
@@ -86,6 +85,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // controller disposed on the line after the await is used after disposal, and
   // the send that follows (which rebuilds this screen) is what makes it certain.
   final TextEditingController _coversCtrl = TextEditingController(text: '2');
+  // 6.8 — the menu list's scroll position and the header above it, so the list
+  // can be held still when the note and Send button appear or go (see [_setQty]).
+  final ScrollController _menuScroll = ScrollController();
+  final GlobalKey _headerKey = GlobalKey();
   String _query = '';
   bool _sending = false;
   String? _error;
@@ -175,6 +178,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _phoneCtrl.dispose();
     _addrCtrl.dispose();
     _coversCtrl.dispose();
+    _menuScroll.dispose();
     super.dispose();
   }
 
@@ -220,6 +224,14 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   int get _count => _cart.values.fold(0, (s, q) => s + q);
 
   void _setQty(String id, int delta) {
+    // 6.8 — HOLD THE MENU STILL UNDER THE WAITER'S THUMB. The note and the Send
+    // button sit ABOVE the menu and only exist while the cart does, so the first
+    // "Add" pushes the whole list down by their height and emptying the cart
+    // pulls it back up — and the next tap lands on the wrong dish. Scrolling the
+    // list by exactly how much the header grew (or shrank) keeps every row where
+    // it was.
+    final wasEmpty = _count == 0;
+    final headerBefore = _headerKey.currentContext?.size?.height ?? 0;
     setState(() {
       final q = (_cart[id] ?? 0) + delta;
       if (q <= 0) {
@@ -229,6 +241,14 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         _cart[id] = q;
       }
     });
+    if (wasEmpty != (_count == 0)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_menuScroll.hasClients) return;
+        final shift = (_headerKey.currentContext?.size?.height ?? 0) - headerBefore;
+        final pos = _menuScroll.position;
+        _menuScroll.jumpTo((pos.pixels + shift).clamp(pos.minScrollExtent, pos.maxScrollExtent));
+      });
+    }
   }
 
   Future<void> _send() async {
@@ -358,39 +378,71 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 ? 'New delivery'
                 : 'New takeaway'),
       ),
-      body: cacheStaleOverlay(Column(children: [
-        // What the table is already running at — visible while the order is
-        // being built, so the waiter can see the per-head gap in time to close
-        // it. Tapping opens the full item-by-item bill.
-        if (widget.isDineIn && _tableBill != null)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-            child: TableApcStrip(
-              bill: _tableBill!,
-              profile: _profile,
-              pendingTotal: _total,
-              onTap: () => showTableBillSheet(
-                context,
-                rest: widget.rest,
-                tableName: widget.tableName ?? '',
-                profile: _profile,
+      body: cacheStaleOverlay(LayoutBuilder(builder: (context, box) => Column(children: [
+        // 6.8 — "SEND ORDER" DIRECTLY UNDER THE SEARCH, NOT AT THE FOOT OF THE
+        // SCREEN. It used to be the Scaffold's bottomNavigationBar, which put the
+        // one control that ends the flow at the very bottom edge of a phone —
+        // first under the Android nav bar, then (once lifted clear of it) still
+        // the furthest thing on the page from where the waiter's eyes are.
+        //
+        // Now the running-bill strip, the search, the order's fields and the
+        // Send button are one header above the menu. It is sticky by
+        // construction: a sibling of the menu list, not a row inside it, so the
+        // menu scrolls beneath it and it never moves. And the old inset
+        // arithmetic is no longer needed rather than merely dropped: the
+        // Scaffold already shrinks its body for the keyboard, and the nav bar is
+        // at the bottom edge, so nothing can sit on top of a control at the top.
+        //
+        // On a short body (a phone with the keyboard up, a takeaway's three
+        // customer fields) the header stops at [_kHeaderMaxShare]; past that its
+        // fields scroll inside it, and the Send button — outside that scroll —
+        // stays on screen. Still hidden with an empty cart, exactly as before.
+        ConstrainedBox(
+          key: _headerKey,
+          constraints: BoxConstraints(maxHeight: box.maxHeight * _kHeaderMaxShare),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  // What the table is already running at — visible while the order is
+                  // being built, so the waiter can see the per-head gap in time to close
+                  // it. Tapping opens the full item-by-item bill.
+                  if (widget.isDineIn && _tableBill != null)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                      child: TableApcStrip(
+                        bill: _tableBill!,
+                        profile: _profile,
+                        pendingTotal: _total,
+                        onTap: () => showTableBillSheet(
+                          context,
+                          rest: widget.rest,
+                          tableName: widget.tableName ?? '',
+                          profile: _profile,
+                        ),
+                      ),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                    child: TextField(
+                      decoration: InputDecoration(
+                        prefixIcon: const Icon(Icons.search),
+                        hintText: 'Search menu…',
+                        isDense: true,
+                        border: const OutlineInputBorder(),
+                        suffixIcon: _query.isEmpty
+                            ? null
+                            : IconButton(icon: const Icon(Icons.clear), onPressed: () => setState(() => _query = '')),
+                      ),
+                      onChanged: (v) => setState(() => _query = v),
+                    ),
+                  ),
+                  if (_count > 0) _orderFields(),
+                ]),
               ),
             ),
-          ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-          child: TextField(
-            decoration: InputDecoration(
-              prefixIcon: const Icon(Icons.search),
-              hintText: 'Search menu…',
-              isDense: true,
-              border: const OutlineInputBorder(),
-              suffixIcon: _query.isEmpty
-                  ? null
-                  : IconButton(icon: const Icon(Icons.clear), onPressed: () => setState(() => _query = '')),
-            ),
-            onChanged: (v) => setState(() => _query = v),
-          ),
+            if (_count > 0) _sendButton(),
+          ]),
         ),
         Expanded(
           child: Builder(
@@ -415,6 +467,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                   ],
                 );
               }
+              // THE ANDROID NAVIGATION BAR IS NOT THE KEYBOARD — kept from the fix
+              // that first lifted "Send order" clear of it. Nothing is pinned to
+              // the bottom edge any more (6.8), but the menu's last dish still is
+              // the bottom edge, so the list ends `padding.bottom` (the nav bar;
+              // zero while the keyboard covers it) above the physical bottom.
+              final menuPadding = EdgeInsets.fromLTRB(12, 12, 12, 12 + MediaQuery.of(context).padding.bottom);
               final q = _query.trim().toLowerCase();
               if (q.isNotEmpty) {
                 // Flat, filtered list across all categories while searching.
@@ -424,7 +482,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 if (matches.isEmpty) {
                   return const Center(child: Text('No items match your search.'));
                 }
-                return ListView(padding: const EdgeInsets.all(12), children: [
+                return ListView(controller: _menuScroll, padding: menuPadding, children: [
                   if (_error != null)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 8),
@@ -440,7 +498,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 (byCat['${m['category'] ?? 'Menu'}'] ??= []).add(m);
               }
               final cats = byCat.keys.toList()..sort();
-              return ListView(padding: const EdgeInsets.all(12), children: [
+              return ListView(controller: _menuScroll, padding: menuPadding, children: [
                 if (_error != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 8),
@@ -464,113 +522,91 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
             },
           ),
         ),
-      ])),
-      // THE ANDROID NAVIGATION BAR IS NOT THE KEYBOARD.
-      //
-      // This padding used to be `12 + viewInsets.bottom`, and that is the whole
-      // defect. `viewInsets` is the KEYBOARD inset: it is ZERO whenever the
-      // keyboard is closed. So with the keyboard down — which is the normal state
-      // while a waiter is tapping dishes — "Send order" sat 12dp from the
-      // PHYSICAL bottom of the screen, underneath the home/back/recents bar that
-      // older Androids and current Samsungs still draw there. Waiters were
-      // hitting the system nav bar instead of sending the order, on the one
-      // control that ends the whole flow.
-      //
-      // `padding.bottom` is the piece that was missing: the system navigation bar
-      // (viewPadding minus whatever an inset has already consumed). It is the nav
-      // bar height with the keyboard DOWN and zero with the keyboard UP, because
-      // an open keyboard already covers the nav bar. Adding both is therefore
-      // correct in both states and double-counts in neither — which is why this
-      // is a sum rather than a max.
-      //
-      // _kSendOrderLift is the extra breathing room asked for on top of merely
-      // clearing the bar, so the button is comfortably reachable with a thumb
-      // rather than sitting flush against it.
-      bottomNavigationBar: _count == 0
-          ? null
-          : Padding(
-              padding: EdgeInsets.only(
-                left: 12,
-                right: 12,
-                top: 8,
-                bottom: 12 +
-                    _kSendOrderLift +
-                    MediaQuery.of(context).viewInsets.bottom +
-                    MediaQuery.of(context).padding.bottom,
+      ]))),
+    );
+  }
+
+  /// 6.8 — the order's own fields, which ride in the header above the Send
+  /// button: a takeaway's customer name / phone / address, and the kitchen note.
+  Widget _orderFields() => Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+            if (!widget.isDineIn) ...[
+              TextField(
+                controller: _custCtrl,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.person_outline),
+                  hintText: 'Customer name (optional)',
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
               ),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                if (!widget.isDineIn) ...[
-                  TextField(
-                    controller: _custCtrl,
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.person_outline),
-                      hintText: 'Customer name (optional)',
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _phoneCtrl,
-                    keyboardType: TextInputType.number,
-                    inputFormatters: mobile10Formatters(),
-                    maxLength: 10,
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      prefixIcon: const Icon(Icons.phone_outlined),
-                      hintText: '10-digit mobile (optional)',
-                      isDense: true,
-                      border: const OutlineInputBorder(),
-                      counterText: '',
-                      errorText: _phoneError,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  if (widget.isDelivery) ...[
-                    TextField(
-                      controller: _addrCtrl,
-                      minLines: 1,
-                      maxLines: 2,
-                      decoration: const InputDecoration(
-                        prefixIcon: Icon(Icons.location_on_outlined),
-                        hintText: 'Delivery address',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                ],
+              const SizedBox(height: 8),
+              TextField(
+                controller: _phoneCtrl,
+                keyboardType: TextInputType.number,
+                inputFormatters: mobile10Formatters(),
+                maxLength: 10,
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  prefixIcon: const Icon(Icons.phone_outlined),
+                  hintText: '10-digit mobile (optional)',
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  counterText: '',
+                  errorText: _phoneError,
+                ),
+              ),
+              const SizedBox(height: 8),
+              if (widget.isDelivery) ...[
                 TextField(
-                  controller: _noteCtrl,
+                  controller: _addrCtrl,
                   minLines: 1,
                   maxLines: 2,
                   decoration: const InputDecoration(
-                    prefixIcon: Icon(Icons.sticky_note_2_outlined),
-                    hintText: 'Note for the kitchen (e.g. no onions)…',
+                    prefixIcon: Icon(Icons.location_on_outlined),
+                    hintText: 'Delivery address',
                     isDense: true,
                     border: OutlineInputBorder(),
                   ),
                 ),
                 const SizedBox(height: 8),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(
-                    onPressed: _sending || _phoneError != null ? null : _send,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: Text(_sending
-                          ? 'Sending…'
-                          : _showsMoney
-                              ? 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'
-                              : 'Send order · $_count item${_count > 1 ? 's' : ''}'),
-                    ),
-                  ),
-                ),
-              ]),
+              ],
+            ],
+            TextField(
+              controller: _noteCtrl,
+              minLines: 1,
+              maxLines: 2,
+              decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.sticky_note_2_outlined),
+                hintText: 'Note for the kitchen (e.g. no onions)…',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
             ),
-    );
-  }
+        ]),
+      );
+
+  /// 6.8 — "Send order", directly under the order's fields and outside the
+  /// header's scroll, so it is always on screen while the cart has anything in it.
+  Widget _sendButton() => Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+        child: SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            key: const ValueKey('order-send'),
+            onPressed: _sending || _phoneError != null ? null : _send,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(_sending
+                  ? 'Sending…'
+                  : _showsMoney
+                      ? 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'
+                      : 'Send order · $_count item${_count > 1 ? 's' : ''}'),
+            ),
+          ),
+        ),
+      );
 
   Future<void> _editItemNote(String id, String name) async {
     final ctrl = TextEditingController(text: _itemNotes[id] ?? '');
