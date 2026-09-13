@@ -8137,9 +8137,11 @@ const double _kReservedWash = 0.13;
 /// worth. Falls back to the id only when the payload carries neither, so a row
 /// is never blank.
 String _kotSummary(Map order) {
-  final food = order['food'];
-  final items = food is Map ? (food['items'] as List?) ?? const [] : const [];
-  final total = food is Map ? (food['total'] ?? food['subtotal']) : null;
+  // `/orders` carries `items` and `total` on the row itself; the nested `food`
+  // map is an older shape, still honoured so nothing that sends it goes blank.
+  final food = order['food'] is Map ? order['food'] as Map : order;
+  final items = (food['items'] as List?) ?? const [];
+  final total = food['total'] ?? food['subtotal'];
   final n = items.length;
   final money = total == null ? '' : ' \u00b7 ${_money(total)}';
   if (n == 0 && money.isEmpty) return 'Order ${_s(order, 'id')}';
@@ -9430,9 +9432,14 @@ class _TableSheetState extends State<_TableSheet> {
     }
     // This table's LIVE tickets. A settled or cancelled order is not a kitchen
     // ticket any more and the server refuses to move one.
+    //
+    // `/orders` rows name their table `table` — every other reader of this
+    // endpoint in the app says so. This filter read `table_name` (the
+    // `/get-tables` spelling), matched nothing against the real server, and
+    // reported "No live order on this table to move." on every table.
     final mine = all.where((o) {
       final m = o as Map;
-      return _s(m, 'table_name') == _name && _orderSection(_s(m, 'status')) != 2;
+      return _s(m, 'table') == _name && _orderSection(_s(m, 'status')) != 2;
     }).toList();
     if (mine.isEmpty) {
       messenger.showSnackBar(const SnackBar(content: Text('No live order on this table to move.')));
