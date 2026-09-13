@@ -12907,7 +12907,6 @@ class _KdsCardState extends State<_KdsCard> {
                                   color: (served || held) ? AppColors.textSecondary : null,
                                 )),
                             if (stationLabel.isNotEmpty) _stationBadge(stationLabel),
-                            if (held) StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
                           ],
                         ),
                       ),
@@ -12978,6 +12977,29 @@ class _KdsCardState extends State<_KdsCard> {
                     ],
                   ],
                 ]),
+                // ROUND 2 ITEM 2 — the hold hangs UNDER the dish, in the note's
+                // slot and style and ahead of the note, the way the docket prints
+                // it. It was a HOLD chip beside the name; on paper it is now a
+                // line under the dish, and the pass should read one shape.
+                if (held)
+                  Padding(
+                    key: ValueKey('kds-item-hold-$iid'),
+                    padding: const EdgeInsets.only(left: 8, bottom: 2),
+                    child: Row(children: [
+                      Icon(Icons.front_hand_outlined, size: 13, color: AppColors.warning),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          kotHoldLine,
+                          style: text.bodySmall!.copyWith(
+                            fontStyle: FontStyle.italic,
+                            fontWeight: FontWeight.w600,
+                            color: Color.lerp(AppColors.warning, Colors.white, 0.35),
+                          ),
+                        ),
+                      ),
+                    ]),
+                  ),
                 if (itemNote.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(left: 8, bottom: 2),
@@ -13230,6 +13252,73 @@ Future<void> _reprintKot(
   }
 }
 
+/// ROUND 2 ITEM 2 — the line a HELD dish carries directly under itself, in the
+/// slot a note uses, word for word what the thermal docket prints (escpos.ts).
+const String kotHoldLine = '[Hold] Do not cook until fired';
+
+/// The note line under a dish, tagged the way the client's reference docket
+/// tags it and the thermal docket now prints it: `[Note] <note>`.
+String kotNoteLine(String note) => '[Note] $note';
+
+/// One dish on a KOT: its number, name and quantity, and the indented lines
+/// that hang under it — [kotHoldLine] first when it is held, then its note.
+typedef KotDocketRow = ({String no, String name, int qty, bool held, List<String> under});
+
+/// The whole item block of a KOT, laid out once so the PDF copy and its tests
+/// read the same thing.
+typedef KotDocket = ({List<KotDocketRow> rows, int totalQty, int holdQty, bool showTotal, bool showHold});
+
+/// THE ITEM BLOCK OF A KITCHEN TICKET, as the thermal docket lays it out.
+///
+/// ROUND 2 ITEM 2: "Hold order should come after the name of the dish which is
+/// to be put on hold and not before. It should be in the same position like the
+/// way a note appears on the food order." This copy used to lift held lines out
+/// under a `** HOLD **` banner with their own H1/H2 numbering, so the kitchen
+/// read the banner BEFORE the dish it applied to. Now:
+///
+///   * every dish keeps its number and its place in the list, held or not;
+///   * a held dish's first under-line is [kotHoldLine], and a note follows it;
+///   * Total Qty counts only what may be cooked now, and Hold Qty — the held
+///     quantity — sits directly under it. A wholly held docket prints no Total
+///     Qty (a "0" reads as an empty ticket); a docket with nothing held prints no
+///     Hold Qty, exactly as before the feature.
+///
+/// `_itemHeld` is the same predicate the on-screen ticket dims by, so the card,
+/// the docket and this copy cannot disagree about which lines wait.
+@visibleForTesting
+KotDocket kotDocket(List items) {
+  final rows = <KotDocketRow>[];
+  var totalQty = 0;
+  var holdQty = 0;
+  var heldLines = 0;
+  for (final it in items) {
+    final m = it as Map;
+    final held = _itemHeld(m);
+    final qty = math.max(1, (num.tryParse('${m['quantity'] ?? 1}') ?? 1).round());
+    if (held) {
+      holdQty += qty;
+      heldLines += 1;
+    } else {
+      totalQty += qty;
+    }
+    final note = '${m['note'] ?? ''}'.trim();
+    rows.add((
+      no: '${rows.length + 1}',
+      name: '${m['name'] ?? ''}',
+      qty: qty,
+      held: held,
+      under: [if (held) kotHoldLine, if (note.isNotEmpty) kotNoteLine(note)],
+    ));
+  }
+  return (
+    rows: rows,
+    totalQty: totalQty,
+    holdQty: holdQty,
+    showTotal: heldLines < rows.length || heldLines == 0,
+    showHold: heldLines > 0,
+  );
+}
+
 // Print a Kitchen Order Ticket (KOT) for a table's items.
 /// A LOCAL PDF copy of one order's kitchen ticket, laid out like the thermal
 /// docket the backend renders (escpos.ts `buildReceiptBase64`, kind "kot") so a
@@ -13248,48 +13337,39 @@ Future<void> _reprintKot(
 /// whole running order set — another reason not to stamp it with a series
 /// number that means "the nth ticket this outlet sent to the kitchen today".
 Future<void> _printKot(String table, List items) async {
-  // HELD LINES ARE LIFTED OUT, exactly as escpos.ts lifts them out of the
-  // thermal docket. The whole point of this local copy is that a chef reads the
-  // same shape whichever piece of paper reached them, and the one shape that
-  // matters most is which lines they are allowed to cook: a held course listed
-  // among the rest gets cooked, which is the defeat the hold feature was fixed
-  // to stop. `_itemHeld` is the same predicate the on-screen ticket dims by, so
-  // the card, the docket and this copy cannot disagree.
-  final fire = <Map>[];
-  final held = <Map>[];
-  for (final it in items) {
-    final m = it as Map;
-    (_itemHeld(m) ? held : fire).add(m);
-  }
-  int qtyOf(Iterable<Map> rows) =>
-      rows.fold(0, (sum, m) => sum + ((m['quantity'] as num?)?.round() ?? 1));
-  final totalQty = qtyOf(fire);
-  final holdQty = qtyOf(held);
-  // One line of the item list. `label` is "1" for a line to cook now and "H1"
-  // for one on hold, so the pass can call either out without collision.
-  pw.Widget row(String label, Map m) {
-    final note = (m['note'] ?? '').toString().trim();
+  final docket = kotDocket(items);
+  // ROUND 2 ITEM 3 — "Dish names should come in bold on KOT, and the font of
+  // other items on the KOT should also be increased slightly." Every size here
+  // is two points up on what this copy printed, and the dish name is the one
+  // bold run on the row besides its quantity.
+  const body = pw.TextStyle(fontSize: 14);
+  const small = pw.TextStyle(fontSize: 11);
+  // The under-dish lines — hold and note alike — in the italic the reference
+  // docket sets its "[Note]" in, so a hold reads as the same kind of line.
+  final underStyle = pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic);
+  pw.Widget row(KotDocketRow r) {
     return pw.Padding(
       padding: const pw.EdgeInsets.symmetric(vertical: 2),
       child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
         pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          pw.SizedBox(width: 28, child: pw.Text(label, style: const pw.TextStyle(fontSize: 14))),
-          pw.Expanded(child: pw.Text('${m['name'] ?? ''}', style: const pw.TextStyle(fontSize: 14))),
+          pw.SizedBox(width: 28, child: pw.Text(r.no, style: const pw.TextStyle(fontSize: 16))),
+          pw.Expanded(
+              child: pw.Text(r.name, style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold))),
           pw.SizedBox(
             width: 34,
             // "x3", bold — the same treatment the thermal docket gives it, and
             // for the same reason: a bare digit at the end of a row reads as a
             // line number as easily as a quantity.
-            child: pw.Text('x${m['quantity'] ?? 1}',
-                style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold),
+            child: pw.Text('x${r.qty}',
+                style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold),
                 textAlign: pw.TextAlign.right),
           ),
         ]),
-        // The one thing on a KOT more important than the dish name.
-        if (note.isNotEmpty)
+        // UNDER the dish, never above it: "[Hold] …" then "[Note] …".
+        for (final l in r.under)
           pw.Padding(
             padding: const pw.EdgeInsets.only(left: 28, top: 1),
-            child: pw.Text('* $note', style: const pw.TextStyle(fontSize: 11)),
+            child: pw.Text(l, style: underStyle),
           ),
       ]),
     );
@@ -13299,39 +13379,25 @@ Future<void> _printKot(String table, List items) async {
   doc.addPage(
     pw.Page(
       build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Text('KOT', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+        pw.Text('KOT', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
         // Printed tickets leave the screen, so they carry the zone explicitly.
-        pw.Text(RestaurantTime.stampNow(), style: const pw.TextStyle(fontSize: 9)),
-        pw.Text('Local copy - no ticket number', style: const pw.TextStyle(fontSize: 8)),
+        pw.Text(RestaurantTime.stampNow(), style: small),
+        pw.Text('Local copy - no ticket number', style: const pw.TextStyle(fontSize: 10)),
         pw.SizedBox(height: 6),
-        pw.Text('Table No: $table', style: const pw.TextStyle(fontSize: 12)),
+        pw.Text('Table No: $table', style: body),
         pw.Divider(),
         // Numbered lines with the quantity in its own right-hand column, matching
         // the thermal docket's "No. / Item / Qty".
         pw.Row(children: [
-          pw.SizedBox(width: 28, child: pw.Text('No.', style: const pw.TextStyle(fontSize: 9))),
-          pw.Expanded(child: pw.Text('Item', style: const pw.TextStyle(fontSize: 9))),
-          pw.SizedBox(width: 34, child: pw.Text('Qty', style: const pw.TextStyle(fontSize: 9), textAlign: pw.TextAlign.right)),
+          pw.SizedBox(width: 28, child: pw.Text('No.', style: small)),
+          pw.Expanded(child: pw.Text('Item', style: small)),
+          pw.SizedBox(width: 34, child: pw.Text('Qty', style: small, textAlign: pw.TextAlign.right)),
         ]),
         pw.Divider(),
-        ...fire.asMap().entries.map((e) => row('${e.key + 1}', e.value)),
-        // A wholly held docket has nothing to total, and "Total Qty: 0" above a
-        // full hold block reads as "there is nothing on this ticket".
-        if (fire.isNotEmpty || held.isEmpty) ...[
-          pw.Divider(),
-          pw.Text('Total Qty: $totalQty', style: const pw.TextStyle(fontSize: 12)),
-        ],
-        if (held.isNotEmpty) ...[
-          pw.Divider(),
-          // Loud, because a docket is read at a glance: a line that has to be
-          // READ to be excluded gets cooked by the third ticket of a service.
-          pw.Text('** HOLD **', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
-          pw.Text('DO NOT COOK UNTIL FIRED', style: const pw.TextStyle(fontSize: 11)),
-          pw.SizedBox(height: 4),
-          ...held.asMap().entries.map((e) => row('H${e.key + 1}', e.value)),
-          pw.Divider(),
-          pw.Text('Hold Qty: $holdQty', style: const pw.TextStyle(fontSize: 12)),
-        ],
+        ...docket.rows.map(row),
+        pw.Divider(),
+        if (docket.showTotal) pw.Text('Total Qty: ${docket.totalQty}', style: body),
+        if (docket.showHold) pw.Text('Hold Qty: ${docket.holdQty}', style: body),
       ]),
     ),
   );
