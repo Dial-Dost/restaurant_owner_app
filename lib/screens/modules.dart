@@ -9144,6 +9144,12 @@ class _TableSheetState extends State<_TableSheet> {
         headerLines: headerLines,
         logo: logo,
         tableName: _name,
+        // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
+        // another till may have printed it since this sheet opened. The same
+        // tri-state C3 uses, so an older backend falls back to this device's
+        // memory and nothing else.
+        reprint: serverBillPrintState(bill) ??
+            PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name),
       ),
     );
     if (confirmed == true) {
@@ -9468,36 +9474,108 @@ class _TableSheetState extends State<_TableSheet> {
   /// /bills/customer-name), then re-read the bill so the sheet, the preview and
   /// the next print all carry it. The dialog and its rules live in
   /// bill_customer_name.dart.
+  ///
+  /// ROUND 2 ITEM 1 — and the customer's GSTIN with it. `customer_gstin` is
+  /// sent only when the person CHANGED it: the route reads an omitted field as
+  /// "unchanged", so a name-only correction is exactly the request it always
+  /// was, and keeps working on a server whose GSTIN column is not migrated yet.
   Future<void> _editBillCustomerName(ScaffoldMessengerState messenger) async {
-    final name = await _askBillCustomerName(context, tableName: _name, current: _bill?['customer']);
-    if (name == null) return;
+    final currentGstin = '${_bill?['customer_gstin'] ?? ''}'.trim();
+    final details = await _askBillCustomerDetails(
+      context,
+      title: 'Name / GSTIN on bill · Table $_name',
+      // Said plainly because the behaviour is not obvious: the name is stored
+      // on every running order, so it changes the whole table's bill, and a
+      // settled bill is refused by this route (Accounting has its own).
+      explanation: 'This is the name printed at the top of the bill. It applies to the whole '
+          'table, and can be changed until the bill is settled. Leave it empty to '
+          'print no name.',
+      currentName: _bill?['customer'],
+      currentGstin: currentGstin,
+    );
+    if (details == null) return;
+    final name = details.customer;
+    final gstinChanged = details.gstin != normaliseBillCustomerGstin(currentGstin);
     try {
-      final res = await widget.rest.post('/bills/customer-name', {'table_name': _name, 'customer': name});
+      final res = await widget.rest.post('/bills/customer-name', {
+        'table_name': _name,
+        'customer': name,
+        if (gstinChanged) 'customer_gstin': details.gstin.isEmpty ? null : details.gstin,
+      });
       // The server's answer when it gave one: it normalises again, and `null`
       // is how it says the name was cleared.
       final saved = res is Map && res.containsKey('customer') ? '${res['customer'] ?? ''}' : name;
+      // A server a release behind answers the name and silently ignores a field
+      // it has never heard of. Its answer then has no `customer_gstin`, and the
+      // person must hear that the GSTIN did not stick rather than find out from
+      // the paper.
+      final gstinIgnored = gstinChanged && res is Map && !res.containsKey('customer_gstin');
+      final savedGstin = res is Map && res.containsKey('customer_gstin') ? '${res['customer_gstin'] ?? ''}' : details.gstin;
       messenger.showSnackBar(SnackBar(
-          content: Text(saved.isEmpty
-              ? 'Name cleared — the bill will print without a guest name.'
-              : "Name updated — this table's bill now prints for $saved.")));
+          content: Text([
+        saved.isEmpty
+            ? 'Name cleared — the bill will print without a guest name.'
+            : "Name updated — this table's bill now prints for $saved.",
+        if (gstinIgnored)
+          'The GSTIN was not saved: this server has not finished updating.'
+        else if (gstinChanged)
+          savedGstin.isEmpty ? 'Customer GSTIN removed.' : 'Customer GSTIN: $savedGstin.',
+      ].join(' '))));
       await _loadBill();
       widget.reload();
-    } on OfflineUnavailable {
-      // /bills is never queued (see OutboxPolicy.billing), and that family's
-      // sentence is about settling. This is not a settle, so say what it is.
-      messenger.showSnackBar(const SnackBar(
-          content: Text('Changing the name on a bill needs a connection — reconnect and try again.')));
-    } on ApiException catch (e) {
-      // A 404 is the ROUTE missing, not the table (that is a 400 with its own
-      // sentence): the API is a release behind the app. Same wording as the web.
-      messenger.showSnackBar(SnackBar(
-          content: Text(e.status == 404
-              ? 'This server has not finished updating, so the name cannot be changed from here yet. '
-                  'Ask your administrator to complete the update.'
-              : '$e')));
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      messenger.showSnackBar(SnackBar(content: Text(_billCustomerDetailsFailure(e, settled: false))));
     }
+  }
+
+  /// ROUND 2 ITEM 1 — "on top of a clicked table these details can be updated".
+  ///
+  /// The guest's name and GSTIN, directly under the table's name, with the edit
+  /// beside them. It USED to be a button in the bill-controls wrap halfway down
+  /// the sheet, which is not where the client looks, and which a phone had to
+  /// scroll past the orders to reach.
+  ///
+  /// Shown to anyone who may edit it (so an unnamed table can be named), and to
+  /// everyone else only when there is something to read. Neither the name nor
+  /// the GSTIN is money, so a waiter's scoping does not remove them (C4).
+  Widget? _billCustomerHeader(ScaffoldMessengerState messenger, TextTheme text) {
+    if (!_occupied || _bill == null) return null;
+    final name = billCustomerNameSeed(_bill!['customer']);
+    final gstin = _s(_bill!, 'customer_gstin', '').trim();
+    final mayEdit = _mayEditBillCustomerName(widget.profile, _scope);
+    if (!mayEdit && name.isEmpty && gstin.isEmpty) return null;
+    return ForkCard(
+      key: const ValueKey('table-bill-customer-header'),
+      inset: true,
+      padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+      child: Row(children: [
+        Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(name.isEmpty ? 'No guest name on the bill' : name,
+                key: const ValueKey('table-bill-customer'),
+                style: name.isEmpty ? text.bodySmall : text.titleSmall,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis),
+            if (gstin.isNotEmpty) ...[
+              const SizedBox(height: 2),
+              Text('GSTIN $gstin', key: const ValueKey('table-bill-customer-gstin'), style: text.bodySmall),
+            ],
+          ]),
+        ),
+        if (mayEdit) ...[
+          const SizedBox(width: 8),
+          ForkButton.ghost(
+            key: const ValueKey('table-bill-customer-name'),
+            label: 'Edit name / GSTIN',
+            icon: Icons.edit_outlined,
+            dense: true,
+            onPressed: () => _editBillCustomerName(messenger),
+          ),
+        ],
+      ]),
+    );
   }
 
   // Even split: divide the total payable N ways and show each share.
@@ -10022,6 +10100,11 @@ class _TableSheetState extends State<_TableSheet> {
                   ),
               ],
             ]),
+            // ROUND 2 ITEM 1 — the name and GSTIN on this table's bill, at the top.
+            if (_billCustomerHeader(messenger, text) case final header?) ...[
+              const SizedBox(height: 12),
+              header,
+            ],
             const SizedBox(height: 16),
             // 6.7 — "Add order" and "Print bill" live HERE, above the QR, the
             // orders and the bill, at hero size. See [_orderAndPrintActions].
@@ -10239,17 +10322,9 @@ class _TableSheetState extends State<_TableSheet> {
                       : null,
                 ),
                 if (_scope.billOps) ...[
-                // 6.5 — first, as on the web: the one control here that is a
-                // CORRECTION rather than a decision. Also needs "Add Orders"; see
-                // [_mayEditBillCustomerName].
-                if (_mayEditBillCustomerName(widget.profile, _scope))
-                ForkButton.ghost(
-                  key: const ValueKey('table-bill-customer-name'),
-                  label: _billCustomerNameLabel(_bill!),
-                  icon: Icons.person_outline,
-                  dense: true,
-                  onPressed: () => _editBillCustomerName(messenger),
-                ),
+                // 6.5's "Edit guest name" used to lead this wrap. Round 2 item 1
+                // moved it, with the same gate, to the top of the sheet — see
+                // [_billCustomerHeader].
                 ForkButton.ghost(
                   label: 'Reprint (no service charge)',
                   icon: Icons.money_off,
@@ -10671,12 +10746,23 @@ class _BillPreviewDialog extends StatelessWidget {
   /// [billLogoBytes].
   final Uint8List? logo;
   final String tableName;
+
+  /// ROUND 2 ITEM 4 — "Reprint has to mention reprint on top once the bill has
+  /// been reprinted and it should show the same on the preview as well."
+  ///
+  /// True when this bill has ALREADY been printed at least once, so the print
+  /// this preview leads to is a reprint — the thermal renderer stamps REPRINT at
+  /// the very top of exactly that print, and a preview that did not would be
+  /// previewing a different slip. False for a first print, which carries no
+  /// banner on paper or here.
+  final bool reprint;
   const _BillPreviewDialog({
     required this.bill,
     required this.restaurantName,
     this.headerLines = const <String>[],
     this.logo,
     required this.tableName,
+    this.reprint = false,
   });
 
   static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
@@ -10741,7 +10827,8 @@ class _BillPreviewDialog extends StatelessWidget {
     final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
     final covers = bill['covers'];
     final billNo = _s(bill, 'bill_no', '');
-    final customer = _s(bill, 'customer', '');
+    // Contract D — `Customer: <name>` / `Customer GSTIN: <gstin>`.
+    final customerLines = billCustomerLines(bill);
 
     return Dialog(
       backgroundColor: Colors.transparent,
@@ -10764,6 +10851,22 @@ class _BillPreviewDialog extends StatelessWidget {
                 child: DefaultTextStyle(
                   style: const TextStyle(fontSize: 13, height: 1.3, color: Colors.black87),
                   child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    // ROUND 2 ITEM 4 — REPRINT, above everything including the
+                    // logo, because that is where the roll prints it. Large, bold
+                    // and boxed so it cannot be read past on a copy turned toward
+                    // a guest.
+                    if (reprint) ...[
+                      Container(
+                        key: const ValueKey('bill-preview-reprint'),
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        decoration: BoxDecoration(border: Border.all(color: Colors.black87, width: 2)),
+                        child: const Text('REPRINT',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.w900, letterSpacing: 4, color: Colors.black)),
+                      ),
+                      const SizedBox(height: 8),
+                    ],
                     // 5.1 — the logo across the top, where the roll prints it. Up to
                     // 72px tall and the width of the slip, so a wordmark reads.
                     if (logo != null) ...[
@@ -10814,10 +10917,14 @@ class _BillPreviewDialog extends StatelessWidget {
                         style: const TextStyle(fontSize: 12, color: inkFaint),
                       ),
                     ),
-                    if (customer.isNotEmpty)
+                    // ROUND 2 ITEM 1 / contract D — who the bill is for, under the
+                    // header, where the roll prints it. The bare name this drew
+                    // before also drew "Guest", which is a placeholder, not a name.
+                    for (final l in customerLines)
                       Center(
-                          child: Text(customer,
-                              textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: inkFaint))),
+                          child: Text(l,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 12.5, color: Colors.black87))),
                     _paperRule,
                     // Item lines: "name ×qty" on the left, line amount on the right.
                     // THE KITCHEN NOTE IS NOT DRAWN HERE, and this dialog is the
@@ -22128,7 +22235,7 @@ String _billTitle(Map b) {
   return table.isEmpty ? left : '$left · $table';
 }
 
-void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? profile]) {
+void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? profile, VoidCallback? onChanged]) {
   final id = _s(bill, 'id', '');
   if (id.isEmpty) return;
   showModalBottomSheet<void>(
@@ -22141,12 +22248,17 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? 
       billId: id,
       title: _billTitle(bill),
       profile: profile,
+      onChanged: onChanged,
     ),
   );
 }
 
 /// One row in the settled-bill list. Tapping it opens the full bill.
-Widget _closedBillRow(BuildContext context, RestClient rest, Map b, [Profile? profile]) {
+///
+/// [onChanged] is told when the name / GSTIN on this bill was edited — from the
+/// row's own control (with the server's answer) or from the sheet (without).
+Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
+    [Profile? profile, void Function(Map<String, dynamic>? saved)? onChanged]) {
   final text = Theme.of(context).textTheme;
   final method = _s(b, 'payment_method', '');
   final refunded = b['refunded'] == true;
@@ -22156,7 +22268,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b, [Profile? pr
     padding: const EdgeInsets.only(bottom: 8),
     child: ForkCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      onTap: () => _openClosedBill(context, rest, b, profile),
+      onTap: () => _openClosedBill(context, rest, b, profile, onChanged == null ? null : () => onChanged(null)),
       child: Row(children: [
         Container(
           width: 36,
@@ -22178,10 +22290,27 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b, [Profile? pr
               if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
               if (method.isNotEmpty && method != '—') InfoChip(icon: Icons.payments_outlined, label: method),
               if (refunded) const InfoChip(icon: Icons.undo, label: 'Refunded'),
+              // ROUND 2 ITEM 1 — who the bill was for, so a correction is visible
+              // on the row it was made from.
+              if (billCustomerNameSeed(b['customer']).isNotEmpty)
+                InfoChip(icon: Icons.person_outline, label: billCustomerNameSeed(b['customer'])),
+              if (_s(b, 'customer_gstin', '').isNotEmpty)
+                InfoChip(icon: Icons.business_outlined, label: 'GSTIN ${_s(b, 'customer_gstin')}'),
             ]),
           ]),
         ),
         const SizedBox(width: AppSpacing.md),
+        // ROUND 2 ITEM 1 — "Edit name / GSTIN" per past bill, behind the reprint
+        // gate (the widget draws nothing for anyone else).
+        if (onChanged != null && _maySetSettledBillCustomer(profile))
+          _EditSettledBillCustomerButton(
+            key: ValueKey('closed-bill-row-edit-customer-${_s(b, 'id', '')}'),
+            rest: rest,
+            bill: b,
+            profile: profile,
+            compact: true,
+            onSaved: onChanged,
+          ),
         Text(_money(b['grand_total']), style: text.titleSmall),
         const SizedBox(width: 4),
         Icon(Icons.chevron_right, size: 18, color: AppColors.textTertiary),
@@ -22318,7 +22447,17 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
       );
     }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      for (final b in _rows) _closedBillRow(context, widget.rest, b, widget.profile),
+      for (final b in _rows)
+        _closedBillRow(context, widget.rest, b, widget.profile, (saved) {
+          if (!mounted) return;
+          // From the row: the server's answer repaints this row in place. From
+          // the sheet: re-read the page quietly, keeping what is on screen.
+          if (saved == null) {
+            _load(silent: true);
+          } else {
+            setState(() => b.addAll(saved));
+          }
+        }),
       if (_hasMore)
         Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -22355,6 +22494,11 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
 /// FAILURES ARE THE SERVER'S SENTENCE, VERBATIM. ApiException carries `details`
 /// precisely for this — who may reprint, why a bill cannot be. Rewriting it here
 /// would put a worse sentence in front of the person who has to act on it.
+/// Who may reprint a settled bill — null (a read-only surface) never may. Named
+/// so round 2's "Edit name / GSTIN" on the same bill asks the same question
+/// rather than a copy of it; see [_maySetSettledBillCustomer].
+bool _mayReprintSettledBill(Profile? p) => p != null && _holdsAction(p, _analyticsPermissionId);
+
 class _ReprintSettledBillButton extends StatefulWidget {
   final RestClient rest;
   final String billId;
@@ -22402,10 +22546,9 @@ class _ReprintSettledBillButtonState extends State<_ReprintSettledBillButton> {
 
   @override
   Widget build(BuildContext context) {
-    final p = widget.profile;
     // A UI convenience only — /print/bill/settled re-checks ACCOUNTING_PERM
     // itself, so a wrong answer here costs an affordance, never a boundary.
-    if (p == null || !_holdsAction(p, _analyticsPermissionId)) return const SizedBox.shrink();
+    if (!_mayReprintSettledBill(widget.profile)) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: AppSpacing.lg),
       child: OutlinedButton.icon(
@@ -22427,11 +22570,16 @@ class _ClosedBillSheet extends StatelessWidget {
   /// Present only where a till correction belongs — see [misBillCounterAction].
   final Profile? profile;
 
+  /// Told when the name / GSTIN on this bill changed, so the list behind the
+  /// sheet repaints its row too.
+  final VoidCallback? onChanged;
+
   const _ClosedBillSheet({
     required this.rest,
     required this.billId,
     required this.title,
     this.profile,
+    this.onChanged,
   });
 
   @override
@@ -22459,6 +22607,18 @@ class _ClosedBillSheet extends StatelessWidget {
                     rest: rest,
                     billId: billId,
                     profile: profile,
+                  ),
+                  // ROUND 2 ITEM 1 — beside the reprint, behind the same gate:
+                  // correct who the bill was for, then reprint it.
+                  _EditSettledBillCustomerButton(
+                    key: const ValueKey('closed-bill-edit-customer'),
+                    rest: rest,
+                    bill: {...bill, 'id': billId},
+                    profile: profile,
+                    onSaved: (_) {
+                      reload();
+                      onChanged?.call();
+                    },
                   ),
                   misBillCounterAction(
                     context,
@@ -22571,12 +22731,18 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       else
         StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
     ]),
+    // ROUND 2 ITEM 1 / contract D — `Customer:` and `Customer GSTIN:` under the
+    // header, the two lines the printed bill carries there. They replace the
+    // bare name chip, which also showed the "Guest" placeholder as if a name.
+    for (final l in billCustomerLines(bill)) ...[
+      const SizedBox(height: 4),
+      Text(l, style: text.bodyMedium),
+    ],
     const SizedBox(height: 10),
     Wrap(spacing: 6, runSpacing: 6, children: [
       if (_billWhen(bill).isNotEmpty) InfoChip(icon: Icons.schedule, label: _fmtTime(_billWhen(bill))),
       if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
       if (_numOf(bill['apc']) > 0) InfoChip(icon: Icons.equalizer, label: 'APC ${_money(bill['apc'])}'),
-      if (_s(bill, 'customer', '').isNotEmpty) InfoChip(icon: Icons.person_outline, label: _s(bill, 'customer')),
       if (_s(bill, 'payment_proof_screenshot_url', '').isNotEmpty)
         const InfoChip(icon: Icons.image_outlined, label: 'Payment proof attached'),
     ]),
