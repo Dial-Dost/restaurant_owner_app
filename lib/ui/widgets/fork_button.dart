@@ -7,6 +7,9 @@ import 'status_chip.dart';
 
 enum ForkButtonKind { primary, ghost, subtle }
 
+/// Minimum height of a [ForkButton.large] — a comfortable thumb target.
+const double kForkButtonLargeHeight = 52;
+
 /// The template's two button voices: a copper-filled primary and a quiet
 /// hairline ghost. [ForkButtonKind.subtle] is a borderless hover-only variant
 /// for "View all" style links.
@@ -18,6 +21,7 @@ class ForkButton extends StatefulWidget {
     this.onPressed,
     this.kind = ForkButtonKind.primary,
     this.dense = false,
+    this.large = false,
   });
 
   const ForkButton.ghost({
@@ -26,6 +30,7 @@ class ForkButton extends StatefulWidget {
     this.icon,
     this.onPressed,
     this.dense = false,
+    this.large = false,
   }) : kind = ForkButtonKind.ghost;
 
   const ForkButton.subtle({
@@ -34,13 +39,20 @@ class ForkButton extends StatefulWidget {
     this.icon,
     this.onPressed,
     this.dense = true,
-  }) : kind = ForkButtonKind.subtle;
+  }) : kind = ForkButtonKind.subtle,
+       large = false;
 
   final String label;
   final IconData? icon;
   final VoidCallback? onPressed;
   final ForkButtonKind kind;
   final bool dense;
+
+  /// 6.7 — the hero size: at least [kForkButtonLargeHeight] tall, a bigger
+  /// glyph and label, content centred. For the one or two controls a screen
+  /// exists for (the table sheet's "Add order" / "Print bill"), never for a
+  /// toolbar. Wins over [dense].
+  final bool large;
 
   @override
   State<ForkButton> createState() => _ForkButtonState();
@@ -65,8 +77,9 @@ class _ForkButtonState extends State<ForkButton> {
         // tall for the toolbars and card footers this app puts buttons in. The
         // dense variant (40px) is the honest match for the app's density, so
         // the non-dense Rustic button maps onto it rather than doubling the
-        // height of every action row on flip.
-        dense: true,
+        // height of every action row on flip. A [large] button IS the phone
+        // hero, so it keeps Gaia's full 52px.
+        dense: !widget.large,
       );
     }
 
@@ -101,9 +114,10 @@ class _ForkButtonState extends State<ForkButton> {
         onTap: widget.onPressed,
         child: AnimatedContainer(
           duration: AppDurations.fast,
+          constraints: widget.large ? const BoxConstraints(minHeight: kForkButtonLargeHeight) : null,
           padding: EdgeInsets.symmetric(
-            horizontal: widget.dense ? 12 : 16,
-            vertical: widget.dense ? 7 : 9,
+            horizontal: widget.large ? 20 : widget.dense ? 12 : 16,
+            vertical: widget.large ? 12 : widget.dense ? 7 : 9,
           ),
           decoration: BoxDecoration(
             gradient: primary
@@ -134,9 +148,10 @@ class _ForkButtonState extends State<ForkButton> {
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: widget.large ? MainAxisAlignment.center : MainAxisAlignment.start,
             children: [
               if (widget.icon != null) ...[
-                Icon(widget.icon, size: widget.dense ? 14 : 15, color: fg),
+                Icon(widget.icon, size: widget.large ? 20 : widget.dense ? 14 : 15, color: fg),
                 const SizedBox(width: 7),
               ],
               // Same rule as the chips: a button stacked in a narrow column
@@ -144,7 +159,7 @@ class _ForkButtonState extends State<ForkButton> {
               ChipLabel(
                 widget.label,
                 style: TextStyle(
-                  fontSize: widget.dense ? 12 : 13,
+                  fontSize: widget.large ? 15 : widget.dense ? 12 : 13,
                   fontWeight: FontWeight.w600,
                   letterSpacing: 0.2,
                   color: fg,

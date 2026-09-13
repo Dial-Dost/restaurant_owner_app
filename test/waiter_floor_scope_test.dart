@@ -14,6 +14,7 @@ import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 /// THE WAITER'S FLOOR — items 14 to 20.
@@ -551,10 +552,10 @@ void main() {
 
       expect(find.text('Approve payment & close'), findsNothing);
       expect(api.to('admin-approve-payment'), isEmpty);
-      // The floor tile still says so.
-      await tester.tap(find.byType(BackButtonIcon).evaluate().isEmpty
-          ? find.text('Actions')
-          : find.text('Actions'));
+      // The floor tile still says so. (6.7: a waiter's sheet has no Actions
+      // heading any more — its two controls lead the sheet — so the sheet's
+      // own title is the inert spot tapped here.)
+      await tester.tap(find.text('Table T1'));
       await tester.pumpAndSettle();
     });
 
@@ -716,6 +717,166 @@ void main() {
       await tester.tap(find.text('Add'));
       await tester.pumpAndSettle();
       expect(find.text('Send order · 1 item · ₹320.00'), findsOneWidget);
+    });
+  });
+
+  // =================================== 6.7 and 6.8: the action buttons, higher
+
+  group('6.7 — Add order and Print bill lead the table sheet, at hero size', () {
+    Future<void> expectLeads(WidgetTester tester, String addKey, String printKey) async {
+      // NOT REVEALED FIRST: "higher up" means on screen the moment it opens.
+      final view = tester.view.physicalSize.height / tester.view.devicePixelRatio;
+      final add = tester.getRect(find.byKey(ValueKey(addKey)));
+      final print = tester.getRect(find.byKey(ValueKey(printKey)));
+      final firstOrder = tester.getRect(find.textContaining('Gulab Jamun').first);
+      expect(add.bottom, lessThanOrEqualTo(view), reason: 'Add order is visible without scrolling');
+      expect(print.bottom, lessThanOrEqualTo(view), reason: 'Print bill is visible without scrolling');
+      expect(add.top, lessThan(print.top), reason: 'Add order leads');
+      expect(print.bottom, lessThan(firstOrder.top), reason: 'both sit above the orders list');
+      // A waiter has no bill card (item 19); an owner's is below them too.
+      if (find.text('TOTAL PAYABLE').evaluate().isNotEmpty) {
+        expect(print.bottom, lessThan(tester.getRect(find.text('TOTAL PAYABLE')).top),
+            reason: 'and above the bill');
+      }
+      expect(add.height, greaterThanOrEqualTo(kForkButtonLargeHeight), reason: '6.7 asked for bigger');
+      expect(print.height, greaterThanOrEqualTo(kForkButtonLargeHeight));
+      expect(add.width, closeTo(print.width, 1));
+    }
+
+    testWidgets('a waiter\'s two controls sit above the orders, at 52px', (tester) async {
+      await _mountFloor(tester, role: 'waiter');
+      await _openTable(tester);
+      await expectLeads(tester, 'table-add-order', 'table-print-bill');
+      // Nothing is left under a heading with nothing under it.
+      expect(find.text('Actions'), findsNothing);
+    });
+
+    testWidgets('an owner\'s two controls moved too, and nothing else went', (tester) async {
+      await _mountFloor(tester, role: 'admin', actions: const ['*']);
+      await _openTable(tester);
+      await expectLeads(tester, 'table-manager-add-order', 'table-manager-print-bill');
+      // Exactly one of each — moved, not copied.
+      expect(_buttons(tester).where((l) => l == 'Add order'), hasLength(1));
+      expect(_buttons(tester).where((l) => l == 'Print bill'), hasLength(1));
+      expect(find.text('Actions'), findsOneWidget);
+      await _reveal(tester, find.text('Settle bill'));
+      expect(find.text('Settle bill'), findsOneWidget);
+    });
+
+    testWidgets('same under gaia', (tester) async {
+      await _mountFloor(tester, role: 'waiter', system: DesignSystem.gaia);
+      await _openTable(tester);
+      await expectLeads(tester, 'table-add-order', 'table-print-bill');
+    });
+  });
+
+  group('6.8 — Send order sits under the search, not at the foot of the pad', () {
+    // A waiter by default: the client's photo is a waiter's pad, which has no
+    // running-bill strip above the search (item 19).
+    Future<_FakeApi> pumpPad(WidgetTester tester,
+        {int dishes = 1, String role = 'waiter', Size size = const Size(420, 860)}) async {
+      await tester.pumpWidget(const SizedBox());
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final routes = _routes(occupied: false)
+        ..['/menu'] = [
+          for (var i = 1; i <= dishes; i++)
+            {'id': 'mi-$i', 'name': 'Dish $i', 'price': 100.0 + i, 'category': 'Starters'},
+        ];
+      final api = _FakeApi(routes, role: role, actions: role == 'waiter' ? const ['a1'] : const ['*']);
+      final rest = await _signIn(api);
+      await tester.pumpWidget(MaterialApp(
+        theme: AppTheme.dark(),
+        home: OrderEntryScreen(rest: rest, tableName: 'T1'),
+      ));
+      await tester.pumpAndSettle();
+      return api;
+    }
+
+    Rect cardOf(WidgetTester tester, String dish) =>
+        tester.getRect(find.ancestor(of: find.text(dish), matching: find.byType(ForkCard)).first);
+
+    testWidgets('hidden while the cart is empty; then directly under the search, above the menu',
+        (tester) async {
+      final api = await pumpPad(tester);
+      expect(find.byKey(const ValueKey('order-send')), findsNothing);
+      expect(find.textContaining('Send order'), findsNothing);
+
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+
+      final search = tester.getRect(find.widgetWithText(TextField, 'Search menu…'));
+      final note = tester.getRect(find.widgetWithText(TextField, 'Note for the kitchen (e.g. no onions)…'));
+      final send = tester.getRect(find.byKey(const ValueKey('order-send')));
+      final dish = cardOf(tester, 'Dish 1');
+      expect(search.bottom, lessThanOrEqualTo(note.top));
+      expect(note.bottom, lessThanOrEqualTo(send.top), reason: 'the note travels with the button');
+      expect(send.bottom, lessThanOrEqualTo(dish.top), reason: 'Send order is above the menu');
+      expect(send.bottom, lessThan(860 / 2), reason: 'in the upper half, not at the foot');
+      expect(send.top - search.bottom, lessThan(note.height + 30),
+          reason: 'nothing but the note between the search and Send');
+
+      await tester.tap(find.byKey(const ValueKey('order-send')));
+      await tester.pumpAndSettle();
+      expect(api.to('/orders'), hasLength(1), reason: 'the same send');
+    });
+
+    testWidgets('an owner\'s pad keeps the running-bill strip, with Send still under the search',
+        (tester) async {
+      await pumpPad(tester, role: 'admin');
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+      final search = tester.getRect(find.widgetWithText(TextField, 'Search menu…'));
+      final send = tester.getRect(find.byKey(const ValueKey('order-send')));
+      expect(send.top, greaterThan(search.bottom));
+      expect(send.bottom, lessThanOrEqualTo(cardOf(tester, 'Dish 1').top));
+      expect(send.bottom, lessThan(860 * 0.6));
+    });
+
+    testWidgets('sticky: it stays put while the menu scrolls under it', (tester) async {
+      await pumpPad(tester, dishes: 30);
+      await tester.tap(find.text('Add').first);
+      await tester.pumpAndSettle();
+      final before = tester.getRect(find.byKey(const ValueKey('order-send')));
+      await tester.drag(find.byType(ListView), const Offset(0, -500));
+      await tester.pumpAndSettle();
+      expect(tester.getRect(find.byKey(const ValueKey('order-send'))), before);
+      expect(find.text('Dish 1'), findsNothing, reason: 'the menu did scroll');
+    });
+
+    testWidgets('never under the keyboard', (tester) async {
+      await pumpPad(tester, dishes: 30);
+      await tester.tap(find.text('Add').first);
+      await tester.pumpAndSettle();
+      tester.view.viewInsets = const FakeViewPadding(bottom: 400);
+      tester.view.padding = const FakeViewPadding(bottom: 48);
+      await tester.pumpAndSettle();
+      final send = tester.getRect(find.byKey(const ValueKey('order-send')));
+      expect(send.bottom, lessThanOrEqualTo(860 - 400));
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('the dish under the thumb does not move when the panel appears or goes',
+        (tester) async {
+      await pumpPad(tester, dishes: 30);
+      await tester.drag(find.byType(ListView), const Offset(0, -400));
+      await tester.pumpAndSettle();
+      const dish = 'Dish 8';
+      final before = cardOf(tester, dish);
+      await tester.tap(find.descendant(
+          of: find.ancestor(of: find.text(dish), matching: find.byType(ForkCard)).first,
+          matching: find.text('Add')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('order-send')), findsOneWidget);
+      expect(cardOf(tester, dish).top, closeTo(before.top, 1));
+
+      await tester.tap(find.descendant(
+          of: find.ancestor(of: find.text(dish), matching: find.byType(ForkCard)).first,
+          matching: find.byIcon(Icons.remove_circle_outline)));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('order-send')), findsNothing);
+      expect(cardOf(tester, dish).top, closeTo(before.top, 1));
     });
   });
 
