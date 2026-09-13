@@ -6,6 +6,7 @@ import 'screens/login_screen.dart';
 import 'services/auth_controller.dart';
 import 'ui/gaia/gaia.dart';
 import 'ui/theme/app_colors.dart';
+import 'ui/theme/app_scrollbar.dart';
 import 'ui/theme/app_theme.dart';
 import 'ui/theme/appearance.dart';
 
@@ -21,6 +22,20 @@ class _DragScrollBehavior extends MaterialScrollBehavior {
         PointerDeviceKind.trackpad,
         PointerDeviceKind.stylus,
       };
+
+  // 6.2 — Material draws a scrollbar on desktop only; on a phone a list simply
+  // has none, so there was nothing to grab however hard scrolling got. Phones
+  // now get one too: the theme's fading overlay (see [AppScrollbar]), which is
+  // invisible — and not hit-testable — until the list moves. Vertical only, as
+  // on desktop: a chip row's bar would sit on top of the chips.
+  @override
+  Widget buildScrollbar(BuildContext context, Widget child, ScrollableDetails details) {
+    if (axisDirectionToAxis(details.direction) == Axis.vertical &&
+        !AppScrollbar.isDesktop(getPlatform(context))) {
+      return Scrollbar(controller: details.controller, child: child);
+    }
+    return super.buildScrollbar(context, child, details);
+  }
 }
 
 class OwnerApp extends StatefulWidget {
