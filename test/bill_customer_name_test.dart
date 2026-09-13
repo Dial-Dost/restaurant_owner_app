@@ -11,6 +11,14 @@
 //   * offline it is refused, never queued;
 //   * hidden from a scoped waiter (the web does not show it to one either) and
 //     from anybody without "Add Orders", the action the route is validated on.
+//
+// ROUND 2 ITEM 1 — the same dialog carries the customer's GSTIN, and the entry
+// point is at the TOP of the sheet with the name and GSTIN beside it:
+//   * the GSTIN is normalised (upper-cased, spaces stripped) and checked against
+//     the server's pattern before any write; empty clears it (null);
+//   * `customer_gstin` is sent only when it changed, so a name-only fix is the
+//     request it always was;
+//   * a server a release behind that ignores the field is called out.
 
 import 'dart:io';
 
@@ -31,9 +39,10 @@ import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 const String _addOrders = '4ad474d4-5230-449c-874f-6a238b833bca';
 
-Map<String, dynamic> _bill(Object? customer) => {
+Map<String, dynamic> _bill(Object? customer, [Object? gstin]) => {
       'bill_id': 'bill-1',
       'customer': customer,
+      'customer_gstin': gstin,
       'total_amt': 699.0,
       'subtotal': 699.0,
       'discount': 0.0,
@@ -52,14 +61,15 @@ Map<String, dynamic> _bill(Object? customer) => {
     };
 
 /// How the fake server answers POST /bills/customer-name.
-enum _Answer { ok, refused, routeMissing, offline }
+enum _Answer { ok, refused, routeMissing, offline, gstinUnknown }
 
 class _FakeApi extends ApiClient {
-  _FakeApi({required this.customer, required this.actions, this.role = 'admin', this.waiterOnly, this.answer = _Answer.ok});
+  _FakeApi({required this.customer, required this.actions, this.gstin, this.role = 'admin', this.waiterOnly, this.answer = _Answer.ok});
 
   /// The name the bill carries; a successful save changes it, so a re-read
   /// shows whether the sheet really went back to the server.
   Object? customer;
+  Object? gstin;
   final List<String> actions;
   final String role;
   final bool? waiterOnly;
@@ -100,15 +110,28 @@ class _FakeApi extends ApiClient {
             throw ApiException('Cannot POST /bills/customer-name', 404);
           case _Answer.offline:
             throw const SocketException('Network is unreachable');
-          case _Answer.ok:
+          case _Answer.gstinUnknown:
+            // A server a release behind: saves the name, has never heard of
+            // `customer_gstin`, and does not answer it.
             final name = '${(body as Map)['customer']}';
             customer = name.isEmpty ? 'Guest' : name;
             return <String, dynamic>{'success': true, 'customer': name.isEmpty ? null : name, 'orders_updated': 1};
+          case _Answer.ok:
+            final b = body as Map;
+            final name = '${b['customer']}';
+            customer = name.isEmpty ? 'Guest' : name;
+            if (b.containsKey('customer_gstin')) gstin = b['customer_gstin'];
+            return <String, dynamic>{
+              'success': true,
+              'customer': name.isEmpty ? null : name,
+              'customer_gstin': gstin,
+              'orders_updated': 1,
+            };
         }
       }
       return <String, dynamic>{'success': true};
     }
-    if (path.startsWith('/bill-for-table')) return _bill(customer);
+    if (path.startsWith('/bill-for-table')) return _bill(customer, gstin);
     if (path.startsWith('/get-tables')) {
       return [
         {
@@ -171,12 +194,17 @@ Future<void> _openT1(WidgetTester tester, _FakeApi api) async {
 final Finder _button = find.byKey(const ValueKey('table-bill-customer-name'));
 final Finder _field = find.byKey(const ValueKey('bill-customer-name-field'));
 final Finder _save = find.byKey(const ValueKey('bill-customer-name-save'));
+final Finder _gstinField = find.byKey(const ValueKey('bill-customer-gstin-field'));
+final Finder _headerGstin = find.byKey(const ValueKey('table-bill-customer-gstin'));
 
 Future<void> _openDialog(WidgetTester tester) async {
   await tester.ensureVisible(_button);
   await tester.tap(_button);
   await tester.pumpAndSettle();
 }
+
+String _headerName(WidgetTester tester) =>
+    tester.widget<Text>(find.byKey(const ValueKey('table-bill-customer'))).data ?? '';
 
 String _fieldText(WidgetTester tester) => tester.widget<TextField>(_field).controller!.text;
 
@@ -203,24 +231,155 @@ void main() {
       expect(m.billCustomerNameMaxLength, 120);
       expect(m.normaliseBillCustomerName('x' * 400), hasLength(120));
     });
+
+    test('a GSTIN is upper-cased and stripped of spaces; empty clears', () {
+      expect(m.normaliseBillCustomerGstin(' 29abcde1234f1z5 '), '29ABCDE1234F1Z5');
+      expect(m.normaliseBillCustomerGstin('29 ABCDE 1234F 1Z5'), '29ABCDE1234F1Z5');
+      expect(m.normaliseBillCustomerGstin('   '), '');
+    });
+
+    test("a GSTIN is checked against the server's pattern, in the server's words", () {
+      expect(m.billCustomerGstinError(''), isNull, reason: 'empty clears it');
+      expect(m.billCustomerGstinError('29abcde1234f1z5'), isNull);
+      expect(m.billCustomerGstinError('27AAPFU0939F1ZV'), isNull);
+      expect(m.billCustomerGstinError('29ABCDE1234F1Z'), m.billCustomerGstinInvalidMessage, reason: '14 chars');
+      expect(m.billCustomerGstinError('29ABCDE1234F1Y5'), isNotNull, reason: 'the 14th must be Z');
+      expect(m.billCustomerGstinError('29ABCDE1234F0Z5'), isNotNull, reason: 'the entity number is 1-9 or A-Z');
+      expect(m.billCustomerGstinError('ABABCDE1234F1Z5'), isNotNull, reason: 'the state code is two digits');
+      expect(m.billCustomerGstinInvalidMessage, 'GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5');
+    });
+
+    test('the customer slot: Customer Name (Guest when unnamed), then Customer GSTIN when set', () {
+      expect(m.billCustomerLines({'customer': 'Acme Ltd', 'customer_gstin': '29ABCDE1234F1Z5'}),
+          ['Customer Name: Acme Ltd', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+      expect(m.billCustomerLines({'customer': 'Guest', 'customer_gstin': '29ABCDE1234F1Z5'}),
+          ['Customer Name: Guest', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+      expect(m.billCustomerLines({'customer': 'QR Guest', 'customer_gstin': null}), ['Customer Name: Guest']);
+      expect(m.billCustomerLines({'customer': '', 'customer_gstin': ''}), ['Customer Name: Guest']);
+      expect(m.billCustomerLines({'customer': 'Mr Sharma'}), ['Customer Name: Mr Sharma']);
+    });
   });
 
-  group('Edit guest name on the table sheet — 6.5', () {
+  group('Customer GSTIN on a live table — round 2 item 1', () {
+    testWidgets('the name and GSTIN sit at the TOP of the sheet, above the table controls', (tester) async {
+      final api = _FakeApi(customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5', actions: const ['*']);
+      await _openT1(tester, api);
+      expect(_headerName(tester), 'Acme Ltd');
+      expect(find.text('GSTIN 29ABCDE1234F1Z5'), findsOneWidget);
+      final header = tester.getTopLeft(find.byKey(const ValueKey('table-bill-customer-header'))).dy;
+      expect(header, lessThan(tester.getTopLeft(find.text('Split')).dy));
+      expect(header, lessThan(tester.getTopLeft(find.text('Customers scan to order & pay')).dy));
+      // One entry point, not two: the old button in the bill wrap is gone.
+      expect(_button, findsOneWidget);
+      expect(find.textContaining('Edit guest name'), findsNothing);
+    });
+
+    testWidgets('Save sends the GSTIN normalised, then the re-read shows it', (tester) async {
+      final api = _FakeApi(customer: 'Guest', actions: const ['*']);
+      await _openT1(tester, api);
+      expect(_headerGstin, findsNothing);
+      await _openDialog(tester);
+      await tester.enterText(_field, 'Acme Ltd');
+      await tester.enterText(_gstinField, '29 abcde 1234f 1z5');
+      await tester.tap(_save);
+      await tester.pumpAndSettle();
+
+      expect(_nameWrites(api).single.body,
+          {'table_name': 'T1', 'customer': 'Acme Ltd', 'customer_gstin': '29ABCDE1234F1Z5'});
+      expect(_headerName(tester), 'Acme Ltd');
+      expect(find.text('GSTIN 29ABCDE1234F1Z5'), findsOneWidget);
+      expect(find.text("Name updated — this table's bill now prints for Acme Ltd. Customer GSTIN: 29ABCDE1234F1Z5."),
+          findsOneWidget);
+    });
+
+    testWidgets('the dialog opens seeded with the GSTIN already on the bill', (tester) async {
+      final api = _FakeApi(customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5', actions: const ['*']);
+      await _openT1(tester, api);
+      await _openDialog(tester);
+      expect(tester.widget<TextField>(_gstinField).controller!.text, '29ABCDE1234F1Z5');
+    });
+
+    testWidgets('a malformed GSTIN is refused in the box and nothing is written', (tester) async {
+      final api = _FakeApi(customer: 'Guest', actions: const ['*']);
+      await _openT1(tester, api);
+      await _openDialog(tester);
+      await tester.enterText(_gstinField, '29ABCDE1234');
+      await tester.tap(_save);
+      await tester.pumpAndSettle();
+      expect(find.text('GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5'), findsOneWidget);
+      expect(find.text('Name / GSTIN on bill · Table T1'), findsOneWidget, reason: 'the dialog stays open');
+      expect(_nameWrites(api), isEmpty);
+    });
+
+    testWidgets('an emptied GSTIN is sent as null, which clears it', (tester) async {
+      final api = _FakeApi(customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5', actions: const ['*']);
+      await _openT1(tester, api);
+      await _openDialog(tester);
+      await tester.enterText(_gstinField, '  ');
+      await tester.tap(_save);
+      await tester.pumpAndSettle();
+      expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': 'Acme Ltd', 'customer_gstin': null});
+      expect(_headerGstin, findsNothing);
+      expect(find.textContaining('Customer GSTIN removed.'), findsOneWidget);
+    });
+
+    testWidgets('an unchanged GSTIN is not sent at all', (tester) async {
+      final api = _FakeApi(customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5', actions: const ['*']);
+      await _openT1(tester, api);
+      await _openDialog(tester);
+      await tester.enterText(_field, 'Acme Pvt Ltd');
+      await tester.tap(_save);
+      await tester.pumpAndSettle();
+      expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': 'Acme Pvt Ltd'});
+    });
+
+    testWidgets('a server that ignores the GSTIN is called out, not trusted', (tester) async {
+      final api = _FakeApi(customer: 'Guest', actions: const ['*'], answer: _Answer.gstinUnknown);
+      await _openT1(tester, api);
+      await _openDialog(tester);
+      await tester.enterText(_field, 'Acme Ltd');
+      await tester.enterText(_gstinField, '29ABCDE1234F1Z5');
+      await tester.tap(_save);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('The GSTIN was not saved: this server has not finished updating.'), findsOneWidget);
+    });
+
+    testWidgets('the header fits a phone: a long name and a GSTIN beside the button, no overflow', (tester) async {
+      final api = _FakeApi(customer: 'Dr Anantharamakrishnan Venkataraghavan Subramanian Iyer', gstin: '29ABCDE1234F1Z5', actions: const ['*']);
+      await _openT1(tester, api);
+      tester.view.physicalSize = const Size(400, 3000);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(_button, findsOneWidget);
+      expect(find.text('GSTIN 29ABCDE1234F1Z5'), findsOneWidget);
+    });
+
+    testWidgets('a scoped waiter reads the name and GSTIN but cannot edit them', (tester) async {
+      final api = _FakeApi(
+          customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5', actions: const [_addOrders], role: 'waiter', waiterOnly: true);
+      await _openT1(tester, api);
+      expect(_headerName(tester), 'Acme Ltd');
+      expect(find.text('GSTIN 29ABCDE1234F1Z5'), findsOneWidget);
+      expect(_button, findsNothing);
+    });
+  });
+
+  group('Edit name / GSTIN at the top of the table sheet — 6.5', () {
     testWidgets('the dialog opens seeded with the name already on the bill', (tester) async {
       final api = _FakeApi(customer: 'Mr Sharma', actions: const ['*']);
       await _openT1(tester, api);
       expect(_button, findsOneWidget);
-      expect(find.text('Edit guest name · Mr Sharma'), findsOneWidget);
+      expect(_headerName(tester), 'Mr Sharma');
 
       await _openDialog(tester);
-      expect(find.text('Name on bill · Table T1'), findsOneWidget);
+      expect(find.text('Name / GSTIN on bill · Table T1'), findsOneWidget);
       expect(_fieldText(tester), 'Mr Sharma');
     });
 
     testWidgets('an unnamed bill opens EMPTY, not seeded with "Guest"', (tester) async {
       final api = _FakeApi(customer: 'Guest', actions: const ['*']);
       await _openT1(tester, api);
-      expect(find.text('Edit guest name'), findsOneWidget);
+      expect(_headerName(tester), 'No guest name on the bill');
       await _openDialog(tester);
       expect(_fieldText(tester), '');
     });
@@ -243,7 +402,7 @@ void main() {
           reason: 'the bill is re-read so the preview and the print carry the new name');
       expect(find.text("Name updated — this table's bill now prints for Mr Sharma."), findsOneWidget);
       // The re-read reached the sheet.
-      expect(find.text('Edit guest name · Mr Sharma'), findsOneWidget);
+      expect(_headerName(tester), 'Mr Sharma');
     });
 
     testWidgets('Cancel writes nothing', (tester) async {
@@ -269,7 +428,7 @@ void main() {
 
       expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': ''});
       expect(find.text('Name cleared — the bill will print without a guest name.'), findsOneWidget);
-      expect(find.text('Edit guest name'), findsOneWidget);
+      expect(_headerName(tester), 'No guest name on the bill');
     });
 
     testWidgets('the box stops at 120 characters, and 120 is what is sent', (tester) async {
@@ -293,7 +452,7 @@ void main() {
       await tester.tap(_save);
       await tester.pumpAndSettle();
       expect(find.text('This table has no running orders to name.'), findsOneWidget);
-      expect(find.text('Edit guest name · Mr Sharma'), findsOneWidget, reason: 'nothing changed');
+      expect(_headerName(tester), 'Mr Sharma', reason: 'nothing changed');
     });
 
     testWidgets('a server without the route says so, in the web\'s words', (tester) async {
@@ -336,7 +495,7 @@ void main() {
       final api = _FakeApi(customer: 'Mr Sharma', actions: const [_addOrders], role: 'waiter', waiterOnly: true);
       await _openT1(tester, api);
       expect(_button, findsNothing);
-      expect(find.textContaining('Edit guest name'), findsNothing);
+      expect(find.textContaining('Edit name / GSTIN'), findsNothing);
     });
   });
 }
