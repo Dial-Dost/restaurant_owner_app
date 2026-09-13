@@ -9563,6 +9563,9 @@ class _TableSheetState extends State<_TableSheet> {
               ],
             ]),
             const SizedBox(height: 16),
+            // 6.7 — "Add order" and "Print bill" live HERE, above the QR, the
+            // orders and the bill, at hero size. See [_orderAndPrintActions].
+            ..._orderAndPrintActions(messenger, text),
             // ITEM 17: THE GUEST QR IS GONE FOR A WAITER, and this is the whole
             // of why the two controls they came here for can be at the top —
             // the code, its URL and "Print QR" were 250-odd vertical pixels of
@@ -9790,18 +9793,9 @@ class _TableSheetState extends State<_TableSheet> {
                 // already sat beside them. Every one of them changes or
                 // re-presents what the guest owes.
                 //
-                // "Print bill" is in this list for the same reason it is NOT in
-                // it for a waiter: item 17 promotes theirs to the top of the
-                // sheet at full size. Nobody loses the action.
-                if (_scope.billOps)
-                ForkButton.ghost(
-                  // Preview the receipt first, then print via the server (unified
-                  // ESC/POS format → thermal printer agent), matching the web bill.
-                  label: 'Print bill',
-                  icon: Icons.receipt_long,
-                  dense: true,
-                  onPressed: () => _previewBill(messenger),
-                ),
+                // "Print bill" used to lead this list. 6.7 moved it, with the
+                // same gate and the same preview-first handler, to the top of the
+                // sheet beside "Add order" — see [_orderAndPrintActions].
                 // Comping is a MANAGER act (migration 034's own permission), and
                 // for a manager this is unchanged: dimmed and SAYING SO IN ITS
                 // OWN LABEL when they lack the permission, because this button
@@ -9881,72 +9875,11 @@ class _TableSheetState extends State<_TableSheet> {
               if (_scope.settle && _bill!['payment_status'] == 'pending_approval')
                 _paymentReview(messenger),
             ],
-            const SizedBox(height: 20),
-            const SectionHeader(title: 'Actions'),
-
-            // ---- ITEM 17: THE TWO CONTROLS A WAITER CAME HERE FOR ----------
-            //
-            // This is the busiest screen in the app, and for a waiter it now
-            // opens on the two things they do at a table: take the order, and
-            // print the bill. Full width, full size, first — where the QR block
-            // used to be. Everything a waiter has lost from this sheet (the QR,
-            // the assign-waiter row, the bill card, the eight bill controls, the
-            // seat/settle/release/edit/delete row) is what makes room for them.
-            //
-            // ADD ORDER SHOWS WHETHER OR NOT THE TABLE IS OCCUPIED — item 16.
-            // A waiter has no "seat guests" button any more, so placing the
-            // order is how a table starts. POST /orders provisions the seating
-            // server-side; nothing here has to be pressed first.
-            if (!_scope.seat) ...[
-              SizedBox(
-                width: double.infinity,
-                child: ForkButton(
-                  key: const ValueKey('table-add-order'),
-                  label: 'Add order',
-                  icon: Icons.add,
-                  onPressed: _addOrder,
-                ),
-              ),
-              // Nothing to print until something has been ordered — an empty
-              // table has no bill, and a button that answers "No open bill to
-              // print for this table" is a button that wasted a walk.
-              //
-              // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME. Once this
-              // waiter has printed, the control is gone and a sentence stands
-              // where it was. The sentence is not decoration — a waiter handed a
-              // blank space where a button was will go and press it on the next
-              // tablet, and a guest asking for their bill again needs to hear
-              // what happens next rather than watch somebody prod a dead screen.
-              if (_occupied) ...[
-                const SizedBox(height: 10),
-                if (_printScope.print)
-                  SizedBox(
-                    width: double.infinity,
-                    child: ForkButton.ghost(
-                      key: const ValueKey('table-print-bill'),
-                      label: 'Print bill',
-                      icon: Icons.receipt_long,
-                      onPressed: () => _printBillWithoutPreview(messenger),
-                    ),
-                  )
-                else
-                  ForkCard(
-                    key: const ValueKey('table-print-spent'),
-                    inset: true,
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                    child: Row(children: [
-                      Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.textSecondary),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          'Bill printed. A manager reprints it and settles the table '
-                          'from here — ask one if the guest needs another copy.',
-                          style: text.bodySmall,
-                        ),
-                      ),
-                    ]),
-                  ),
-              ],
+            // 6.7: a waiter's Add order / Print bill moved to the top of the
+            // sheet, which leaves them nothing under this heading — so no heading.
+            if (_scope.seat || _scope.editSeating) ...[
+              const SizedBox(height: 20),
+              const SectionHeader(title: 'Actions'),
             ],
 
             // ---- everyone else: the sheet exactly as it shipped -------------
@@ -9965,12 +9898,8 @@ class _TableSheetState extends State<_TableSheet> {
                 ),
               ),
             if (_scope.seat && _occupied) ...[
+              // 6.7: "Add order" moved out of this row to the top of the sheet.
               Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
-                ForkButton.ghost(
-                  label: 'Add order',
-                  icon: Icons.add,
-                  onPressed: _addOrder,
-                ),
                 if (_scope.settle)
                   ForkButton(
                     label: 'Settle bill',
@@ -10121,6 +10050,112 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     widget.reload();
+  }
+
+  /// REQUIREMENT 6.7: "ADD ORDER" AND "PRINT BILL", HIGHER UP AND BIGGER.
+  ///
+  /// These are the two things anyone opens a table's sheet to do while the
+  /// party is ordering, and they used to sit under the Actions heading at the
+  /// very bottom — below every order line, the bill card and the bill controls —
+  /// so on a busy table they were a scroll away. They now lead the sheet,
+  /// directly under the table's name and chips, full width and at
+  /// [kForkButtonLargeHeight].
+  ///
+  /// ONLY THE PLACE AND THE SIZE CHANGED. Each button keeps the gate and the
+  /// handler it had where it came from: a waiter's print is still the direct
+  /// one with requirement C3's one-print rule; a manager's is still the
+  /// preview-first one gated by [FloorScope.billOps]; both open [_addOrder].
+  List<Widget> _orderAndPrintActions(ScaffoldMessengerState messenger, TextTheme text) {
+    Widget full(Widget child) => SizedBox(width: double.infinity, child: child);
+    return [
+      // ---- ITEM 17: THE TWO CONTROLS A WAITER CAME HERE FOR ----------
+      //
+      // This is the busiest screen in the app, and for a waiter it now
+      // opens on the two things they do at a table: take the order, and
+      // print the bill. Full width, full size, first — where the QR block
+      // used to be. Everything a waiter has lost from this sheet (the QR,
+      // the assign-waiter row, the bill card, the eight bill controls, the
+      // seat/settle/release/edit/delete row) is what makes room for them.
+      //
+      // ADD ORDER SHOWS WHETHER OR NOT THE TABLE IS OCCUPIED — item 16.
+      // A waiter has no "seat guests" button any more, so placing the
+      // order is how a table starts. POST /orders provisions the seating
+      // server-side; nothing here has to be pressed first.
+      if (!_scope.seat) ...[
+        full(ForkButton(
+          key: const ValueKey('table-add-order'),
+          label: 'Add order',
+          icon: Icons.add,
+          large: true,
+          onPressed: _addOrder,
+        )),
+        // Nothing to print until something has been ordered — an empty
+        // table has no bill, and a button that answers "No open bill to
+        // print for this table" is a button that wasted a walk.
+        //
+        // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME. Once this
+        // waiter has printed, the control is gone and a sentence stands
+        // where it was. The sentence is not decoration — a waiter handed a
+        // blank space where a button was will go and press it on the next
+        // tablet, and a guest asking for their bill again needs to hear
+        // what happens next rather than watch somebody prod a dead screen.
+        if (_occupied) ...[
+          const SizedBox(height: 10),
+          if (_printScope.print)
+            full(ForkButton.ghost(
+              key: const ValueKey('table-print-bill'),
+              label: 'Print bill',
+              icon: Icons.receipt_long,
+              large: true,
+              onPressed: () => _printBillWithoutPreview(messenger),
+            ))
+          else
+            ForkCard(
+              key: const ValueKey('table-print-spent'),
+              inset: true,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Row(children: [
+                Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.textSecondary),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Bill printed. A manager reprints it and settles the table '
+                    'from here — ask one if the guest needs another copy.',
+                    style: text.bodySmall,
+                  ),
+                ),
+              ]),
+            ),
+        ],
+        const SizedBox(height: 16),
+      ],
+      // ---- everyone else: the same two controls, same gates as shipped ----
+      //
+      // "Add order" came out of the Settle row (occupied tables only — a free
+      // table is still seated first). "Print bill" came out of the bill-ops
+      // wrap and still previews the receipt first, then prints via the server
+      // (unified ESC/POS format → thermal printer agent), matching the web bill.
+      if (_scope.seat && _occupied) ...[
+        full(ForkButton(
+          key: const ValueKey('table-manager-add-order'),
+          label: 'Add order',
+          icon: Icons.add,
+          large: true,
+          onPressed: _addOrder,
+        )),
+        if (_bill != null && _scope.billOps) ...[
+          const SizedBox(height: 10),
+          full(ForkButton.ghost(
+            key: const ValueKey('table-manager-print-bill'),
+            label: 'Print bill',
+            icon: Icons.receipt_long,
+            large: true,
+            onPressed: () => _previewBill(messenger),
+          )),
+        ],
+        const SizedBox(height: 16),
+      ],
+    ];
   }
 
   Future<void> _settle(ScaffoldMessengerState messenger) async {
