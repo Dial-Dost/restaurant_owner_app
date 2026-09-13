@@ -115,6 +115,7 @@ Future<_FakeApi> _mount(
   DesignSystem system = DesignSystem.rustic,
   double width = 1200,
   double height = 4000,
+  bool plan = true,
 }) async {
   await tester.pumpWidget(const SizedBox());
   tester.view.physicalSize = Size(width, height);
@@ -130,10 +131,26 @@ Future<_FakeApi> _mount(
   // tables. Those controls left `tablesModule` (which is now service only: read
   // the floor, open a table, order, print, settle) and live on `floorPlanModule`.
   // Same widget, same data, same assertions — the surface flag is what moved.
-  await tester.pumpWidget(_host(m.floorPlanModule(rest, profile ?? _admin), system));
+  //
+  // REQUIREMENT 2.1 THEN TOOK THE LIVE FLOOR OFF THE LAYOUT SCREEN ("what is seen
+  // in Tables is not shown in the Floor Plan"), so the occupancy states and the
+  // table sheet's service actions below are asserted where they now live —
+  // [_mountTables] — and only the layout groups still open the Floor plan.
+  final profileFor = profile ?? _admin;
+  await tester.pumpWidget(_host(
+      plan ? m.floorPlanModule(rest, profileFor) : m.tablesModule(rest, profileFor), system));
   await tester.pumpAndSettle();
   return api;
 }
+
+/// The SERVICE screen — occupancy states, the table sheet, Move table.
+Future<_FakeApi> _mountTables(
+  WidgetTester tester,
+  Map<String, dynamic> routes, {
+  Profile? profile,
+  DesignSystem system = DesignSystem.rustic,
+}) =>
+    _mount(tester, routes, profile: profile, system: system, plan: false);
 
 Map<String, dynamic> _table(
   String name, {
@@ -377,7 +394,7 @@ void main() {
   // --------------------------------------------------------------- ITEM 11 ---
   group('item 11 — Occupied means an order has been placed', () {
     testWidgets('seated with no order reads SEATED; seated with an order reads OCCUPIED', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: false),
@@ -396,7 +413,7 @@ void main() {
     });
 
     testWidgets('the legend counts the same states the cards paint', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: false),
@@ -411,7 +428,7 @@ void main() {
     });
 
     testWidgets('with nobody waiting, no Seated chip clutters the legend', (tester) async {
-      await _mount(tester, _routes([_table('T1', occupied: true, hasOrder: true, total: 50), _table('T2')]));
+      await _mountTables(tester, _routes([_table('T1', occupied: true, hasOrder: true, total: 50), _table('T2')]));
       expect(find.textContaining('Seated'), findsNothing);
       expect(find.text('1 Occupied'), findsOneWidget);
     });
@@ -419,7 +436,7 @@ void main() {
     testWidgets('an OLDER backend that never sends has_order still reads Occupied', (tester) async {
       // Missing data must degrade to the behaviour that shipped, never to a new
       // claim that nobody in the restaurant has ordered anything.
-      await _mount(tester, _routes([_table('T1', occupied: true)]));
+      await _mountTables(tester, _routes([_table('T1', occupied: true)]));
       expect(_statusChip('Occupied'), findsOneWidget);
       expect(_statusChip('Seated'), findsNothing);
     });
@@ -427,7 +444,7 @@ void main() {
     testWidgets('a SEATED table still offers every seated action, money included', (tester) async {
       // The states are a rendering. The seating is real, so the sheet must not
       // treat a party who has not ordered as an empty table.
-      await _mount(tester, _routes([_table('T1', occupied: true, hasOrder: false, covers: 4)]));
+      await _mountTables(tester, _routes([_table('T1', occupied: true, hasOrder: false, covers: 4)]));
       await _openSheet(tester, 'T1');
       expect(_button('Settle bill'), findsOneWidget);
       expect(_button('Add order'), findsOneWidget);
@@ -439,7 +456,7 @@ void main() {
 
     testWidgets('the three states render under Gaia too', (tester) async {
       await AppearanceController.instance.setDesignSystem(DesignSystem.gaia);
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: false),
@@ -459,7 +476,7 @@ void main() {
     testWidgets('Move table posts ONE call to the transactional route', (tester) async {
       // The whole safety argument is that this screen never composes a sequence
       // of its own: one request, one transaction, everything or nothing.
-      final api = await _mount(
+      final api = await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: true, covers: 2, total: 500),
@@ -486,7 +503,7 @@ void main() {
     testWidgets('an OCCUPIED table is never offered as a move destination', (tester) async {
       // Putting a party onto an occupied table is Merge, and it is a different
       // act with a different effect on the bill.
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: true, covers: 2),
@@ -502,7 +519,7 @@ void main() {
     });
 
     testWidgets('a table the party does not fit is never offered either', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T1', occupied: true, hasOrder: true, covers: 6, capacity: 6),
@@ -518,7 +535,7 @@ void main() {
     testWidgets('Move an order says what the KITCHEN will see before it does it', (tester) async {
       // The kitchen may already hold paper for the wrong table. Saying so in the
       // confirm is what stops a silent move being worse than the mis-key.
-      final api = await _mount(
+      final api = await _mountTables(
         tester,
         _routes([
           _table('T4', occupied: true, hasOrder: true, covers: 2, total: 450),
@@ -562,7 +579,7 @@ void main() {
     });
 
     testWidgets('several live orders on the real /orders shape open a picker that says what each holds', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([
           _table('T4', occupied: true, hasOrder: true, covers: 2, total: 760),
@@ -602,7 +619,7 @@ void main() {
     });
 
     testWidgets('an UNBARKED order says nothing will print', (tester) async {
-      final api = await _mount(
+      final api = await _mountTables(
         tester,
         _routes([
           _table('T4', occupied: true, hasOrder: true, covers: 2),
@@ -633,7 +650,7 @@ void main() {
     });
 
     testWidgets('a table with no live order says so instead of opening an empty picker', (tester) async {
-      await _mount(
+      await _mountTables(
         tester,
         _routes([_table('T4', occupied: true, hasOrder: false, covers: 2), _table('T7')]),
       );
@@ -645,7 +662,7 @@ void main() {
 
     testWidgets('both moves render, and are reachable, under Gaia', (tester) async {
       await AppearanceController.instance.setDesignSystem(DesignSystem.gaia);
-      await _mount(
+      await _mountTables(
         tester,
         _routes([_table('T1', occupied: true, hasOrder: true, covers: 2), _table('T2')]),
         system: DesignSystem.gaia,

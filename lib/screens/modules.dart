@@ -6501,24 +6501,33 @@ Widget floorPlanModule(RestClient rest, Profile p) => _floorModule(rest, p, Floo
 Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncView<Map<String, dynamic>>(
       load: () async {
         final tables = await rest.getList('/get-tables');
+        // 2.1 — "WHAT IS SEEN IN TABLES IS NOT SHOWN IN THE FLOOR PLAN." Who is
+        // waiting on a table and which booking it is clubbed into are the live
+        // floor, and the layout editor draws neither (see [_TableBox]), so it
+        // does not ask for them either.
+        final live = surface == FloorSurface.service;
         List assignments = const [];
-        try {
-          assignments = await rest.getList('/table-assignments');
-        } catch (_) {/* assignments are optional */}
+        if (live) {
+          try {
+            assignments = await rest.getList('/table-assignments');
+          } catch (_) {/* assignments are optional */}
+        }
         // A clubbed party (T1 + T2) lives on the BOOKING, not on the table, so
         // the floor plan has to fold it in to be able to mark it.
         final clubbed = <String, List<String>>{};
-        try {
-          for (final b in await rest.getList('/get-bookings')) {
-            final status = _s(b as Map, 'status', '').toLowerCase();
-            if (status.contains('cancel') || status.contains('no')) continue;
-            final names = _strList(b['table_names']);
-            if (names.length < 2) continue;
-            for (final n in names) {
-              clubbed[n.toLowerCase()] = names;
+        if (live) {
+          try {
+            for (final b in await rest.getList('/get-bookings')) {
+              final status = _s(b as Map, 'status', '').toLowerCase();
+              if (status.contains('cancel') || status.contains('no')) continue;
+              final names = _strList(b['table_names']);
+              if (names.length < 2) continue;
+              for (final n in names) {
+                clubbed[n.toLowerCase()] = names;
+              }
             }
-          }
-        } catch (_) {/* bookings are optional here */}
+          } catch (_) {/* bookings are optional here */}
+        }
         final byName = <String, Map>{};
         for (final a in assignments) {
           byName[_s(a as Map, 'table_name').toLowerCase()] = a;
@@ -6664,7 +6673,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
         final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
-        final legend = <Widget>[
+        final serviceLegend = <Widget>[
           StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
           // Only when there IS one. A restaurant where every seated table has
           // ordered should not carry a permanent "0 Seated" chip explaining a
@@ -6674,6 +6683,21 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
           StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
           StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
         ];
+        // 2.1 — ON THE FLOOR PLAN THE HEADER READS THE ROOM, NOT THE SERVICE.
+        // "4 Occupied · 23 Free" is the Tables screen's read-out (2.2), and the
+        // requirement is that what Tables shows, the Floor plan does not. The
+        // layout editor counts what it edits: tables and the seats they lay.
+        final layoutLegend = <Widget>[
+          StatusChip(
+              label: '${rows.length} table${rows.length == 1 ? '' : 's'}',
+              color: AppColors.neutral,
+              dense: true),
+          StatusChip(
+              label: '${rows.fold<int>(0, (n, r) => n + (_int((r as Map)['capacity']) ?? 0))} seats',
+              color: AppColors.neutral,
+              dense: true),
+        ];
+        final legend = surface == FloorSurface.plan ? layoutLegend : serviceLegend;
         final legendBelow = MediaQuery.sizeOf(context).width < 620;
         // REQUIREMENTS C7 AND H8 — 'Delete table' lives HERE and nowhere else.
         //
@@ -8193,6 +8217,7 @@ class _TableBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (surface == FloorSurface.plan) return _planTile(context);
     final text = Theme.of(context).textTheme;
     final name = _s(table, 'table_name');
     // `occupied` here is the SEATING — a party is physically at this table —
@@ -8427,6 +8452,148 @@ class _TableBox extends StatelessWidget {
               Text('Tap to manage', style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
           ],
         ),
+      ),
+    );
+  }
+
+  /// THE SAME TABLE, AS A PIECE OF FURNITURE — requirement 2.1.
+  ///
+  /// "In the Floor Plan, users can rearrange, group tables, and modify the
+  /// layout … make sure what is seen in Tables is not shown in the floor plan."
+  ///
+  /// D5 split the CONTROLS across the two screens but left them drawing one
+  /// tile, so the layout editor still repainted the live floor: the Occupied /
+  /// Seated / Reserved / Free chip and its wash, the bill and APC, covers, the
+  /// waiter, the guest OTP, PAID, the outbox badge — and a tap opened the
+  /// service sheet with the running order, the bill and Settle on it. That is
+  /// the Tables screen, twice. On [FloorSurface.plan] the tile is the name and
+  /// the seats, one neutral surface for every table, and a tap opens
+  /// [_PlanTableSheet], which is layout only.
+  ///
+  /// The drag is untouched: [_FloorSections] wraps THIS widget either way.
+  Widget _planTile(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final name = _s(table, 'table_name');
+    final seats = _seatsLabel(table);
+    final canEditSeating = FloorScope.of(profile, surface: FloorSurface.plan).editSeating;
+    return InkWell(
+      key: ValueKey('plan-table-$name'),
+      onTap: () => showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        backgroundColor: AppColors.surface,
+        builder: (_) => _PlanTableSheet(rest: rest, profile: profile, table: table, reload: reload),
+      ),
+      borderRadius: AppRadius.cardAll,
+      child: Container(
+        width: width,
+        constraints: const BoxConstraints(minHeight: 96),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          gradient: AppColors.cardGradient,
+          borderRadius: AppRadius.cardAll,
+          border: Border.all(color: focused ? AppColors.copperHi : AppColors.border, width: focused ? 2 : 1),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
+            if (seats.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              InfoChip(icon: Icons.event_seat_outlined, label: seats),
+            ],
+            const SizedBox(height: 10),
+            Text(canEditSeating ? 'Tap to edit seating' : 'Layout',
+                style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The Floor plan's per-table sheet — requirement 2.1's other half.
+///
+/// What a table IS in the room: its name, its seats and its zone, and the one
+/// per-table layout act, "Edit seating" (PATCH /table/:name {capacity,
+/// max_capacity}). Deliberately nothing the Tables screen shows: no state chip,
+/// no order, no bill, no timers, no waiter, no QR, no Settle. Deleting stays in
+/// the Floor plan header (C7 / H8), and seating a party stays on Tables.
+class _PlanTableSheet extends StatefulWidget {
+  final RestClient rest;
+  final Profile profile;
+  final Map table;
+  final VoidCallback reload;
+  const _PlanTableSheet({required this.rest, required this.profile, required this.table, required this.reload});
+
+  @override
+  State<_PlanTableSheet> createState() => _PlanTableSheetState();
+}
+
+class _PlanTableSheetState extends State<_PlanTableSheet> {
+  late final FloorScope _scope = FloorScope.of(widget.profile, surface: FloorSurface.plan);
+  String get _name => _s(widget.table, 'table_name');
+
+  // The same write the service sheet used to carry, and the same dialog. The
+  // server refuses a table with a party seated on it; its words are shown.
+  Future<void> _editSeating(ScaffoldMessengerState messenger) async {
+    final seats = await showDialog<_TableSeating>(
+      context: context,
+      builder: (_) => _TableSeatingDialog(existing: widget.table),
+    );
+    if (seats == null) return;
+    try {
+      final res = await widget.rest.patch('/table/${Uri.encodeComponent(_name)}', {
+        'capacity': seats.capacity,
+        'max_capacity': seats.maxCapacity,
+      });
+      if (mounted) {
+        setState(() {
+          widget.table['capacity'] = res is Map ? (res['capacity'] ?? seats.capacity) : seats.capacity;
+          widget.table['max_capacity'] =
+              res is Map ? (res['max_capacity'] ?? seats.maxCapacity) : seats.maxCapacity;
+        });
+      }
+      widget.reload();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final messenger = ScaffoldMessenger.of(context);
+    final text = Theme.of(context).textTheme;
+    final seats = _seatsLabel(widget.table);
+    final zone = _s(widget.table, 'section', '').trim();
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Table $_name', style: text.headlineMedium),
+          const SizedBox(height: 10),
+          Wrap(spacing: 6, runSpacing: 6, children: [
+            if (seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: seats),
+            InfoChip(icon: Icons.grid_view, label: zone.isEmpty ? 'Unassigned' : zone),
+          ]),
+          const SizedBox(height: 12),
+          Text('Seating guests, orders and bills are on the Tables screen.',
+              style: text.bodySmall!.copyWith(color: AppColors.textTertiary)),
+          if (_scope.editSeating) ...[
+            const SizedBox(height: 14),
+            Center(
+              child: ForkButton.ghost(
+                key: const ValueKey('plan-edit-seating'),
+                label: 'Edit seating',
+                icon: Icons.event_seat_outlined,
+                dense: true,
+                onPressed: () => _editSeating(messenger),
+              ),
+            ),
+          ],
+        ]),
       ),
     );
   }
@@ -8920,6 +9087,18 @@ class _TableSheetState extends State<_TableSheet> {
     // the server renders, so a settings/profile hiccup must degrade to the old
     // name-only header rather than block the print.
     final headerLines = await _billHeaderLines();
+    // 5.1 — and the LOGO, which this preview never drew. The logo the roll
+    // prints (GET /restaurant/logo/bill: the SVG bill logo or the branding PNG,
+    // fitted and thresholded exactly as the printer gets it), falling back to
+    // the branding PNG on a backend that predates that route. Best-effort like
+    // the header: no logo is a preview without one, never a blocked print.
+    Uint8List? logo;
+    for (final path in const ['/restaurant/logo/bill', '/restaurant/logo']) {
+      try {
+        logo = billLogoBytes(await widget.rest.get(path));
+      } catch (_) {/* none configured, or an older backend */}
+      if (logo != null) break;
+    }
     if (!mounted) return;
     final confirmed = await showDialog<bool>(
       context: context,
@@ -8927,6 +9106,7 @@ class _TableSheetState extends State<_TableSheet> {
         bill: bill!,
         restaurantName: widget.profile.restaurantName,
         headerLines: headerLines,
+        logo: logo,
         tableName: _name,
       ),
     );
@@ -10367,6 +10547,24 @@ class _TableSheetState extends State<_TableSheet> {
 
 }
 
+/// The bill logo as PNG bytes off a `{logo_base64}` response — the shape both
+/// GET /restaurant/logo/bill and GET /restaurant/logo answer with — or null when
+/// there is none or it is not base64. Tolerates a `data:` URL prefix.
+@visibleForTesting
+Uint8List? billLogoBytes(dynamic response) {
+  if (response is! Map) return null;
+  var b64 = '${response['logo_base64'] ?? ''}'.trim();
+  final comma = b64.startsWith('data:') ? b64.indexOf(',') : -1;
+  if (comma >= 0) b64 = b64.substring(comma + 1);
+  if (b64.isEmpty) return null;
+  try {
+    final bytes = base64Decode(b64);
+    return bytes.isEmpty ? null : bytes;
+  } catch (_) {
+    return null;
+  }
+}
+
 /// Receipt-style preview of a table's bill, shown before it is sent to the
 /// thermal printer. Renders the same data web/Flutter already display
 /// (/bill-for-table). Returns `true` from the dialog when the user taps Print.
@@ -10385,11 +10583,16 @@ class _BillPreviewDialog extends StatelessWidget {
   // ones this tenant has. Empty for a tenant that has set none, in which case
   // the header is just the trading name — same as before these fields existed.
   final List<String> headerLines;
+
+  /// The bill logo as PNG bytes, or null when the tenant has none. See
+  /// [billLogoBytes].
+  final Uint8List? logo;
   final String tableName;
   const _BillPreviewDialog({
     required this.bill,
     required this.restaurantName,
     this.headerLines = const <String>[],
+    this.logo,
     required this.tableName,
   });
 
@@ -10478,6 +10681,25 @@ class _BillPreviewDialog extends StatelessWidget {
                 child: DefaultTextStyle(
                   style: const TextStyle(fontSize: 13, height: 1.3, color: Colors.black87),
                   child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    // 5.1 — the logo across the top, where the roll prints it. Up to
+                    // 72px tall and the width of the slip, so a wordmark reads.
+                    if (logo != null) ...[
+                      Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 72),
+                          child: Image.memory(
+                            logo!,
+                            key: const ValueKey('bill-preview-logo'),
+                            fit: BoxFit.contain,
+                            gaplessPlayback: true,
+                            // A logo that will not decode is left off, not drawn
+                            // as a broken-image box on a paper-styled preview.
+                            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                    ],
                     // Header — restaurant + table + optional bill no / customer.
                     Center(
                       child: Text(restaurantName,
@@ -10485,13 +10707,16 @@ class _BillPreviewDialog extends StatelessWidget {
                           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
                     ),
                     // Registered entity, address, GSTIN — only the ones set.
+                    // 5.1: in full ink at body size. They were 11px black54 —
+                    // the faintest type on the sheet, for the lines the
+                    // requirement names as the ones that must be clearly visible.
                     if (headerLines.isNotEmpty) ...[
                       const SizedBox(height: 2),
                       for (final l in headerLines)
                         Center(
                           child: Text(l,
                               textAlign: TextAlign.center,
-                              style: const TextStyle(fontSize: 11, color: inkFaint)),
+                              style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
                         ),
                     ],
                     const SizedBox(height: 2),
