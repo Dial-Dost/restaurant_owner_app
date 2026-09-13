@@ -173,9 +173,9 @@ Widget _host(Widget child) => GaiaScope(
       ),
     );
 
-Future<void> _openT1(WidgetTester tester, _FakeApi api) async {
+Future<void> _openT1(WidgetTester tester, _FakeApi api, {Size size = const Size(1400, 3000)}) async {
   await tester.pumpWidget(const SizedBox());
-  tester.view.physicalSize = const Size(1400, 3000);
+  tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
@@ -296,6 +296,20 @@ void main() {
       expect(_cancel(5), findsOneWidget);
       expect(_cancel(7), findsOneWidget);
       expect(_cancel('none'), findsNothing);
+    });
+
+    testWidgets('fits a phone: headers and Cancel KOT lay out without overflow at 390px',
+        (tester) async {
+      final routes = _routes(orders: _threeOrders);
+      // Target APC off: the Bill card's covers / APC / target APC row under the
+      // blocks is not part of this change and does not fit three four-digit
+      // amounts at 390px on its own.
+      (routes['/bill-for-table'] as Map)['target_apc'] = 0;
+      final api = _FakeApi(routes, actions: const ['*']);
+      await _openT1(tester, api, size: const Size(390, 3000));
+      expect(_header(5), findsOneWidget);
+      expect(_cancel(5), findsOneWidget);
+      expect(tester.takeException(), isNull);
     });
 
     testWidgets('Cancel KOT asks for the reason, voids through the existing route, and refreshes',
