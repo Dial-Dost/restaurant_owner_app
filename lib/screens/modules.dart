@@ -84,6 +84,10 @@ part 'mis_capture.dart';
 // `_cancelOrder`, not copies of them.
 part 'table_kots.dart';
 
+// 6.5 — "Edit guest name" on the table sheet's bill. A part so it is gated
+// through this library's own `_holdsAction` and `_permAddOrders`.
+part 'bill_customer_name.dart';
+
 // Feature modules for the owner app. Each is a builder `(RestClient, Profile) ->
 // Widget` that loads from the live backend via AsyncView and renders the data.
 // Read views for every module; Inventory and Employees also support adding.
@@ -9460,6 +9464,42 @@ class _TableSheetState extends State<_TableSheet> {
     }
   }
 
+  /// 6.5 — change the name printed on this table's bill (POST
+  /// /bills/customer-name), then re-read the bill so the sheet, the preview and
+  /// the next print all carry it. The dialog and its rules live in
+  /// bill_customer_name.dart.
+  Future<void> _editBillCustomerName(ScaffoldMessengerState messenger) async {
+    final name = await _askBillCustomerName(context, tableName: _name, current: _bill?['customer']);
+    if (name == null) return;
+    try {
+      final res = await widget.rest.post('/bills/customer-name', {'table_name': _name, 'customer': name});
+      // The server's answer when it gave one: it normalises again, and `null`
+      // is how it says the name was cleared.
+      final saved = res is Map && res.containsKey('customer') ? '${res['customer'] ?? ''}' : name;
+      messenger.showSnackBar(SnackBar(
+          content: Text(saved.isEmpty
+              ? 'Name cleared — the bill will print without a guest name.'
+              : "Name updated — this table's bill now prints for $saved.")));
+      await _loadBill();
+      widget.reload();
+    } on OfflineUnavailable {
+      // /bills is never queued (see OutboxPolicy.billing), and that family's
+      // sentence is about settling. This is not a settle, so say what it is.
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Changing the name on a bill needs a connection — reconnect and try again.')));
+    } on ApiException catch (e) {
+      // A 404 is the ROUTE missing, not the table (that is a 400 with its own
+      // sentence): the API is a release behind the app. Same wording as the web.
+      messenger.showSnackBar(SnackBar(
+          content: Text(e.status == 404
+              ? 'This server has not finished updating, so the name cannot be changed from here yet. '
+                  'Ask your administrator to complete the update.'
+              : '$e')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
   // Even split: divide the total payable N ways and show each share.
   Future<void> _splitBill(ScaffoldMessengerState messenger) async {
     final ctrl = TextEditingController(text: '2');
@@ -10199,6 +10239,17 @@ class _TableSheetState extends State<_TableSheet> {
                       : null,
                 ),
                 if (_scope.billOps) ...[
+                // 6.5 — first, as on the web: the one control here that is a
+                // CORRECTION rather than a decision. Also needs "Add Orders"; see
+                // [_mayEditBillCustomerName].
+                if (_mayEditBillCustomerName(widget.profile, _scope))
+                ForkButton.ghost(
+                  key: const ValueKey('table-bill-customer-name'),
+                  label: _billCustomerNameLabel(_bill!),
+                  icon: Icons.person_outline,
+                  dense: true,
+                  onPressed: () => _editBillCustomerName(messenger),
+                ),
                 ForkButton.ghost(
                   label: 'Reprint (no service charge)',
                   icon: Icons.money_off,

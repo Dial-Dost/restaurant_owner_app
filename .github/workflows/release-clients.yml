@@ -430,9 +430,32 @@ jobs:
           chmod 600 android/key.properties
           echo "key.properties written"
 
+      # arm64 ONLY, and the size is the reason.
+      #
+      # `flutter build apk --release` builds a FAT apk: 93 MB of native libraries
+      # for three architectures, measured on the 1.9.3 artifact —
+      #
+      #     x86_64        34.3 MB   emulators. No handset on any counter runs it.
+      #     arm64-v8a     32.3 MB   every Android phone since roughly 2017.
+      #     armeabi-v7a   26.5 MB   32-bit devices, pre-2017.
+      #
+      # That 97 MB apk cannot be hosted anywhere the in-app updater can reach it:
+      # GitHub release assets 404 for an unauthenticated client because this repo
+      # is private, and the public object storage the manifest now points at
+      # refuses it as too large. So the fat build is not merely wasteful, it is
+      # the thing that stops an existing install updating itself at all.
+      #
+      # arm64-only lands around 36 MB: it fits, and it halves the download for a
+      # restaurant on a bad connection.
+      #
+      # WHAT THIS GIVES UP, stated rather than discovered: a genuinely 32-bit
+      # Android device can no longer install this apk. If one turns up, the fix
+      # is --split-per-abi and a per-ABI download in the manifest, NOT going back
+      # to a fat build that cannot be distributed.
       - name: flutter build apk
         run: >
           flutter build apk --release
+          --target-platform android-arm64
           --dart-define=BACKEND_URL=${{ env.BACKEND_URL }}
           --dart-define=ORDER_BASE_URL=${{ env.ORDER_BASE_URL }}
 
@@ -684,3 +707,88 @@ jobs:
               echo "> Android client will be offered an update whose download 404s."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # WHERE THE IN-APP UPDATER CAN ACTUALLY REACH THEM.
+      #
+      # A GitHub release asset is NOT a distribution channel for this product.
+      # The repo is private, so an unauthenticated GET returns 404 — and the
+      # updater in lib/services/app_updater.dart carries no token and never
+      # will. The release above is the archive and the audit trail; it is not
+      # the thing a till downloads.
+      #
+      # So each artifact is also pushed to a PUBLIC object-storage bucket, which
+      # is the same storage the menu images and payment proofs already live in.
+      # `app_release.ts` builds its download URLs from exactly this path shape
+      # and pins them to the version, so the manifest and the artifact cannot
+      # drift apart.
+      #
+      # WHY THIS IS NOT THE OLD public/downloads/ ROUTE. That committed ~115 MB
+      # of undeltifiable binary per release into the dashboard repo, whose .git
+      # is 473 MB and paid for by every clone and every deploy, permanently.
+      # Object storage costs the repo nothing.
+      #
+      # NOT `if: always()` — this runs only when the release above succeeded.
+      # Publishing a download for a release that does not exist is how a client
+      # ends up with an artifact nobody can trace back to a tag.
+      - name: Publish the artifacts to public storage (what clients download)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TAG: ${{ needs.gate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_SERVICE_KEY:-}" ]; then
+            echo "::error::SUPABASE_URL / SUPABASE_SERVICE_KEY are not set, so the artifacts"
+            echo "were published to the GitHub release but NOT to public storage."
+            echo "Every client reads the manifest, which points at storage — so nobody"
+            echo "can download this release until those secrets exist and this re-runs."
+            exit 1
+          fi
+
+          # One helper, because the only difference between the two is the
+          # content type. `x-upsert: true` so re-running a release replaces the
+          # object rather than failing on a name collision — the PATH is part of
+          # the manifest contract and must not gain a suffix.
+          put() {
+            local file="$1" name="$2" ctype="$3"
+            [ -f "$file" ] || { echo "  skip $name (not built in this run)"; return 0; }
+            local size; size=$(wc -c < "$file")
+            echo "  uploading $name (${size} bytes) -> app-releases/${TAG}/${name}"
+            local code
+            code=$(curl -sS -m 900 -o /tmp/put.out -w '%{http_code}' \
+              -X POST "${SUPABASE_URL}/storage/v1/object/app-releases/${TAG}/${name}" \
+              -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+              -H "Content-Type: ${ctype}" -H "x-upsert: true" \
+              --data-binary "@${file}")
+            if [ "$code" != "200" ]; then
+              echo "::error::upload of $name failed with HTTP $code: $(head -c 300 /tmp/put.out)"
+              exit 1
+            fi
+          }
+
+          put "dist/${WINDOWS_ASSET}" "${WINDOWS_ASSET}" "application/zip"
+          put "dist/${ANDROID_ASSET}" "${ANDROID_ASSET}" "application/vnd.android.package-archive"
+
+          # PROVE IT ANONYMOUSLY. Uploading with a service key and declaring
+          # success says nothing about whether a till can fetch it — the bucket
+          # could be private and every call above would still return 200. This
+          # is the only check that tests the thing clients actually do.
+          base="${SUPABASE_URL}/storage/v1/object/public/app-releases/${TAG}"
+          for name in "${WINDOWS_ASSET}" "${ANDROID_ASSET}"; do
+            [ -f "dist/${name}" ] || continue
+            code=$(curl -sSL -m 300 -o /dev/null -w '%{http_code}' "${base}/${name}")
+            if [ "$code" != "200" ]; then
+              echo "::error::${name} is not anonymously downloadable (HTTP $code). A client cannot update."
+              exit 1
+            fi
+            echo "  verified public: ${base}/${name}"
+          done
+
+          {
+            echo ""
+            echo "**Downloads clients actually use** (public, no auth):"
+            echo "- \`${base}/${WINDOWS_ASSET}\`"
+            [ -f "dist/${ANDROID_ASSET}" ] && echo "- \`${base}/${ANDROID_ASSET}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
