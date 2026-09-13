@@ -350,7 +350,11 @@ void main() {
       ];
       expect(figures.any((f) => f.contains('₹')), isFalse,
           reason: 'no rupee figure may appear on the reprint confirmation');
-      expect(find.textContaining('still charged the service charge'), findsOneWidget);
+      // 4.1: the dialog states the outcome as a condition — the server removes
+      // the charge only when a waiver is recorded, and says so — rather than the
+      // old sentence this used to pin.
+      expect(find.textContaining('prints WITH the service charge'), findsOneWidget);
+      expect(find.descendant(of: find.byType(AlertDialog), matching: find.textContaining('Waive service charge')), findsOneWidget);
 
       await tester.tap(find.text('Reprint'));
       await tester.pumpAndSettle();
