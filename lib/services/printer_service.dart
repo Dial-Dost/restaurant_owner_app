@@ -66,6 +66,11 @@ class _IoAgentSocket implements AgentSocket {
 /// [listening].
 enum PrinterLink { offline, joining, listening }
 
+/// What /auth/me said about ONE token. [unknown] is everything that is not the
+/// server's word — no connection, a timeout, a 5xx from a proxy mid-restart — and
+/// is never grounds for a sign-out.
+enum _SessionVerdict { alive, expired, unknown }
+
 /// WHERE THE BYTES GO — one printer, named in a way that survives being stored.
 ///
 /// There are two transports and a role has to be able to point at either:
@@ -332,7 +337,13 @@ class PrinterService extends ChangeNotifier {
   bool _subscribed = false;
   Timer? _joinWatchdog;
   int _joinMisses = 0;
-  bool _probingSession = false;
+
+  // The start() — by [_lifecycle] — whose /auth/me probe is in flight, if any.
+  // SCOPED TO THE GENERATION, NOT A BARE FLAG. A probe can outlive the start()
+  // that sent it, and a flag still set across a stop() and start() made every
+  // probe of the NEW connection return early, taking the watchdog with it: a
+  // till left deaf behind an answer about a connection that no longer existed.
+  int? _probingLifecycle;
 
   // The token this connection last introduced itself with — read at handshake
   // time, so a rejection can be checked against the session we hold NOW before
@@ -351,6 +362,7 @@ class PrinterService extends ChangeNotifier {
   AgentSocketFactory _socketFactory = ioSocketFactory;
   Duration _joinAnswerTimeout = const Duration(seconds: 5);
   Duration _keepAliveEvery = const Duration(minutes: 25);
+  Duration _sessionProbeTimeout = const Duration(seconds: 10);
 
   // Re-ask timer. A window can legitimately come back EMPTY while the previous
   // connection's lease is still held, so an empty window must not end the
@@ -427,6 +439,7 @@ class PrinterService extends ChangeNotifier {
     AgentSocketFactory? socketFactory,
     Duration joinAnswerTimeout = const Duration(seconds: 5),
     Duration keepAliveEvery = const Duration(minutes: 25),
+    Duration sessionProbeTimeout = const Duration(seconds: 10),
   }) {
     final s = PrinterService._();
     s._auth = auth;
@@ -435,6 +448,7 @@ class PrinterService extends ChangeNotifier {
     if (socketFactory != null) s._socketFactory = socketFactory;
     s._joinAnswerTimeout = joinAnswerTimeout;
     s._keepAliveEvery = keepAliveEvery;
+    s._sessionProbeTimeout = sessionProbeTimeout;
     s._supportedOverride = supported;
     s._spoolerOverride = spooler ?? supported;
     s._selectedPrinter = printer;
@@ -639,14 +653,12 @@ class PrinterService extends ChangeNotifier {
       final auth = _auth;
       final t = auth?.token;
       if (auth == null || t == null) return;
-      try {
-        await auth.api.me(t);
-      } on ApiException catch (e) {
-        if (e.status == 401) {
-          await _endExpiredSession();
-          return;
-        }
-      } catch (_) {/* transport: says nothing about the session */}
+      final verdict = await _askServer(auth, t);
+      if (verdict == _SessionVerdict.expired && _endExpiredSession(t, generation)) return;
+      // Cancelling the timer does not recall a request already out. One that
+      // lands after a stop() belongs to a start() that is over, and says
+      // nothing about whatever connection is up now.
+      if (generation != _lifecycle) return;
       // A backstop for the watchdog, not a second loop: only ever re-asks while
       // the server has not confirmed the room.
       if (_connected && !_subscribed) _emitJoin();
@@ -818,27 +830,57 @@ class PrinterService extends ChangeNotifier {
   /// while the backend restarts — is not evidence about the session, and a till
   /// on flaky Wi-Fi must never be signed out mid-service over it. Those get a
   /// fresh handshake instead, which is what a close-and-reopen was really doing.
+  ///
+  /// THE ANSWER IS ABOUT THE SESSION THAT ASKED. The request can still be out
+  /// when the agent is stopped and started again — an outlet switch, a network
+  /// printer added, a sign-out and sign-in — and a 401 for the old token used to
+  /// sign the NEW session out and destroy it on the server. A 401 now signs out
+  /// only through [_endExpiredSession]'s check that this start() still holds the
+  /// token it was about; any other answer reconnects only the connection it was
+  /// asked on behalf of.
   Future<void> _probeSession() async {
     final auth = _auth;
     final token = auth?.token;
-    if (auth == null || token == null || _probingSession || _sessionEnded) return;
-    final socket = _socket;
-    _probingSession = true;
-    try {
-      await auth.api.me(token);
-    } on ApiException catch (e) {
-      if (e.status == 401) {
-        _probingSession = false;
-        await _endExpiredSession();
-        return;
-      }
-    } catch (_) {
-      // Transport failure: handled below exactly like a live session.
+    if (auth == null || token == null || _sessionEnded) return;
+    final generation = _lifecycle;
+    if (_probingLifecycle == generation) {
+      // This session's probe is already out, and its answer covers this miss
+      // too. Keep climbing the ladder meanwhile instead of returning with the
+      // watchdog disarmed, so nothing depends on that one answer ever arriving.
+      _armJoinWatchdog();
+      return;
     }
-    _probingSession = false;
-    if (!identical(socket, _socket) || _subscribed || !_started || _sessionEnded) return;
+    final socket = _socket;
+    _probingLifecycle = generation;
+    final verdict = await _askServer(auth, token);
+    if (_probingLifecycle == generation) _probingLifecycle = null;
+    if (verdict == _SessionVerdict.expired && _endExpiredSession(token, generation)) return;
+    // Alive, unreachable, or dead but no longer the token this device holds. The
+    // connection this probe was sent for, if it is still the current one and
+    // still unconfirmed, gets a fresh handshake as the session held NOW. A newer
+    // start() owns its own connection, watchdog and probe, and is left alone.
+    final held = auth.token;
+    if (generation != _lifecycle || _sessionEnded || held == null) return;
+    if (!identical(socket, _socket) || _subscribed || !_started) return;
     _log('Reconnecting to realtime to resume printing');
-    _openSocket(token);
+    _openSocket(held);
+  }
+
+  /// Ask /auth/me about [token], within [_sessionProbeTimeout].
+  ///
+  /// BOUNDED, because ApiClient.me is a bare http.get: a request stuck on a
+  /// half-open connection would otherwise hold the probe — and with it the
+  /// watchdog — for as long as the OS keeps the socket. Running out of time is
+  /// [_SessionVerdict.unknown], exactly like any other transport failure.
+  Future<_SessionVerdict> _askServer(AuthController auth, String token) async {
+    try {
+      await auth.api.me(token).timeout(_sessionProbeTimeout);
+      return _SessionVerdict.alive;
+    } on ApiException catch (e) {
+      return e.status == 401 ? _SessionVerdict.expired : _SessionVerdict.unknown;
+    } catch (_) {
+      return _SessionVerdict.unknown;
+    }
   }
 
   void _onJoinedOutlet(dynamic data) {
@@ -874,20 +916,28 @@ class PrinterService extends ChangeNotifier {
       _openSocket(held);
       return;
     }
-    unawaited(_endExpiredSession());
+    _endExpiredSession(held, _lifecycle);
   }
 
   /// The server has said this session is gone. Send the user back to sign in —
   /// once — exactly as a 401 anywhere else in the app does. HomeShell's teardown
   /// stops this agent, and the next sign-in starts a fresh connection with the
   /// fresh token.
-  Future<void> _endExpiredSession() async {
+  ///
+  /// THE ONE GATE EVERY VERDICT PASSES. [token] is the token the verdict was
+  /// about and [generation] the start() that heard it. If either has moved on,
+  /// the dead session is one this device already let go of — a request can land
+  /// after a sign-out and sign-in — and ending the session it holds NOW would
+  /// sign out a fresh login and destroy it on the server. Returns whether it
+  /// acted, so a caller whose verdict was stale can carry on as if it were not one.
+  bool _endExpiredSession(String token, int generation) {
     final auth = _auth;
-    if (auth == null || auth.token == null || _sessionEnded) return;
+    if (auth == null || _sessionEnded || generation != _lifecycle || auth.token != token) return false;
     _sessionEnded = true;
     _joinWatchdog?.cancel();
     _log('Session expired — sign in again to resume printing');
-    await auth.logout(expired: true);
+    unawaited(auth.logout(expired: true));
+    return true;
   }
 
   /// The app came back to the foreground.

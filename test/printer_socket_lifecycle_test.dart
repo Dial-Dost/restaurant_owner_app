@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -42,6 +43,14 @@ class _FakeApi extends ApiClient {
 
   /// What /auth/me does next: null answers 200; anything else is thrown.
   Object? meFailure;
+
+  /// Per-token answers, consulted before [meFailure] — so a test can hold a
+  /// verdict about one session while a newer session is asked about freely.
+  final Map<String, Object> meFailureFor = <String, Object>{};
+
+  /// A request for this token stays in flight until the test completes it: the
+  /// /auth/me call that is still out when the till is stopped and restarted.
+  final Map<String, Completer<void>> meGate = <String, Completer<void>>{};
   int meCalls = 0;
   final List<String> serverLogouts = <String>[];
 
@@ -55,7 +64,9 @@ class _FakeApi extends ApiClient {
   @override
   Future<Profile> me(String token) async {
     meCalls++;
-    final f = meFailure;
+    final gate = meGate[token];
+    if (gate != null) await gate.future;
+    final f = meFailureFor[token] ?? meFailure;
     if (f != null) throw f;
     return _profile();
   }
@@ -154,6 +165,7 @@ void main() {
   Future<({PrinterService svc, AuthController auth, _FakeApi api, _FakeServer server})> agent({
     List<String>? tokens,
     Duration keepAliveEvery = const Duration(minutes: 25),
+    Duration sessionProbeTimeout = const Duration(seconds: 10),
   }) async {
     final api = _FakeApi(tokens: tokens);
     final auth = AuthController(api: api);
@@ -168,6 +180,7 @@ void main() {
       socketFactory: server.call,
       joinAnswerTimeout: _answer,
       keepAliveEvery: keepAliveEvery,
+      sessionProbeTimeout: sessionProbeTimeout,
     );
     addTearDown(svc.stop);
     return (svc: svc, auth: auth, api: api, server: server);
@@ -442,6 +455,144 @@ void main() {
       await _wait(const Duration(milliseconds: 100));
       expect(a.auth.token, 'token-1');
       expect(a.server.sockets, hasLength(1));
+    });
+  });
+
+  // AN ANSWER IS ABOUT THE SESSION THAT ASKED. /auth/me is an ordinary HTTP call
+  // that can still be out when the agent is stopped and started again — a
+  // sign-out and sign-in, an outlet switch, a network printer added. Its verdict
+  // is about the token it carried and the start() that sent it, and nothing else.
+  group('an old /auth/me answer cannot act on the session that replaced it', () {
+    Future<void> signBackIn(({PrinterService svc, AuthController auth, _FakeApi api, _FakeServer server}) a) async {
+      await a.svc.stop();
+      await a.auth.logout(expired: true);
+      await a.auth.login('Gaia', 'till', 'pw');
+      await a.svc.start(a.auth);
+      a.server.last.serverSends('connect');
+      a.server.last.serverSends('joinedOutlet', {'outletId': 'outlet-1'});
+    }
+
+    test('a late 401 from a probe sent before a restart does not sign the new session out', () async {
+      final a = await agent(tokens: <String>['token-1', 'token-2']);
+      final held = a.api.meGate['token-1'] = Completer<void>();
+      a.api.meFailureFor['token-1'] = ApiException('Unauthorized', 401);
+      await a.svc.start(a.auth);
+      a.server.last.serverSends('connect');
+      await _wait(_answer * 5); // two unanswered joins: the probe goes out, and hangs
+      expect(a.api.meCalls, 1, reason: 'precondition: the probe for token-1 is in flight');
+
+      await signBackIn(a);
+      held.complete(); // token-1's 401 finally lands
+      await pumpEventQueue();
+
+      expect(a.auth.token, 'token-2', reason: 'a verdict on token-1 is not a verdict on token-2');
+      expect(a.api.serverLogouts, <String>['token-1'], reason: 'the fresh sign-in must not be destroyed on the server');
+      expect(a.svc.subscribed, isTrue);
+      expect(a.server.live, hasLength(1));
+    });
+
+    test('a late 401 from a keepalive sent before a restart does not sign the new session out', () async {
+      final a = await agent(tokens: <String>['token-1', 'token-2'], keepAliveEvery: const Duration(milliseconds: 30));
+      final held = a.api.meGate['token-1'] = Completer<void>();
+      a.api.meFailureFor['token-1'] = ApiException('Unauthorized', 401);
+      await a.svc.start(a.auth);
+      a.server.last.serverSends('connect');
+      a.server.last.serverSends('joinedOutlet', {'outletId': 'outlet-1'});
+      await _wait(const Duration(milliseconds: 50));
+      expect(a.api.meCalls, greaterThanOrEqualTo(1), reason: 'precondition: a keepalive for token-1 is in flight');
+
+      await signBackIn(a);
+      held.complete();
+      await pumpEventQueue();
+      await _wait(const Duration(milliseconds: 50)); // token-2's own keepalives answer 200
+
+      expect(a.auth.token, 'token-2');
+      expect(a.api.serverLogouts, <String>['token-1']);
+      expect(a.svc.subscribed, isTrue);
+    });
+
+    test('a 401 about a token replaced within the same start reconnects with the one held now', () async {
+      final a = await agent(tokens: <String>['token-1', 'token-2']);
+      final held = a.api.meGate['token-1'] = Completer<void>();
+      a.api.meFailureFor['token-1'] = ApiException('Unauthorized', 401);
+      await a.svc.start(a.auth);
+      final s = a.server.last;
+      s.serverSends('connect');
+      await _wait(_answer * 5);
+      expect(a.api.meCalls, 1);
+
+      await a.auth.login('Gaia', 'till', 'pw'); // same controller, now holding token-2
+      held.complete();
+      await pumpEventQueue();
+
+      expect(a.auth.token, 'token-2');
+      expect(a.api.serverLogouts, isEmpty);
+      expect(s.disposed, isTrue, reason: 'this connection introduced itself as the dead token-1');
+      expect(a.server.last.handshakeToken, 'token-2');
+      expect(a.server.live, hasLength(1));
+    });
+
+    test('a probe still out across a restart does not leave the new connection deaf', () async {
+      final a = await agent();
+      final held = a.api.meGate['token-1'] = Completer<void>();
+      await a.svc.start(a.auth);
+      a.server.last.serverSends('connect');
+      await _wait(_answer * 5);
+      expect(a.api.meCalls, 1, reason: 'precondition: the probe is out, and hanging');
+
+      // The stop-then-start an outlet switch and addNetworkPrinter both make.
+      await a.svc.stop();
+      await a.svc.start(a.auth);
+      final fresh = a.server.last;
+      fresh.serverSends('connect'); // ...and its join goes unanswered too
+      await _wait(_answer * 5);
+      expect(fresh.joins, 2);
+      expect(a.api.meCalls, 2,
+          reason: 'the new connection checks its own session rather than waiting behind the old probe forever');
+
+      held.complete(); // both answers: 200
+      await pumpEventQueue();
+      expect(a.server.sockets, hasLength(3),
+          reason: "the old probe's answer is dropped; the new one reconnects the connection that is still deaf");
+      expect(fresh.disposed, isTrue);
+      expect(a.server.live, hasLength(1));
+      expect(a.auth.token, 'token-1');
+    });
+
+    test('a probe that never answers is given up on, as no verdict: it reconnects, never signs out', () async {
+      final a = await agent(sessionProbeTimeout: const Duration(milliseconds: 60));
+      final held = a.api.meGate['token-1'] = Completer<void>(); // a request stuck on a half-open connection
+      addTearDown(held.complete);
+      await a.svc.start(a.auth);
+      final first = a.server.last;
+      first.serverSends('connect');
+
+      await _wait(_answer * 7); // probe out at ~120ms, given up on at ~180ms
+      expect(a.api.meCalls, 1);
+      expect(a.auth.token, 'token-1');
+      expect(first.disposed, isTrue, reason: 'the ApiClient call has no timeout of its own; the probe must');
+      expect(a.server.sockets, hasLength(2));
+      expect(a.server.live, hasLength(1));
+    });
+
+    test("a miss that lands while this session's probe is out keeps the ladder climbing", () async {
+      final a = await agent();
+      final held = a.api.meGate['token-1'] = Completer<void>();
+      addTearDown(held.complete);
+      await a.svc.start(a.auth);
+      final s = a.server.last;
+      s.serverSends('connect');
+      await _wait(_answer * 5);
+      expect(a.api.meCalls, 1);
+      expect(s.joins, 2);
+
+      // The window regains focus mid-probe: that re-ask arms the watchdog again,
+      // and its second miss reaches the probe rung while the probe is still out.
+      await a.svc.onResume();
+      expect(s.joins, 3);
+      await _wait(const Duration(milliseconds: 400)); // 40ms, 80ms (probe rung), then 160ms
+      expect(s.joins, greaterThanOrEqualTo(5), reason: 'the skipped probe re-armed the watchdog');
+      expect(a.api.meCalls, 1, reason: 'and did not send a second probe beside the first');
     });
   });
 
