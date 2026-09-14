@@ -31358,7 +31358,31 @@ class _BillIdentityCardState extends State<_BillIdentityCard> {
   }
 }
 
-// Configure the customer feedback form (title, valet gate, categories, review link).
+/// THE FEEDBACK-FORM KEYS AN OWNER ACTUALLY CHANGED, as the save body.
+///
+/// This card used to post the WHOLE form from the state it read when it was
+/// built. Valet parking now has a second editor (web Settings > Feedback form),
+/// and the backend writes feedback settings as a PATCH — so a card opened before
+/// someone flipped valet on the web would, on saving an unrelated welcome-text
+/// edit, have written its stale `valet_enabled` back over theirs. Sending only
+/// what differs from the card's own baseline keeps every other editor's change.
+///
+/// Categories compare as the ordered label list the card edits; keys are derived
+/// from labels exactly as the save always derived them.
+Map<String, dynamic> feedbackSettingsChanges(Map<String, dynamic> baseline, Map<String, dynamic> current) {
+  final out = <String, dynamic>{};
+  for (final key in const ['title', 'subtitle', 'review_url', 'valet_enabled', 'require_image']) {
+    if (baseline[key] != current[key]) out[key] = current[key];
+  }
+  final before = (baseline['categories'] as List?) ?? const [];
+  final after = (current['categories'] as List?) ?? const [];
+  final same = before.length == after.length &&
+      [for (var i = 0; i < before.length; i++) (before[i] as Map)['label'] == (after[i] as Map)['label']].every((b) => b);
+  if (!same) out['categories'] = after;
+  return out;
+}
+
+// Configure the customer feedback form (title, valet parking, categories, review link).
 class _FeedbackSettingsCard extends StatefulWidget {
   final RestClient rest;
   final Map initial;
@@ -31377,6 +31401,27 @@ class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
   late List<TextEditingController> _cats;
   bool _saving = false;
 
+  /// What the form held when it was loaded or last saved — the base the save
+  /// compares against (see [feedbackSettingsChanges]).
+  late Map<String, dynamic> _baseline;
+
+  /// The form as the owner has it now, in save-body shape.
+  Map<String, dynamic> _current() => {
+        'title': _title.text.trim(),
+        'subtitle': _subtitle.text.trim(),
+        'valet_enabled': _valet,
+        'require_image': _requireImage,
+        'review_url': _reviewUrl.text.trim(),
+        'categories': _cats
+            .map((c) => c.text.trim())
+            .where((s) => s.isNotEmpty)
+            .map((label) => {
+                  'label': label,
+                  'key': label.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+$'), ''),
+                })
+            .toList(),
+      };
+
   @override
   void initState() {
     super.initState();
@@ -31391,6 +31436,7 @@ class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
         ? const ['Initial Greeting', 'Waiter Service', 'Food Quality', 'Ambience', 'Restroom', 'Valet Parking']
         : cats.map((e) => _s(e as Map, 'label')).where((s) => s.isNotEmpty).toList();
     _cats = labels.map((s) => TextEditingController(text: s)).toList();
+    _baseline = _current();
   }
 
   @override
@@ -31406,26 +31452,16 @@ class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
 
   Future<void> _save() async {
     final messenger = ScaffoldMessenger.of(context);
+    final current = _current();
+    final changes = feedbackSettingsChanges(_baseline, current);
+    if (changes.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Nothing to save — the feedback form is unchanged.')));
+      return;
+    }
     setState(() => _saving = true);
-    final categories = _cats
-        .map((c) => c.text.trim())
-        .where((s) => s.isNotEmpty)
-        .map((label) => {
-              'label': label,
-              'key': label.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '_').replaceAll(RegExp(r'^_+|_+$'), ''),
-            })
-        .toList();
     try {
-      await widget.rest.post('/restaurant/settings', {
-        'feedback_config': {
-          'title': _title.text.trim(),
-          'subtitle': _subtitle.text.trim(),
-          'valet_enabled': _valet,
-          'require_image': _requireImage,
-          'review_url': _reviewUrl.text.trim(),
-          'categories': categories,
-        },
-      });
+      await widget.rest.post('/restaurant/settings', {'feedback_config': changes});
+      _baseline = current;
       messenger.showSnackBar(const SnackBar(content: Text('Feedback form saved.')));
       widget.reload();
     } catch (e) {
@@ -31476,7 +31512,7 @@ class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
         Text('Customer feedback form', style: text.titleMedium),
         const SizedBox(height: 4),
         Text(
-            'Configure the QR feedback form: title, the valet vehicle gate, rating categories, a review link for happy guests, and whether a photo is required. It is themed with your branding.',
+            'Configure the QR feedback form: title, valet parking, rating categories, a review link for happy guests, and whether a photo is required. It is themed with your branding.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.lg),
         _field('Form title', _title),
@@ -31485,7 +31521,11 @@ class _FeedbackSettingsCardState extends State<_FeedbackSettingsCard> {
         const SizedBox(height: AppSpacing.md),
         _field('Review link for happy guests (Google/TripAdvisor)', _reviewUrl, hint: 'https://…', kb: TextInputType.url),
         const SizedBox(height: AppSpacing.sm),
-        _switchRow('Show valet vehicle gate', 'Ask for the vehicle number before feedback', _valet,
+        // ONE SWITCH FOR THE WHOLE VALET PART of the guest form: the vehicle-number
+        // step AND the "Valet Parking" rating, which the form now hides with valet
+        // off (web src/lib/feedback-form.ts). The same flag the web dashboard's
+        // Settings > Feedback form switch edits.
+        _switchRow('Valet parking', "Ask guests for their vehicle number and to rate valet parking. Off hides both.", _valet,
             (v) => setState(() => _valet = v)),
         _switchRow('Require a photo', 'Force guests to upload an image (off = optional)', _requireImage,
             (v) => setState(() => _requireImage = v)),
