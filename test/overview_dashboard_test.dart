@@ -131,6 +131,35 @@ void _window(WidgetTester tester, double width, [double height = 3000]) {
   addTearDown(tester.view.reset);
 }
 
+/// Live shape of GET /analytics/headline, with today's takings by payment
+/// method. The rows are the server's Settlement Summary cut over today, so they
+/// add up to today_gross (22680.90) and the Cash row is cash_collection.
+Map<String, dynamic> _headline({Map<String, dynamic> over = const {}}) => {
+      'today': '2026-09-14',
+      'month_from': '2026-09-01',
+      'timezone': 'Asia/Kolkata',
+      'today_net': {'value': 20000, 'label': "Today's net sale", 'hint': 'Settled today, after discounts.'},
+      'today_gross': {'value': 22680.9, 'label': "Today's gross sale", 'hint': 'Settled today, tax inclusive.'},
+      'online_net': {'value': 0, 'label': 'Online sale (net)', 'hint': 'Delivery and aggregators.'},
+      'online_gross': {'value': 0, 'label': 'Online sale (gross)', 'hint': 'Delivery and aggregators.'},
+      'cash_collection': {'value': 8430.5, 'label': 'Cash collection', 'hint': 'Cash taken today.'},
+      'month_to_date': {'value': 412000, 'label': 'Month to date', 'hint': 'Gross sales this month.'},
+      'today_bills': 14,
+      'month_bills': 301,
+      'today_by_method': [
+        {'method': 'Upi', 'bills': 6, 'amount': 11000, 'share_pct': 48.5, 'refund': 0, 'net_amount': 11000},
+        {'method': 'Cash', 'bills': 6, 'amount': 8430.5, 'share_pct': 37.17, 'refund': 120, 'net_amount': 8310.5},
+        {'method': 'Card', 'bills': 3, 'amount': 3250.4, 'share_pct': 14.33, 'refund': 0, 'net_amount': 3250.4},
+      ],
+      'today_split_bills': 1,
+      'today_unallocated': 0,
+      'by_method': {
+        'label': 'Collected by payment method',
+        'hint': "Settled today, by how it was paid; adds up to Today's gross sale.",
+      },
+      ...over,
+    };
+
 /// 14 days of revenue — the minimum the week-on-week delta needs — collapsing to
 /// nothing in the last 7, which is the widest the delta line ever prints.
 Map<String, dynamic> _dailySeries() => {
@@ -640,5 +669,196 @@ void main() {
     expect(api.calls, isNot(contains('GET /waitlist')));
     expect(api.calls, isNot(contains('GET /bills/open?limit=1')));
     expect(find.text('Operations'), findsNothing);
+  });
+
+  // ---- TODAY BY PAYMENT METHOD ---------------------------------------------
+  // Client ask: "How much money from each payment method made in the day has to
+  // be shown." The rows ride on /analytics/headline; the server proves they add
+  // up to Today's gross and that the Cash row is Cash collection. What these pin
+  // is that the Overview prints them, prints them verbatim, and prints nothing
+  // when an older server did not send them.
+
+  testWidgets('today by payment method renders one bar per mode inside the headline box', (tester) async {
+    final api = _FakeApi({'/analytics/headline': _headline()});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('COLLECTED BY PAYMENT METHOD'), findsOneWidget);
+    expect(find.text("Settled today, by how it was paid; adds up to Today's gross sale."), findsOneWidget);
+    final bars = tester.widgetList<HBarRow>(find.byType(HBarRow)).where((b) => ['Upi', 'Cash', 'Card'].contains(b.label)).toList();
+    // In the server's order — largest first — with the money at two decimals.
+    expect(bars.map((b) => b.label), ['Upi', 'Cash', 'Card']);
+    expect(bars.map((b) => b.value), ['₹11000.00', '₹8430.50', '₹3250.40']);
+    expect(find.text('6 bill(s) · 48.5%'), findsOneWidget);
+    // The bar is the share of today, not the size against the largest mode.
+    expect(bars[2].fraction, closeTo(3250.4 / 22680.9, 1e-9));
+    // A refund gets its own line, with what survived it.
+    expect(find.text('6 bill(s) · 37.2% · − ₹120.00 refunded · ₹8310.50 net'), findsOneWidget);
+    // And the split note, because the bill counts now add to more than 14.
+    expect(find.textContaining('1 bill(s) paid across more than one method'), findsOneWidget);
+    expect(find.textContaining('could not be put under a payment method'), findsNothing);
+  });
+
+  testWidgets('the Cash row is the Cash collection tile', (tester) async {
+    final api = _FakeApi({'/analytics/headline': _headline()});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    final cashRow = tester.widget<HBarRow>(find.ancestor(of: find.text('Cash'), matching: find.byType(HBarRow)));
+    // The tile prints the same payload value through the same formatter.
+    final tile = find.ancestor(of: find.text('CASH COLLECTION'), matching: find.byType(Column)).first;
+    expect(find.descendant(of: tile, matching: find.text(cashRow.value)), findsOneWidget);
+    expect(cashRow.value, '₹8430.50');
+  });
+
+  testWidgets('an older backend that sends no rows gets no block — not "nothing by any method"', (tester) async {
+    final legacy = _headline()
+      ..remove('today_by_method')
+      ..remove('today_split_bills')
+      ..remove('today_unallocated')
+      ..remove('by_method');
+    final api = _FakeApi({'/analytics/headline': legacy});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    // The headline itself still draws…
+    expect(find.text('Today at a glance'), findsOneWidget);
+    expect(find.text('CASH COLLECTION'), findsOneWidget);
+    // …and the block does not.
+    expect(find.text('COLLECTED BY PAYMENT METHOD'), findsNothing);
+    expect(find.ancestor(of: find.text('Cash'), matching: find.byType(HBarRow)), findsNothing);
+  });
+
+  testWidgets('an empty day or an unlabelled block draws nothing either', (tester) async {
+    for (final over in <Map<String, dynamic>>[
+      {'today_by_method': <dynamic>[], 'today_bills': 0},
+      {'by_method': <String, dynamic>{'label': '  ', 'hint': 'x'}},
+    ]) {
+      final api = _FakeApi({'/analytics/headline': _headline(over: over)});
+      final rest = await _signIn(api);
+      _wideWindow(tester);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Today at a glance'), findsOneWidget);
+      expect(find.text('COLLECTED BY PAYMENT METHOD'), findsNothing, reason: '$over');
+    }
+  });
+
+  testWidgets('money that could not be put under a mode is flagged, in either direction', (tester) async {
+    final api = _FakeApi({
+      '/analytics/headline': _headline(over: {
+        'today_by_method': [
+          {'method': 'Cash', 'bills': 1, 'amount': 1200, 'share_pct': 120, 'refund': 0, 'net_amount': 1200},
+          {'method': 'Unallocated', 'bills': 1, 'amount': -200, 'share_pct': -20, 'refund': 0, 'net_amount': -200},
+        ],
+        'today_gross': {'value': 1000, 'label': "Today's gross sale", 'hint': 'x'},
+        'today_unallocated': -200,
+      }),
+    });
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.textContaining('₹200.00 could not be put under a payment method'), findsOneWidget);
+    final row = tester.widget<HBarRow>(find.ancestor(of: find.text('Unallocated'), matching: find.byType(HBarRow)));
+    expect(row.fraction, 0, reason: 'a negative residual draws no bar');
+  });
+
+  testWidgets('a mode opens its drill-down, which jumps to Accounting when Accounting is reachable', (tester) async {
+    final api = _FakeApi({'/analytics/headline': _headline()});
+    final rest = await _signIn(api);
+    final opened = <String>[];
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      visible: const [..._allVisible, 'Accounting'],
+      openModule: (label, {Map<String, dynamic>? target}) => opened.add('$label:$target'),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Cash'));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('Cash · ₹8430.50'), findsOneWidget);
+    expect(find.text('− ₹120.00'), findsOneWidget);
+    expect(find.text('₹8310.50'), findsOneWidget);
+    expect(find.text('37.2%'), findsOneWidget);
+
+    await tester.tap(find.text('View in Accounting'));
+    await tester.pumpAndSettle();
+    // No focus payload: Accounting takes none, and an unread key would make it
+    // claim the record is missing.
+    expect(opened, ['Accounting:null']);
+    expect(find.byType(Dialog), findsNothing);
+  });
+
+  testWidgets('without Accounting the drill-down still opens but offers no dead jump', (tester) async {
+    final api = _FakeApi({'/analytics/headline': _headline()});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Card'));
+    await tester.pumpAndSettle();
+    expect(find.text('Card · ₹3250.40'), findsOneWidget);
+    expect(find.text('View in Accounting'), findsNothing);
+  });
+
+  testWidgets('the by-method block and its drill-down survive a phone and a raised text scale', (tester) async {
+    for (final width in [360.0, 390.0, 800.0, 1200.0]) {
+      for (final scale in [1.0, 1.3]) {
+        final api = _FakeApi({
+          '/analytics/headline': _headline(over: {
+            'today_by_method': [
+              {'method': 'Eazydiner', 'bills': 1234, 'amount': 98765432.1, 'share_pct': 97.5, 'refund': 12345.67, 'net_amount': 98753086.43},
+              {'method': 'Cash', 'bills': 999, 'amount': 2468013.57, 'share_pct': 2.44, 'refund': 0, 'net_amount': 2468013.57},
+              {'method': 'Unallocated', 'bills': 12, 'amount': 55555.55, 'share_pct': 0.06, 'refund': 0, 'net_amount': 55555.55},
+            ],
+            'today_gross': {'value': 101289001.22, 'label': "Today's gross sale", 'hint': 'x'},
+            'cash_collection': {'value': 2468013.57, 'label': 'Cash collection', 'hint': 'x'},
+            'today_split_bills': 321,
+            'today_unallocated': 55555.55,
+          }),
+        });
+        final rest = await _signIn(api);
+        tester.view.physicalSize = Size(width, 4000);
+        tester.view.devicePixelRatio = 1.0;
+        tester.platformDispatcher.textScaleFactorTestValue = scale;
+        addTearDown(tester.view.reset);
+        addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!), visible: const [..._allVisible, 'Accounting']));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'by-method block at ${width}px / ${scale}x');
+        expect(find.text('COLLECTED BY PAYMENT METHOD'), findsOneWidget);
+
+        await tester.tap(find.text('Eazydiner'));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'by-method drill-down at ${width}px / ${scale}x');
+        await tester.tap(find.text('Close'));
+        await tester.pumpAndSettle();
+      }
+    }
   });
 }

@@ -1215,6 +1215,9 @@ Color _stageColor(String status) {
 ///    month is still inside it.
 ///  * anything else — the six figures, in the order the requirement lists them.
 ///
+/// Under the figures, when the server sent them: today's takings BY PAYMENT
+/// METHOD — see [_headlineByMethod].
+///
 /// [columns] lays the figures out; the call site owns the breakpoints.
 List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2}) {
   // State one. "Not fetched" — which is not "fetched and empty", and is why the
@@ -1307,6 +1310,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   // table does not carry, which is not a word to put in front of an owner.
   final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
   final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone · $offset');
+  final byMethod = _headlineByMethod(context, h, columns: columns);
 
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
@@ -1358,10 +1362,190 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
           const SizedBox(height: AppSpacing.lg),
         ],
         if (figures.isNotEmpty) _dashGrid(figures, columns),
+        if (byMethod != null) ...[
+          const SizedBox(height: AppSpacing.lg),
+          byMethod,
+        ],
       ]),
     ),
     const SizedBox(height: 28),
   ];
+}
+
+/// TODAY BY PAYMENT METHOD, inside the headline box. Client ask: "How much money
+/// from each payment method made in the day has to be shown."
+///
+/// The box could name one mode — Cash — and the per-mode cut lived two modules
+/// deep (Accounting, Reports > Settlement Summary) on a 30-day window. The rows
+/// are `today_by_method` from the SAME `/analytics/headline` payload: the
+/// Settlement Summary's own computation (settlementByMethod) over today's bills,
+/// with a released ₹0 table left out. So the Cash row here IS the Cash
+/// collection tile above it, and the rows add up to Today's gross sale — the
+/// server proves both; this prints them and re-sums nothing. The web
+/// `headline-stats.tsx` draws the same block from the same fields.
+///
+/// NULL — nothing drawn — when the rows are absent (an older backend: "the
+/// server did not say" is not "no money by any method"), when they are empty
+/// (the nothing-settled sentence above already says so), or when the block has
+/// no label (an unnamed list of money — the rule `figure` applies above).
+///
+/// Each row opens a drill-down with a jump to Accounting. Not Reports: the
+/// report pack takes no focus target, so a jump there would land on whichever
+/// report was open last.
+Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
+  final raw = h['today_by_method'];
+  if (raw is! List) return null;
+  final modes = raw.whereType<Map>().where((m) => '${m['method'] ?? ''}'.trim().isNotEmpty).toList();
+  if (modes.isEmpty) return null;
+  final section = h['by_method'];
+  final label = section is Map ? '${section['label'] ?? ''}'.trim() : '';
+  if (label.isEmpty) return null;
+  final hint = section is Map ? '${section['hint'] ?? ''}'.trim() : '';
+
+  final text = Theme.of(context).textTheme;
+  // The server's Today's gross sale — the figure the rows add up to. Summed
+  // here only if a payload somehow carried rows without it.
+  final grossFig = h['today_gross'];
+  final total = (grossFig is Map && grossFig['value'] is num)
+      ? (grossFig['value'] as num).toDouble()
+      : modes.fold<double>(0, (s, m) => s + _numOf(m['amount']));
+  final splitBills = _int(h['today_split_bills']) ?? 0;
+  final unallocated = _numOf(h['today_unallocated']);
+  final today = '${h['today'] ?? ''}';
+
+  // The server's share, else computed; a dash — never 0% — with nothing to
+  // divide by. Same rule as the web's modeSharePct.
+  String shareOf(Map m) {
+    final s = m['share_pct'];
+    if (s is num) return '${s.toStringAsFixed(1)}%';
+    if (!(total > 0)) return '–';
+    return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
+  }
+
+  final rows = <Widget>[];
+  for (final m in modes) {
+    final method = '${m['method']}'.trim();
+    final amount = _numOf(m['amount']);
+    final bills = _int(m['bills']) ?? 0;
+    final refund = _numOf(m['refund']);
+    final share = shareOf(m);
+    final isUnallocated = method == 'Unallocated';
+    rows.add(Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+      HBarRow(
+        label: method,
+        // The mode's SHARE of today, not its size against the largest mode: a
+        // till that took ₹200 by card and ₹20,000 in cash must not draw a card
+        // bar that looks half full.
+        fraction: total > 0 ? (amount / total).clamp(0.0, 1.0) : 0,
+        value: _money(amount),
+        color: isUnallocated ? AppColors.warning : null,
+        tooltip: '$method · ${_money(amount)} · $bills bill(s) · $share of today',
+        onTap: () => _headlineMethodSheet(
+          context,
+          mode: m,
+          share: share,
+          label: label,
+          hint: hint,
+          today: today,
+          splitBills: splitBills,
+        ),
+      ),
+      // The counts go on their own line UNDER the bar, not in HBarRow's `sub`.
+      // That row gives only its label, so a bill count and a share beside the
+      // figure overflowed a 360px phone by 99px once the day ran to eight
+      // digits. A wrapping line cannot, and it is the web block's layout too.
+      Text(
+        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} net' : ''}',
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: text.bodySmall!.copyWith(fontSize: 11),
+      ),
+    ]));
+  }
+
+  return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+    Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+    if (hint.isNotEmpty) ...[
+      const SizedBox(height: 3),
+      Text(hint,
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+    ],
+    const SizedBox(height: AppSpacing.sm),
+    // One across on a phone, two or three on wider windows — the web's
+    // 1 / 2 / 3 grid, keyed off the headline's own column count.
+    _dashGrid(rows, columns >= 6 ? 3 : (columns >= 3 ? 2 : 1)),
+    if (splitBills > 0) ...[
+      const SizedBox(height: AppSpacing.sm),
+      Text(
+        '$splitBills bill(s) paid across more than one method, so the bill counts add up to more than the '
+        'bills settled.',
+        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+      ),
+    ],
+    // LOUD: the one line that means something is wrong. It should always be 0,
+    // and it is wrong in EITHER direction — a split whose parts exceed the bill
+    // books a negative residual.
+    if (unallocated != 0) ...[
+      const SizedBox(height: AppSpacing.sm),
+      Text(
+        "${_money(unallocated.abs())} could not be put under a payment method — those bills' split "
+        'amounts do not add up to their totals and need looking at.',
+        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+      ),
+    ],
+  ]);
+}
+
+/// One mode's drill-down from [_headlineByMethod]: what it took today, what
+/// came back off it, and a jump to Accounting — hidden when Accounting is not
+/// reachable for this user, which [_detailSheet] decides.
+Future<void> _headlineMethodSheet(
+  BuildContext context, {
+  required Map mode,
+  required String share,
+  required String label,
+  required String hint,
+  required String today,
+  required int splitBills,
+}) {
+  final text = Theme.of(context).textTheme;
+  final method = '${mode['method'] ?? ''}'.trim();
+  final refund = _numOf(mode['refund']);
+  final note = TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
+  return _detailSheet(
+    context,
+    eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
+    title: '$method · ${_money(mode['amount'])}',
+    jumpTo: 'Accounting',
+    children: [
+      _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
+      _detailRow(context, "Share of today's gross", share),
+      _detailRow(context, 'Refunds', refund > 0 ? '− ${_money(refund)}' : _money(0)),
+      _detailRow(context, 'Net of refunds', _money(mode['net_amount'])),
+      if (method == 'Unallocated') ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          'Money whose split-payment parts do not add up to the bill total. It should always be zero; '
+          'the bills behind it need looking at.',
+          style: text.bodySmall!.copyWith(color: AppColors.warning),
+        ),
+      ],
+      if (splitBills > 0) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          '$splitBills bill(s) today were paid across more than one method; each part counts under its '
+          'own method.',
+          style: note,
+        ),
+      ],
+      if (hint.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(hint, style: note),
+      ],
+    ],
+  );
 }
 
 /// Quick-insight cards for the Overview tab, built from ONE server read
