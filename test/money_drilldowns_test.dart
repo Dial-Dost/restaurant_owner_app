@@ -502,6 +502,22 @@ void main() {
       expect(find.text('₹5500.00'), findsOneWidget);
     });
 
+    testWidgets('a payment method reads by the label the owner gave it, the one the till shows', (tester) async {
+      // The server attaches `label` beside the stored id (Settings > Payments). A
+      // renamed built-in must not read "Dineout" here while the till says
+      // "Swiggy Dineout".
+      _size(tester, 1200);
+      await _mount(tester, m.accountingModule, _accountingRoutes(byMethod: const [
+        {'method': 'Dineout', 'label': 'Swiggy Dineout', 'sales': 220000.00, 'bills': 40},
+        {'method': 'Upi', 'label': 'UPI', 'sales': 189733.92, 'bills': 60},
+      ]));
+      expect(find.text('Swiggy Dineout'), findsWidgets);
+      expect(find.text('Dineout'), findsNothing);
+      await _tap(tester, find.text('Swiggy Dineout').first);
+      expect(find.text('Share of gross sales'), findsOneWidget);
+      expect(find.text('53.7%'), findsOneWidget);
+    });
+
     testWidgets('a tax rate row opens the base behind it and excludes the service charge',
         (tester) async {
       _size(tester, 1200);

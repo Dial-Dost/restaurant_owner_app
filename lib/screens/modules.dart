@@ -46,6 +46,7 @@ import '../ui/widgets/stat_card.dart';
 import '../ui/widgets/status_chip.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
+import '../models/payment_modes.dart';
 import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
@@ -21599,7 +21600,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
-            _detailRow(context, _s(m, 'method', 'Other'), _money(m['sales']),
+            _detailRow(context, PaymentModes.reportName(m), _money(m['sales']),
                 trailing: _billsWord(_int(m['bills']) ?? 0)),
         ],
       ],
@@ -21703,7 +21704,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     return _detailSheet(
       context,
       eyebrow: 'Payment method · $_windowLabel',
-      title: _s(m, 'method', 'Other'),
+      title: PaymentModes.reportName(m),
       children: [
         _detailRow(context, 'Taken this way', _money(sales)),
         _detailRow(context, 'Share of gross sales', total > 0 ? '${(sales / total * 100).toStringAsFixed(1)}%' : '—'),
@@ -22035,11 +22036,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                 return Column(children: [
                   for (final m in rows)
                     HBarRow(
-                      label: _s(m, 'method', 'Other'),
+                      label: PaymentModes.reportName(m),
                       sub: '${m['bills'] ?? 0} bills',
                       fraction: maxV > 0 ? (_n(m['sales']) / maxV).clamp(0.0, 1.0) : 0,
                       value: money(_n(m['sales'])),
-                      tooltip: '${_s(m, 'method', 'Other')} · ${_money(m['sales'])}',
+                      tooltip: '${PaymentModes.reportName(m)} · ${_money(m['sales'])}',
                       onTap: () => _methodSheet(m),
                     ),
                 ]);
@@ -22168,7 +22169,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                   for (final m in byMethod)
                     DropdownMenuItem<String>(
                       value: _s(m as Map, 'method', ''),
-                      child: Text(_s(m, 'method', 'Other'), overflow: TextOverflow.ellipsis),
+                      child: Text(PaymentModes.reportName(m), overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),
@@ -32586,7 +32587,21 @@ class _BillingControlsCardState extends State<_BillingControlsCard> {
   }
 }
 
-// Currency picker + per-method enable / require-screenshot config.
+// Currency picker + the restaurant's payment modes: switch any on or off, rename
+// any, require a screenshot, offer it on the guest QR page — and ADD ITS OWN.
+//
+// "There has to be an option to add mode of payments, it's not there." This card
+// used to render a closed list of eight and said it chose what GUESTS can use; its
+// switches never reached the till. Now it edits the one list both this app's
+// settle sheet and the web dashboard's pickers read (GET /restaurant/settings
+// `payment_methods`, models/payment_modes.dart):
+//   * A NEW MODE'S NAME IS PERMANENT — it is what every bill settled with it
+//     stores and what reports group by. The LABEL can change any time.
+//   * NOTHING IS DELETED. A mode is switched off; its old bills keep their name.
+//   * Some names are refused (Complimentary / NC / Staff meal: use Mark as
+//     non-chargeable; Credit / Due: no money has arrived; built-ins; report
+//     rows). The server refuses them regardless and its sentence is shown as-is.
+//   * Modes you add are NOT cash: the drawer counts Cash only.
 class _PaymentSettingsCard extends StatefulWidget {
   final RestClient rest;
   final String initialCurrency;
@@ -32602,7 +32617,8 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
   // Mutable (NOT const) — we add the saved currency if it isn't a preset.
   final List<String> _currencies = ['₹', '\$', '€', '£', 'AED', '¥'];
   late String _currency;
-  late List<Map<String, dynamic>> _methods;
+  late List<PaymentMode> _methods;
+  final Map<String, TextEditingController> _labels = {};
   bool _busy = false;
 
   @override
@@ -32610,40 +32626,88 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
     super.initState();
     _currency = widget.initialCurrency.isNotEmpty ? widget.initialCurrency : '₹';
     if (!_currencies.contains(_currency)) _currencies.add(_currency);
-    _methods = widget.initialMethods
-        .map<Map<String, dynamic>>((m) => {
-              'id': '${(m as Map)['id'] ?? ''}',
-              'label': '${m['label'] ?? m['id'] ?? ''}',
-              'enabled': m['enabled'] != false,
-              'requires_screenshot': m['requires_screenshot'] == true,
-              'online': m['online'] == true,
-            })
-        .toList();
+    _adopt(PaymentModes.parse(widget.initialMethods));
   }
 
-  Future<void> _save() async {
+  @override
+  void dispose() {
+    for (final c in _labels.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  /// Take [modes] as the card's list, keeping a label box per mode.
+  void _adopt(List<PaymentMode> modes) {
+    _methods = modes;
+    for (final m in modes) {
+      final c = _labels[m.id];
+      if (c == null) {
+        _labels[m.id] = TextEditingController(text: m.label);
+      } else if (c.text != m.label) {
+        c.text = m.label;
+      }
+    }
+  }
+
+  void _patch(String id, PaymentMode Function(PaymentMode) change) {
+    setState(() => _methods = [for (final m in _methods) m.id == id ? change(m) : m]);
+  }
+
+  /// The list as it is on screen, labels from their boxes.
+  List<PaymentMode> get _current =>
+      [for (final m in _methods) m.copyWith(label: PaymentModes.tidy(_labels[m.id]?.text ?? m.label))];
+
+  String? _labelRefusal(PaymentMode m) =>
+      PaymentModes.labelRefusal(_labels[m.id]?.text ?? m.label, m.id, _current);
+
+  Future<bool> _save({List<PaymentMode>? modes, String message = 'Payment settings saved.'}) async {
+    final list = modes ?? _current;
     setState(() => _busy = true);
     try {
-      await widget.rest.post('/restaurant/settings', {'currency': _currency, 'payment_methods': _methods});
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Payment settings saved.')));
-        widget.reload();
-      }
+      final res = await widget.rest.post('/restaurant/settings', {
+        'currency': _currency,
+        'payment_methods': [for (final m in list) m.toJson()],
+      });
+      if (!mounted) return true;
+      setState(() => _adopt(res is Map && res['payment_methods'] is List ? PaymentModes.parse(res['payment_methods']) : list));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      widget.reload();
+      return true;
     } catch (e) {
+      // A refused save names every problem (a reserved name, a clash…) — as-is.
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      return false;
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  Future<void> _addMode() async {
+    // The dialog OWNS its text controller (see _AddPaymentModeDialog): disposing
+    // one here, the moment showDialog returns, pulls it out from under the
+    // TextField while the dialog is still animating closed.
+    final draft = await showDialog<({String name, bool requiresScreenshot, bool showToGuests})>(
+      context: context,
+      builder: (_) => _AddPaymentModeDialog(existing: _current),
+    );
+    if (draft == null || !mounted) return;
+    final next = PaymentModes.withCustom(_current,
+        name: draft.name, requiresScreenshot: draft.requiresScreenshot, showToGuests: draft.showToGuests);
+    await _save(modes: next, message: '${PaymentModes.tidy(draft.name)} can now be chosen when settling a bill.');
+  }
+
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    final refusals = [for (final m in _methods) ?_labelRefusal(m)];
     return ForkCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Text('Payments & currency', style: text.titleMedium),
         const SizedBox(height: 4),
-        Text('Choose currency + which payment methods guests can use (and whether a screenshot is required).',
+        Text(
+            'Payment modes offered at the till and on the guest QR page. Add your own, rename any, '
+            'or switch one off — a switched-off mode can’t be used for new payments, and past bills keep their mode.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.lg),
         Row(children: [
@@ -32666,65 +32730,199 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
           ),
         ]),
         const Divider(height: 24),
-        Text('PAYMENT METHODS', style: text.labelSmall),
+        Text('PAYMENT MODES', style: text.labelSmall),
         const SizedBox(height: 6),
         for (final m in _methods)
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Column(key: ValueKey('payment-mode-row-${m.id}'), crossAxisAlignment: CrossAxisAlignment.start, children: [
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 6),
               child: Row(children: [
                 Expanded(
-                  child: Row(children: [
-                    Flexible(
-                      child: Text('${m['label']}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.bodyMedium!.copyWith(
-                              color: m['enabled'] == true ? AppColors.textPrimary : AppColors.textSecondary)),
+                  child: TextField(
+                    key: ValueKey('payment-mode-label-${m.id}'),
+                    controller: _labels[m.id],
+                    maxLength: PaymentModes.labelMax,
+                    enabled: !_busy,
+                    onChanged: (_) => setState(() {}),
+                    style: text.bodyMedium!.copyWith(
+                        color: m.enabled ? AppColors.textPrimary : AppColors.textSecondary),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      counterText: '',
+                      hintText: PaymentModes.fallback.where((d) => d.id == m.id).firstOrNull?.label ?? m.id,
                     ),
-                    if (m['online'] == true) ...[
-                      const SizedBox(width: 8),
-                      const InfoChip(icon: Icons.bolt, label: 'online'),
-                    ],
-                  ]),
+                  ),
                 ),
+                if (m.custom) ...[
+                  const SizedBox(width: 8),
+                  const InfoChip(icon: Icons.add_card_outlined, label: 'added'),
+                ],
+                if (m.online) ...[
+                  const SizedBox(width: 8),
+                  const InfoChip(icon: Icons.bolt, label: 'online'),
+                ],
                 const SizedBox(width: AppSpacing.md),
                 SizedBox(
                   height: 24,
                   child: FittedBox(
                     fit: BoxFit.contain,
-                    child: Switch(value: m['enabled'] == true, onChanged: (v) => setState(() => m['enabled'] = v)),
+                    child: Switch(
+                        key: ValueKey('payment-mode-enabled-${m.id}'),
+                        value: m.enabled,
+                        onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(enabled: v))),
                   ),
                 ),
               ]),
             ),
-            if (m['enabled'] == true && m['online'] != true)
+            if (_labelRefusal(m) != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 4),
+                child: Text(_labelRefusal(m)!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            if (m.custom || PaymentModes.tidy(_labels[m.id]?.text ?? '') != m.id)
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 2),
+                child: Text('Stored on bills as “${m.id}”${m.enabled ? '' : ' · switched off'}',
+                    style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+              ),
+            if (m.enabled && !m.online)
               Padding(
                 padding: const EdgeInsets.only(left: 16, bottom: 4),
-                child: Row(children: [
-                  Checkbox(
-                    value: m['requires_screenshot'] == true,
-                    visualDensity: VisualDensity.compact,
-                    activeColor: AppColors.copper,
-                    checkColor: AppColors.onCopper,
-                    side: BorderSide(color: AppColors.borderStrong),
-                    onChanged: (v) => setState(() => m['requires_screenshot'] = v ?? false),
-                  ),
-                  Text('Require payment screenshot', style: text.bodySmall),
+                child: Wrap(spacing: 12, children: [
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    Checkbox(
+                      value: m.requiresScreenshot,
+                      visualDensity: VisualDensity.compact,
+                      activeColor: AppColors.copper,
+                      checkColor: AppColors.onCopper,
+                      side: BorderSide(color: AppColors.borderStrong),
+                      onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(requiresScreenshot: v ?? false)),
+                    ),
+                    Text('Require payment screenshot', style: text.bodySmall),
+                  ]),
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    Checkbox(
+                      value: m.showToGuests,
+                      visualDensity: VisualDensity.compact,
+                      activeColor: AppColors.copper,
+                      checkColor: AppColors.onCopper,
+                      side: BorderSide(color: AppColors.borderStrong),
+                      onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(showToGuests: v ?? false)),
+                    ),
+                    Text('Show on guest QR page', style: text.bodySmall),
+                  ]),
                 ]),
               ),
           ]),
         const SizedBox(height: AppSpacing.md),
-        Align(
-          alignment: Alignment.centerRight,
-          child: ForkButton(
+        Wrap(alignment: WrapAlignment.spaceBetween, spacing: 8, runSpacing: 8, children: [
+          ForkButton.ghost(
+            key: const ValueKey('payment-mode-open-add'),
+            label: 'Add payment mode',
+            icon: Icons.add,
+            dense: true,
+            onPressed: _busy ? null : _addMode,
+          ),
+          ForkButton(
             label: _busy ? 'Saving…' : 'Save payments & currency',
             icon: Icons.save_outlined,
             dense: true,
-            onPressed: _busy ? null : _save,
+            // A label the server would refuse is said beside its box, not after a round trip.
+            onPressed: (_busy || refusals.isNotEmpty) ? null : _save,
           ),
-        ),
+        ]),
       ]),
+    );
+  }
+}
+
+/// "Add payment mode": a name, whether it needs a screenshot, whether guests see
+/// it. The name is checked against the same rules the server applies, live, so
+/// the owner reads why "Complimentary" is not a payment mode before pressing Add.
+class _AddPaymentModeDialog extends StatefulWidget {
+  const _AddPaymentModeDialog({required this.existing});
+
+  final List<PaymentMode> existing;
+
+  @override
+  State<_AddPaymentModeDialog> createState() => _AddPaymentModeDialogState();
+}
+
+class _AddPaymentModeDialogState extends State<_AddPaymentModeDialog> {
+  final TextEditingController _name = TextEditingController();
+  bool _needsShot = false;
+  bool _showGuests = false;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final refusal = _name.text.trim().isEmpty ? null : PaymentModes.newModeRefusal(_name.text, widget.existing);
+    return AlertDialog(
+      title: const Text('Add payment mode'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            TextField(
+              key: const ValueKey('payment-mode-name'),
+              controller: _name,
+              autofocus: true,
+              maxLength: PaymentModes.idMax,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: 'Name',
+                hintText: 'e.g. Swiggy Dineout, Magicpin, HDFC card machine',
+              ),
+            ),
+            if (refusal != null)
+              Text(refusal,
+                  key: const ValueKey('payment-mode-refusal'),
+                  style: text.bodySmall!.copyWith(color: AppColors.danger)),
+            CheckboxListTile(
+              key: const ValueKey('payment-mode-screenshot'),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _needsShot,
+              onChanged: (v) => setState(() => _needsShot = v ?? false),
+              title: const Text('Require payment screenshot'),
+            ),
+            CheckboxListTile(
+              key: const ValueKey('payment-mode-guests'),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _showGuests,
+              onChanged: (v) => setState(() => _showGuests = v ?? false),
+              title: const Text('Show on guest QR page'),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'The name is permanent — it is what bills and reports record — but the label can be '
+              'changed later. Modes you add count as non-cash: the cash drawer counts Cash only. '
+              'For free food use "Mark as non-chargeable" on the bill, not a payment mode.',
+              style: text.bodySmall,
+            ),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          key: const ValueKey('payment-mode-add'),
+          onPressed: (_name.text.trim().isEmpty || refusal != null)
+              ? null
+              : () => Navigator.pop(
+                    context,
+                    (name: _name.text, requiresScreenshot: _needsShot, showToGuests: _showGuests),
+                  ),
+          child: const Text('Add'),
+        ),
+      ],
     );
   }
 }
