@@ -6,6 +6,7 @@ import 'package:restaurant_owner_app/models/profile.dart';
 import 'package:restaurant_owner_app/screens/modules.dart' as m;
 import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
+import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
@@ -847,8 +848,13 @@ void main() {
     expect(row.fraction, 0, reason: 'a negative residual draws no bar');
   });
 
-  testWidgets('a mode opens its drill-down, which jumps to Accounting when Accounting is reachable', (tester) async {
-    final api = _FakeApi({'/analytics/headline': _headline()});
+  testWidgets('a mode opens its drill-down, which jumps to Accounting ON THAT DAY', (tester) async {
+    // The day the headline is about is the device's today here — the ordinary
+    // tap. Accounting was last on 30 days, as it is on a first visit.
+    DateRangeMemory.reset();
+    addTearDown(DateRangeMemory.reset);
+    DateRangeMemory.remember('accounting', DateRange.fromPreset(RangePreset.last30));
+    final api = _FakeApi({'/analytics/headline': _headline(over: {'today': todayKey()})});
     final rest = await _signIn(api);
     final opened = <String>[];
     _wideWindow(tester);
@@ -868,12 +874,49 @@ void main() {
     expect(find.text('₹8310.50'), findsOneWidget);
     expect(find.text('37.2%'), findsOneWidget);
 
+    // Looking is not jumping: closing the sheet leaves Accounting's window alone.
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+    expect(DateRangeMemory.of('accounting').preset, RangePreset.last30);
+    expect(opened, isEmpty);
+
+    await tester.tap(find.text('Cash'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('View in Accounting'));
     await tester.pumpAndSettle();
     // No focus payload: Accounting takes none, and an unread key would make it
     // claim the record is missing.
     expect(opened, ['Accounting:null']);
     expect(find.byType(Dialog), findsNothing);
+    // And it opens on TODAY — not the 30 days it was on, where its Cash bar is a
+    // month of cash beside the day's ₹8430.50 the owner just tapped. The Today
+    // PRESET, so it moves with the calendar past midnight like any other Today.
+    expect(DateRangeMemory.of('accounting'), DateRange.fromPreset(RangePreset.today));
+  });
+
+  testWidgets("a headline whose day is not the device's day pins Accounting to the headline's day", (tester) async {
+    // The device has crossed midnight (or sits in another zone) while the sheet
+    // still names the server's day. Landing on the device's Today would put a
+    // different day's figures behind the jump.
+    DateRangeMemory.reset();
+    addTearDown(DateRangeMemory.reset);
+    final serverDay = addDaysToKey(todayKey(), -1);
+    final api = _FakeApi({'/analytics/headline': _headline(over: {'today': serverDay})});
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(
+      m.overviewModule(rest, rest.auth.profile!),
+      visible: const [..._allVisible, 'Accounting'],
+      openModule: (label, {Map<String, dynamic>? target}) {},
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Upi'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('View in Accounting'));
+    await tester.pumpAndSettle();
+    expect(DateRangeMemory.of('accounting'), DateRange(from: serverDay, to: serverDay, preset: RangePreset.custom));
   });
 
   testWidgets('without Accounting the drill-down still opens but offers no dead jump', (tester) async {

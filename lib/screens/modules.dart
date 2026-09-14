@@ -986,6 +986,10 @@ Widget _recordHeadRow(
 // eyebrow, title, scrolling body and an optional "View in <Module>" jump. The
 // jump is hidden outright when that module is not reachable for this user,
 // rather than offering a control that would no-op.
+//
+// [beforeJump] runs only when the jump is actually taken, just before the shell
+// switches module — the place to set up the destination (its reporting window,
+// say) without touching it when the sheet is merely closed.
 Future<void> _detailSheet(
   BuildContext context, {
   required String eyebrow,
@@ -993,6 +997,7 @@ Future<void> _detailSheet(
   required List<Widget> children,
   String? jumpTo,
   Map<String, dynamic>? jumpTarget,
+  VoidCallback? beforeJump,
 }) {
   final nav = ModuleNavigator.of(context);
   final canJump = jumpTo != null && (nav?.canOpen(jumpTo) ?? false);
@@ -1042,6 +1047,7 @@ Future<void> _detailSheet(
                       dense: true,
                       onPressed: () {
                         Navigator.pop(ctx);
+                        beforeJump?.call();
                         nav!.openModule(jumpTo, target: jumpTarget);
                       },
                     ),
@@ -1409,6 +1415,9 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final total = (grossFig is Map && grossFig['value'] is num)
       ? (grossFig['value'] as num).toDouble()
       : modes.fold<double>(0, (s, m) => s + _numOf(m['amount']));
+  // Bills paid by MORE THAN ONE REAL MODE — which is all the note below claims.
+  // The server leaves out a 'Split' bill whose only other part is the
+  // Unallocated residual: that bill was paid one way and belongs to the warning.
   final splitBills = _int(h['today_split_bills']) ?? 0;
   final unallocated = _numOf(h['today_unallocated']);
   // Bills whose split parts did not add back — the Unallocated row's own count.
@@ -1513,9 +1522,31 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   ]);
 }
 
+/// The Accounting window the by-method drill-down jumps to: the day the sheet
+/// was about.
+///
+/// The SERVER's day, not the device's. The sheet names `today` off the headline
+/// payload, and a till whose clock has already crossed midnight — or that sits
+/// in another zone — must not land on a different day from the one it printed.
+/// When the two agree, which is every ordinary tap, it is stored as the Today
+/// PRESET, so coming back to Accounting after midnight moves with the calendar
+/// like any other Today; when they do not, the server's day is pinned.
+///
+/// What still differs on that day is Accounting's card, not the window: its
+/// "By payment method" is /reports/sales by_method, which has no Unallocated
+/// row and takes no refunds off. So its bar matches this sheet's Collected on
+/// every bill whose split parts add up — production holds no split that does
+/// not — and a bad split's residual is on this sheet alone. Routing that card through
+/// settlementByMethod too is its own change: it moves an existing report.
+DateRange _headlineAccountingWindow(String serverToday) {
+  final device = DateRange.fromPreset(RangePreset.today);
+  if (!isDayKey(serverToday) || serverToday == device.from) return device;
+  return DateRange(from: serverToday, to: serverToday, preset: RangePreset.custom);
+}
+
 /// One mode's drill-down from [_headlineByMethod]: what it took today, what
-/// came back off it, and a jump to Accounting — hidden when Accounting is not
-/// reachable for this user, which [_detailSheet] decides.
+/// came back off it, and a jump to Accounting on that same day — hidden when
+/// Accounting is not reachable for this user, which [_detailSheet] decides.
 Future<void> _headlineMethodSheet(
   BuildContext context, {
   required Map mode,
@@ -1534,6 +1565,13 @@ Future<void> _headlineMethodSheet(
     eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
     title: '$method · ${_money(mode['amount'])}',
     jumpTo: 'Accounting',
+    // Land on THIS DAY. Accounting opens on the window it last showed — Last 30
+    // days on a first visit — and its Cash bar there is a month of cash beside
+    // the day's figure the owner just tapped. A remembered window rather than a
+    // focus request: Accounting reads no focus, and a request left parked on
+    // the shell would reset the window again on the next remount, after the
+    // owner had moved the chip themselves.
+    beforeJump: () => DateRangeMemory.remember('accounting', _headlineAccountingWindow(today)),
     children: [
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
