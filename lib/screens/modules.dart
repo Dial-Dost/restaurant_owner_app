@@ -19207,9 +19207,25 @@ class _AnalyticsModule extends StatefulWidget {
 class _AnalyticsModuleState extends State<_AnalyticsModule> {
   DateRange _range = DateRangeMemory.of('analytics');
 
-  void _setRange(DateRange next) {
-    setState(() => _range = next);
+  // Section headers that carry their own copy of the date chip (Kitchen,
+  // Attendance, Actionable insights). The body remounts on a new window and
+  // comes back at the top, so the header whose chip was used is scrolled back
+  // into view once it has painted. Keys live HERE, not in the body, so they
+  // survive that remount.
+  final _reveal = _SectionReveal();
+
+  void _setRange(DateRange next, {String? revealSection}) {
+    setState(() {
+      _range = next;
+      _reveal.ask(revealSection);
+    });
     DateRangeMemory.remember('analytics', next);
+  }
+
+  @override
+  void dispose() {
+    _reveal.scroll.dispose();
+    super.dispose();
   }
 
   @override
@@ -19225,7 +19241,44 @@ class _AnalyticsModuleState extends State<_AnalyticsModule> {
       range,
       _setRange,
       key: ValueKey('analytics-${range.from}-${range.to}'),
+      sectionRange: (section) => SectionRangeChip(
+        value: range,
+        onChanged: (r) => _setRange(r, revealSection: section),
+      ),
+      reveal: _reveal,
     );
+  }
+}
+
+/// Which Analytics section asked for the current window, where each one is, and
+/// where the page was scrolled when it asked.
+class _SectionReveal {
+  final Map<String, GlobalKey> _keys = {};
+
+  /// Owned by the module state (which disposes it), handed to every remount of
+  /// the body's list, so the offset can be read before the remount and restored
+  /// after it.
+  final ScrollController scroll = ScrollController();
+  String? _pending;
+  double? _offset;
+
+  GlobalKey keyFor(String section) =>
+      _keys.putIfAbsent(section, () => GlobalKey(debugLabel: 'analytics-$section'));
+
+  /// A chip picked a window. Null = the top chip, which asks for nothing.
+  void ask(String? section) {
+    _pending = section;
+    _offset = section != null && scroll.hasClients ? scroll.offset : null;
+  }
+
+  /// Called while the body builds: bring the asking section back into view and
+  /// forget the request, so a later rebuild (a view tab, the cache-then-network
+  /// repaint) does not yank the page there again.
+  void schedule() {
+    final section = _pending;
+    if (section == null) return;
+    _pending = null;
+    revealAfterPaint(keyFor(section), controller: scroll, offset: _offset);
   }
 }
 
@@ -19237,6 +19290,10 @@ Widget _analyticsBody(
   DateRange range,
   ValueChanged<DateRange> onRange, {
   Key? key,
+  // A section header's live date chip, on THIS module's window. The headers used
+  // to carry a static calendar InfoChip that looked exactly like it.
+  required Widget Function(String section) sectionRange,
+  required _SectionReveal reveal,
 }) => AsyncView<Map<String, dynamic>>(
       key: key,
       load: () async {
@@ -19584,7 +19641,9 @@ Widget _analyticsBody(
           return _kpiHomeView[key] == view;
         }).toList();
 
-        return ListView(padding: AppSpacing.pageNarrow, children: [
+        // A section header's chip picked this window: scroll it back into view.
+        reveal.schedule();
+        return ListView(controller: reveal.scroll, padding: AppSpacing.pageNarrow, children: [
           // The window, first thing on the screen and above the view tabs: every
           // figure below is cut on it, so it has to be the first thing read.
           Row(children: [
@@ -19974,6 +20033,7 @@ Widget _analyticsBody(
           ],
           if (kitchenVisible) ...[
             SectionHeader(
+              key: reveal.keyFor('kitchen'),
               title: 'Kitchen',
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 _dlButton(() => dl('kitchen-summary', const ['Metric', 'Value'], [
@@ -19987,7 +20047,7 @@ Widget _analyticsBody(
                       ['Period (days)', kitchenDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+                sectionRange('kitchen'),
               ]),
             ),
             if (kOrdersTimed == 0 && kByDish.isEmpty && kBySection.isEmpty)
@@ -20510,6 +20570,7 @@ Widget _analyticsBody(
           // because there is no shift roster; the caption says so on screen.
           if (vis('staff') && (attendance.isNotEmpty || attSummary.isNotEmpty)) ...[
             SectionHeader(
+              key: reveal.keyFor('attendance'),
               title: 'Attendance',
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 _dlButton(() => dl('attendance-summary', const ['Metric', 'Value'], [
@@ -20525,7 +20586,7 @@ Widget _analyticsBody(
                       ['Window (days)', attDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+                sectionRange('attendance'),
               ]),
             ),
             if (attendance.isEmpty)
@@ -20656,8 +20717,9 @@ Widget _analyticsBody(
           if (vis('menu', onOverview: true) || vis('staff')) ...[
             const SizedBox(height: AppSpacing.sm),
             SectionHeader(
+              key: reveal.keyFor('insights'),
               title: 'Actionable insights',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+              trailing: sectionRange('insights'),
             ),
           ],
           if (vis('menu', onOverview: true) && topDishes.isNotEmpty) ...[
@@ -20964,14 +21026,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   void dispose() {
     _billDebounce?.cancel();
     _billSearch.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
+  // The 'Settled bills' header and the page's scroll position, so picking dates
+  // from THAT header's chip lands the owner back on the bills after the reload
+  // instead of at the top of the page (see revealAfterPaint).
+  final GlobalKey _settledBillsKey = GlobalKey(debugLabel: 'accounting-settled-bills');
+  final ScrollController _scroll = ScrollController();
+
   // Adopt a window the owner picked, remember it for the session, refetch.
-  void _setRange(DateRange next) {
+  // ONE window for the whole page whichever chip set it: the top control and the
+  // Settled bills header both land here. `revealBills` only decides where the
+  // page is scrolled once the new figures are up.
+  Future<void> _setRange(DateRange next, {bool revealBills = false}) async {
+    // Read BEFORE the reload: the skeleton detaches the list from the controller.
+    final offset = _scroll.hasClients ? _scroll.offset : null;
     setState(() => _range = next);
     DateRangeMemory.remember('accounting', next);
-    _load();
+    await _load();
+    if (revealBills && mounted) revealAfterPaint(_settledBillsKey, controller: _scroll, offset: offset);
   }
 
   /// Side-effect-free GET composition over the CURRENT window/month — replayable
@@ -21642,7 +21717,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
 
     return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
-      child: ListView(padding: AppSpacing.pageNarrow, children: [
+      child: ListView(controller: _scroll, padding: AppSpacing.pageNarrow, children: [
         // The two exports drop below the period control on a phone, and wrap
         // again between themselves if they still do not fit. Side by side on one
         // line they wanted 410px of a 358px column at 1.3x.
@@ -21798,9 +21873,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         // every other figure on this page so the list and the totals above can
         // never disagree about which days they are describing.
         const SizedBox(height: AppSpacing.sm),
+        // The pill here used to be a static InfoChip dressed as the date control
+        // (same icon, same dates, no tap). It is now the live control, on the
+        // SAME window as the chip at the top.
         SectionHeader(
+          key: _settledBillsKey,
           title: 'Settled bills',
-          trailing: InfoChip(icon: Icons.event_outlined, label: _range.label()),
+          trailing: SectionRangeChip(value: _range, onChanged: (r) => _setRange(r, revealBills: true)),
           padding: const EdgeInsets.only(bottom: 6),
         ),
         Text('Every bill closed in this period, newest first — tap one for its items, taxes, payment and who closed it.',

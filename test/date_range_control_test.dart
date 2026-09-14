@@ -9,8 +9,13 @@ import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/services/restaurant_time.dart';
+import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/widgets/date_range_picker.dart';
+import 'package:restaurant_owner_app/ui/widgets/section_header.dart';
+import 'package:restaurant_owner_app/ui/widgets/skeleton.dart';
+import 'package:restaurant_owner_app/ui/widgets/status_chip.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 /// The shared date-range control, wired to real modules.
@@ -31,9 +36,14 @@ import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 ///      disagrees with the figures above it is the copy that gets filed.
 ///   5. THE WINDOW SURVIVES LEAVING THE MODULE AND COMING BACK.
 class _FakeApi extends ApiClient {
-  _FakeApi(this.routes);
+  _FakeApi(this.routes, {this.latency = Duration.zero});
 
   final Map<String, dynamic> routes;
+
+  /// How long a GET takes to answer. Zero (the default) answers inside the same
+  /// frame, so a loud reload never paints its skeleton; a real network does, and
+  /// the skeleton is what throws the page's scroll position away.
+  final Duration latency;
 
   /// Every path requested, in order — this is what the assertions read.
   final List<String> paths = <String>[];
@@ -57,6 +67,7 @@ class _FakeApi extends ApiClient {
   Future<dynamic> request(String method, String path, String token,
       [Object? body, String? outletId]) async {
     paths.add(path);
+    if (latency > Duration.zero) await Future<void>.delayed(latency);
     if (method != 'GET') return <String, dynamic>{'success': true};
     if (routes.containsKey(path)) return routes[path];
     // Longest matching prefix, so one route answers a whole query-carrying family.
@@ -116,6 +127,37 @@ Map<String, dynamic> _accountingRoutes() => {
       '/bills/closed': {'bills': <Map<String, dynamic>>[], 'total': 0, 'has_more': false},
     };
 
+/// A trading month's worth of detail ABOVE the Settled bills section, so on a
+/// phone the bills sit well past the list's build-ahead margin: the case where
+/// the header has no element at all once the reload puts the page at the top.
+Map<String, dynamic> _tallAccountingRoutes() => {
+      ..._accountingRoutes(),
+      '/reports/sales': {
+        ...(_accountingRoutes()['/reports/sales'] as Map<String, dynamic>),
+        'by_day': [
+          for (var i = 1; i <= 14; i++) {'date': '2026-08-${i.toString().padLeft(2, '0')}', 'sales': 1000.0 + i},
+        ],
+        'by_method': [
+          for (final mth in ['Cash', 'Upi', 'Card', 'Zomato', 'District', 'Dineout'])
+            {'method': mth, 'sales': 500.0, 'bills': 3},
+        ],
+      },
+      '/reports/gst': {
+        'total_taxable': 0.0,
+        'total_tax': 0.0,
+        'by_rate': [
+          for (var i = 0; i < 12; i++) {'name': 'GST $i', 'percentage': 5, 'taxable': 100.0, 'tax': 5.0},
+        ],
+      },
+      '/reports/discounts': {
+        'bill_count': 20,
+        'discounted_bills': 20,
+        'by_coupon': [
+          for (var i = 0; i < 20; i++) {'code': 'SAVE$i', 'kind': 'coupon', 'amount': 50.0, 'uses': 1},
+        ],
+      },
+    };
+
 Map<String, dynamic> _analyticsRoutes() => {
       '/orders/apc': {'orders': <Map<String, dynamic>>[], 'employee_incentives': <Map<String, dynamic>>[]},
       '/feedback/summary': <String, dynamic>{},
@@ -138,31 +180,94 @@ Future<_FakeApi> _mount(
   Widget Function(RestClient, Profile) module,
   Map<String, dynamic> routes, {
   double width = 1400,
+  double height = 2400,
+  double textScale = 1.0,
+  DesignSystem system = DesignSystem.rustic,
+  Duration latency = Duration.zero,
 }) async {
   await tester.pumpWidget(const SizedBox());
-  tester.view.physicalSize = Size(width, 2400);
+  tester.view.physicalSize = Size(width, height);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
 
   SharedPreferences.setMockInitialValues(<String, Object>{});
-  final api = _FakeApi(routes);
+  final api = _FakeApi(routes, latency: latency);
   final auth = AuthController(api: api);
   await auth.login('CSR Organics', 'admin', 'admin123');
   final rest = RestClient(auth);
 
-  await tester.pumpWidget(MaterialApp(
-    theme: AppTheme.dark(),
-    home: ModuleNavigator(
-      openModule: (_, {Map<String, dynamic>? target}) {},
-      visibleLabels: const ['Accounting', 'Analytics', 'Cash'],
-      clearFocus: () {},
-      child: Scaffold(body: module(rest, rest.auth.profile!)),
+  await tester.pumpWidget(GaiaScope(
+    system: system,
+    child: MaterialApp(
+      theme: system == DesignSystem.gaia ? GaiaTheme.dark() : AppTheme.dark(),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(textScale)),
+        child: child!,
+      ),
+      home: ModuleNavigator(
+        openModule: (_, {Map<String, dynamic>? target}) {},
+        visibleLabels: const ['Accounting', 'Analytics', 'Cash'],
+        clearFocus: () {},
+        child: Scaffold(body: module(rest, rest.auth.profile!)),
+      ),
     ),
   ));
+  if (latency > Duration.zero) {
+    // The skeleton animates forever, so settle only once the first load is in.
+    for (var i = 0; i < 20 && find.byType(SkeletonBox).evaluate().isNotEmpty; i++) {
+      await tester.pump(latency);
+    }
+  }
   await tester.pumpAndSettle();
   return api;
 }
+
+/// The section header titled [title]. Gaia upper-cases the title inside its own
+/// header, but the SectionHeader widget and its `title` are the same in both.
+Finder _header(String title) =>
+    find.byWidgetPredicate((w) => w is SectionHeader && w.title == title, description: 'SectionHeader "$title"');
+
+/// THE BUG CLASS: a bordered pill that reads the window, drawn as a static
+/// InfoChip. It looks exactly like the date control and does nothing on tap.
+Finder _deadRangePills(DateRange r) => find.byWidgetPredicate((w) => w is InfoChip && w.label == r.label(),
+    description: 'static InfoChip reading ${r.label()}');
+
+/// Is [finder]'s widget painted inside the test window right now?
+bool _onScreen(WidgetTester tester, Finder finder) {
+  if (finder.evaluate().isEmpty) return false;
+  final rect = tester.getRect(finder);
+  final size = tester.view.physicalSize / tester.view.devicePixelRatio;
+  return rect.top >= 0 && rect.bottom <= size.height;
+}
+
+/// Open the chip INSIDE [header] and tap a preset: the reported path, where the
+/// owner is down at a section rather than at the top of the page.
+Future<void> _pickPresetFrom(WidgetTester tester, Finder header, String label) async {
+  final chip = find.descendant(of: header, matching: find.byType(DateRangeChip));
+  expect(chip, findsOneWidget, reason: 'no live date chip in that header');
+  await tester.tap(chip, warnIfMissed: false);
+  await tester.pumpAndSettle();
+  expect(find.text('Period'), findsOneWidget, reason: 'the range sheet did not open');
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
+}
+
+/// Scroll the module's page (its outermost vertical list) until [finder] shows.
+Future<void> _scrollTo(WidgetTester tester, Finder finder) async {
+  await tester.scrollUntilVisible(finder, 300, scrollable: find.byType(Scrollable).first);
+  await tester.pumpAndSettle();
+}
+
+Map<String, dynamic> _analyticsWithAttendance() => {
+      ..._analyticsRoutes(),
+      // Attendance only renders with something to say; a summary with an empty
+      // list is enough to put its header on screen.
+      '/analytics/advanced': {
+        'staff_attendance': <Map<String, dynamic>>[],
+        'attendance_summary': {'staff_tracked': 0, 'window_days': 30},
+      },
+    };
 
 /// Open the chip's sheet and tap a preset by its label.
 Future<void> _pickPreset(WidgetTester tester, String label) async {
@@ -262,6 +367,104 @@ void main() {
       expect(find.text('Select a period'), findsWidgets);
       expect(find.text('Apply'), findsWidgets);
     });
+
+    // "In Accounting in settled bills the date frame is not selectable." The pill
+    // beside 'Settled bills' was a static InfoChip dressed as this control.
+    testWidgets('the Settled bills header carries the LIVE chip, reading the page window', (tester) async {
+      await _mount(tester, m.accountingModule, _accountingRoutes());
+      final window = DateRange.fromPreset(RangePreset.last30);
+
+      await tester.ensureVisible(_header('Settled bills'));
+      await tester.pumpAndSettle();
+      final chip = find.descendant(of: _header('Settled bills'), matching: find.byType(DateRangeChip));
+      expect(chip, findsOneWidget);
+      expect(tester.widget<DateRangeChip>(chip).value.label(), window.label());
+      expect(tester.widget<DateRangeChip>(chip).dense, isTrue);
+      expect(_deadRangePills(window), findsNothing, reason: 'a static pill still reads the window');
+    });
+
+    testWidgets('picking from the Settled bills header moves the ONE window: bills AND reports refetch',
+        (tester) async {
+      final api = await _mount(tester, m.accountingModule, _accountingRoutes());
+      await tester.ensureVisible(_header('Settled bills'));
+      await tester.pumpAndSettle();
+      api.mark();
+
+      await _pickPresetFrom(tester, _header('Settled bills'), 'Last 7 days');
+
+      final week = DateRange.fromPreset(RangePreset.last7);
+      expect(api.sinceMatching('/bills/closed?').where((p) => p.contains('from=${week.from}&to=${week.to}')),
+          isNotEmpty,
+          reason: 'the bills list was not refetched on the picked window');
+      // Not a section-private window: the totals above the list follow it too.
+      for (final route in ['/reports/sales', '/reports/gst', '/reports/pnl']) {
+        expect(api.sinceMatching('$route?'), contains('$route?${week.reportQuery}'),
+            reason: '$route did not follow the Settled bills chip');
+      }
+      final chips = tester.widgetList<DateRangeChip>(find.byType(DateRangeChip)).toList();
+      expect(chips, hasLength(2), reason: 'the top chip and the Settled bills chip');
+      for (final c in chips) {
+        expect(c.value.label(), week.label(), reason: 'both chips must show the window the bills chip set');
+      }
+      expect(DateRangeMemory.of('accounting').label(), week.label());
+    });
+
+    testWidgets('after the reload the owner is back on Settled bills, not at the top of the page',
+        (tester) async {
+      // A phone: the bills sit several screens below the top chip, which is
+      // exactly where the reload used to strand the owner.
+      await _mount(tester, m.accountingModule, _tallAccountingRoutes(),
+          width: 400, height: 800, latency: const Duration(milliseconds: 200));
+      expect(find.byWidgetPredicate((w) => w is SectionHeader && w.title == 'Settled bills', skipOffstage: false),
+          findsNothing,
+          reason: 'precondition: the section must be past the build-ahead margin, or this proves nothing');
+      await _scrollTo(tester, _header('Settled bills'));
+
+      final chip = find.descendant(of: _header('Settled bills'), matching: find.byType(DateRangeChip));
+      await tester.tap(chip, warnIfMissed: false);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Last 7 days').last);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      // The reload really is loud: the list is gone behind the skeleton, taking
+      // its scroll position with it. Without this the test would pass on a list
+      // that was never torn down.
+      expect(find.byType(SkeletonBox), findsWidgets, reason: 'precondition: the reload never showed the skeleton');
+      for (var i = 0; i < 20 && find.byType(SkeletonBox).evaluate().isNotEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+      await tester.pumpAndSettle();
+
+      expect(_onScreen(tester, _header('Settled bills')), isTrue,
+          reason: 'picking dates from the bills header threw the page back to the top');
+      // The toolbar at the very top (the exports beside the top chip) is not even
+      // built, so the page really did not reset.
+      expect(_onScreen(tester, find.text('Tally XML')), isFalse, reason: 'the page reset to the top');
+    });
+
+    testWidgets('the TOP chip keeps its old behaviour: no jump down the page', (tester) async {
+      await _mount(tester, m.accountingModule, _tallAccountingRoutes(), width: 400, height: 800);
+      await _pickPreset(tester, 'Last 7 days');
+      expect(_onScreen(tester, find.byType(DateRangeChip).first), isTrue);
+      expect(_onScreen(tester, _header('Settled bills')), isFalse);
+    });
+
+    for (final system in DesignSystem.values) {
+      testWidgets('the header chip fits a 320dp phone at 1.3x on a year-straddling window (${system.name})',
+          (tester) async {
+        const straddle = DateRange(from: '2025-07-28', to: '2026-01-03', preset: RangePreset.custom);
+        DateRangeMemory.remember('accounting', straddle);
+        await _mount(tester, m.accountingModule, _accountingRoutes(),
+            width: 320, height: 900, textScale: 1.3, system: system);
+        await _scrollTo(tester, _header('Settled bills'));
+
+        expect(tester.takeException(), isNull, reason: 'the header overflowed');
+        final chip = find.descendant(of: _header('Settled bills'), matching: find.byType(DateRangeChip));
+        expect(chip, findsOneWidget);
+        expect(tester.getSize(chip).width, lessThanOrEqualTo(220));
+        expect(tester.getRect(chip).right, lessThanOrEqualTo(tester.getRect(_header('Settled bills')).right + 0.5));
+      });
+    }
   });
 
   group('Analytics', () {
@@ -292,6 +495,51 @@ void main() {
 
       expect(api.paths.where((p) => p.startsWith('/analytics/kitchen?')).single,
           '/analytics/kitchen?from=2026-08-01&to=2026-08-15&days=15');
+    });
+
+    // Same bug class as Accounting's Settled bills pill: three section headers
+    // carried a static calendar InfoChip reading the window.
+    testWidgets("Kitchen, Attendance and Actionable insights carry the live chip, on this module's window",
+        (tester) async {
+      await _mount(tester, m.analyticsModule, _analyticsWithAttendance(), height: 6000);
+      // 'Everything' puts all three on one screen. The view choice is module-wide
+      // on purpose, so it is handed back to Overview for the tests after this one.
+      await tester.ensureVisible(find.text('Everything').first);
+      await tester.tap(find.text('Everything').first);
+      await tester.pumpAndSettle();
+      try {
+        final window = DateRange.fromPreset(RangePreset.last30);
+        for (final title in ['Kitchen', 'Attendance', 'Actionable insights']) {
+          final chip = find.descendant(of: _header(title), matching: find.byType(DateRangeChip));
+          expect(chip, findsOneWidget, reason: '$title has no live date chip');
+          expect(tester.widget<DateRangeChip>(chip).value.label(), window.label());
+        }
+        expect(_deadRangePills(window), findsNothing, reason: 'a static pill still reads the window');
+      } finally {
+        await tester.ensureVisible(find.text('Overview').first);
+        await tester.tap(find.text('Overview').first);
+        await tester.pumpAndSettle();
+      }
+    });
+
+    testWidgets('picking from the Kitchen header re-requests every read and lands back on Kitchen',
+        (tester) async {
+      final api = await _mount(tester, m.analyticsModule, _analyticsRoutes(), width: 400, height: 420);
+      expect(_onScreen(tester, _header('Kitchen')), isFalse,
+          reason: 'precondition: Kitchen must start below the fold, or this proves nothing');
+      await _scrollTo(tester, _header('Kitchen'));
+      api.mark();
+
+      await _pickPresetFrom(tester, _header('Kitchen'), 'Last 7 days');
+
+      final week = DateRange.fromPreset(RangePreset.last7);
+      for (final route in ['/analytics/menu-insights', '/analytics/advanced', '/analytics/kitchen']) {
+        expect(api.sinceMatching('$route?'), contains('$route?${week.query}'),
+            reason: '$route did not follow the Kitchen chip');
+      }
+      expect(DateRangeMemory.of('analytics').label(), week.label());
+      expect(_onScreen(tester, _header('Kitchen')), isTrue,
+          reason: 'picking dates from the Kitchen header threw the page back to the top');
     });
   });
 

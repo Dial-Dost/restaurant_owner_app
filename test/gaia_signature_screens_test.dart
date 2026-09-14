@@ -303,7 +303,11 @@ void main() {
         (tester) async {
       await _mount(tester, (r) => m.analyticsModule(r, r.auth.profile!), _analyticsRoutes(),
           system: DesignSystem.gaia);
-      expect(find.byType(DateRangeChip), findsOneWidget);
+      // The top picker, plus the live copies in the Kitchen and Actionable
+      // insights headers (they were static pills): all on the ONE module window.
+      final chips = tester.widgetList<DateRangeChip>(find.byType(DateRangeChip)).toList();
+      expect(chips, isNotEmpty);
+      expect(chips.map((c) => c.value.label()).toSet(), hasLength(1));
       expect(find.byType(ForkTabs), findsOneWidget);
     });
 
