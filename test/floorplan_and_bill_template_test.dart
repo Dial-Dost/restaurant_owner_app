@@ -16,6 +16,9 @@
 // app's preview drew no logo at all, and drew the address and GSTIN as the
 // faintest type on the sheet.
 
+import 'dart:convert';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -308,6 +311,99 @@ void main() {
         expect(t.style?.color, Colors.black87, reason: '"$line" was not drawn in full ink');
         expect(t.style?.fontSize, greaterThanOrEqualTo(12), reason: '"$line" was drawn too small');
       }
+    });
+
+    // The paper's header: the name BOLD AT THE SIZE OF THE LINES UNDER IT (no
+    // longer a double-size headline), then legal name, address, phone, GSTIN —
+    // all centred, the phone where escpos.ts prints "Ph : …".
+    testWidgets('the name is bold at body size, over legal name, address, phone and GSTIN', (tester) async {
+      await _mount(tester, plan: false, extra: {
+        '/restaurant/profile': {
+          'outlet_add': 'NO 283, 15TH CROSS ROAD\n100 FEET ROAD, JP NAGAR',
+          'outlet_phone': '080-41234567',
+        },
+      });
+      await openPreview(tester);
+      final name = tester.widget<Text>(inPreview(find.text('Gaia Test')));
+      final address = tester.widget<Text>(inPreview(find.text('NO 283, 15TH CROSS ROAD')));
+      expect(name.style?.fontWeight, FontWeight.bold);
+      expect(name.style?.fontSize, address.style?.fontSize, reason: 'the name prints at body size now');
+      double y(String s) => tester.getTopLeft(inPreview(find.text(s))).dy;
+      final order = ['Gaia Test', 'NAVKRISH HOSPITALITY LLP', 'NO 283, 15TH CROSS ROAD', '100 FEET ROAD, JP NAGAR', 'Ph : 080-41234567', 'GSTN : 29AAXFN2701Q1ZF'];
+      for (var i = 1; i < order.length; i++) {
+        expect(y(order[i]), greaterThan(y(order[i - 1])), reason: '"${order[i]}" must print under "${order[i - 1]}"');
+      }
+      for (final line in order) {
+        expect(tester.widget<Text>(inPreview(find.text(line))).textAlign, TextAlign.center, reason: '"$line" is not centred');
+      }
+    });
+
+    // 5.1, THE SIZE OF IT. /restaurant/logo/bill answers with the raster the
+    // printer receives, fitted inside two thirds of the roll (bill_logo.ts) and
+    // never enlarged there. The preview draws its pixels as dots, so a logo
+    // takes the same share of the bill's 528-dot text area on screen as on the
+    // paper: a full-size 384-dot wordmark and a small 240-dot one alike — the
+    // small one is NOT stretched to the cap, because the roll does not stretch
+    // it either.
+    testWidgets('the logo takes the share of the sheet it takes of the roll, and is never enlarged', (tester) async {
+      for (final (w, h) in const [(384, 120), (240, 80)]) {
+        final png = await tester.runAsync(() async {
+          final recorder = ui.PictureRecorder();
+          Canvas(recorder).drawRect(Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()), Paint()..color = const Color(0xFF000000));
+          final image = await recorder.endRecording().toImage(w, h);
+          final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+          return base64Encode(bytes!.buffer.asUint8List());
+        });
+        await _mount(tester, plan: false, extra: {
+          '/restaurant/logo/bill': {'logo_base64': png, 'width': w, 'height': h},
+        });
+        await openPreview(tester);
+        final logo = inPreview(find.byKey(const ValueKey('bill-preview-logo')));
+        expect(logo, findsOneWidget);
+        await tester.runAsync(() => precacheImage(tester.widget<Image>(logo).image, tester.element(logo)));
+        await tester.pumpAndSettle();
+
+        // The text area is as wide as a centred header line's box.
+        final area = tester.getSize(inPreview(find.text('Gaia Test'))).width;
+        final drawn = tester.getSize(logo);
+        expect(drawn.width, moreOrLessEquals(area * w / 528, epsilon: 1.5),
+            reason: 'a $w-dot logo must take the share of the sheet it takes of the roll');
+        expect(drawn.height, moreOrLessEquals(drawn.width * h / w, epsilon: 1.5), reason: 'aspect kept');
+        expect(drawn.width, lessThanOrEqualTo(w), reason: 'never drawn larger than the raster');
+        // Centred on the text area.
+        expect(tester.getCenter(logo).dx,
+            moreOrLessEquals(tester.getCenter(inPreview(find.text('Gaia Test'))).dx, epsilon: 1));
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+      }
+    });
+
+    // THE NARROW ROLL. 58mm has 32 columns and no margins, so "Total Qty: 2
+    // Sub Total 1200.00" does not fit on one line there and the paper splits it
+    // in two; on 80mm it is one rung. The preview follows the setting the paper
+    // is cut from. Asserted on the RUNG each label sits in, not on pixels — the
+    // test font's glyphs are a full em wide, which no receipt font is.
+    bool shareRung(WidgetTester tester) {
+      final rung = find.ancestor(of: inPreview(find.text('Sub Total')), matching: find.byType(Row)).first;
+      return find.descendant(of: rung, matching: find.text('Total Qty: 2')).evaluate().isNotEmpty;
+    }
+
+    testWidgets('on the 58mm roll the Total Qty and Sub Total rungs split, as the paper splits them', (tester) async {
+      await _mount(tester, plan: false, extra: {
+        '/restaurant/settings': {'kitchen_sections': <dynamic>[], 'bill_paper_width': '58mm'},
+      });
+      await openPreview(tester);
+      expect(inPreview(find.text('Total Qty: 2')), findsOneWidget);
+      expect(shareRung(tester), isFalse, reason: 'Sub Total is its own rung on 58mm');
+      expect(tester.getTopLeft(inPreview(find.text('Sub Total'))).dy,
+          greaterThan(tester.getTopLeft(inPreview(find.text('Total Qty: 2'))).dy));
+    });
+
+    testWidgets('on the 80mm roll they share one rung', (tester) async {
+      await _mount(tester, plan: false);
+      await openPreview(tester);
+      expect(inPreview(find.text('Total Qty: 2')), findsOneWidget);
+      expect(shareRung(tester), isTrue, reason: '"Total Qty: 2   Sub Total" is one rung on 80mm');
     });
   });
 }

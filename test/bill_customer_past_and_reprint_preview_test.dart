@@ -11,9 +11,10 @@
 //     is a release behind.
 //
 // The customer slot: the bill preview and the settled-bill sheet show
-// `Customer Name: <name or Guest>` and, when set, `Customer GSTIN: <gstin>`, in
+// `Name: <name>` — a bare `Name:` for a walk-in, the slot left blank as the
+// client's printed bill leaves it — and, when set, `Customer GSTIN: <gstin>`, in
 // their own ruled-off block directly under the restaurant header and above the
-// table / bill-no block — where the client's printed bill has them.
+// date / cashier / bill-no block — where the client's printed bill has them.
 //
 // Item 4: "Reprint has to mention reprint on top once the bill has been
 // reprinted and it should show the same on the preview as well." The preview of
@@ -250,7 +251,7 @@ void main() {
       final api = _FakeApi(customer: 'Acme Ltd', gstin: '29ABCDE1234F1Z5');
       await _mount(tester, api, m.accountingModule);
       await _openBillSheet(tester);
-      expect(find.text('Customer Name: Acme Ltd'), findsOneWidget);
+      expect(find.text('Name: Acme Ltd'), findsOneWidget);
       expect(find.text('Customer GSTIN: 29ABCDE1234F1Z5'), findsOneWidget);
       expect(find.text('Reprint bill'), findsOneWidget);
       expect(_sheetEdit, findsOneWidget);
@@ -269,7 +270,7 @@ void main() {
           reason: 'the sheet re-reads the bill');
       expect(api.calls.where((c) => c.startsWith('GET /bills/closed?')).length, greaterThan(listReads),
           reason: 'the list behind the sheet refreshes its row');
-      expect(find.text('Customer Name: Acme Pvt Ltd'), findsOneWidget);
+      expect(find.text('Name: Acme Pvt Ltd'), findsOneWidget);
       expect(find.textContaining('Customer GSTIN:'), findsNothing);
     });
 
@@ -314,7 +315,7 @@ void main() {
       expect(find.text('Edit name / GSTIN'), findsNothing);
       expect(find.byTooltip('Edit name / GSTIN'), findsNothing);
       // The lines are not money, so they are still read.
-      expect(find.text('Customer Name: Acme Ltd'), findsOneWidget);
+      expect(find.text('Name: Acme Ltd'), findsOneWidget);
     });
 
     testWidgets('a manager holding the accounting permission gets it', (tester) async {
@@ -363,29 +364,32 @@ void main() {
       expect(find.text('Bill preview'), findsOneWidget);
     }
 
-    testWidgets('the customer slot sits under the restaurant header and ABOVE the table / bill-no line',
+    testWidgets('the customer slot sits under the restaurant header and ABOVE the date / bill-no block',
         (tester) async {
       await openPreview(tester, _FakeApi(bill: openBill(prints: {'print_count': 0, 'bill_printed_at': null})));
-      final name = inPreview(find.text('Customer Name: Acme Ltd'));
+      final name = inPreview(find.text('Name: Acme Ltd'));
       final gstin = inPreview(find.text('Customer GSTIN: 29ABCDE1234F1Z5'));
       expect(name, findsOneWidget);
       expect(gstin, findsOneWidget);
       double y(Finder f) => tester.getTopLeft(f).dy;
       expect(y(name), greaterThan(y(inPreview(find.text('CSR Organics')))), reason: 'below the restaurant header');
       expect(y(gstin), greaterThan(y(name)), reason: 'GSTIN directly under the name');
-      expect(y(gstin), lessThan(y(inPreview(find.textContaining('Bill #88')))),
-          reason: 'above the table / bill-no block, not under it');
+      expect(y(gstin), lessThan(y(inPreview(find.text('Dine In: T1')))),
+          reason: 'above the date / table row, not under it');
+      expect(y(gstin), lessThan(y(inPreview(find.text('Bill No.: 88')))),
+          reason: 'above the bill-no block, not under it');
       expect(y(name), lessThan(y(inPreview(find.textContaining('Gin & Tonic')))));
       // One name line only — the old bare name under the bill number is gone.
       expect(inPreview(find.text('Acme Ltd')), findsNothing);
       expect(inPreview(find.textContaining('Acme Ltd')), findsOneWidget);
     });
 
-    testWidgets('an unnamed bill prints "Customer Name: Guest" and no GSTIN line', (tester) async {
+    testWidgets('a walk-in bill leaves the "Name:" slot blank and prints no GSTIN line', (tester) async {
       await openPreview(tester, _FakeApi(bill: openBill(customer: 'Guest', gstin: null, prints: {'print_count': 0})));
-      expect(inPreview(find.text('Customer Name: Guest')), findsOneWidget);
+      expect(inPreview(find.text('Name:')), findsOneWidget, reason: 'the slot is still there, as on the paper');
       expect(inPreview(find.textContaining('Customer GSTIN')), findsNothing);
-      expect(inPreview(find.textContaining('Guest')), findsOneWidget, reason: 'not duplicated');
+      expect(inPreview(find.textContaining('Guest')), findsNothing,
+          reason: 'the "Guest" placeholder is not a name, and the paper no longer prints it as one');
     });
 
     testWidgets('a first print carries NO reprint banner', (tester) async {
@@ -409,7 +413,7 @@ void main() {
       expect(style.fontSize, greaterThanOrEqualTo(20));
       // Above the restaurant name, which heads the receipt.
       expect(tester.getTopLeft(banner).dy, lessThan(tester.getTopLeft(inPreview(find.text('CSR Organics'))).dy));
-      expect(tester.getTopLeft(banner).dy, lessThan(tester.getTopLeft(inPreview(find.text('Customer Name: Acme Ltd'))).dy));
+      expect(tester.getTopLeft(banner).dy, lessThan(tester.getTopLeft(inPreview(find.text('Name: Acme Ltd'))).dy));
     });
 
     testWidgets('a printed_at stamp alone is enough to mark the reprint', (tester) async {

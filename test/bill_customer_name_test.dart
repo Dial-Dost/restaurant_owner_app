@@ -249,14 +249,24 @@ void main() {
       expect(m.billCustomerGstinInvalidMessage, 'GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5');
     });
 
-    test('the customer slot: Customer Name (Guest when unnamed), then Customer GSTIN when set', () {
+    // Worded as the client's printed bill words it — "Name:" — and, like that
+    // bill, a walk-in's slot is left BLANK rather than filled with the "Guest"
+    // placeholder, which printed reads as a name somebody wrote down.
+    test('the customer slot: Name (blank for a walk-in), then Customer GSTIN when set', () {
       expect(m.billCustomerLines({'customer': 'Acme Ltd', 'customer_gstin': '29ABCDE1234F1Z5'}),
-          ['Customer Name: Acme Ltd', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+          ['Name: Acme Ltd', 'Customer GSTIN: 29ABCDE1234F1Z5']);
       expect(m.billCustomerLines({'customer': 'Guest', 'customer_gstin': '29ABCDE1234F1Z5'}),
-          ['Customer Name: Guest', 'Customer GSTIN: 29ABCDE1234F1Z5']);
-      expect(m.billCustomerLines({'customer': 'QR Guest', 'customer_gstin': null}), ['Customer Name: Guest']);
-      expect(m.billCustomerLines({'customer': '', 'customer_gstin': ''}), ['Customer Name: Guest']);
-      expect(m.billCustomerLines({'customer': 'Mr Sharma'}), ['Customer Name: Mr Sharma']);
+          ['Name:', 'Customer GSTIN: 29ABCDE1234F1Z5']);
+      expect(m.billCustomerLines({'customer': 'QR Guest', 'customer_gstin': null}), ['Name:']);
+      expect(m.billCustomerLines({'customer': '', 'customer_gstin': ''}), ['Name:']);
+      expect(m.billCustomerLines({'customer': null}), ['Name:']);
+      // escpos.ts `present()` drops a stored "null"; so does the slot.
+      expect(m.billCustomerLines({'customer': 'null', 'customer_gstin': 'null'}), ['Name:']);
+      expect(m.billCustomerLines({'customer': 'Mr Sharma'}), ['Name: Mr Sharma']);
+      // Never a placeholder, in any casing, anywhere in the slot.
+      for (final placeholder in ['Guest', 'guest', 'QR Guest', 'qr guest']) {
+        expect(m.billCustomerLines({'customer': placeholder}).join(' '), isNot(matches(RegExp('guest', caseSensitive: false))));
+      }
     });
   });
 
