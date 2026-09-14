@@ -394,6 +394,13 @@ class PrinterService extends ChangeNotifier {
   int _replayPrinted = 0;
   int _replayRounds = 0;
 
+  /// Whether a backlog catch-up stopped at [_maxReplayRounds] with output still
+  /// coming. NOT the same as the round count being at the cap: the empty-window
+  /// retry spends rounds too, so an ordinary till with no backlog reaches the cap
+  /// after a couple of dozen quiet gaps between live dockets. Only this flag
+  /// means there is a paused catch-up for [onResume] to continue.
+  bool _replayPaused = false;
+
   SpoolerWrite _write = WinRawPrinter.sendBytes;
   NetworkWrite _netWrite = NetworkPrinter.send;
   bool? _supportedOverride;
@@ -731,6 +738,7 @@ class PrinterService extends ChangeNotifier {
       // hook: the server replays the outlet's outstanding jobs in response.
       _replayRounds = 0;
       _replayPrinted = 0;
+      _replayPaused = false;
       _emitJoin();
       notifyListeners();
       // Anything held over from before the drop (the queue is no longer
@@ -887,9 +895,12 @@ class PrinterService extends ChangeNotifier {
   /// Re-asks ONLY where something is wrong. A till that is connected and
   /// confirmed in its room is left alone: a joinOutlet costs the server a tenant
   /// transaction for the replay, and a desktop window regains focus far too often
-  /// to pay that every time. The one exception is a backlog catch-up that hit its
-  /// round cap, which previously said "reconnect to continue" — coming back to
-  /// the app is that reconnect.
+  /// to pay that every time. The one exception is a backlog catch-up that really
+  /// paused at its round cap ([_replayPaused]), which previously said "reconnect
+  /// to continue" — coming back to the app is that reconnect. A round count that
+  /// merely sits at the cap is not that: quiet gaps between live dockets spend
+  /// rounds on every long-running till, and continuing on THAT would re-join a
+  /// listening socket on every window focus.
   Future<void> onResume() async {
     if (!_started || _sessionEnded) return;
     final socket = _socket;
@@ -904,7 +915,8 @@ class PrinterService extends ChangeNotifier {
       _emitJoin();
       return;
     }
-    if (_replayRounds >= _maxReplayRounds) {
+    if (_replayPaused) {
+      _replayPaused = false;
       _replayRounds = 0;
       _replayPrinted = 1; // let the guard through; this IS the continue
       _requestNextReplayWindow();
@@ -927,6 +939,7 @@ class PrinterService extends ChangeNotifier {
     } catch (_) {/* ignore */}
     _replayRounds = 0;
     _replayPrinted = 0;
+    _replayPaused = false;
     // THE QUEUE IS DELIBERATELY KEPT. stop() is a logout, an outlet switch or a
     // shell teardown — every one of which is normally followed by a start(), and
     // the pending jobs are receipts for tables at THIS printer either way.
@@ -1126,6 +1139,9 @@ class PrinterService extends ChangeNotifier {
     _replayRetry?.cancel();
     _replayPrinted = 0;
     if (_replayRounds >= _maxReplayRounds) {
+      // Reached only with output from the last window (the retry timer stops
+      // arming at the cap, above), so this is a backlog genuinely cut short.
+      _replayPaused = true;
       _log('Paused catching up after $_maxReplayRounds batches — reconnect to continue.');
       return;
     }

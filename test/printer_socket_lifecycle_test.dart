@@ -475,6 +475,86 @@ void main() {
       expect(s.joins, 1);
       expect(s.connectCalls, 1);
     });
+
+    // The two below run in testWidgets for its fake clock: the empty-window
+    // retry is 150 real seconds, and an hour of service has to pass in a test.
+    Future<({PrinterService svc, _FakeSocket s})> listeningTill() async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'printer_net_outlet-1': <String>['tcp://192.168.1.50:9100'],
+        'selected_printer': 'tcp://192.168.1.50:9100',
+      });
+      final a = await agent();
+      await a.svc.start(a.auth);
+      final s = a.server.last;
+      s.serverSends('connect');
+      s.serverSends('joinedOutlet', {'outletId': 'outlet-1'});
+      return (svc: a.svc, s: s);
+    }
+
+    // A LONG-RUNNING TILL IS NOT A PAUSED CATCH-UP. Every live docket that
+    // drains arms the empty-window retry, and each quiet gap after it spends one
+    // of the 25 rounds — so an ordinary till reaches the cap within an hour or
+    // two of service without ever having had a backlog. Reading that cap as
+    // "paused" re-joined a listening socket on every window focus (a replay
+    // transaction each) and handed back a fresh 25-round budget every time.
+    testWidgets('a till that spent its retry rounds on quiet gaps is still left alone', (tester) async {
+      final t = await listeningTill();
+      Future<void> liveDocketsWithQuietGaps(String prefix) async {
+        for (var i = 0; i < 30; i++) {
+          t.s.serverSends('bill:print', {'billId': '$prefix-$i', 'escBase64': 'SGVsbG8='});
+          await tester.pump();
+          await tester.pump(const Duration(seconds: 151));
+        }
+      }
+
+      await liveDocketsWithQuietGaps('A');
+      expect(t.svc.logs.where((l) => l.contains('Printed A-')), hasLength(30));
+      expect(t.s.joins, 26, reason: 'precondition: the connect join, then all 25 retry rounds spent');
+      expect(t.svc.subscribed, isTrue);
+
+      await t.svc.onResume();
+      await t.svc.onResume();
+      expect(t.s.joins, 26, reason: 'no replay transaction for a window regaining focus');
+
+      await liveDocketsWithQuietGaps('B');
+      expect(t.s.joins, 26, reason: 'and no fresh retry budget handed out by the resume either');
+      await t.svc.stop();
+    });
+
+    testWidgets('a catch-up that really paused at its cap is continued by coming back, once', (tester) async {
+      final t = await listeningTill();
+      // 26 re-sent dockets: each of the first 25 drains into a request for the
+      // next window; the 26th arrives with the budget spent.
+      for (var i = 0; i <= 25; i++) {
+        t.s.serverSends('bill:print', {'billId': 'R-$i', 'escBase64': 'SGVsbG8=', 'replay': true});
+        await tester.pump();
+      }
+      expect(t.s.joins, 26);
+      expect(t.svc.logs.any((l) => l.contains('Paused catching up')), isTrue);
+
+      await t.svc.onResume();
+      expect(t.s.joins, 27, reason: 'coming back to the app is the reconnect the log asked for');
+      await t.svc.onResume();
+      expect(t.s.joins, 27, reason: 'once — the next resume finds nothing paused');
+      await t.svc.stop();
+    });
+
+    testWidgets('a reconnect already restarted a paused catch-up, so a resume after it adds nothing', (tester) async {
+      final t = await listeningTill();
+      for (var i = 0; i <= 25; i++) {
+        t.s.serverSends('bill:print', {'billId': 'R-$i', 'escBase64': 'SGVsbG8=', 'replay': true});
+        await tester.pump();
+      }
+      expect(t.svc.logs.any((l) => l.contains('Paused catching up')), isTrue);
+
+      t.s.serverSends('disconnect');
+      t.s.serverSends('connect'); // its join is the continue
+      t.s.serverSends('joinedOutlet', {'outletId': 'outlet-1'});
+      expect(t.s.joins, 27);
+      await t.svc.onResume();
+      expect(t.s.joins, 27);
+      await t.svc.stop();
+    });
   });
 
   group('wiring', () {
