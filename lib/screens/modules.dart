@@ -1447,7 +1447,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     final method = '${m['method']}'.trim();
     // The owner's name for the mode when the server sends one ("UPI", a custom
     // mode's label); the stored id otherwise. Unallocated is matched on the id.
-    final modeLabel = '${m['label'] ?? ''}'.trim().isNotEmpty ? '${m['label']}'.trim() : method;
+    final modeLabel = PaymentModes.reportName(m, method);
     final amount = _numOf(m['amount']);
     final bills = _int(m['bills']) ?? 0;
     final refund = _numOf(m['refund']);
@@ -1568,7 +1568,7 @@ Future<void> _headlineMethodSheet(
   return _detailSheet(
     context,
     eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
-    title: '$method · ${_money(mode['amount'])}',
+    title: '${PaymentModes.reportName(mode, method)} · ${_money(mode['amount'])}',
     jumpTo: 'Accounting',
     // Land on THIS DAY. Accounting opens on the window it last showed — Last 30
     // days on a first visit — and its Cash bar there is a month of cash beside
@@ -31068,6 +31068,28 @@ class _PrinterRoutingCardState extends State<_PrinterRoutingCard> {
   }
 }
 
+/// A stable identity for the Settings payload: equal payloads give equal keys,
+/// in any key order. Used to remount the Settings cards only when the live
+/// settings differ from what they were seeded with.
+@visibleForTesting
+String settingsPayloadKey(Map m) {
+  Object? canon(Object? v) {
+    if (v is Map) {
+      final keys = v.keys.map((k) => '$k').toList()..sort();
+      return {for (final k in keys) k: canon(v[k])};
+    }
+    if (v is List) return [for (final e in v) canon(e)];
+    return v;
+  }
+  try {
+    return jsonEncode(canon(m));
+  } catch (_) {
+    // Not JSON (never the case for this payload): fall back to identity, which
+    // remounts on every new payload — the safe direction for a form.
+    return '${identityHashCode(m)}';
+  }
+}
+
 Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic>>(
       load: () async {
         final prof = await rest.getMap('/restaurant/profile');
@@ -31141,7 +31163,17 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
       // Landing: the template settings idiom — a single centered column of
       // grouped cards under copper-tick section headers. Every card carries
       // its own titleMedium title + gray caption; groups sit 24px apart.
-      builder: (context, m, reload) => Center(
+      // EVERY CARD BELOW IS SEEDED FROM `m` ONCE, in its own initState, and saves
+      // what it was seeded with plus the owner's edits. AsyncView deliberately
+      // keeps this subtree mounted when the live refresh lands over a saved copy
+      // (so a page never jumps to the top — see _StaleFrame), which left the cards
+      // showing, and SAVING, the saved copy: a payment mode switched off on the
+      // web came back on the next time Settings was saved here. Keying the page on
+      // the payload remounts the cards exactly when the settings actually changed,
+      // and never when the refresh only confirmed what was already on screen.
+      builder: (context, m, reload) => KeyedSubtree(
+        key: ValueKey<String>('settings:${settingsPayloadKey(m)}'),
+        child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 760),
           child: ListView(padding: AppSpacing.pageNarrow, children: [
@@ -31279,6 +31311,7 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             ),
           ]),
         ),
+      ),
       ),
     );
 

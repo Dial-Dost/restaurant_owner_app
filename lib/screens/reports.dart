@@ -1209,7 +1209,12 @@ Widget _misLadderCard(BuildContext context, Map ladder) {
       line('Net', ladder['net'], prefix: '=', strong: true, rule: true),
       line('Service charge', ladder['service_charge'], prefix: '+'),
       line('Tax', ladder['tax'], prefix: '+'),
-      line('Round off', ladder['round_off'], prefix: '+'),
+      // Signed like every other round-off on a bill screen: the rung is a SUM of
+      // per-bill round-offs and is usually negative, so a fixed '+' read as
+      // "+ Round off ₹-3.45". Hidden when there is none, as the bill screens do.
+      if (billRoundOff(ladder['round_off']) != null)
+        line('Round off', billRoundOff(ladder['round_off'])!.abs(),
+            prefix: billRoundOff(ladder['round_off'])! < 0 ? '−' : '+'),
       line('Grand total', ladder['grand_total'], prefix: '=', strong: true, rule: true),
       if (_numOf(ladder['refund']) > 0) line('Refunds', ladder['refund'], prefix: '−'),
     ]),
