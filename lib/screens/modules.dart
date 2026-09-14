@@ -1445,6 +1445,9 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final rows = <Widget>[];
   for (final m in modes) {
     final method = '${m['method']}'.trim();
+    // The owner's name for the mode when the server sends one ("UPI", a custom
+    // mode's label); the stored id otherwise. Unallocated is matched on the id.
+    final modeLabel = '${m['label'] ?? ''}'.trim().isNotEmpty ? '${m['label']}'.trim() : method;
     final amount = _numOf(m['amount']);
     final bills = _int(m['bills']) ?? 0;
     final refund = _numOf(m['refund']);
@@ -1452,14 +1455,14 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     final isUnallocated = method == 'Unallocated';
     rows.add(Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
       HBarRow(
-        label: method,
+        label: modeLabel,
         // The mode's SHARE of today, not its size against the largest mode: a
         // till that took ₹200 by card and ₹20,000 in cash must not draw a card
         // bar that looks half full.
         fraction: total > 0 ? (amount / total).clamp(0.0, 1.0) : 0,
         value: _money(amount),
         color: isUnallocated ? AppColors.warning : null,
-        tooltip: '$method · ${_money(amount)} · $bills bill(s) · $share of today',
+        tooltip: '$modeLabel · ${_money(amount)} · $bills bill(s) · $share of today',
         onTap: () => _headlineMethodSheet(
           context,
           mode: m,
