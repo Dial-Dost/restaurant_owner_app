@@ -30145,6 +30145,27 @@ class _PasswordRequestsBanner extends StatelessWidget {
   }
 }
 
+/// The connection card's chip and sentence, from the agent's [PrinterLink].
+///
+/// THREE STATES, because "Connected" used to cover two. A socket whose transport
+/// is up but which the server never put in the outlet's room receives no
+/// `bill:print` at all, and showing it green is how a till went a whole lunch
+/// printing nothing while every screen said it was fine. Amber is the honest
+/// colour for it: the agent is working on it (see PrinterService's watchdog),
+/// and if it cannot, it will say so or send the user to sign in.
+({String label, Color color, String caption}) printerLinkStatus(PrinterLink link, {required bool unconfigured}) =>
+    switch (link) {
+      PrinterLink.listening =>
+        (label: 'Listening', color: AppColors.success, caption: 'Listening for print jobs in realtime'),
+      PrinterLink.joining =>
+        (label: 'Connecting', color: AppColors.warning, caption: 'Connected, not receiving jobs yet — retrying'),
+      PrinterLink.offline => (
+          label: 'Offline',
+          color: AppColors.danger,
+          caption: unconfigured ? 'Add a printer below and this device starts printing' : 'Not connected to realtime',
+        ),
+    };
+
 // Built-in thermal printer agent UI: set up the printers, watch the realtime
 // connection, and monitor the print queue/log. The PrinterService runs in the
 // background (started at login) — this screen just configures and observes it.
@@ -30176,6 +30197,7 @@ Widget printerModule(RestClient rest, Profile p) {
       // room until it can — so "Offline" here is a setup step, not a fault, and
       // the card below says which.
       final unconfigured = !svc.hasSpooler && svc.networkPrinters.isEmpty;
+      final link = printerLinkStatus(svc.linkState, unconfigured: unconfigured);
       return ListView(padding: AppSpacing.pageNarrow, children: [
         // Connection status
         ForkCard(
@@ -30186,19 +30208,15 @@ Widget printerModule(RestClient rest, Profile p) {
               switchInCurve: Curves.easeOut,
               switchOutCurve: Curves.easeIn,
               child: StatusChip(
-                key: ValueKey('printer-conn-${svc.connected}'),
-                label: svc.connected ? 'Connected' : 'Offline',
-                color: svc.connected ? AppColors.success : AppColors.danger,
+                key: ValueKey('printer-conn-${svc.linkState.name}'),
+                label: link.label,
+                color: link.color,
               ),
             ),
             const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Text(
-                  svc.connected
-                      ? 'Listening for print jobs in realtime'
-                      : unconfigured
-                          ? 'Add a printer below and this device starts printing'
-                          : 'Not connected to realtime',
+                  link.caption,
                   style: text.bodySmall,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis),
