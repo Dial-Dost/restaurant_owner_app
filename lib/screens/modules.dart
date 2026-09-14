@@ -10299,7 +10299,7 @@ class _TableSheetState extends State<_TableSheet> {
               //
               // For everyone else it is unchanged, including the money scoping
               // inside it: the already-waived card prints what came off the
-              // charge and off the total, and `showsMoney` still drops those two
+              // charge and charge + tax, and `showsMoney` still drops those two
               // lines while leaving the reason, the names and the reverse
               // control standing.
               if (_scope.managerOnlyAsks)

@@ -737,11 +737,16 @@ void main() {
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
 
-      // The charge that came off, and the larger amount the TOTAL fell by. Only
-      // showing one of them is how a guest is told a different number from the
-      // one on the paper.
+      // The charge that came off, and the larger amount it came off WITH its
+      // tax. Only showing one of them is how a guest is told a different number
+      // from the one on the paper.
       expect(find.textContaining('₹120.00 charge off'), findsOneWidget);
-      expect(find.textContaining('₹126.00 off the total'), findsOneWidget);
+      // …labelled as what it is. The figure is measured before round-off and
+      // the total the guest pays is rounded to the rupee (migration 048), so
+      // calling it "off the total" put a number on the card that the bill's own
+      // before/after totals did not agree with.
+      expect(find.textContaining('₹126.00 with its tax, before round-off'), findsOneWidget);
+      expect(find.textContaining('off the total'), findsNothing);
       expect(find.textContaining('authorised by manager01'), findsOneWidget);
       // …while the BILL shows nothing about it: a removed charge has no row
       // ("don't show service charge opted out when removed"). This card is

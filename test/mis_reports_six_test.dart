@@ -509,6 +509,10 @@ void main() {
     // Twice: once as the headline tile, once as the grid's own column header.
     expect(find.text('TOTAL REDUCTION'), findsWidgets);
     expect(find.text('₹126.00'), findsWidgets);
+    // …and the tile says what it is: charge + tax measured before each bill's
+    // round-off, not the rounded grand totals' gap (migration 048).
+    expect(find.text('charge + tax, before round-off'), findsOneWidget);
+    expect(find.text('off the grand total'), findsNothing);
     expect(find.text('CHARGE COLLECTED'), findsOneWidget);
     // Money never entered a sales figure — said, not implied.
     expect(find.textContaining('never entered a sales figure'), findsOneWidget);
