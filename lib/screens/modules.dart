@@ -16,6 +16,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
+import '../models/bill_round_off.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -10253,12 +10254,18 @@ class _TableSheetState extends State<_TableSheet> {
                     billRow('Non-chargeable (given away)', _money(_bill!['nc_total'])),
                   if (_bn('discount') > 0)
                     billRow('Discount${_s(_bill!, 'discount_type') == 'percent' ? ' (${_bn('discount_value').toStringAsFixed(_bn('discount_value') % 1 == 0 ? 0 : 1)}%)' : ''}', '− ${_money(_bill!['discount'])}'),
+                  // Only a charge that is charged. A removed one (a recorded
+                  // waiver) shows no row at all — the client asked for exactly
+                  // that ("don't show service charge opted out when removed").
+                  // The manager's waiver card below still says who took it off,
+                  // and is where it is put back.
                   if (_bn('service_charge') > 0) billRow('Service charge', _money(_bill!['service_charge'])),
-                  // Why the charge is zero, rather than leaving the guest and the
-                  // waiter to work it out from an absent line.
-                  if (_bill!['service_charge_waived'] == true)
-                    billRow('Service charge', 'waived'),
                   if (_bn('tax_total') > 0) billRow('Tax', _money(_bill!['tax_total'])),
+                  // What the server rounded the total to the rupee by (backend
+                  // migration 048) — the line on the guest's paper, shown only
+                  // when it is not zero. Read, never computed here.
+                  if (billRoundOff(_bill!['round_off']) != null)
+                    billRow('Round off', billRoundOffMoney(billRoundOff(_bill!['round_off'])!)),
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: Divider(),
@@ -10825,7 +10832,7 @@ const String _billQrNoteFallback = 'For calling Valet kindly scan the below QR c
 /// one matcher the server bills by — and this is the same predicate as the web
 /// print page's `billChargesForService`. A live waiver took the charge off both
 /// legs before this bill was computed, so a waived bill never carries the
-/// sentence; its paper prints "Opted-out" instead.
+/// sentence — and, like its paper, shows no service-charge line either.
 @visibleForTesting
 bool billPrintsServiceChargeNote(Map bill) {
   if (bill['service_charge_waived'] == true) return false;
@@ -11077,29 +11084,21 @@ class _BillPreviewDialog extends StatelessWidget {
     final subtotal = _n(bill['subtotal'] ?? bill['total_amt']);
     final discount = _n(bill['discount']);
     final serviceCharge = _n(bill['service_charge']);
-    // Zero on a tax_line tenant even when a charge IS levied (it rides in
-    // `taxes`), so this boolean — not the absence of a charge line — is the only
-    // truthful way to say the charge was taken off.
-    final serviceChargeWaived = bill['service_charge_waived'] == true;
     // Only the lines that carry money, as escpos.ts filters `taxLines`.
     final taxes = ((bill['taxes'] as List?) ?? const []).whereType<Map>().where((t) => _n(t['amount']) > 0).toList();
     final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
-    // A round-off the billing layer DISCLOSED, printed only when it is not zero
-    // — the renderer's rule for a supplied grand total. The open-bill read
-    // carries none today, so neither does this sheet: nothing is re-rounded here.
-    final roundOff = _n(bill['round_off']);
-    final showRoundOff = bill['round_off'] != null && (roundOff * 100).round() != 0;
+    // The round-off the billing layer DISCLOSED (backend migration 048: every
+    // bill is rounded to the rupee in computeBillCharges), printed only when it
+    // is not zero — the renderer's rule for a supplied grand total. Read off the
+    // same payload as the total; nothing is re-rounded here.
+    final roundOff = billRoundOff(bill['round_off']);
     final billNo = _s(bill, 'bill_no', '');
     // The customer slot — `Name:` / `Customer GSTIN:`.
     final customerLines = billCustomerLines(bill);
-    // The label the paper gives the charge line. The configured percentage
-    // while the charge is on; on a waived bill the payload's percent is the
-    // restaurant_percent leg and is 0 on a tax-line tenant, so the percentage the
-    // waiver was priced at names it instead. A label, never a figure.
-    final waiver = bill['service_charge_waiver'];
-    final scPct = _n(bill['service_charge_percent']) > 0
-        ? _n(bill['service_charge_percent'])
-        : (waiver is Map ? _n(waiver['basis_percent']) : 0.0);
+    // The label the paper gives the charge line: the configured percentage. It
+    // labels a charge that is charged and nothing else — a removed charge has
+    // no line to label. A label, never a figure.
+    final scPct = _n(bill['service_charge_percent']);
     final scLabel = scPct > 0 ? 'Service Charge ${_pct(scPct)}%' : 'Service Charge';
     // Quantities as the paper counts them (a whole number, at least one a line).
     // A count of dishes, not money.
@@ -11279,22 +11278,18 @@ class _BillPreviewDialog extends StatelessWidget {
                       if (discount > 0)
                         _ladder(col, [_s(bill, 'coupon_code', '').trim().isEmpty ? 'Discount' : 'Coupon ${_s(bill, 'coupon_code')}'],
                             '-${discount.toStringAsFixed(2)}'),
+                      // A charge only when one is charged. A waived bill prints
+                      // no service-charge line — escpos.ts prints none either
+                      // since the client asked for a removed charge not to be
+                      // shown on the bill.
                       if (serviceCharge > 0) _ladder(col, [scLabel], serviceCharge.toStringAsFixed(2)),
-                      // WHY THE CHARGE IS ZERO, rather than leaving the guest and
-                      // the waiter to work it out from a line that is simply
-                      // absent — the line escpos.ts prints as "Opted-out", worded
-                      // as it does. Never a figure: on a tax_line tenant the
-                      // amount that came off is a difference between two ladders,
-                      // not a rung, and this sheet does not compute differences.
-                      if (serviceChargeWaived) _ladder(col, [scLabel], 'Opted-out'),
                       ...taxes.map((m) {
                         final pct = _n(m['percentage']);
                         final label = pct > 0 ? '${_s(m, 'name', 'Tax')} ${_pct(pct)}%' : _s(m, 'name', 'Tax');
                         return _ladder(col, [label], _n(m['amount']).toStringAsFixed(2));
                       }),
                       _rule(),
-                      if (showRoundOff)
-                        _ladder(col, ['Round off'], '${roundOff > 0 ? '+' : ''}${roundOff.toStringAsFixed(2)}'),
+                      if (roundOff != null) _ladder(col, ['Round off'], billRoundOffPaper(roundOff)),
                       // The one figure bigger than the rest: bold and tall, as the
                       // paper's double-height Grand Total row is.
                       _ladder(col, ['Grand Total'], _money(grandTotal),
@@ -11341,15 +11336,6 @@ class _BillPreviewDialog extends StatelessWidget {
               );
             }),
           ),
-          // Staff-facing, OFF the paper: the slip itself says "Opted-out" and no
-          // more, but the person about to hand it over should know the charge
-          // came off by a recorded waiver rather than by accident.
-          if (serviceChargeWaived)
-            Padding(
-              padding: const EdgeInsets.only(top: 10),
-              child: Text('Service charge waived on this bill.',
-                  style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: AppColors.textSecondary)),
-            ),
           const SizedBox(height: 14),
           Row(mainAxisAlignment: MainAxisAlignment.end, children: [
             ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
@@ -23089,8 +23075,13 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
   final coupon = _s(bill, 'coupon_code', '');
   final method = _s(bill, 'payment_method', '');
   final covers = _int(bill['covers']);
-  // The contract's invariant, shown rather than trusted.
-  final balances = (taxable + service + taxTotal - grand).abs() < 0.05;
+  // What rounded the settled total to the rupee (backend migration 048), as
+  // recorded at settle. Null on a bill that needed none or was settled before
+  // rounding existed.
+  final roundOff = billRoundOff(bill['round_off']);
+  // The contract's invariant, shown rather than trusted — with the round-off as
+  // its fourth rung, or every rounded bill would read as not adding up.
+  final balances = (taxable + service + taxTotal + (roundOff ?? 0) - grand).abs() < 0.05;
 
   Widget rule() => Container(height: 1, color: AppColors.divider);
   Widget money(String label, String value, {String? sub, bool strong = false, Color? tint}) => Padding(
@@ -23210,6 +23201,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       for (final t in taxes)
         money('${_s(t, 'name', 'Tax')} ${_numOf(t['percentage'])}%', _money(t['amount'])),
       if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
+      if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
       money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
       const SizedBox(height: 6),
@@ -23219,7 +23211,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax = ${_money(grand)}',
+            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax'
+            '${roundOff == null ? '' : ' ${roundOff < 0 ? '−' : '+'} ${_money(roundOff.abs())} round off'} = ${_money(grand)}',
             style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
           ),
         ),
