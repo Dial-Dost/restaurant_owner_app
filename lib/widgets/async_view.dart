@@ -255,8 +255,9 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
 
   /// [silent] keeps whatever is on screen on screen while the refetch is in
   /// flight: no skeleton, and no error state if it fails. Because the widget tree
-  /// at this slot never changes shape, nothing below is remounted either — scroll
-  /// position, the selected filter and every child's own state survive.
+  /// at this slot never changes shape (the staleness pill included, see
+  /// [_StaleFrame]), nothing below is remounted either — scroll position, the
+  /// selected filter and every child's own state survive.
   Future<void> _load({bool silent = false}) async {
     final gen = ++_gen;
     if (!silent) setState(() { _loading = true; _error = null; });
@@ -340,25 +341,11 @@ class _AsyncViewState<T> extends State<AsyncView<T>> {
     final asOf = _dataAsOf;
     final aged = asOf != null &&
         DateTime.now().difference(asOf) > const Duration(seconds: 60);
-    if (!_offline && !(_fromCache && aged)) return content;
-    // Passthrough keeps the builder's constraints byte-identical to what it
-    // received before the banner existed — loosening them here could re-lay-out
-    // every module for the sake of a chip.
-    return Stack(
-      fit: StackFit.passthrough,
-      children: [
-        content,
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: AppSpacing.xl,
-          child: IgnorePointer(
-            child: Center(
-              child: _StaleBanner(offline: _offline, asOf: asOf, superseded: _superseded),
-            ),
-          ),
-        ),
-      ],
+    return _StaleFrame(
+      content: content,
+      banner: _offline || (_fromCache && aged)
+          ? _StaleBanner(offline: _offline, asOf: asOf, superseded: _superseded)
+          : null,
     );
   }
 }
@@ -552,21 +539,55 @@ mixin CachePrimedScreen<T extends StatefulWidget> on State<T> {
     final asOf = _cacheAsOf;
     final aged = asOf != null &&
         DateTime.now().difference(asOf) > const Duration(seconds: 60);
-    if (!_cacheOffline && !(_primedFromCache && aged)) return content;
+    // One tree with or without the pill, so its clearing never remounts the
+    // screen's list (see [_StaleFrame]).
+    return _StaleFrame(
+      content: content,
+      banner: _cacheOffline || (_primedFromCache && aged)
+          ? _StaleBanner(offline: _cacheOffline, asOf: asOf, superseded: _cacheSuperseded)
+          : null,
+    );
+  }
+}
+
+/// [content], with the staleness pill floating over it or not — in the SAME
+/// tree either way.
+///
+/// Both staleness affordances used to return the bare `content` when there was
+/// no pill and a Stack when there was. That changes the widget type at the
+/// slot, so whenever the pill came or went (the silent refresh landing over a
+/// saved copy more than a minute old, the line dropping or coming back, the age
+/// tick crossing the minute) everything under it was thrown away and mounted
+/// afresh: every list back at offset 0, every child's own state gone. On a page
+/// scrolled down to a section that reads as the page jumping to the top by
+/// itself, and it undid the Analytics section chips' scroll-back whenever the
+/// window they returned to had an old saved copy. Always the Stack, with the
+/// pill as an optional second child, keeps [content] at index 0 of one Stack,
+/// so a refresh updates it in place.
+class _StaleFrame extends StatelessWidget {
+  const _StaleFrame({required this.content, required this.banner});
+
+  final Widget content;
+  final Widget? banner;
+
+  @override
+  Widget build(BuildContext context) {
+    final pill = banner;
+    // Passthrough keeps the builder's constraints byte-identical to what it
+    // received before the banner existed — loosening them here could re-lay-out
+    // every module for the sake of a chip. With [content] the only non-positioned
+    // child, the Stack is exactly its size.
     return Stack(
       fit: StackFit.passthrough,
       children: [
         content,
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: AppSpacing.xl,
-          child: IgnorePointer(
-            child: Center(
-              child: _StaleBanner(offline: _cacheOffline, asOf: asOf, superseded: _cacheSuperseded),
-            ),
+        if (pill != null)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: AppSpacing.xl,
+            child: IgnorePointer(child: Center(child: pill)),
           ),
-        ),
       ],
     );
   }

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,6 +9,7 @@ import 'package:restaurant_owner_app/screens/modules.dart' as m;
 import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/date_range.dart';
+import 'package:restaurant_owner_app/services/get_cache.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
@@ -269,10 +272,17 @@ Map<String, dynamic> _analyticsWithAttendance() => {
       },
     };
 
-/// Open the chip's sheet and tap a preset by its label.
+/// The page-level window picker: the one full-size chip. Section headers carry
+/// dense copies of it now, so `find.byType(DateRangeChip).first` would quietly
+/// resolve to one of those if the top picker ever went missing.
+Finder _topChip() =>
+    find.byWidgetPredicate((w) => w is DateRangeChip && !w.dense, description: 'the top DateRangeChip');
+
+/// Open the TOP chip's sheet and tap a preset by its label.
 Future<void> _pickPreset(WidgetTester tester, String label) async {
-  await tester.ensureVisible(find.byType(DateRangeChip).first);
-  await tester.tap(find.byType(DateRangeChip).first, warnIfMissed: false);
+  expect(_topChip(), findsOneWidget, reason: 'the page-level date picker is missing');
+  await tester.ensureVisible(_topChip());
+  await tester.tap(_topChip(), warnIfMissed: false);
   await tester.pumpAndSettle();
   expect(find.text('Period'), findsOneWidget, reason: 'the range sheet did not open');
   await tester.tap(find.text(label).last);
@@ -353,8 +363,8 @@ void main() {
 
     testWidgets('the calendar is reachable from the sheet', (tester) async {
       await _mount(tester, m.accountingModule, _accountingRoutes());
-      await tester.ensureVisible(find.byType(DateRangeChip).first);
-      await tester.tap(find.byType(DateRangeChip).first, warnIfMissed: false);
+      await tester.ensureVisible(_topChip());
+      await tester.tap(_topChip(), warnIfMissed: false);
       await tester.pumpAndSettle();
 
       // Presets first, calendar second — both present, both one tap from the chip.
@@ -445,7 +455,7 @@ void main() {
     testWidgets('the TOP chip keeps its old behaviour: no jump down the page', (tester) async {
       await _mount(tester, m.accountingModule, _tallAccountingRoutes(), width: 400, height: 800);
       await _pickPreset(tester, 'Last 7 days');
-      expect(_onScreen(tester, find.byType(DateRangeChip).first), isTrue);
+      expect(_onScreen(tester, _topChip()), isTrue);
       expect(_onScreen(tester, _header('Settled bills')), isFalse);
     });
 
@@ -540,6 +550,52 @@ void main() {
       expect(DateRangeMemory.of('analytics').label(), week.label());
       expect(_onScreen(tester, _header('Kitchen')), isTrue,
           reason: 'picking dates from the Kitchen header threw the page back to the top');
+    });
+
+    // The same pick, on the path a real tablet takes most: going BACK to a window
+    // that loaded minutes ago (the 'Last 30 days' the module opened on). The
+    // remounted body paints that window's saved copy first, old enough to wear
+    // the "Updated Xm ago" pill, and the reveal fires on that paint. Then the
+    // silent refresh lands and the pill clears. AsyncView used to return the
+    // bare list there instead of the Stack it had just been, which remounted the
+    // list at offset 0: the owner landed on Kitchen and was thrown back to the
+    // top a moment later. Zero latency or a fresh copy never shows that.
+    testWidgets('going back to an older saved window still lands on Kitchen once the live figures arrive',
+        (tester) async {
+      await _mount(tester, m.analyticsModule, _analyticsRoutes(),
+          width: 400, height: 420, latency: const Duration(milliseconds: 300));
+      await _scrollTo(tester, _header('Kitchen'));
+      await _pickPresetFrom(tester, _header('Kitchen'), 'Last 7 days');
+      expect(_onScreen(tester, _header('Kitchen')), isTrue, reason: 'precondition: the first pick did not land');
+
+      // Every saved copy is now ten minutes old, the opening window's included.
+      final prefs = await SharedPreferences.getInstance();
+      final old = DateTime.now().subtract(const Duration(minutes: 10)).millisecondsSinceEpoch;
+      final saved = prefs.getKeys().where((k) => k.startsWith(GetCache.keyPrefix)).toList();
+      expect(saved, isNotEmpty, reason: 'precondition: nothing was saved, so no saved copy can paint');
+      for (final k in saved) {
+        final d = (jsonDecode(prefs.getString(k)!) as Map)['d'];
+        await prefs.setString(k, '{"t":$old,"d":${jsonEncode(d)}}');
+      }
+
+      await tester.tap(find.descendant(of: _header('Kitchen'), matching: find.byType(DateRangeChip)),
+          warnIfMissed: false);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Last 30 days').last);
+      // Frame by frame, so the saved-copy paint and the live swap are both seen.
+      var copyPainted = false;
+      for (var i = 0; i < 40; i++) {
+        await tester.pump(const Duration(milliseconds: 25));
+        if (find.text('Updated 10m ago').evaluate().isNotEmpty) copyPainted = true;
+      }
+      await tester.pumpAndSettle();
+
+      expect(copyPainted, isTrue, reason: 'precondition: the aged saved copy never painted with its pill');
+      expect(find.textContaining('Updated '), findsNothing,
+          reason: 'precondition: the live figures never replaced the saved copy');
+      expect(DateRangeMemory.of('analytics').label(), DateRange.fromPreset(RangePreset.last30).label());
+      expect(_onScreen(tester, _header('Kitchen')), isTrue,
+          reason: 'the live refresh after the saved copy threw the page back to the top');
     });
   });
 
