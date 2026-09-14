@@ -299,24 +299,94 @@ void main() {
               ' zeroed. The two must differ.');
     });
 
-    // The waived preview must not merely be quieter — the charge must be gone
-    // from the ladder AND the paper must say why, because a line that is simply
-    // absent leaves the guest and the waiter to work it out.
-    testWidgets('a waived bill drops the charge line and says so',
+    // THE CLIENT: "In the overview, don't show service charge opted out when
+    // removed" — and, of the bill, "this too". A waived bill's preview reads like
+    // a bill with no service charge, because it is one: no charge line, no
+    // "Opted-out" rung, and no staff caption announcing the waiver. The paper
+    // (escpos.ts) prints none of it either.
+    testWidgets('a waived bill drops the charge line and shows nothing in its place',
         (tester) async {
       await _mount(tester, _taxLineBill(waived: true));
       await _openPreview(tester);
+      final dialog = find.byType(Dialog);
 
-      // ONE row names the charge, and it carries no figure: "Opted-out", the
-      // paper's own word. A second "Service Charge 10%" row would be the waived
-      // charge still billed as a tax line — _previewAmount insists on exactly one.
-      expect(_previewAmount(tester, 'Service Charge 10%'), 'Opted-out',
-          reason: 'the waived charge must not still be billed as a tax line');
-      expect(find.text('Service charge waived on this bill.'), findsOneWidget);
+      expect(find.descendant(of: dialog, matching: find.textContaining('Service Charge')), findsNothing,
+          reason: 'a removed charge has no row — not a figure, not a word');
+      expect(find.descendant(of: dialog, matching: find.textContaining('Opted-out')), findsNothing);
+      expect(find.textContaining('waived on this bill'), findsNothing,
+          reason: 'the staff caption announced the waiver on a receipt-shaped sheet');
       expect(_previewFigures(tester), isNot(contains('549.90')),
           reason: 'a waived charge must not be priced anywhere on the receipt');
       expect(_serviceChargeNote, findsNothing,
           reason: 'no voluntary-charge disclaimer on a bill that charges none');
+      // The total is still the server's own, waiver and all.
+      expect(_previewAmount(tester, 'Grand Total'), '₹5773.96');
+    });
+
+    testWidgets('the table sheet\'s Bill card shows no "waived" service-charge row either',
+        (tester) async {
+      await _mount(tester, _taxLineBill(waived: true));
+      await _openTable(tester);
+      await _reveal(tester, find.text('TOTAL PAYABLE'));
+      expect(find.text('TOTAL PAYABLE'), findsOneWidget);
+      expect(find.text('waived'), findsNothing,
+          reason: 'the Bill card used to read "Service charge   waived"');
+      expect(find.text('Service charge'), findsNothing);
+    });
+
+    // BACKEND MIGRATION 048: every bill is rounded to the rupee in the billing
+    // layer and `round_off` rides beside `grand_total`. The client's receipt:
+    // 4745 + SGST 118.63 + CGST 118.63 = 4982.26 -> "Round off -0.26",
+    // "Grand Total 4982.00".
+    Map<String, dynamic> gaiaRounded({required double? roundOff}) => {
+          ..._taxLineBill(waived: true),
+          'subtotal': 4745.0,
+          'total_amt': 4745.0,
+          'service_charge_waived': false,
+          'service_charge_waiver': null,
+          'service_charge_percent': 0.0,
+          'taxes': const [
+            {'name': 'SGST', 'percentage': 2.5, 'amount': 118.63},
+            {'name': 'CGST', 'percentage': 2.5, 'amount': 118.63},
+          ],
+          'tax_total': 237.26,
+          'round_off': roundOff,
+          'grand_total': roundOff == null ? 4982.26 : 4982.0,
+          'items': const [
+            {'name': 'Thali', 'price': 4745.0, 'quantity': 1},
+          ],
+        };
+
+    testWidgets('a rounded bill shows its Round off above the Grand Total, on the preview and the sheet',
+        (tester) async {
+      await _mount(tester, gaiaRounded(roundOff: -0.26));
+      await _openPreview(tester);
+      // The paper's own wording and sign, and no currency on the rung.
+      expect(_previewAmount(tester, 'Round off'), '-0.26');
+      expect(_previewAmount(tester, 'Grand Total'), '₹4982.00');
+      final dialog = find.byType(Dialog);
+      expect(tester.getTopLeft(find.descendant(of: dialog, matching: find.text('Round off'))).dy,
+          lessThan(tester.getTopLeft(find.descendant(of: dialog, matching: find.text('Grand Total'))).dy));
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+
+      await _reveal(tester, find.text('TOTAL PAYABLE'));
+      expect(find.text('Round off'), findsOneWidget, reason: 'the table sheet\'s Bill card');
+      expect(find.text('−₹0.26'), findsOneWidget);
+    });
+
+    testWidgets('a bill with no round-off (whole, or an older backend) shows no Round off line',
+        (tester) async {
+      await _mount(tester, gaiaRounded(roundOff: null));
+      await _openPreview(tester);
+      expect(find.descendant(of: find.byType(Dialog), matching: find.text('Round off')), findsNothing);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+
+      await _mount(tester, gaiaRounded(roundOff: 0.0));
+      await _openTable(tester);
+      await _reveal(tester, find.text('TOTAL PAYABLE'));
+      expect(find.text('Round off'), findsNothing);
     });
 
     // THE RULE ITSELF, pinned independently of any particular tax shape: the

@@ -1049,7 +1049,7 @@ Widget misServiceChargeBlock(
   required String tableName,
   required VoidCallback onChanged,
   /// Whether this reader may be shown the two rupee figures on the ALREADY-WAIVED
-  /// card — what came off the charge, and what came off the grand total.
+  /// card — what came off the charge, and the charge plus the tax on it.
   ///
   /// Defaults to true, so every existing caller behaves exactly as it did. The
   /// table sheet passes a waiter's `false`: item 19 takes the restaurant's money
@@ -1084,12 +1084,18 @@ Widget misServiceChargeBlock(
           ]),
           if (showsMoney) ...[
             const SizedBox(height: 6),
-            // BOTH numbers, because with GST on the charge they differ and the
-            // guest is told the second one: the charge itself came off, and the
-            // grand total fell by the charge PLUS the tax that rode on it.
+            // BOTH numbers, because with GST on the charge they differ: the
+            // charge itself came off, and so did the tax that rode on it.
+            //
+            // The second is NOT "off the total" (migration 048). It is measured
+            // before round-off, while the total the guest pays is rounded to the
+            // rupee, so the payable total can fall by a little more or less —
+            // 577.40 of charge and tax took 6351 to 5774. The card has no rounded
+            // totals to show (the record keeps the exact figure), so it says
+            // what the figure is instead of what it is not.
             Text(
               '${_money(w['amount_waived'])} charge off · '
-              '${_money(w['grand_total_reduction'])} off the total',
+              '${_money(w['grand_total_reduction'])} with its tax, before round-off',
               style: text.bodyMedium,
             ),
           ],
@@ -1188,7 +1194,10 @@ Future<void> _waiveServiceCharge(
       'reason': answer.reason,
       'authorised_by': answer.authorisedBy,
     });
-    // The two totals that DIFFERENCED — what the till can show the guest.
+    // The two payable totals, each rounded to the rupee — what the guest was
+    // asked for before the waiver and is asked for now. Not the differenced
+    // pre-round figures the waiver records, which can be off their gap by under
+    // a rupee.
     final before = res is Map ? _numOf(res['grand_total_before']) : 0.0;
     final after = res is Map ? _numOf(res['grand_total_after']) : 0.0;
     messenger.showSnackBar(SnackBar(
