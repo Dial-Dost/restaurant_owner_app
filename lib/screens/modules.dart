@@ -21288,7 +21288,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
-            _detailRow(context, _s(m, 'method', 'Other'), _money(m['sales']),
+            _detailRow(context, PaymentModes.reportName(m), _money(m['sales']),
                 trailing: _billsWord(_int(m['bills']) ?? 0)),
         ],
       ],
@@ -21392,7 +21392,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     return _detailSheet(
       context,
       eyebrow: 'Payment method · $_windowLabel',
-      title: _s(m, 'method', 'Other'),
+      title: PaymentModes.reportName(m),
       children: [
         _detailRow(context, 'Taken this way', _money(sales)),
         _detailRow(context, 'Share of gross sales', total > 0 ? '${(sales / total * 100).toStringAsFixed(1)}%' : '—'),
@@ -21724,11 +21724,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                 return Column(children: [
                   for (final m in rows)
                     HBarRow(
-                      label: _s(m, 'method', 'Other'),
+                      label: PaymentModes.reportName(m),
                       sub: '${m['bills'] ?? 0} bills',
                       fraction: maxV > 0 ? (_n(m['sales']) / maxV).clamp(0.0, 1.0) : 0,
                       value: money(_n(m['sales'])),
-                      tooltip: '${_s(m, 'method', 'Other')} · ${_money(m['sales'])}',
+                      tooltip: '${PaymentModes.reportName(m)} · ${_money(m['sales'])}',
                       onTap: () => _methodSheet(m),
                     ),
                 ]);
@@ -21853,7 +21853,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                   for (final m in byMethod)
                     DropdownMenuItem<String>(
                       value: _s(m as Map, 'method', ''),
-                      child: Text(_s(m, 'method', 'Other'), overflow: TextOverflow.ellipsis),
+                      child: Text(PaymentModes.reportName(m), overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),

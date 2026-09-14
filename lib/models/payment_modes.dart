@@ -127,11 +127,59 @@ class PaymentModes {
   static final Map<String, String> _aliasKeys = {
     for (final e in _builtinAliases.entries) key(e.key): e.value,
   };
-  static final Set<String> _compKeys =
-      {'complimentary', 'comp', 'nc', 'non chargeable', 'non-chargeable', 'staff meal'}.map(key).toSet();
-  static final Set<String> _creditKeys = {'credit', 'on account', 'due', 'pay later'}.map(key).toSet();
+  static const List<String> _notMoneyComp = [
+    'complimentary', 'comp', 'comps', 'nc', 'foc', 'non chargeable', 'nonchargeable', 'staff meal', 'staff meals',
+  ];
+  static const List<String> _notMoneyCredit = ['credit', 'on account', 'due', 'pay later', 'paylater'];
+  static final Set<String> _compKeys = _notMoneyComp.map(key).toSet();
+  static final Set<String> _creditKeys = _notMoneyCredit.map(key).toSet();
   static final Set<String> _bucketKeys = {'split', 'other', 'unallocated'}.map(key).toSet();
   static final RegExp _idCharset = RegExp(r"^[A-Za-z0-9 &+.\-/()']+$");
+
+  static List<String> _words(String raw) =>
+      raw.toLowerCase().split(RegExp(r'[^a-z0-9]+')).where((w) => w.isNotEmpty).toList();
+
+  static bool _phraseAt(List<String> words, String phrase, int i) {
+    final p = _words(phrase);
+    for (var j = 0; j < p.length; j++) {
+      if (i + j >= words.length || words[i + j] != p[j]) return false;
+    }
+    return true;
+  }
+
+  /// Whether a name says it is NOT money collected: 'comp' (free food booked as
+  /// sales and tax), 'credit' (a bill closed as paid with nothing received), or
+  /// null. The server's notMoneyKind, word for word: whole words anywhere in the
+  /// name ("Staff Meals", "Due Payment", "Credit/Due" are refused; "Company Card"
+  /// and "Duet Pay" are not), plus the whole-name key ("N/C"). "credit" with
+  /// "card" after it is a credit CARD — money the acquirer pays out.
+  static String? notMoneyKind(String name) {
+    final k = key(name);
+    if (_compKeys.contains(k)) return 'comp';
+    if (_creditKeys.contains(k)) return 'credit';
+    final words = _words(name);
+    for (var i = 0; i < words.length; i++) {
+      if (_notMoneyComp.any((p) => _phraseAt(words, p, i))) return 'comp';
+    }
+    for (var i = 0; i < words.length; i++) {
+      for (final p in _notMoneyCredit) {
+        if (!_phraseAt(words, p, i)) continue;
+        if (p == 'credit' && words.skip(i + 1).any((w) => w == 'card' || w == 'cards')) continue;
+        return 'credit';
+      }
+    }
+    return null;
+  }
+
+  /// What a REPORT row calls its mode: the label the server attached (Settings >
+  /// Payments), else the stored id, else [fallback]. Display only — the rows
+  /// group, and the closed-bill filter matches, on `method`.
+  static String reportName(Map row, [String fallback = 'Other']) {
+    final label = '${row['label'] ?? ''}'.trim();
+    if (label.isNotEmpty) return label;
+    final method = '${row['method'] ?? ''}'.trim();
+    return method.isEmpty ? fallback : method;
+  }
 
   static PaymentMode? find(String? method, List<PaymentMode> modes) {
     final k = key(method);
@@ -167,11 +215,12 @@ class PaymentModes {
     if (name.isEmpty) return 'Give the payment mode a name.';
     final k = key(name);
     if (k.isEmpty) return '"$name" needs at least one letter or number.';
-    if (_compKeys.contains(k)) {
+    final notMoney = notMoneyKind(name);
+    if (notMoney == 'comp') {
       return '"$name" can\'t be a payment mode: a free meal is not money collected, and settling it as '
           'paid books it as sales and tax. Use "Mark as non-chargeable" on the bill instead.';
     }
-    if (_creditKeys.contains(k)) {
+    if (notMoney == 'credit') {
       return '"$name" can\'t be a payment mode: it would close the bill as paid while no money has arrived.';
     }
     if (_bucketKeys.contains(k)) {
@@ -209,10 +258,11 @@ class PaymentModes {
     if (label.isEmpty) return null;
     if (label.length > labelMax) return 'A label can be at most $labelMax characters.';
     final k = key(label);
-    if (_compKeys.contains(k)) {
+    final notMoney = notMoneyKind(label);
+    if (notMoney == 'comp') {
       return '"$label" can\'t be used as a label: a free meal is not money collected — use "Mark as non-chargeable" on the bill instead.';
     }
-    if (_creditKeys.contains(k)) {
+    if (notMoney == 'credit') {
       return '"$label" can\'t be used as a label: it would close the bill as paid while no money has arrived.';
     }
     if (_bucketKeys.contains(k)) {

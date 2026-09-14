@@ -254,6 +254,33 @@ void main() {
       expect(PaymentModes.labelRefusal('Zomato Pay', 'Zomato', modes), isNull);
     });
 
+    test('names that CONTAIN a not-money word are refused too — whole words, like the server', () {
+      final modes = PaymentModes.parse(_savedModes());
+      // The same cases the server's suite pins (jest-tests/payment_methods.test.ts).
+      for (final n in ['Staff Meals', 'Complimentary Meal', 'Comps', 'FOC', 'Non Chargeable Bill', 'Guest (Comp)', 'Staff-Meal Friday', 'NonChargeable']) {
+        expect(PaymentModes.notMoneyKind(n), 'comp', reason: n);
+        expect(PaymentModes.newModeRefusal(n, modes), contains('Mark as non-chargeable'), reason: n);
+      }
+      for (final n in ['On Credit', 'Due Payment', 'Credit/Due', 'Customer Credit', 'Pay Later - Regulars', 'PayLater', 'On Account (Corporate)']) {
+        expect(PaymentModes.notMoneyKind(n), 'credit', reason: n);
+        expect(PaymentModes.newModeRefusal(n, modes), contains('no money has arrived'), reason: n);
+      }
+      for (final n in ['Credit Card', 'HDFC Credit/Debit Card', 'Credit Cards (Visa)', 'Company Card', 'Compass Pay', 'Duet Pay', 'NCB Bank', 'Focus Wallet', 'Staffing Co']) {
+        expect(PaymentModes.notMoneyKind(n), isNull, reason: n);
+        expect(PaymentModes.newModeRefusal(n, modes), isNull, reason: n);
+      }
+      expect(PaymentModes.notMoneyKind('Card Credit'), 'credit');
+      expect(PaymentModes.labelRefusal('Staff Meals', 'Swiggy Dineout', modes), contains('non-chargeable'));
+      expect(PaymentModes.labelRefusal('Card on Credit', 'Card', modes), contains('no money has arrived'));
+    });
+
+    test('a report row reads by the label the server attached, and still keys on the id', () {
+      expect(PaymentModes.reportName({'method': 'Dineout', 'label': 'Swiggy Dineout'}), 'Swiggy Dineout');
+      expect(PaymentModes.reportName({'method': 'Upi'}), 'Upi');
+      expect(PaymentModes.reportName({'method': 'Cash', 'label': '  '}), 'Cash');
+      expect(PaymentModes.reportName({'method': ''}), 'Other');
+    });
+
     test('what a new mode saves as: permanent tidy id, label = name, custom, flags as ticked', () {
       final next = PaymentModes.withCustom(PaymentModes.fallback,
           name: '  Swiggy   Dineout ', requiresScreenshot: true, showToGuests: false);
@@ -394,6 +421,13 @@ void main() {
       expect(capture, contains("getMap('/restaurant/settings')"));
       expect(capture, contains('PaymentModes.till(modes)'));
       expect(capture, contains('PaymentModes.needsScreenshot(_method, _allModes)'));
+    });
+
+    test('Accounting names each payment method by its label; the filter still matches on the id', () {
+      expect(modules, isNot(contains("_s(m, 'method', 'Other')")),
+          reason: 'every by_method row reads PaymentModes.reportName, so a renamed mode matches the till');
+      expect("PaymentModes.reportName(m)".allMatches(modules).length, greaterThanOrEqualTo(5));
+      expect(modules, contains("value: _s(m as Map, 'method', ''),"));
     });
 
     test('the Settings card edits PaymentModes and can add one', () {
