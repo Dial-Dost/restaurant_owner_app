@@ -22,8 +22,9 @@
 // carrying its service charge as a TAX LINE (the shipped default shape):
 //
 //   no waiver  -> removed=false, waiver_required=true, paper Grand Total 1060.00
-//   waiver     -> removed=true,  waiver_required=false, paper reads
-//                 "Service Charge (1%)  Opted-out", Grand Total 1050.00
+//   waiver     -> removed=true,  waiver_required=false, Grand Total 1050.00
+//                 (the paper then read "Service Charge (1%)  Opted-out"; it now
+//                 prints no service-charge line at all on a waived bill)
 //
 // So the money was never wrong. The sentence was. This pins the sentence.
 

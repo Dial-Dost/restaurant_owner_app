@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/bill_round_off.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../services/rest_client.dart';
@@ -335,6 +336,9 @@ class _TableBillSheetState extends State<_TableBillSheet> {
         if (_num(bill['discount']) > 0) row('Discount', '− ${_money(bill['discount'])}'),
         if (_num(bill['service_charge']) > 0) row('Service charge', _money(bill['service_charge'])),
         if (_num(bill['tax_total']) > 0) row('Tax', _money(bill['tax_total'])),
+        // What the server rounded the total to the rupee by (backend migration
+        // 048), shown only when it is not zero — never computed here.
+        if (billRoundOff(bill['round_off']) != null) row('Round off', billRoundOffMoney(billRoundOff(bill['round_off'])!)),
         const Padding(padding: EdgeInsets.symmetric(vertical: 8), child: Divider()),
         Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
           Expanded(child: Text('TOTAL PAYABLE', style: text.labelSmall)),

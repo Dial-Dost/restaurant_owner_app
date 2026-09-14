@@ -312,6 +312,77 @@ class _PresetPill extends StatelessWidget {
   }
 }
 
+/// The page's date control again, in a SECTION HEADER — never a second window.
+///
+/// "In Accounting in settled bills the date frame is not selectable." The
+/// header beside 'Settled bills' carried a static InfoChip: a bordered pill with
+/// a calendar icon and the window's dates, the exact look of this control, and
+/// no tap handler at all. The live chip was several cards above. A section that
+/// lists figures cut on the window is exactly where an owner reaches for it, so
+/// the pill there is now the real thing — bound by its caller to the SAME
+/// `_range`/`_setRange` as the chip at the top. A private per-section window
+/// would let a list and the totals above it describe different days.
+///
+/// Dense, and WIDTH-BOUNDED: [SectionHeader]'s trailing slot is a non-flex Row
+/// child, so an unbounded chip could not ellipsise its label and would overflow
+/// a 320dp phone at 1.3x with a year-straddling label like
+/// '28 Jul 2025 – 3 Jan 2026'. Bounded, the dates truncate inside the chip.
+class SectionRangeChip extends StatelessWidget {
+  const SectionRangeChip({
+    super.key,
+    required this.value,
+    required this.onChanged,
+    this.maxWidth = 220,
+  });
+
+  final DateRange value;
+  final ValueChanged<DateRange> onChanged;
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) => ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: maxWidth),
+        child: DateRangeChip(value: value, onChanged: onChanged, dense: true),
+      );
+}
+
+/// Bring the section under [key] back into view after a window change reloaded
+/// the page it sits on.
+///
+/// The reload comes back at the TOP: Accounting swaps its whole list for the
+/// loading skeleton and Analytics remounts its body on the new range. Picking
+/// dates from a section header deep in the page and landing at the top would
+/// read as a second "it doesn't work".
+///
+/// [Scrollable.ensureVisible] alone cannot fix that. Both pages are
+/// `ListView(children: …)`, which builds only what is near the viewport, so
+/// back at offset 0 a section several screens down has no element and [key]
+/// has no context to scroll to. So the list is first put back at [offset] — where
+/// the owner was when they tapped — which builds the section, and ensureVisible
+/// then settles it exactly even if the cards above it changed height with the
+/// new window. Does nothing when the section did not paint (a failed load shows
+/// the error state instead).
+void revealAfterPaint(GlobalKey key, {ScrollController? controller, double? offset}) {
+  void settle() {
+    final ctx = key.currentContext;
+    if (ctx == null || !ctx.mounted) return;
+    Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+  }
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    if (controller != null && offset != null && controller.hasClients) {
+      final pos = controller.position;
+      controller.jumpTo(offset.clamp(pos.minScrollExtent, pos.maxScrollExtent));
+      // The jump lays the list out again; settle on the frame that follows it.
+      // A post-frame callback does not request that frame itself.
+      WidgetsBinding.instance.addPostFrameCallback((_) => settle());
+      WidgetsBinding.instance.scheduleFrame();
+    } else {
+      settle();
+    }
+  });
+}
+
 /// The always-visible statement of what a figure was cut on, for use INSIDE a
 /// card — under a title, beside a total, in a chart caption.
 ///

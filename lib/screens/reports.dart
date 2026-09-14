@@ -1375,8 +1375,10 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
               sub: reversed > 0 ? '$reversed reversed' : null),
           _misStat(context, 'Charge denied', _money(totals['amount_waived']), tint: AppColors.warning),
           _misStat(context, 'Tax denied', _money(totals['tax_on_waived'])),
+          // Charge + tax, measured before each bill's round-off (migration 048):
+          // not "off the grand total", which is rounded and can differ by paise.
           _misStat(context, 'Total reduction', _money(totals['grand_total_reduction']),
-              sub: 'off the grand total'),
+              sub: 'charge + tax, before round-off'),
           _misStat(context, 'Charge collected', _money(totals['service_charge_collected']),
               sub: 'settlement clock'),
           _misStat(context, '% denied', misPercent(totals['denied_pct_of_chargeable'])),

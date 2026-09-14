@@ -1049,7 +1049,7 @@ Widget misServiceChargeBlock(
   required String tableName,
   required VoidCallback onChanged,
   /// Whether this reader may be shown the two rupee figures on the ALREADY-WAIVED
-  /// card — what came off the charge, and what came off the grand total.
+  /// card — what came off the charge, and the charge plus the tax on it.
   ///
   /// Defaults to true, so every existing caller behaves exactly as it did. The
   /// table sheet passes a waiter's `false`: item 19 takes the restaurant's money
@@ -1084,12 +1084,18 @@ Widget misServiceChargeBlock(
           ]),
           if (showsMoney) ...[
             const SizedBox(height: 6),
-            // BOTH numbers, because with GST on the charge they differ and the
-            // guest is told the second one: the charge itself came off, and the
-            // grand total fell by the charge PLUS the tax that rode on it.
+            // BOTH numbers, because with GST on the charge they differ: the
+            // charge itself came off, and so did the tax that rode on it.
+            //
+            // The second is NOT "off the total" (migration 048). It is measured
+            // before round-off, while the total the guest pays is rounded to the
+            // rupee, so the payable total can fall by a little more or less —
+            // 577.40 of charge and tax took 6351 to 5774. The card has no rounded
+            // totals to show (the record keeps the exact figure), so it says
+            // what the figure is instead of what it is not.
             Text(
               '${_money(w['amount_waived'])} charge off · '
-              '${_money(w['grand_total_reduction'])} off the total',
+              '${_money(w['grand_total_reduction'])} with its tax, before round-off',
               style: text.bodyMedium,
             ),
           ],
@@ -1188,7 +1194,10 @@ Future<void> _waiveServiceCharge(
       'reason': answer.reason,
       'authorised_by': answer.authorisedBy,
     });
-    // The two totals that DIFFERENCED — what the till can show the guest.
+    // The two payable totals, each rounded to the rupee — what the guest was
+    // asked for before the waiver and is asked for now. Not the differenced
+    // pre-round figures the waiver records, which can be off their gap by under
+    // a rupee.
     final before = res is Map ? _numOf(res['grand_total_before']) : 0.0;
     final after = res is Map ? _numOf(res['grand_total_after']) : 0.0;
     messenger.showSnackBar(SnackBar(
@@ -1325,8 +1334,21 @@ class _PaymentSheet extends StatefulWidget {
 }
 
 class _PaymentSheetState extends State<_PaymentSheet> {
-  static const _methods = ['Upi', 'Cash', 'Card', 'Dineout', 'Zomato', 'Eazydiner', 'District'];
-  static const _needsProof = {'Dineout', 'Zomato', 'Eazydiner', 'District'};
+  // ---- the modes -------------------------------------------------------------
+  //
+  // THE RESTAURANT'S OWN, read from GET /restaurant/settings `payment_methods`
+  // in [_load]: the modes the owner switched on (built-ins and the ones they
+  // added), minus the online gateway. A pill SHOWS the label and SENDS the id,
+  // and whether it needs a screenshot is the config's rule — the same rule the
+  // server enforces on the settle. Until the read answers, and whenever it
+  // cannot (an older backend, a dead line), the built-in list the server
+  // settles with for a restaurant that never opened the editor: a settle is
+  // never blocked by a settings read.
+  List<PaymentMode> _allModes = PaymentModes.fallback;
+  List<PaymentMode> _modes = PaymentModes.till(PaymentModes.fallback);
+
+  static const String _noModes =
+      'No payment mode is switched on. An owner can switch one on in Settings > Payments.';
 
   /// Same ~3MB ceiling POST /billing/upload-payment-proof enforces (its limit is
   /// on the base64 text, which is ~4/3 of the byte count), checked here so an
@@ -1429,11 +1451,25 @@ class _PaymentSheetState extends State<_PaymentSheet> {
         counters = [for (final c in (m['counters'] as List?) ?? const []) if (c is Map) c];
       } catch (_) {/* no tills configured, or an older backend */}
     }
+    // Any signed-in staff may read the settings document's payment modes (they
+    // are not a privileged field), so this is not gated on record-payment.
+    var modes = PaymentModes.fallback;
+    try {
+      final s = await widget.rest.getMap('/restaurant/settings');
+      modes = PaymentModes.parse(s['payment_methods']);
+    } catch (_) {/* an older backend or no line: the built-in list, see above */}
     if (!mounted) return;
     setState(() {
       _state = state;
       _ledgerOk = ok;
       _counters = counters;
+      _allModes = modes;
+      _modes = PaymentModes.till(modes);
+      // Keep the cashier's pick if it is still on offer; otherwise UPI, as the
+      // sheet always opened on, or the first mode this restaurant takes.
+      if (!_modes.any((m) => m.id == _method) && _modes.isNotEmpty) {
+        _method = _modes.any((m) => m.id == 'Upi') ? 'Upi' : _modes.first.id;
+      }
       _loading = false;
       _amount.text = _remaining <= 0 ? '' : _remaining.toStringAsFixed(2);
     });
@@ -1476,13 +1512,17 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   double get _composerAmount => double.tryParse(_amount.text.trim()) ?? 0;
   double get _composerTip => _tipping ? (double.tryParse(_tip.text.trim()) ?? 0) : 0;
 
-  bool get _needsProofNow => _needsProof.contains(_method);
+  bool get _needsProofNow => PaymentModes.needsScreenshot(_method, _allModes);
+
+  /// What the cashier reads for the chosen mode — the owner's label, not the id.
+  String get _methodLabel => PaymentModes.labelFor(_method, _allModes);
   bool get _hasProof => (_proofUrl ?? '').isNotEmpty;
 
   /// Why the composer cannot be used yet, or null when it can. One sentence, so
   /// the disabled control always says what would fix it.
   String? get _composerRefusal {
     if (!_ledgerOk) return null;
+    if (_modes.isEmpty) return _noModes;
     if (_composerAmount <= 0) return 'Enter how much of the bill this payment covers.';
     // OVER-TENDER IS REFUSED, never recorded and never netted off — change
     // handed back in cash is not a negative tender. Caught here so the cashier
@@ -1495,7 +1535,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       return 'A tip has to say who it goes to — a name, or "pool".';
     }
     if (_needsProofNow && !_hasProof) {
-      return '$_method needs a payment screenshot before it can settle.';
+      return '$_methodLabel needs a payment screenshot before it can settle.';
     }
     return null;
   }
@@ -1754,9 +1794,13 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// refused by the server (the tenders must reconstruct the grand total to the
   /// paisa); saying so here means the cashier is not told after the card machine.
   String? get _settleRefusal {
+    // Every mode switched off in Settings: there is nothing a NEW payment could
+    // be taken in. Said, not left as a grey button. (A bill the ledger has
+    // already paid in full is not blocked by it — see below.)
     if (!_ledgerOk) {
+      if (_modes.isEmpty) return _noModes;
       return (_needsProofNow && !_hasProof)
-          ? 'Attach a payment proof photo before settling a $_method bill.'
+          ? 'Attach a payment proof photo before settling a $_methodLabel bill.'
           : null;
     }
     // ALREADY PAID IN FULL through part payments, with nothing new keyed. There
@@ -1765,9 +1809,10 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     // settles it.
     if (_remaining <= 0.005 && _composerAmount <= 0) {
       return (_needsProofNow && !_hasProof)
-          ? 'Attach a payment proof photo before settling a $_method bill.'
+          ? 'Attach a payment proof photo before settling a $_methodLabel bill.'
           : null;
     }
+    if (_modes.isEmpty) return _noModes;
     final left = _remaining - (_composed?.amount ?? 0);
     if (left > 0.005) {
       return 'That leaves ${_money(left)} unpaid. A bill settles in full — '
@@ -1960,7 +2005,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
             child: Row(children: [
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('${_s(t, 'method')} · ${_money(t['amount'])}', style: text.titleSmall),
+                  Text('${PaymentModes.labelFor(_s(t, 'method'), _allModes)} · ${_money(t['amount'])}',
+                      style: text.titleSmall),
                   if (_numOf(t['tip_amount']) > 0)
                     Text(
                       '+ ${_money(t['tip_amount'])} tip '
@@ -1998,7 +2044,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
             child: Row(children: [
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('${_drafts[i].method} · ${_money(_drafts[i].amount)}', style: text.titleSmall),
+                  Text('${PaymentModes.labelFor(_drafts[i].method, _allModes)} · ${_money(_drafts[i].amount)}',
+                      style: text.titleSmall),
                   if (_drafts[i].tip > 0)
                     Text('+ ${_money(_drafts[i].tip)} tip to ${_drafts[i].tipTo}',
                         style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
@@ -2028,12 +2075,13 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       Text(_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART', style: text.labelSmall),
       const SizedBox(height: 8),
       Wrap(spacing: 8, runSpacing: 8, children: [
-        for (final m in _methods)
+        // Keyed by the id (what is sent), labelled by the owner's name for it.
+        for (final m in _modes)
           _CapturePill(
-            key: ValueKey('pay-method-$m'),
-            label: m,
-            selected: _method == m,
-            onTap: locked ? null : () => setState(() => _method = m),
+            key: ValueKey('pay-method-${m.id}'),
+            label: m.label,
+            selected: _method == m.id,
+            onTap: locked ? null : () => setState(() => _method = m.id),
           ),
       ]),
       if (_ledgerOk) ...[
@@ -2133,7 +2181,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
               ? 'Uploading…'
               : _hasProof
                   ? 'Proof attached — it uploads with the settlement.'
-                  : '$_method needs a payment screenshot. Capture or pick one; it uploads straight away.',
+                  : '$_methodLabel needs a payment screenshot. Capture or pick one; it uploads straight away.',
           style: text.bodySmall!.copyWith(
             fontSize: 11.5,
             color: _hasProof && !_uploading ? AppColors.success : AppColors.textTertiary,

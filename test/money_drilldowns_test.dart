@@ -502,6 +502,22 @@ void main() {
       expect(find.text('₹5500.00'), findsOneWidget);
     });
 
+    testWidgets('a payment method reads by the label the owner gave it, the one the till shows', (tester) async {
+      // The server attaches `label` beside the stored id (Settings > Payments). A
+      // renamed built-in must not read "Dineout" here while the till says
+      // "Swiggy Dineout".
+      _size(tester, 1200);
+      await _mount(tester, m.accountingModule, _accountingRoutes(byMethod: const [
+        {'method': 'Dineout', 'label': 'Swiggy Dineout', 'sales': 220000.00, 'bills': 40},
+        {'method': 'Upi', 'label': 'UPI', 'sales': 189733.92, 'bills': 60},
+      ]));
+      expect(find.text('Swiggy Dineout'), findsWidgets);
+      expect(find.text('Dineout'), findsNothing);
+      await _tap(tester, find.text('Swiggy Dineout').first);
+      expect(find.text('Share of gross sales'), findsOneWidget);
+      expect(find.text('53.7%'), findsOneWidget);
+    });
+
     testWidgets('a tax rate row opens the base behind it and excludes the service charge',
         (tester) async {
       _size(tester, 1200);
@@ -608,6 +624,52 @@ void main() {
       );
 
       expect(api.writes, isEmpty, reason: 'opening a settled bill must not write');
+    });
+
+    // BACKEND MIGRATION 048: a settled bill carries the round-off it was
+    // rounded to the rupee by. It is its own line, and the printed identity
+    // includes it — without it every rounded bill would show the red "does not
+    // balance" mark.
+    testWidgets('a rounded settled bill shows its Round off and still balances', (tester) async {
+      _size(tester, 1200);
+      final detail = {
+        ..._billDetail(),
+        'taxes': [
+          {'name': 'CGST', 'percentage': 2.5, 'amount': 100.13},
+          {'name': 'SGST', 'percentage': 2.5, 'amount': 100.13},
+        ],
+        'tax_total': 200.26,
+        'round_off': -0.26,
+        'grand_total': 4600.00,
+      };
+      await _mount(
+        tester,
+        m.accountingModule,
+        _accountingRoutes(closedBills: [_closedBillRow()], billDetail: detail),
+      );
+      await _tap(tester, find.text('Bill #57 · T1'));
+
+      expect(find.text('Round off'), findsOneWidget);
+      expect(find.text('−₹0.26'), findsOneWidget);
+      expect(
+        find.text('₹4000.00 base + ₹400.00 service + ₹200.26 tax − ₹0.26 round off = ₹4600.00'),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.check_circle_outline), findsOneWidget,
+          reason: 'the ladder balances once the round-off is a rung');
+      expect(find.byIcon(Icons.error_outline), findsNothing);
+    });
+
+    testWidgets('a settled bill with no round-off shows no Round off line', (tester) async {
+      _size(tester, 1200);
+      await _mount(
+        tester,
+        m.accountingModule,
+        _accountingRoutes(closedBills: [_closedBillRow()], billDetail: {..._billDetail(), 'round_off': 0}),
+      );
+      await _tap(tester, find.text('Bill #57 · T1'));
+      expect(find.text('Round off'), findsNothing);
+      expect(find.text('₹4000.00 base + ₹400.00 service + ₹200.00 tax = ₹4600.00'), findsOneWidget);
     });
 
     testWidgets('the bill sheet is fetched only when it is opened', (tester) async {

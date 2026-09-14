@@ -286,7 +286,7 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   // False until the first build has placed this user on their landing tab.
   //
@@ -331,6 +331,8 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void initState() {
     super.initState();
+    // Lifecycle, for the printer agent: see didChangeAppLifecycleState.
+    WidgetsBinding.instance.addObserver(this);
     // Restore the persisted sidebar collapsed/expanded preference.
     SharedPreferences.getInstance().then((prefs) {
       if (!mounted) return;
@@ -373,10 +375,24 @@ class _HomeShellState extends State<HomeShell> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // Tear down the realtime printer connection when leaving the signed-in shell
     // (e.g. on logout).
     PrinterService.instance.stop();
     super.dispose();
+  }
+
+  // COMING BACK TO THE APP IS WHEN STAFF NOTICE A SILENT PRINTER, so it is when
+  // the agent gets a chance to put itself right: a socket that dropped while the
+  // app was in the background reconnects, and one still waiting on its outlet
+  // subscription asks again. Without this the only remedy anybody found was to
+  // close the app and open it again. onResume() does nothing to a till that is
+  // already confirmed in its room — see its comment for why.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && widget.startPrinterAgent) {
+      PrinterService.instance.onResume();
+    }
   }
 
   // The one "make this outlet active" path: the AppBar switcher, a module's

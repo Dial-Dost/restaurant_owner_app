@@ -305,6 +305,37 @@ void main() {
       expect(find.textContaining('Updated'), findsNothing);
     });
 
+    // cacheStaleOverlay had AsyncView's shape swap: bare screen without the pill,
+    // a Stack with it. Its clearing remounted the screen's list at offset 0, so
+    // an owner scrolled down the POs was thrown to the top when the refresh
+    // landed. Same one-tree fix as AsyncView (_StaleFrame).
+    testWidgets('the "Updated" pill clearing leaves a scrolled PO list where it was', (tester) async {
+      _size(tester, 1200, 600);
+      final many = [for (var i = 0; i < 30; i++) _po('po$i', 'Vendor $i')];
+      final api = _FakeApi(routes(orders: many));
+      final rest = await _signIn(api);
+      await _warm(tester, m.purchaseOrdersModule(rest, rest.auth.profile!), 'Vendor 0');
+      await _ageCache(const Duration(minutes: 5));
+
+      api.gate = Completer<void>();
+      await tester.pumpWidget(_host(m.purchaseOrdersModule(rest, rest.auth.profile!)));
+      await tester.pump();
+      await tester.pump();
+      expect(find.textContaining('Updated 5m ago'), findsOneWidget, reason: 'precondition: no pill over the copy');
+      final list = tester.state<ScrollableState>(find.byType(Scrollable).first).position;
+      expect(list.maxScrollExtent, greaterThan(600), reason: 'precondition: the PO list must scroll');
+      list.jumpTo(600);
+      await tester.pump();
+
+      api.gate!.complete();
+      api.gate = null;
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Updated'), findsNothing, reason: 'precondition: the refresh never landed');
+      final after = tester.state<ScrollableState>(find.byType(Scrollable).first).position;
+      expect(after.pixels, 600, reason: 'the refresh threw the PO list back to the top');
+      expect(identical(after, list), isTrue, reason: 'the PO list was remounted');
+    });
+
     testWidgets('offline: the saved POs stay up behind the offline pill, not an error screen',
         (tester) async {
       _size(tester, 1200, 900);

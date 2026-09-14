@@ -104,6 +104,22 @@ Future<void> _warmCache(WidgetTester tester, RestClient rest) async {
 Iterable<String> _cacheKeys(SharedPreferences p) =>
     p.getKeys().where((k) => k.startsWith(GetCache.keyPrefix));
 
+/// [_module] as a page long enough to scroll, which is where a remount shows:
+/// every row names the payload it was built from, so a row on screen after a
+/// refresh proves which data it is showing.
+Widget _longModule(RestClient rest, {Duration? pollEvery}) => AsyncView<Map<String, dynamic>>(
+      load: () => rest.getMap('/dishes'),
+      pollEvery: pollEvery,
+      builder: (context, data, reload) {
+        final n = ((data['items'] as List?) ?? const []).length;
+        return ListView(children: [
+          for (var i = 0; i < 60; i++) SizedBox(height: 48, child: Text('row $i of $n')),
+        ]);
+      },
+    );
+
+ScrollPosition _pagePosition(WidgetTester tester) => tester.state<ScrollableState>(find.byType(Scrollable)).position;
+
 void main() {
   testWidgets('a revisited module paints the saved copy before the network answers, then updates in place',
       (tester) async {
@@ -305,6 +321,67 @@ void main() {
     api.gate = null;
     await tester.pumpAndSettle();
     expect(find.textContaining('Updated'), findsNothing);
+  });
+
+  // The pill coming or going must not remount what is under it. AsyncView used
+  // to return the bare builder output with no pill and a Stack with one, so the
+  // moment an old copy's refresh landed the whole list was thrown away and
+  // rebuilt at offset 0: a page scrolled down to a section jumped to the top by
+  // itself (and undid the Analytics section chips' scroll-back).
+  testWidgets('the "Updated" pill clearing leaves the list where it was scrolled', (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final api = _FakeApi({'/dishes': {'items': [1, 2]}});
+    final rest = await _signIn(api);
+    await _warmCache(tester, rest);
+    final p = await SharedPreferences.getInstance();
+    final oldMs = DateTime.now().subtract(const Duration(minutes: 5)).millisecondsSinceEpoch;
+    for (final k in _cacheKeys(p).toList()) {
+      final d = (jsonDecode(p.getString(k)!) as Map)['d'];
+      await p.setString(k, '{"t":$oldMs,"d":${jsonEncode(d)}}');
+    }
+
+    api.gate = Completer<void>();
+    api.routes['/dishes'] = {'items': [1, 2, 3]};
+    await tester.pumpWidget(_host(_longModule(rest)));
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('Updated 5m ago'), findsOneWidget, reason: 'precondition: no pill over the copy');
+    _pagePosition(tester).jumpTo(900);
+    await tester.pump();
+    final scrolled = _pagePosition(tester);
+
+    api.gate!.complete();
+    api.gate = null;
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Updated'), findsNothing, reason: 'precondition: the refresh never landed');
+    expect(find.text('row 20 of 3'), findsOneWidget, reason: 'the live payload did not reach the list');
+    expect(_pagePosition(tester).pixels, 900, reason: 'the refresh threw the list back to the top');
+    expect(identical(_pagePosition(tester), scrolled), isTrue, reason: 'the list was remounted');
+  });
+
+  testWidgets('the offline pill coming and going over a polled list leaves it where it was scrolled',
+      (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final api = _FakeApi({'/dishes': {'items': [1, 2]}});
+    final rest = await _signIn(api);
+    await tester.pumpWidget(_host(_longModule(rest, pollEvery: const Duration(seconds: 10))));
+    await tester.pumpAndSettle();
+    _pagePosition(tester).jumpTo(900);
+    await tester.pump();
+
+    api.offline = true;
+    await tester.pump(const Duration(seconds: 10));
+    await tester.pump();
+    expect(find.textContaining('Offline'), findsOneWidget, reason: 'precondition: the failed poll showed no pill');
+    expect(_pagePosition(tester).pixels, 900, reason: 'the pill appearing threw the list back to the top');
+
+    api.offline = false;
+    await tester.pump(const Duration(seconds: 10));
+    await tester.pump();
+    expect(find.textContaining('Offline'), findsNothing, reason: 'precondition: the recovered poll kept the pill');
+    expect(_pagePosition(tester).pixels, 900, reason: 'the pill clearing threw the list back to the top');
+
+    await tester.pumpWidget(const SizedBox()); // stop the poll
   });
 
   testWidgets('a slow stale refresh cannot overwrite a newer manual reload (the generation guard holds)',

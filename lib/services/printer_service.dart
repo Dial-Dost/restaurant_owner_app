@@ -23,6 +23,54 @@ typedef SpoolerWrite = bool Function(String printerName, List<int> bytes);
 /// [NetworkPrinter.send].
 typedef NetworkWrite = Future<String?> Function(String host, int port, List<int> bytes);
 
+/// The four things the agent does with its realtime connection.
+///
+/// Indirected so a test can play the SERVER — withhold `joinedOutlet`, send
+/// `joinRejected`, drop the transport — without a Socket.IO server behind it.
+/// That is the only way the subscription watchdog below can be driven at all,
+/// and the watchdog is what stands between a till that is connected-but-deaf
+/// and a till that gets closed and reopened by staff. Production always uses
+/// [PrinterService.ioSocketFactory].
+abstract class AgentSocket {
+  void on(String event, void Function(dynamic data) handler);
+  void emit(String event, [dynamic data]);
+  void connect();
+  void dispose();
+}
+
+/// Builds one connection from the url and the options map
+/// [PrinterService.socketOptions] produced.
+typedef AgentSocketFactory = AgentSocket Function(String url, Map<String, dynamic> options);
+
+class _IoAgentSocket implements AgentSocket {
+  _IoAgentSocket(this._socket);
+  final io.Socket _socket;
+
+  @override
+  void on(String event, void Function(dynamic data) handler) => _socket.on(event, handler);
+  @override
+  void emit(String event, [dynamic data]) => _socket.emit(event, data);
+  @override
+  void connect() => _socket.connect();
+  @override
+  void dispose() => _socket.dispose();
+}
+
+/// What the printer screen can truthfully say about the realtime link.
+///
+/// TWO FACTS, NOT ONE. "The transport is up" and "the server put this device in
+/// its outlet's room" used to be reported as the same green "Connected", and the
+/// gap between them is exactly the state in which a till printed nothing all
+/// lunch while looking healthy: a socket that handshook with a dead session, or
+/// whose join the server never heard. Only a `joinedOutlet` answer earns
+/// [listening].
+enum PrinterLink { offline, joining, listening }
+
+/// What /auth/me said about ONE token. [unknown] is everything that is not the
+/// server's word — no connection, a timeout, a 5xx from a proxy mid-restart — and
+/// is never grounds for a sign-out.
+enum _SessionVerdict { alive, expired, unknown }
+
 /// WHERE THE BYTES GO — one printer, named in a way that survives being stored.
 ///
 /// There are two transports and a role has to be able to point at either:
@@ -239,6 +287,30 @@ class PrinterService extends ChangeNotifier {
   // lands after a dead connection's hold has lapsed rather than bouncing off it.
   static const _replayRetryDelay = Duration(seconds: 150);
 
+  /// Longest wait between unanswered joinOutlet re-asks. The ladder starts at
+  /// [_joinAnswerTimeout] and doubles to here, so a server that is genuinely
+  /// failing costs one small socket event a minute per till — never a tight loop,
+  /// and never a database transaction, because an unanswered join ran none.
+  static const _joinRetryCap = Duration(seconds: 60);
+
+  /// How many unanswered joins before the agent stops guessing and asks the
+  /// server whether its session is still alive — then again every few after,
+  /// so a till left deaf all afternoon keeps checking without hammering /auth/me.
+  static const _missesBeforeProbe = 2;
+  static const _missesBetweenProbes = 4;
+
+  /// The re-ask ladder for an unanswered joinOutlet: 5s, 10s, 20s, 40s, then
+  /// [_joinRetryCap] for as long as it stays unanswered. [misses] is how many
+  /// have already gone unanswered on this subscription attempt.
+  @visibleForTesting
+  static Duration joinRetryDelay(int misses, {Duration first = const Duration(seconds: 5)}) {
+    var d = first;
+    for (var i = 0; i < misses && d < _joinRetryCap; i++) {
+      d *= 2;
+    }
+    return d > _joinRetryCap ? _joinRetryCap : d;
+  }
+
   /// How long to wait before trying [target] again.
   ///
   /// A NETWORK printer gets a longer breath than a spooler does. A queue that
@@ -254,9 +326,43 @@ class PrinterService extends ChangeNotifier {
   Duration retryDelayFor(String target) =>
       PrintTarget.isNetwork(target) ? _retryDelay * 4 : _retryDelay;
 
-  io.Socket? _socket;
+  AgentSocket? _socket;
   AuthController? _auth;
   Timer? _keepAlive;
+
+  // SUBSCRIPTION LIVENESS. [_connected] is the transport; [_subscribed] is the
+  // server's word that this socket is in the outlet room, and it is set by a
+  // matching `joinedOutlet` and nothing else. While the first is true and the
+  // second is not, [_joinWatchdog] keeps re-asking on a capped ladder.
+  bool _subscribed = false;
+  Timer? _joinWatchdog;
+  int _joinMisses = 0;
+
+  // The start() — by [_lifecycle] — whose /auth/me probe is in flight, if any.
+  // SCOPED TO THE GENERATION, NOT A BARE FLAG. A probe can outlive the start()
+  // that sent it, and a flag still set across a stop() and start() made every
+  // probe of the NEW connection return early, taking the watchdog with it: a
+  // till left deaf behind an answer about a connection that no longer existed.
+  int? _probingLifecycle;
+
+  // The token this connection last introduced itself with — read at handshake
+  // time, so a rejection can be checked against the session we hold NOW before
+  // anybody is signed out over it.
+  String? _handshakeToken;
+
+  // Latched once this start() has handed the user back to sign-in, so a
+  // rejection, a watchdog probe and a keepalive that all notice the same dead
+  // session produce one sign-out between them, not three.
+  bool _sessionEnded = false;
+
+  // Bumped by every start() that proceeds and every stop(), so a start() still
+  // awaiting prefs can tell it has been superseded.
+  int _lifecycle = 0;
+
+  AgentSocketFactory _socketFactory = ioSocketFactory;
+  Duration _joinAnswerTimeout = const Duration(seconds: 5);
+  Duration _keepAliveEvery = const Duration(minutes: 25);
+  Duration _sessionProbeTimeout = const Duration(seconds: 10);
 
   // Re-ask timer. A window can legitimately come back EMPTY while the previous
   // connection's lease is still held, so an empty window must not end the
@@ -300,6 +406,13 @@ class PrinterService extends ChangeNotifier {
   int _replayPrinted = 0;
   int _replayRounds = 0;
 
+  /// Whether a backlog catch-up stopped at [_maxReplayRounds] with output still
+  /// coming. NOT the same as the round count being at the cap: the empty-window
+  /// retry spends rounds too, so an ordinary till with no backlog reaches the cap
+  /// after a couple of dozen quiet gaps between live dockets. Only this flag
+  /// means there is a paused catch-up for [onResume] to continue.
+  bool _replayPaused = false;
+
   SpoolerWrite _write = WinRawPrinter.sendBytes;
   NetworkWrite _netWrite = NetworkPrinter.send;
   bool? _supportedOverride;
@@ -322,11 +435,20 @@ class PrinterService extends ChangeNotifier {
     String? outletId = 'outlet-1',
     Duration retryDelay = Duration.zero,
     List<String> networkPrinters = const <String>[],
+    /// The realtime connection. Omitted, start() would dial the real backend.
+    AgentSocketFactory? socketFactory,
+    Duration joinAnswerTimeout = const Duration(seconds: 5),
+    Duration keepAliveEvery = const Duration(minutes: 25),
+    Duration sessionProbeTimeout = const Duration(seconds: 10),
   }) {
     final s = PrinterService._();
     s._auth = auth;
     s._write = write;
     if (netWrite != null) s._netWrite = netWrite;
+    if (socketFactory != null) s._socketFactory = socketFactory;
+    s._joinAnswerTimeout = joinAnswerTimeout;
+    s._keepAliveEvery = keepAliveEvery;
+    s._sessionProbeTimeout = sessionProbeTimeout;
     s._supportedOverride = supported;
     s._spoolerOverride = spooler ?? supported;
     s._selectedPrinter = printer;
@@ -361,6 +483,17 @@ class PrinterService extends ChangeNotifier {
   bool get hasSpooler => _spoolerOverride ?? WinRawPrinter.supported;
 
   bool get connected => _connected;
+
+  /// Whether the server has confirmed this device is in its outlet's room — the
+  /// only state in which a `bill:print` can actually arrive.
+  bool get subscribed => _subscribed;
+
+  PrinterLink get linkState => !_connected
+      ? PrinterLink.offline
+      : _subscribed
+          ? PrinterLink.listening
+          : PrinterLink.joining;
+
   bool get paused => _paused;
   String? get selectedPrinter => _selectedPrinter;
   List<String> get printers => _printers;
@@ -456,6 +589,9 @@ class PrinterService extends ChangeNotifier {
     }
     if (_started) return;
     _started = true;
+    _sessionEnded = false;
+    _joinMisses = 0;
+    final generation = ++_lifecycle;
 
     final prefs = await SharedPreferences.getInstance();
     _selectedPrinter = prefs.getString(_printerKey);
@@ -499,71 +635,361 @@ class PrinterService extends ChangeNotifier {
       return;
     }
 
+    // A stop() — or a stop() and a newer start() — that landed while this one
+    // was awaiting prefs owns the agent now. The usual one is a logout, which
+    // destroyed the token this start() read; opening a socket for it here would
+    // leave a connection nobody owns.
+    if (generation != _lifecycle || !_started) return;
+
     _log('Connecting to realtime…');
-    try {
-      final opts = io.OptionBuilder()
+    _openSocket(token);
+
+    // Keep the session warm so a long-idle till still prints after a reconnect —
+    // and HEAR the answer. This used to swallow every failure, a 401 included,
+    // so a till whose session had died kept its green light and printed nothing.
+    _keepAlive?.cancel();
+    _replayRetry?.cancel();
+    _keepAlive = Timer.periodic(_keepAliveEvery, (_) async {
+      final auth = _auth;
+      final t = auth?.token;
+      if (auth == null || t == null) return;
+      final verdict = await _askServer(auth, t);
+      if (verdict == _SessionVerdict.expired && _endExpiredSession(t, generation)) return;
+      // Cancelling the timer does not recall a request already out. One that
+      // lands after a stop() belongs to a start() that is over, and says
+      // nothing about whatever connection is up now.
+      if (generation != _lifecycle) return;
+      // A backstop for the watchdog, not a second loop: only ever re-asks while
+      // the server has not confirmed the room.
+      if (_connected && !_subscribed) _emitJoin();
+    });
+  }
+
+  /// The Socket.IO options for one agent connection.
+  ///
+  /// `forceNew` IS THE FIX FOR "CLOSE AND REOPEN THE APP TO PRINT". Without it,
+  /// socket_io_client 3.1.6 caches a Manager per host for the life of the
+  /// process, and its same-namespace test compares the url's path ('' for
+  /// https://api.dialdost.com) against '/', so it never matches and the cache is
+  /// always reused. Manager.socket('/') then hands back the FIRST Socket this
+  /// process ever made — with the auth it captured in its constructor — and
+  /// ignores the options passed now. dispose() does not evict it. So every
+  /// start() after the first reused the first sign-in's token: sign out and back
+  /// in, or be signed out by an expired session, and the agent handshook with a
+  /// destroyed token, the server ignored it, and nothing printed until a restart
+  /// gave the process a fresh cache. (`disableMultiplex()` would express the same
+  /// intent, but is itself broken in that release.)
+  ///
+  /// The auth is a FUNCTION, read on every connect and reconnect, so a transport
+  /// that comes back after the session has changed introduces itself as the
+  /// session this device holds now rather than the one it held at start().
+  @visibleForTesting
+  static Map<String, dynamic> socketOptions({required String? Function() token, required String resId}) =>
+      io.OptionBuilder()
           // websocket first, polling fallback (matches the backend's accepted
           // transports) so it still connects behind proxies that block WS upgrade.
           .setTransports(['websocket', 'polling'])
           .disableAutoConnect()
           .enableReconnection()
-          .setAuth({'token': token, 'restaurantId': resId})
+          .enableForceNew()
+          .setAuthFn((send) => send(<String, dynamic>{'token': token(), 'restaurantId': resId}))
           .build();
-      final socket = io.io(AppConfig.backendUrl, opts);
-      _socket = socket;
 
-      socket.onConnect((_) {
-        _connected = true;
-        _log('Connected to realtime');
-        // Fires on every RECONNECT too, which is what makes this the resume
-        // hook: the server replays the outlet's outstanding jobs in response.
-        _replayRounds = 0;
-        _replayPrinted = 0;
-        socket.emit('joinOutlet', joinPayload(resId, outletId));
-        notifyListeners();
-        // Anything held over from before the drop (the queue is no longer
-        // discarded) goes out now.
-        unawaited(_processQueue());
-      });
-      socket.onDisconnect((_) {
-        _connected = false;
-        _log('Disconnected from realtime');
-        notifyListeners();
-      });
-      socket.onConnectError((e) => _log('Connect error: $e'));
-      socket.onError((e) => _log('Socket error: $e'));
-      socket.on('joinedOutlet', (_) => _log('Subscribed to outlet $outletId'));
-      socket.on('bill:print', onPrintEvent);
+  /// The production connection: a real Socket.IO client.
+  static AgentSocket ioSocketFactory(String url, Map<String, dynamic> options) =>
+      _IoAgentSocket(io.io(url, options));
 
-      socket.connect();
-    } catch (e) {
-      _log('Failed to connect: $e');
+  /// Replace the realtime connection with a fresh one.
+  ///
+  /// THE PREVIOUS SOCKET IS DISPOSED FIRST, ALWAYS. With `forceNew` every call
+  /// really is a new connection, so one left alive would still be in the outlet
+  /// room and every broadcast would arrive twice. jobId dedup absorbs that for
+  /// persisted jobs, but a job with no jobId (a payload over the size cap, or a
+  /// backend without migration 027) would print twice. Every handler below also
+  /// checks it still belongs to the CURRENT socket, so a late event from a
+  /// replaced one can change nothing.
+  void _openSocket(String startToken) {
+    final resId = _resId;
+    final outletId = _outletId;
+    if (resId == null || outletId == null) return;
+    final previous = _socket;
+    _socket = null;
+    _connected = false;
+    _subscribed = false;
+    _joinWatchdog?.cancel();
+    if (previous != null) {
+      try {
+        previous.dispose();
+      } catch (_) {/* already gone */}
     }
 
-    // Keep the session warm so a long-idle till still prints after a reconnect.
-    _keepAlive?.cancel();
-    _replayRetry?.cancel();
-    _keepAlive = Timer.periodic(const Duration(minutes: 25), (_) async {
-      final t = _auth?.token;
-      if (t == null) return;
-      try {
-        await _auth!.api.me(t);
-      } catch (_) {/* surfaced elsewhere if the session is truly gone */}
+    final AgentSocket socket;
+    try {
+      socket = _socketFactory(
+        AppConfig.backendUrl,
+        socketOptions(
+          token: () => _handshakeToken = _auth?.token ?? startToken,
+          resId: resId,
+        ),
+      );
+    } catch (e) {
+      _log('Failed to connect: $e');
+      return;
+    }
+    _socket = socket;
+    bool current() => identical(_socket, socket);
+
+    socket.on('connect', (_) {
+      if (!current()) return;
+      _connected = true;
+      // A new connection is a new server-side socket in no rooms at all,
+      // whatever the last one had.
+      _subscribed = false;
+      _log('Connected to realtime');
+      // Fires on every RECONNECT too, which is what makes this the resume
+      // hook: the server replays the outlet's outstanding jobs in response.
+      _replayRounds = 0;
+      _replayPrinted = 0;
+      _replayPaused = false;
+      _emitJoin();
+      notifyListeners();
+      // Anything held over from before the drop (the queue is no longer
+      // discarded) goes out now.
+      unawaited(_processQueue());
+    });
+    socket.on('disconnect', (_) {
+      if (!current()) return;
+      _connected = false;
+      _subscribed = false;
+      _joinWatchdog?.cancel();
+      _log('Disconnected from realtime');
+      notifyListeners();
+    });
+    socket.on('connect_error', (e) {
+      if (current()) _log('Connect error: $e');
+    });
+    socket.on('error', (e) {
+      if (current()) _log('Socket error: $e');
+    });
+    socket.on('joinedOutlet', (data) {
+      if (current()) _onJoinedOutlet(data);
+    });
+    socket.on('joinRejected', (data) {
+      if (current()) _onJoinRejected(data);
+    });
+    socket.on('bill:print', (data) {
+      // A replaced connection prints nothing, even if an event slips out of it.
+      if (current()) unawaited(onPrintEvent(data));
+    });
+
+    socket.connect();
+    notifyListeners();
+  }
+
+  /// Ask the server for this outlet's room, and start listening for the answer.
+  void _emitJoin() {
+    final socket = _socket;
+    final resId = _resId;
+    final outletId = _outletId;
+    if (socket == null || resId == null || outletId == null || !_connected) return;
+    socket.emit('joinOutlet', joinPayload(resId, outletId));
+    if (!_subscribed) _armJoinWatchdog();
+  }
+
+  void _armJoinWatchdog() {
+    _joinWatchdog?.cancel();
+    final socket = _socket;
+    _joinWatchdog = Timer(joinRetryDelay(_joinMisses, first: _joinAnswerTimeout), () {
+      if (!identical(socket, _socket) || !_connected || _subscribed || _sessionEnded) return;
+      _onJoinUnanswered();
     });
   }
 
+  /// The server has not confirmed the room. Either the join was lost (the
+  /// backend's old connect race), the server is struggling, or this connection's
+  /// session is dead and an older backend is ignoring it in silence. Re-asking is
+  /// right for the first two; only the server can say whether it is the third.
+  void _onJoinUnanswered() {
+    _joinMisses++;
+    final probe = _joinMisses >= _missesBeforeProbe &&
+        (_joinMisses - _missesBeforeProbe) % _missesBetweenProbes == 0;
+    if (probe) {
+      _log('Still not receiving print jobs — checking the sign-in');
+      unawaited(_probeSession());
+      return;
+    }
+    _log('No answer to the print subscription yet — asking again');
+    _emitJoin();
+  }
+
+  /// Ask /auth/me whether this device's session is alive, and act on the answer.
+  ///
+  /// SIGN-OUT ONLY ON THE SERVER'S WORD. A 401 is the backend saying this token
+  /// is dead, which is the same thing the rest of the app signs out on
+  /// (RestClient). Anything else — no connection, a timeout, a 502 from a proxy
+  /// while the backend restarts — is not evidence about the session, and a till
+  /// on flaky Wi-Fi must never be signed out mid-service over it. Those get a
+  /// fresh handshake instead, which is what a close-and-reopen was really doing.
+  ///
+  /// THE ANSWER IS ABOUT THE SESSION THAT ASKED. The request can still be out
+  /// when the agent is stopped and started again — an outlet switch, a network
+  /// printer added, a sign-out and sign-in — and a 401 for the old token used to
+  /// sign the NEW session out and destroy it on the server. A 401 now signs out
+  /// only through [_endExpiredSession]'s check that this start() still holds the
+  /// token it was about; any other answer reconnects only the connection it was
+  /// asked on behalf of.
+  Future<void> _probeSession() async {
+    final auth = _auth;
+    final token = auth?.token;
+    if (auth == null || token == null || _sessionEnded) return;
+    final generation = _lifecycle;
+    if (_probingLifecycle == generation) {
+      // This session's probe is already out, and its answer covers this miss
+      // too. Keep climbing the ladder meanwhile instead of returning with the
+      // watchdog disarmed, so nothing depends on that one answer ever arriving.
+      _armJoinWatchdog();
+      return;
+    }
+    final socket = _socket;
+    _probingLifecycle = generation;
+    final verdict = await _askServer(auth, token);
+    if (_probingLifecycle == generation) _probingLifecycle = null;
+    if (verdict == _SessionVerdict.expired && _endExpiredSession(token, generation)) return;
+    // Alive, unreachable, or dead but no longer the token this device holds. The
+    // connection this probe was sent for, if it is still the current one and
+    // still unconfirmed, gets a fresh handshake as the session held NOW. A newer
+    // start() owns its own connection, watchdog and probe, and is left alone.
+    final held = auth.token;
+    if (generation != _lifecycle || _sessionEnded || held == null) return;
+    if (!identical(socket, _socket) || _subscribed || !_started) return;
+    _log('Reconnecting to realtime to resume printing');
+    _openSocket(held);
+  }
+
+  /// Ask /auth/me about [token], within [_sessionProbeTimeout].
+  ///
+  /// BOUNDED, because ApiClient.me is a bare http.get: a request stuck on a
+  /// half-open connection would otherwise hold the probe — and with it the
+  /// watchdog — for as long as the OS keeps the socket. Running out of time is
+  /// [_SessionVerdict.unknown], exactly like any other transport failure.
+  Future<_SessionVerdict> _askServer(AuthController auth, String token) async {
+    try {
+      await auth.api.me(token).timeout(_sessionProbeTimeout);
+      return _SessionVerdict.alive;
+    } on ApiException catch (e) {
+      return e.status == 401 ? _SessionVerdict.expired : _SessionVerdict.unknown;
+    } catch (_) {
+      return _SessionVerdict.unknown;
+    }
+  }
+
+  void _onJoinedOutlet(dynamic data) {
+    final outletId = data is Map ? '${data['outletId'] ?? ''}' : '';
+    // A confirmation for some OTHER outlet is not a confirmation. Every join this
+    // socket sends names [_outletId], so a mismatch is stale, and trusting it
+    // would light "Listening" over a room this device is not in.
+    if (outletId.isEmpty || outletId != _outletId) return;
+    _joinWatchdog?.cancel();
+    _joinMisses = 0;
+    if (_subscribed) return; // a replay window's re-join, already known
+    _subscribed = true;
+    _log('Subscribed to outlet $outletId');
+    notifyListeners();
+  }
+
+  void _onJoinRejected(dynamic data) {
+    final reason = data is Map ? data['reason'] : null;
+    if (reason != 'session_invalid') {
+      // Not a statement about the session, so it changes nothing here: the
+      // watchdog keeps asking.
+      _log('Print subscription refused${reason == null ? '' : ' ($reason)'}');
+      return;
+    }
+    _joinWatchdog?.cancel();
+    final held = _auth?.token;
+    if (held == null) return; // already signed out by something else
+    if (_handshakeToken != null && _handshakeToken != held) {
+      // The server rejected the token this CONNECTION introduced itself with,
+      // which is not the session this device holds now. Signing out would end a
+      // perfectly good session; reconnecting as it is the whole fix.
+      _log('Reconnecting to realtime with the current sign-in');
+      _openSocket(held);
+      return;
+    }
+    _endExpiredSession(held, _lifecycle);
+  }
+
+  /// The server has said this session is gone. Send the user back to sign in —
+  /// once — exactly as a 401 anywhere else in the app does. HomeShell's teardown
+  /// stops this agent, and the next sign-in starts a fresh connection with the
+  /// fresh token.
+  ///
+  /// THE ONE GATE EVERY VERDICT PASSES. [token] is the token the verdict was
+  /// about and [generation] the start() that heard it. If either has moved on,
+  /// the dead session is one this device already let go of — a request can land
+  /// after a sign-out and sign-in — and ending the session it holds NOW would
+  /// sign out a fresh login and destroy it on the server. Returns whether it
+  /// acted, so a caller whose verdict was stale can carry on as if it were not one.
+  bool _endExpiredSession(String token, int generation) {
+    final auth = _auth;
+    if (auth == null || _sessionEnded || generation != _lifecycle || auth.token != token) return false;
+    _sessionEnded = true;
+    _joinWatchdog?.cancel();
+    _log('Session expired — sign in again to resume printing');
+    unawaited(auth.logout(expired: true));
+    return true;
+  }
+
+  /// The app came back to the foreground.
+  ///
+  /// Re-asks ONLY where something is wrong. A till that is connected and
+  /// confirmed in its room is left alone: a joinOutlet costs the server a tenant
+  /// transaction for the replay, and a desktop window regains focus far too often
+  /// to pay that every time. The one exception is a backlog catch-up that really
+  /// paused at its round cap ([_replayPaused]), which previously said "reconnect
+  /// to continue" — coming back to the app is that reconnect. A round count that
+  /// merely sits at the cap is not that: quiet gaps between live dockets spend
+  /// rounds on every long-running till, and continuing on THAT would re-join a
+  /// listening socket on every window focus.
+  Future<void> onResume() async {
+    if (!_started || _sessionEnded) return;
+    final socket = _socket;
+    if (socket == null) return;
+    if (!_connected) {
+      socket.connect();
+      return;
+    }
+    if (!_subscribed) {
+      _joinMisses = 0;
+      _log('Back in the app — asking for print jobs again');
+      _emitJoin();
+      return;
+    }
+    if (_replayPaused) {
+      _replayPaused = false;
+      _replayRounds = 0;
+      _replayPrinted = 1; // let the guard through; this IS the continue
+      _requestNextReplayWindow();
+    }
+  }
+
   Future<void> stop() async {
+    _lifecycle++;
     _started = false;
     _connected = false;
+    _subscribed = false;
     _keepAlive?.cancel();
     _replayRetry?.cancel();
+    _joinWatchdog?.cancel();
     _keepAlive = null;
-    try {
-      _socket?.dispose();
-    } catch (_) {/* ignore */}
+    final socket = _socket;
     _socket = null;
+    try {
+      socket?.dispose();
+    } catch (_) {/* ignore */}
     _replayRounds = 0;
     _replayPrinted = 0;
+    _replayPaused = false;
     // THE QUEUE IS DELIBERATELY KEPT. stop() is a logout, an outlet switch or a
     // shell teardown — every one of which is normally followed by a start(), and
     // the pending jobs are receipts for tables at THIS printer either way.
@@ -763,6 +1189,9 @@ class PrinterService extends ChangeNotifier {
     _replayRetry?.cancel();
     _replayPrinted = 0;
     if (_replayRounds >= _maxReplayRounds) {
+      // Reached only with output from the last window (the retry timer stops
+      // arming at the cap, above), so this is a backlog genuinely cut short.
+      _replayPaused = true;
       _log('Paused catching up after $_maxReplayRounds batches — reconnect to continue.');
       return;
     }

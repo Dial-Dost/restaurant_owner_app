@@ -16,6 +16,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
+import '../models/bill_round_off.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -46,6 +47,7 @@ import '../ui/widgets/stat_card.dart';
 import '../ui/widgets/status_chip.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
+import '../models/payment_modes.dart';
 import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
@@ -986,6 +988,10 @@ Widget _recordHeadRow(
 // eyebrow, title, scrolling body and an optional "View in <Module>" jump. The
 // jump is hidden outright when that module is not reachable for this user,
 // rather than offering a control that would no-op.
+//
+// [beforeJump] runs only when the jump is actually taken, just before the shell
+// switches module — the place to set up the destination (its reporting window,
+// say) without touching it when the sheet is merely closed.
 Future<void> _detailSheet(
   BuildContext context, {
   required String eyebrow,
@@ -993,6 +999,7 @@ Future<void> _detailSheet(
   required List<Widget> children,
   String? jumpTo,
   Map<String, dynamic>? jumpTarget,
+  VoidCallback? beforeJump,
 }) {
   final nav = ModuleNavigator.of(context);
   final canJump = jumpTo != null && (nav?.canOpen(jumpTo) ?? false);
@@ -1042,6 +1049,7 @@ Future<void> _detailSheet(
                       dense: true,
                       onPressed: () {
                         Navigator.pop(ctx);
+                        beforeJump?.call();
                         nav!.openModule(jumpTo, target: jumpTarget);
                       },
                     ),
@@ -1215,6 +1223,9 @@ Color _stageColor(String status) {
 ///    month is still inside it.
 ///  * anything else — the six figures, in the order the requirement lists them.
 ///
+/// Under the figures, when the server sent them: today's takings BY PAYMENT
+/// METHOD — see [_headlineByMethod].
+///
 /// [columns] lays the figures out; the call site owns the breakpoints.
 List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2}) {
   // State one. "Not fetched" — which is not "fetched and empty", and is why the
@@ -1307,6 +1318,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   // table does not carry, which is not a word to put in front of an owner.
   final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
   final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone · $offset');
+  final byMethod = _headlineByMethod(context, h, columns: columns);
 
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
@@ -1358,10 +1370,237 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
           const SizedBox(height: AppSpacing.lg),
         ],
         if (figures.isNotEmpty) _dashGrid(figures, columns),
+        if (byMethod != null) ...[
+          const SizedBox(height: AppSpacing.lg),
+          byMethod,
+        ],
       ]),
     ),
     const SizedBox(height: 28),
   ];
+}
+
+/// TODAY BY PAYMENT METHOD, inside the headline box. Client ask: "How much money
+/// from each payment method made in the day has to be shown."
+///
+/// The box could name one mode — Cash — and the per-mode cut lived two modules
+/// deep (Accounting, Reports > Settlement Summary) on a 30-day window. The rows
+/// are `today_by_method` from the SAME `/analytics/headline` payload: the
+/// Settlement Summary's own computation (settlementByMethod) over today's bills,
+/// with a released ₹0 table left out. So the Cash row here IS the Cash
+/// collection tile above it, and the rows add up to Today's gross sale — the
+/// server proves both; this prints them and re-sums nothing. The web
+/// `headline-stats.tsx` draws the same block from the same fields.
+///
+/// NULL — nothing drawn — when the rows are absent (an older backend: "the
+/// server did not say" is not "no money by any method"), when they are empty
+/// (the nothing-settled sentence above already says so), or when the block has
+/// no label (an unnamed list of money — the rule `figure` applies above).
+///
+/// Each row opens a drill-down with a jump to Accounting. Not Reports: the
+/// report pack takes no focus target, so a jump there would land on whichever
+/// report was open last.
+Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
+  final raw = h['today_by_method'];
+  if (raw is! List) return null;
+  final modes = raw.whereType<Map>().where((m) => '${m['method'] ?? ''}'.trim().isNotEmpty).toList();
+  if (modes.isEmpty) return null;
+  final section = h['by_method'];
+  final label = section is Map ? '${section['label'] ?? ''}'.trim() : '';
+  if (label.isEmpty) return null;
+  final hint = section is Map ? '${section['hint'] ?? ''}'.trim() : '';
+
+  final text = Theme.of(context).textTheme;
+  // The server's Today's gross sale — the figure the rows add up to. Summed
+  // here only if a payload somehow carried rows without it.
+  final grossFig = h['today_gross'];
+  final total = (grossFig is Map && grossFig['value'] is num)
+      ? (grossFig['value'] as num).toDouble()
+      : modes.fold<double>(0, (s, m) => s + _numOf(m['amount']));
+  // Bills paid by MORE THAN ONE REAL MODE — which is all the note below claims.
+  // The server leaves out a 'Split' bill whose only other part is the
+  // Unallocated residual: that bill was paid one way and belongs to the warning.
+  final splitBills = _int(h['today_split_bills']) ?? 0;
+  final unallocated = _numOf(h['today_unallocated']);
+  // Bills whose split parts did not add back — the Unallocated row's own count.
+  // NOT the sum above: residuals net across bills, so ₹50 short on one split and
+  // ₹50 over on another is ₹0.00 there, and two bills still need looking at.
+  // The server never filters this row for that reason.
+  final unallocatedRow = modes.where((m) => '${m['method']}'.trim() == 'Unallocated');
+  final unallocatedBills = unallocatedRow.isEmpty ? 0 : (_int(unallocatedRow.first['bills']) ?? 0);
+  final whose = unallocatedBills == 0
+      ? "those bills'"
+      : (unallocatedBills == 1 ? "1 bill's" : "$unallocatedBills bills'");
+  final today = '${h['today'] ?? ''}';
+
+  // The server's share, else computed; a dash — never 0% — with nothing to
+  // divide by. Same rule as the web's modeSharePct.
+  String shareOf(Map m) {
+    final s = m['share_pct'];
+    if (s is num) return '${s.toStringAsFixed(1)}%';
+    if (!(total > 0)) return '–';
+    return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
+  }
+
+  final rows = <Widget>[];
+  for (final m in modes) {
+    final method = '${m['method']}'.trim();
+    final amount = _numOf(m['amount']);
+    final bills = _int(m['bills']) ?? 0;
+    final refund = _numOf(m['refund']);
+    final share = shareOf(m);
+    final isUnallocated = method == 'Unallocated';
+    rows.add(Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+      HBarRow(
+        label: method,
+        // The mode's SHARE of today, not its size against the largest mode: a
+        // till that took ₹200 by card and ₹20,000 in cash must not draw a card
+        // bar that looks half full.
+        fraction: total > 0 ? (amount / total).clamp(0.0, 1.0) : 0,
+        value: _money(amount),
+        color: isUnallocated ? AppColors.warning : null,
+        tooltip: '$method · ${_money(amount)} · $bills bill(s) · $share of today',
+        onTap: () => _headlineMethodSheet(
+          context,
+          mode: m,
+          share: share,
+          label: label,
+          hint: hint,
+          today: today,
+          splitBills: splitBills,
+        ),
+      ),
+      // The counts go on their own line UNDER the bar, not in HBarRow's `sub`.
+      // That row gives only its label, so a bill count and a share beside the
+      // figure overflowed a 360px phone by 99px once the day ran to eight
+      // digits. A wrapping line cannot, and it is the web block's layout too.
+      Text(
+        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} net' : ''}',
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: text.bodySmall!.copyWith(fontSize: 11),
+      ),
+    ]));
+  }
+
+  return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+    Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+    if (hint.isNotEmpty) ...[
+      const SizedBox(height: 3),
+      Text(hint,
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+    ],
+    const SizedBox(height: AppSpacing.sm),
+    // One across on a phone, two or three on wider windows — the web's
+    // 1 / 2 / 3 grid, keyed off the headline's own column count.
+    _dashGrid(rows, columns >= 6 ? 3 : (columns >= 3 ? 2 : 1)),
+    // Says only what is always true. The counts do NOT reliably add up to more
+    // than "N bill(s) settled": that tag counts a released ₹0 table, which has no
+    // row here.
+    if (splitBills > 0) ...[
+      const SizedBox(height: AppSpacing.sm),
+      Text(
+        '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
+        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+      ),
+    ],
+    // LOUD: the one line that means something is wrong. It should always be 0,
+    // and it is wrong in EITHER direction — a split whose parts exceed the bill
+    // books a negative residual — and wrong even when the residuals cancel. Same
+    // words as the web's unallocatedWarning.
+    if (unallocated != 0 || unallocatedBills > 0) ...[
+      const SizedBox(height: AppSpacing.sm),
+      Text(
+        unallocated != 0
+            ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
+                'do not add up to their totals and need looking at.'
+            : '$whose split amounts do not add up to their totals and need looking at '
+                '(the differences cancel out to ${_money(0)} today).',
+        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+      ),
+    ],
+  ]);
+}
+
+/// The Accounting window the by-method drill-down jumps to: the day the sheet
+/// was about.
+///
+/// The SERVER's day, not the device's. The sheet names `today` off the headline
+/// payload, and a till whose clock has already crossed midnight — or that sits
+/// in another zone — must not land on a different day from the one it printed.
+/// When the two agree, which is every ordinary tap, it is stored as the Today
+/// PRESET, so coming back to Accounting after midnight moves with the calendar
+/// like any other Today; when they do not, the server's day is pinned.
+///
+/// What still differs on that day is Accounting's card, not the window: its
+/// "By payment method" is /reports/sales by_method, which has no Unallocated
+/// row and takes no refunds off. So its bar matches this sheet's Collected on
+/// every bill whose split parts add up — production holds no split that does
+/// not — and a bad split's residual is on this sheet alone. Routing that card through
+/// settlementByMethod too is its own change: it moves an existing report.
+DateRange _headlineAccountingWindow(String serverToday) {
+  final device = DateRange.fromPreset(RangePreset.today);
+  if (!isDayKey(serverToday) || serverToday == device.from) return device;
+  return DateRange(from: serverToday, to: serverToday, preset: RangePreset.custom);
+}
+
+/// One mode's drill-down from [_headlineByMethod]: what it took today, what
+/// came back off it, and a jump to Accounting on that same day — hidden when
+/// Accounting is not reachable for this user, which [_detailSheet] decides.
+Future<void> _headlineMethodSheet(
+  BuildContext context, {
+  required Map mode,
+  required String share,
+  required String label,
+  required String hint,
+  required String today,
+  required int splitBills,
+}) {
+  final text = Theme.of(context).textTheme;
+  final method = '${mode['method'] ?? ''}'.trim();
+  final refund = _numOf(mode['refund']);
+  final note = TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
+  return _detailSheet(
+    context,
+    eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
+    title: '$method · ${_money(mode['amount'])}',
+    jumpTo: 'Accounting',
+    // Land on THIS DAY. Accounting opens on the window it last showed — Last 30
+    // days on a first visit — and its Cash bar there is a month of cash beside
+    // the day's figure the owner just tapped. A remembered window rather than a
+    // focus request: Accounting reads no focus, and a request left parked on
+    // the shell would reset the window again on the next remount, after the
+    // owner had moved the chip themselves.
+    beforeJump: () => DateRangeMemory.remember('accounting', _headlineAccountingWindow(today)),
+    children: [
+      _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
+      _detailRow(context, "Share of today's gross", share),
+      _detailRow(context, 'Refunds', refund > 0 ? '− ${_money(refund)}' : _money(0)),
+      _detailRow(context, 'Net of refunds', _money(mode['net_amount'])),
+      if (method == 'Unallocated') ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          'Money whose split-payment parts do not add up to the bill total. Short on one bill and over on '
+          'another can net to ₹0.00, so every bill counted here needs looking at, whatever the amount.',
+          style: text.bodySmall!.copyWith(color: AppColors.warning),
+        ),
+      ],
+      if (splitBills > 0) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(
+          '$splitBills bill(s) today were paid across more than one method; each part counts under its '
+          'own method.',
+          style: note,
+        ),
+      ],
+      if (hint.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(hint, style: note),
+      ],
+    ],
+  );
 }
 
 /// Quick-insight cards for the Overview tab, built from ONE server read
@@ -10253,12 +10492,18 @@ class _TableSheetState extends State<_TableSheet> {
                     billRow('Non-chargeable (given away)', _money(_bill!['nc_total'])),
                   if (_bn('discount') > 0)
                     billRow('Discount${_s(_bill!, 'discount_type') == 'percent' ? ' (${_bn('discount_value').toStringAsFixed(_bn('discount_value') % 1 == 0 ? 0 : 1)}%)' : ''}', '− ${_money(_bill!['discount'])}'),
+                  // Only a charge that is charged. A removed one (a recorded
+                  // waiver) shows no row at all — the client asked for exactly
+                  // that ("don't show service charge opted out when removed").
+                  // The manager's waiver card below still says who took it off,
+                  // and is where it is put back.
                   if (_bn('service_charge') > 0) billRow('Service charge', _money(_bill!['service_charge'])),
-                  // Why the charge is zero, rather than leaving the guest and the
-                  // waiter to work it out from an absent line.
-                  if (_bill!['service_charge_waived'] == true)
-                    billRow('Service charge', 'waived'),
                   if (_bn('tax_total') > 0) billRow('Tax', _money(_bill!['tax_total'])),
+                  // What the server rounded the total to the rupee by (backend
+                  // migration 048) — the line on the guest's paper, shown only
+                  // when it is not zero. Read, never computed here.
+                  if (billRoundOff(_bill!['round_off']) != null)
+                    billRow('Round off', billRoundOffMoney(billRoundOff(_bill!['round_off'])!)),
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: Divider(),
@@ -10292,7 +10537,7 @@ class _TableSheetState extends State<_TableSheet> {
               //
               // For everyone else it is unchanged, including the money scoping
               // inside it: the already-waived card prints what came off the
-              // charge and off the total, and `showsMoney` still drops those two
+              // charge and charge + tax, and `showsMoney` still drops those two
               // lines while leaving the reason, the names and the reverse
               // control standing.
               if (_scope.managerOnlyAsks)
@@ -10825,7 +11070,7 @@ const String _billQrNoteFallback = 'For calling Valet kindly scan the below QR c
 /// one matcher the server bills by — and this is the same predicate as the web
 /// print page's `billChargesForService`. A live waiver took the charge off both
 /// legs before this bill was computed, so a waived bill never carries the
-/// sentence; its paper prints "Opted-out" instead.
+/// sentence — and, like its paper, shows no service-charge line either.
 @visibleForTesting
 bool billPrintsServiceChargeNote(Map bill) {
   if (bill['service_charge_waived'] == true) return false;
@@ -11077,29 +11322,21 @@ class _BillPreviewDialog extends StatelessWidget {
     final subtotal = _n(bill['subtotal'] ?? bill['total_amt']);
     final discount = _n(bill['discount']);
     final serviceCharge = _n(bill['service_charge']);
-    // Zero on a tax_line tenant even when a charge IS levied (it rides in
-    // `taxes`), so this boolean — not the absence of a charge line — is the only
-    // truthful way to say the charge was taken off.
-    final serviceChargeWaived = bill['service_charge_waived'] == true;
     // Only the lines that carry money, as escpos.ts filters `taxLines`.
     final taxes = ((bill['taxes'] as List?) ?? const []).whereType<Map>().where((t) => _n(t['amount']) > 0).toList();
     final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
-    // A round-off the billing layer DISCLOSED, printed only when it is not zero
-    // — the renderer's rule for a supplied grand total. The open-bill read
-    // carries none today, so neither does this sheet: nothing is re-rounded here.
-    final roundOff = _n(bill['round_off']);
-    final showRoundOff = bill['round_off'] != null && (roundOff * 100).round() != 0;
+    // The round-off the billing layer DISCLOSED (backend migration 048: every
+    // bill is rounded to the rupee in computeBillCharges), printed only when it
+    // is not zero — the renderer's rule for a supplied grand total. Read off the
+    // same payload as the total; nothing is re-rounded here.
+    final roundOff = billRoundOff(bill['round_off']);
     final billNo = _s(bill, 'bill_no', '');
     // The customer slot — `Name:` / `Customer GSTIN:`.
     final customerLines = billCustomerLines(bill);
-    // The label the paper gives the charge line. The configured percentage
-    // while the charge is on; on a waived bill the payload's percent is the
-    // restaurant_percent leg and is 0 on a tax-line tenant, so the percentage the
-    // waiver was priced at names it instead. A label, never a figure.
-    final waiver = bill['service_charge_waiver'];
-    final scPct = _n(bill['service_charge_percent']) > 0
-        ? _n(bill['service_charge_percent'])
-        : (waiver is Map ? _n(waiver['basis_percent']) : 0.0);
+    // The label the paper gives the charge line: the configured percentage. It
+    // labels a charge that is charged and nothing else — a removed charge has
+    // no line to label. A label, never a figure.
+    final scPct = _n(bill['service_charge_percent']);
     final scLabel = scPct > 0 ? 'Service Charge ${_pct(scPct)}%' : 'Service Charge';
     // Quantities as the paper counts them (a whole number, at least one a line).
     // A count of dishes, not money.
@@ -11279,22 +11516,18 @@ class _BillPreviewDialog extends StatelessWidget {
                       if (discount > 0)
                         _ladder(col, [_s(bill, 'coupon_code', '').trim().isEmpty ? 'Discount' : 'Coupon ${_s(bill, 'coupon_code')}'],
                             '-${discount.toStringAsFixed(2)}'),
+                      // A charge only when one is charged. A waived bill prints
+                      // no service-charge line — escpos.ts prints none either
+                      // since the client asked for a removed charge not to be
+                      // shown on the bill.
                       if (serviceCharge > 0) _ladder(col, [scLabel], serviceCharge.toStringAsFixed(2)),
-                      // WHY THE CHARGE IS ZERO, rather than leaving the guest and
-                      // the waiter to work it out from a line that is simply
-                      // absent — the line escpos.ts prints as "Opted-out", worded
-                      // as it does. Never a figure: on a tax_line tenant the
-                      // amount that came off is a difference between two ladders,
-                      // not a rung, and this sheet does not compute differences.
-                      if (serviceChargeWaived) _ladder(col, [scLabel], 'Opted-out'),
                       ...taxes.map((m) {
                         final pct = _n(m['percentage']);
                         final label = pct > 0 ? '${_s(m, 'name', 'Tax')} ${_pct(pct)}%' : _s(m, 'name', 'Tax');
                         return _ladder(col, [label], _n(m['amount']).toStringAsFixed(2));
                       }),
                       _rule(),
-                      if (showRoundOff)
-                        _ladder(col, ['Round off'], '${roundOff > 0 ? '+' : ''}${roundOff.toStringAsFixed(2)}'),
+                      if (roundOff != null) _ladder(col, ['Round off'], billRoundOffPaper(roundOff)),
                       // The one figure bigger than the rest: bold and tall, as the
                       // paper's double-height Grand Total row is.
                       _ladder(col, ['Grand Total'], _money(grandTotal),
@@ -11341,15 +11574,6 @@ class _BillPreviewDialog extends StatelessWidget {
               );
             }),
           ),
-          // Staff-facing, OFF the paper: the slip itself says "Opted-out" and no
-          // more, but the person about to hand it over should know the charge
-          // came off by a recorded waiver rather than by accident.
-          if (serviceChargeWaived)
-            Padding(
-              padding: const EdgeInsets.only(top: 10),
-              child: Text('Service charge waived on this bill.',
-                  style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: AppColors.textSecondary)),
-            ),
           const SizedBox(height: 14),
           Row(mainAxisAlignment: MainAxisAlignment.end, children: [
             ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
@@ -19207,9 +19431,25 @@ class _AnalyticsModule extends StatefulWidget {
 class _AnalyticsModuleState extends State<_AnalyticsModule> {
   DateRange _range = DateRangeMemory.of('analytics');
 
-  void _setRange(DateRange next) {
-    setState(() => _range = next);
+  // Section headers that carry their own copy of the date chip (Kitchen,
+  // Attendance, Actionable insights). The body remounts on a new window and
+  // comes back at the top, so the header whose chip was used is scrolled back
+  // into view once it has painted. Keys live HERE, not in the body, so they
+  // survive that remount.
+  final _reveal = _SectionReveal();
+
+  void _setRange(DateRange next, {String? revealSection}) {
+    setState(() {
+      _range = next;
+      _reveal.ask(revealSection);
+    });
     DateRangeMemory.remember('analytics', next);
+  }
+
+  @override
+  void dispose() {
+    _reveal.scroll.dispose();
+    super.dispose();
   }
 
   @override
@@ -19225,7 +19465,44 @@ class _AnalyticsModuleState extends State<_AnalyticsModule> {
       range,
       _setRange,
       key: ValueKey('analytics-${range.from}-${range.to}'),
+      sectionRange: (section) => SectionRangeChip(
+        value: range,
+        onChanged: (r) => _setRange(r, revealSection: section),
+      ),
+      reveal: _reveal,
     );
+  }
+}
+
+/// Which Analytics section asked for the current window, where each one is, and
+/// where the page was scrolled when it asked.
+class _SectionReveal {
+  final Map<String, GlobalKey> _keys = {};
+
+  /// Owned by the module state (which disposes it), handed to every remount of
+  /// the body's list, so the offset can be read before the remount and restored
+  /// after it.
+  final ScrollController scroll = ScrollController();
+  String? _pending;
+  double? _offset;
+
+  GlobalKey keyFor(String section) =>
+      _keys.putIfAbsent(section, () => GlobalKey(debugLabel: 'analytics-$section'));
+
+  /// A chip picked a window. Null = the top chip, which asks for nothing.
+  void ask(String? section) {
+    _pending = section;
+    _offset = section != null && scroll.hasClients ? scroll.offset : null;
+  }
+
+  /// Called while the body builds: bring the asking section back into view and
+  /// forget the request, so a later rebuild (a view tab, the cache-then-network
+  /// repaint) does not yank the page there again.
+  void schedule() {
+    final section = _pending;
+    if (section == null) return;
+    _pending = null;
+    revealAfterPaint(keyFor(section), controller: scroll, offset: _offset);
   }
 }
 
@@ -19237,6 +19514,10 @@ Widget _analyticsBody(
   DateRange range,
   ValueChanged<DateRange> onRange, {
   Key? key,
+  // A section header's live date chip, on THIS module's window. The headers used
+  // to carry a static calendar InfoChip that looked exactly like it.
+  required Widget Function(String section) sectionRange,
+  required _SectionReveal reveal,
 }) => AsyncView<Map<String, dynamic>>(
       key: key,
       load: () async {
@@ -19584,7 +19865,9 @@ Widget _analyticsBody(
           return _kpiHomeView[key] == view;
         }).toList();
 
-        return ListView(padding: AppSpacing.pageNarrow, children: [
+        // A section header's chip picked this window: scroll it back into view.
+        reveal.schedule();
+        return ListView(controller: reveal.scroll, padding: AppSpacing.pageNarrow, children: [
           // The window, first thing on the screen and above the view tabs: every
           // figure below is cut on it, so it has to be the first thing read.
           Row(children: [
@@ -19974,6 +20257,7 @@ Widget _analyticsBody(
           ],
           if (kitchenVisible) ...[
             SectionHeader(
+              key: reveal.keyFor('kitchen'),
               title: 'Kitchen',
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 _dlButton(() => dl('kitchen-summary', const ['Metric', 'Value'], [
@@ -19987,7 +20271,7 @@ Widget _analyticsBody(
                       ['Period (days)', kitchenDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+                sectionRange('kitchen'),
               ]),
             ),
             if (kOrdersTimed == 0 && kByDish.isEmpty && kBySection.isEmpty)
@@ -20510,6 +20794,7 @@ Widget _analyticsBody(
           // because there is no shift roster; the caption says so on screen.
           if (vis('staff') && (attendance.isNotEmpty || attSummary.isNotEmpty)) ...[
             SectionHeader(
+              key: reveal.keyFor('attendance'),
               title: 'Attendance',
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                 _dlButton(() => dl('attendance-summary', const ['Metric', 'Value'], [
@@ -20525,7 +20810,7 @@ Widget _analyticsBody(
                       ['Window (days)', attDays],
                     ])),
                 const SizedBox(width: 8),
-                InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+                sectionRange('attendance'),
               ]),
             ),
             if (attendance.isEmpty)
@@ -20656,8 +20941,9 @@ Widget _analyticsBody(
           if (vis('menu', onOverview: true) || vis('staff')) ...[
             const SizedBox(height: AppSpacing.sm),
             SectionHeader(
+              key: reveal.keyFor('insights'),
               title: 'Actionable insights',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+              trailing: sectionRange('insights'),
             ),
           ],
           if (vis('menu', onOverview: true) && topDishes.isNotEmpty) ...[
@@ -20964,14 +21250,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   void dispose() {
     _billDebounce?.cancel();
     _billSearch.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
+  // The 'Settled bills' header and the page's scroll position, so picking dates
+  // from THAT header's chip lands the owner back on the bills after the reload
+  // instead of at the top of the page (see revealAfterPaint).
+  final GlobalKey _settledBillsKey = GlobalKey(debugLabel: 'accounting-settled-bills');
+  final ScrollController _scroll = ScrollController();
+
   // Adopt a window the owner picked, remember it for the session, refetch.
-  void _setRange(DateRange next) {
+  // ONE window for the whole page whichever chip set it: the top control and the
+  // Settled bills header both land here. `revealBills` only decides where the
+  // page is scrolled once the new figures are up.
+  Future<void> _setRange(DateRange next, {bool revealBills = false}) async {
+    // Read BEFORE the reload: the skeleton detaches the list from the controller.
+    final offset = _scroll.hasClients ? _scroll.offset : null;
     setState(() => _range = next);
     DateRangeMemory.remember('accounting', next);
-    _load();
+    await _load();
+    if (revealBills && mounted) revealAfterPaint(_settledBillsKey, controller: _scroll, offset: offset);
   }
 
   /// Side-effect-free GET composition over the CURRENT window/month — replayable
@@ -21287,7 +21586,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
-            _detailRow(context, _s(m, 'method', 'Other'), _money(m['sales']),
+            _detailRow(context, PaymentModes.reportName(m), _money(m['sales']),
                 trailing: _billsWord(_int(m['bills']) ?? 0)),
         ],
       ],
@@ -21391,7 +21690,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     return _detailSheet(
       context,
       eyebrow: 'Payment method · $_windowLabel',
-      title: _s(m, 'method', 'Other'),
+      title: PaymentModes.reportName(m),
       children: [
         _detailRow(context, 'Taken this way', _money(sales)),
         _detailRow(context, 'Share of gross sales', total > 0 ? '${(sales / total * 100).toStringAsFixed(1)}%' : '—'),
@@ -21642,7 +21941,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
 
     return cacheStaleOverlay(RefreshIndicator(
       onRefresh: _load,
-      child: ListView(padding: AppSpacing.pageNarrow, children: [
+      child: ListView(controller: _scroll, padding: AppSpacing.pageNarrow, children: [
         // The two exports drop below the period control on a phone, and wrap
         // again between themselves if they still do not fit. Side by side on one
         // line they wanted 410px of a 358px column at 1.3x.
@@ -21723,11 +22022,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                 return Column(children: [
                   for (final m in rows)
                     HBarRow(
-                      label: _s(m, 'method', 'Other'),
+                      label: PaymentModes.reportName(m),
                       sub: '${m['bills'] ?? 0} bills',
                       fraction: maxV > 0 ? (_n(m['sales']) / maxV).clamp(0.0, 1.0) : 0,
                       value: money(_n(m['sales'])),
-                      tooltip: '${_s(m, 'method', 'Other')} · ${_money(m['sales'])}',
+                      tooltip: '${PaymentModes.reportName(m)} · ${_money(m['sales'])}',
                       onTap: () => _methodSheet(m),
                     ),
                 ]);
@@ -21798,9 +22097,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         // every other figure on this page so the list and the totals above can
         // never disagree about which days they are describing.
         const SizedBox(height: AppSpacing.sm),
+        // The pill here used to be a static InfoChip dressed as the date control
+        // (same icon, same dates, no tap). It is now the live control, on the
+        // SAME window as the chip at the top.
         SectionHeader(
+          key: _settledBillsKey,
           title: 'Settled bills',
-          trailing: InfoChip(icon: Icons.event_outlined, label: _range.label()),
+          trailing: SectionRangeChip(value: _range, onChanged: (r) => _setRange(r, revealBills: true)),
           padding: const EdgeInsets.only(bottom: 6),
         ),
         Text('Every bill closed in this period, newest first — tap one for its items, taxes, payment and who closed it.',
@@ -21852,7 +22155,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                   for (final m in byMethod)
                     DropdownMenuItem<String>(
                       value: _s(m as Map, 'method', ''),
-                      child: Text(_s(m, 'method', 'Other'), overflow: TextOverflow.ellipsis),
+                      child: Text(PaymentModes.reportName(m), overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),
@@ -23089,8 +23392,13 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
   final coupon = _s(bill, 'coupon_code', '');
   final method = _s(bill, 'payment_method', '');
   final covers = _int(bill['covers']);
-  // The contract's invariant, shown rather than trusted.
-  final balances = (taxable + service + taxTotal - grand).abs() < 0.05;
+  // What rounded the settled total to the rupee (backend migration 048), as
+  // recorded at settle. Null on a bill that needed none or was settled before
+  // rounding existed.
+  final roundOff = billRoundOff(bill['round_off']);
+  // The contract's invariant, shown rather than trusted — with the round-off as
+  // its fourth rung, or every rounded bill would read as not adding up.
+  final balances = (taxable + service + taxTotal + (roundOff ?? 0) - grand).abs() < 0.05;
 
   Widget rule() => Container(height: 1, color: AppColors.divider);
   Widget money(String label, String value, {String? sub, bool strong = false, Color? tint}) => Padding(
@@ -23210,6 +23518,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       for (final t in taxes)
         money('${_s(t, 'name', 'Tax')} ${_numOf(t['percentage'])}%', _money(t['amount'])),
       if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
+      if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
       money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
       const SizedBox(height: 6),
@@ -23219,7 +23528,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax = ${_money(grand)}',
+            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax'
+            '${roundOff == null ? '' : ' ${roundOff < 0 ? '−' : '+'} ${_money(roundOff.abs())} round off'} = ${_money(grand)}',
             style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
           ),
         ),
@@ -30145,6 +30455,27 @@ class _PasswordRequestsBanner extends StatelessWidget {
   }
 }
 
+/// The connection card's chip and sentence, from the agent's [PrinterLink].
+///
+/// THREE STATES, because "Connected" used to cover two. A socket whose transport
+/// is up but which the server never put in the outlet's room receives no
+/// `bill:print` at all, and showing it green is how a till went a whole lunch
+/// printing nothing while every screen said it was fine. Amber is the honest
+/// colour for it: the agent is working on it (see PrinterService's watchdog),
+/// and if it cannot, it will say so or send the user to sign in.
+({String label, Color color, String caption}) printerLinkStatus(PrinterLink link, {required bool unconfigured}) =>
+    switch (link) {
+      PrinterLink.listening =>
+        (label: 'Listening', color: AppColors.success, caption: 'Listening for print jobs in realtime'),
+      PrinterLink.joining =>
+        (label: 'Connecting', color: AppColors.warning, caption: 'Connected, not receiving jobs yet — retrying'),
+      PrinterLink.offline => (
+          label: 'Offline',
+          color: AppColors.danger,
+          caption: unconfigured ? 'Add a printer below and this device starts printing' : 'Not connected to realtime',
+        ),
+    };
+
 // Built-in thermal printer agent UI: set up the printers, watch the realtime
 // connection, and monitor the print queue/log. The PrinterService runs in the
 // background (started at login) — this screen just configures and observes it.
@@ -30176,6 +30507,7 @@ Widget printerModule(RestClient rest, Profile p) {
       // room until it can — so "Offline" here is a setup step, not a fault, and
       // the card below says which.
       final unconfigured = !svc.hasSpooler && svc.networkPrinters.isEmpty;
+      final link = printerLinkStatus(svc.linkState, unconfigured: unconfigured);
       return ListView(padding: AppSpacing.pageNarrow, children: [
         // Connection status
         ForkCard(
@@ -30186,19 +30518,15 @@ Widget printerModule(RestClient rest, Profile p) {
               switchInCurve: Curves.easeOut,
               switchOutCurve: Curves.easeIn,
               child: StatusChip(
-                key: ValueKey('printer-conn-${svc.connected}'),
-                label: svc.connected ? 'Connected' : 'Offline',
-                color: svc.connected ? AppColors.success : AppColors.danger,
+                key: ValueKey('printer-conn-${svc.linkState.name}'),
+                label: link.label,
+                color: link.color,
               ),
             ),
             const SizedBox(width: AppSpacing.md),
             Expanded(
               child: Text(
-                  svc.connected
-                      ? 'Listening for print jobs in realtime'
-                      : unconfigured
-                          ? 'Add a printer below and this device starts printing'
-                          : 'Not connected to realtime',
+                  link.caption,
                   style: text.bodySmall,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis),
@@ -32252,7 +32580,21 @@ class _BillingControlsCardState extends State<_BillingControlsCard> {
   }
 }
 
-// Currency picker + per-method enable / require-screenshot config.
+// Currency picker + the restaurant's payment modes: switch any on or off, rename
+// any, require a screenshot, offer it on the guest QR page — and ADD ITS OWN.
+//
+// "There has to be an option to add mode of payments, it's not there." This card
+// used to render a closed list of eight and said it chose what GUESTS can use; its
+// switches never reached the till. Now it edits the one list both this app's
+// settle sheet and the web dashboard's pickers read (GET /restaurant/settings
+// `payment_methods`, models/payment_modes.dart):
+//   * A NEW MODE'S NAME IS PERMANENT — it is what every bill settled with it
+//     stores and what reports group by. The LABEL can change any time.
+//   * NOTHING IS DELETED. A mode is switched off; its old bills keep their name.
+//   * Some names are refused (Complimentary / NC / Staff meal: use Mark as
+//     non-chargeable; Credit / Due: no money has arrived; built-ins; report
+//     rows). The server refuses them regardless and its sentence is shown as-is.
+//   * Modes you add are NOT cash: the drawer counts Cash only.
 class _PaymentSettingsCard extends StatefulWidget {
   final RestClient rest;
   final String initialCurrency;
@@ -32268,7 +32610,8 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
   // Mutable (NOT const) — we add the saved currency if it isn't a preset.
   final List<String> _currencies = ['₹', '\$', '€', '£', 'AED', '¥'];
   late String _currency;
-  late List<Map<String, dynamic>> _methods;
+  late List<PaymentMode> _methods;
+  final Map<String, TextEditingController> _labels = {};
   bool _busy = false;
 
   @override
@@ -32276,40 +32619,88 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
     super.initState();
     _currency = widget.initialCurrency.isNotEmpty ? widget.initialCurrency : '₹';
     if (!_currencies.contains(_currency)) _currencies.add(_currency);
-    _methods = widget.initialMethods
-        .map<Map<String, dynamic>>((m) => {
-              'id': '${(m as Map)['id'] ?? ''}',
-              'label': '${m['label'] ?? m['id'] ?? ''}',
-              'enabled': m['enabled'] != false,
-              'requires_screenshot': m['requires_screenshot'] == true,
-              'online': m['online'] == true,
-            })
-        .toList();
+    _adopt(PaymentModes.parse(widget.initialMethods));
   }
 
-  Future<void> _save() async {
+  @override
+  void dispose() {
+    for (final c in _labels.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  /// Take [modes] as the card's list, keeping a label box per mode.
+  void _adopt(List<PaymentMode> modes) {
+    _methods = modes;
+    for (final m in modes) {
+      final c = _labels[m.id];
+      if (c == null) {
+        _labels[m.id] = TextEditingController(text: m.label);
+      } else if (c.text != m.label) {
+        c.text = m.label;
+      }
+    }
+  }
+
+  void _patch(String id, PaymentMode Function(PaymentMode) change) {
+    setState(() => _methods = [for (final m in _methods) m.id == id ? change(m) : m]);
+  }
+
+  /// The list as it is on screen, labels from their boxes.
+  List<PaymentMode> get _current =>
+      [for (final m in _methods) m.copyWith(label: PaymentModes.tidy(_labels[m.id]?.text ?? m.label))];
+
+  String? _labelRefusal(PaymentMode m) =>
+      PaymentModes.labelRefusal(_labels[m.id]?.text ?? m.label, m.id, _current);
+
+  Future<bool> _save({List<PaymentMode>? modes, String message = 'Payment settings saved.'}) async {
+    final list = modes ?? _current;
     setState(() => _busy = true);
     try {
-      await widget.rest.post('/restaurant/settings', {'currency': _currency, 'payment_methods': _methods});
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Payment settings saved.')));
-        widget.reload();
-      }
+      final res = await widget.rest.post('/restaurant/settings', {
+        'currency': _currency,
+        'payment_methods': [for (final m in list) m.toJson()],
+      });
+      if (!mounted) return true;
+      setState(() => _adopt(res is Map && res['payment_methods'] is List ? PaymentModes.parse(res['payment_methods']) : list));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      widget.reload();
+      return true;
     } catch (e) {
+      // A refused save names every problem (a reserved name, a clash…) — as-is.
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      return false;
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  Future<void> _addMode() async {
+    // The dialog OWNS its text controller (see _AddPaymentModeDialog): disposing
+    // one here, the moment showDialog returns, pulls it out from under the
+    // TextField while the dialog is still animating closed.
+    final draft = await showDialog<({String name, bool requiresScreenshot, bool showToGuests})>(
+      context: context,
+      builder: (_) => _AddPaymentModeDialog(existing: _current),
+    );
+    if (draft == null || !mounted) return;
+    final next = PaymentModes.withCustom(_current,
+        name: draft.name, requiresScreenshot: draft.requiresScreenshot, showToGuests: draft.showToGuests);
+    await _save(modes: next, message: '${PaymentModes.tidy(draft.name)} can now be chosen when settling a bill.');
+  }
+
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    final refusals = [for (final m in _methods) ?_labelRefusal(m)];
     return ForkCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Text('Payments & currency', style: text.titleMedium),
         const SizedBox(height: 4),
-        Text('Choose currency + which payment methods guests can use (and whether a screenshot is required).',
+        Text(
+            'Payment modes offered at the till and on the guest QR page. Add your own, rename any, '
+            'or switch one off — a switched-off mode can’t be used for new payments, and past bills keep their mode.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.lg),
         Row(children: [
@@ -32332,65 +32723,199 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
           ),
         ]),
         const Divider(height: 24),
-        Text('PAYMENT METHODS', style: text.labelSmall),
+        Text('PAYMENT MODES', style: text.labelSmall),
         const SizedBox(height: 6),
         for (final m in _methods)
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Column(key: ValueKey('payment-mode-row-${m.id}'), crossAxisAlignment: CrossAxisAlignment.start, children: [
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 6),
               child: Row(children: [
                 Expanded(
-                  child: Row(children: [
-                    Flexible(
-                      child: Text('${m['label']}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.bodyMedium!.copyWith(
-                              color: m['enabled'] == true ? AppColors.textPrimary : AppColors.textSecondary)),
+                  child: TextField(
+                    key: ValueKey('payment-mode-label-${m.id}'),
+                    controller: _labels[m.id],
+                    maxLength: PaymentModes.labelMax,
+                    enabled: !_busy,
+                    onChanged: (_) => setState(() {}),
+                    style: text.bodyMedium!.copyWith(
+                        color: m.enabled ? AppColors.textPrimary : AppColors.textSecondary),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      counterText: '',
+                      hintText: PaymentModes.fallback.where((d) => d.id == m.id).firstOrNull?.label ?? m.id,
                     ),
-                    if (m['online'] == true) ...[
-                      const SizedBox(width: 8),
-                      const InfoChip(icon: Icons.bolt, label: 'online'),
-                    ],
-                  ]),
+                  ),
                 ),
+                if (m.custom) ...[
+                  const SizedBox(width: 8),
+                  const InfoChip(icon: Icons.add_card_outlined, label: 'added'),
+                ],
+                if (m.online) ...[
+                  const SizedBox(width: 8),
+                  const InfoChip(icon: Icons.bolt, label: 'online'),
+                ],
                 const SizedBox(width: AppSpacing.md),
                 SizedBox(
                   height: 24,
                   child: FittedBox(
                     fit: BoxFit.contain,
-                    child: Switch(value: m['enabled'] == true, onChanged: (v) => setState(() => m['enabled'] = v)),
+                    child: Switch(
+                        key: ValueKey('payment-mode-enabled-${m.id}'),
+                        value: m.enabled,
+                        onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(enabled: v))),
                   ),
                 ),
               ]),
             ),
-            if (m['enabled'] == true && m['online'] != true)
+            if (_labelRefusal(m) != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 4),
+                child: Text(_labelRefusal(m)!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+              ),
+            if (m.custom || PaymentModes.tidy(_labels[m.id]?.text ?? '') != m.id)
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 2),
+                child: Text('Stored on bills as “${m.id}”${m.enabled ? '' : ' · switched off'}',
+                    style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+              ),
+            if (m.enabled && !m.online)
               Padding(
                 padding: const EdgeInsets.only(left: 16, bottom: 4),
-                child: Row(children: [
-                  Checkbox(
-                    value: m['requires_screenshot'] == true,
-                    visualDensity: VisualDensity.compact,
-                    activeColor: AppColors.copper,
-                    checkColor: AppColors.onCopper,
-                    side: BorderSide(color: AppColors.borderStrong),
-                    onChanged: (v) => setState(() => m['requires_screenshot'] = v ?? false),
-                  ),
-                  Text('Require payment screenshot', style: text.bodySmall),
+                child: Wrap(spacing: 12, children: [
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    Checkbox(
+                      value: m.requiresScreenshot,
+                      visualDensity: VisualDensity.compact,
+                      activeColor: AppColors.copper,
+                      checkColor: AppColors.onCopper,
+                      side: BorderSide(color: AppColors.borderStrong),
+                      onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(requiresScreenshot: v ?? false)),
+                    ),
+                    Text('Require payment screenshot', style: text.bodySmall),
+                  ]),
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    Checkbox(
+                      value: m.showToGuests,
+                      visualDensity: VisualDensity.compact,
+                      activeColor: AppColors.copper,
+                      checkColor: AppColors.onCopper,
+                      side: BorderSide(color: AppColors.borderStrong),
+                      onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(showToGuests: v ?? false)),
+                    ),
+                    Text('Show on guest QR page', style: text.bodySmall),
+                  ]),
                 ]),
               ),
           ]),
         const SizedBox(height: AppSpacing.md),
-        Align(
-          alignment: Alignment.centerRight,
-          child: ForkButton(
+        Wrap(alignment: WrapAlignment.spaceBetween, spacing: 8, runSpacing: 8, children: [
+          ForkButton.ghost(
+            key: const ValueKey('payment-mode-open-add'),
+            label: 'Add payment mode',
+            icon: Icons.add,
+            dense: true,
+            onPressed: _busy ? null : _addMode,
+          ),
+          ForkButton(
             label: _busy ? 'Saving…' : 'Save payments & currency',
             icon: Icons.save_outlined,
             dense: true,
-            onPressed: _busy ? null : _save,
+            // A label the server would refuse is said beside its box, not after a round trip.
+            onPressed: (_busy || refusals.isNotEmpty) ? null : _save,
           ),
-        ),
+        ]),
       ]),
+    );
+  }
+}
+
+/// "Add payment mode": a name, whether it needs a screenshot, whether guests see
+/// it. The name is checked against the same rules the server applies, live, so
+/// the owner reads why "Complimentary" is not a payment mode before pressing Add.
+class _AddPaymentModeDialog extends StatefulWidget {
+  const _AddPaymentModeDialog({required this.existing});
+
+  final List<PaymentMode> existing;
+
+  @override
+  State<_AddPaymentModeDialog> createState() => _AddPaymentModeDialogState();
+}
+
+class _AddPaymentModeDialogState extends State<_AddPaymentModeDialog> {
+  final TextEditingController _name = TextEditingController();
+  bool _needsShot = false;
+  bool _showGuests = false;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final refusal = _name.text.trim().isEmpty ? null : PaymentModes.newModeRefusal(_name.text, widget.existing);
+    return AlertDialog(
+      title: const Text('Add payment mode'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            TextField(
+              key: const ValueKey('payment-mode-name'),
+              controller: _name,
+              autofocus: true,
+              maxLength: PaymentModes.idMax,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: 'Name',
+                hintText: 'e.g. Swiggy Dineout, Magicpin, HDFC card machine',
+              ),
+            ),
+            if (refusal != null)
+              Text(refusal,
+                  key: const ValueKey('payment-mode-refusal'),
+                  style: text.bodySmall!.copyWith(color: AppColors.danger)),
+            CheckboxListTile(
+              key: const ValueKey('payment-mode-screenshot'),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _needsShot,
+              onChanged: (v) => setState(() => _needsShot = v ?? false),
+              title: const Text('Require payment screenshot'),
+            ),
+            CheckboxListTile(
+              key: const ValueKey('payment-mode-guests'),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _showGuests,
+              onChanged: (v) => setState(() => _showGuests = v ?? false),
+              title: const Text('Show on guest QR page'),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'The name is permanent — it is what bills and reports record — but the label can be '
+              'changed later. Modes you add count as non-cash: the cash drawer counts Cash only. '
+              'For free food use "Mark as non-chargeable" on the bill, not a payment mode.',
+              style: text.bodySmall,
+            ),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          key: const ValueKey('payment-mode-add'),
+          onPressed: (_name.text.trim().isEmpty || refusal != null)
+              ? null
+              : () => Navigator.pop(
+                    context,
+                    (name: _name.text, requiresScreenshot: _needsShot, showToGuests: _showGuests),
+                  ),
+          child: const Text('Add'),
+        ),
+      ],
     );
   }
 }
