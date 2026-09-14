@@ -76,17 +76,25 @@ String? billCustomerGstinError(String raw) {
 
 /// THE CUSTOMER SLOT — the lines the client's printed bill carries in their own
 /// ruled-off block, directly under the restaurant header (logo, name, legal
-/// entity, address, GSTN) and ABOVE the date / cashier / bill-no block:
-/// `Customer Name: <name>` always — "Guest" when nobody gave one, as the paper
-/// prints it (the QR flow's "QR Guest" placeholder reads as "Guest" too) — and
-/// `Customer GSTIN: <gstin>` directly under it, only when one is set. The
-/// thermal renderer, the app bill preview and the settled-bill sheet all draw
-/// exactly these, in this order.
+/// entity, address, phone, GSTN) and ABOVE the date / cashier / bill-no block:
+/// `Name: <name>` always, worded as the client's bill words it, and
+/// `Customer GSTIN: <gstin>` directly under it, only when one is set.
+///
+/// A WALK-IN LEAVES THE SLOT BLANK — a bare `Name:` — because that is what the
+/// client's bill does and what escpos.ts now prints. "Guest" and "QR Guest" are
+/// the placeholders the ordering flows store for "nobody gave a name"
+/// ([billCustomerNameSeed] reads both as empty); printed, either reads as a
+/// name somebody wrote down. The thermal renderer, the app bill preview and the
+/// settled-bill sheet all draw exactly these, in this order.
+///
+/// A stored "null" / "undefined" is no value either — escpos.ts `present()`
+/// drops both before printing, so the slip never says "Name: null".
 List<String> billCustomerLines(Map bill) {
-  final name = billCustomerNameSeed(bill['customer']);
-  final gstin = '${bill['customer_gstin'] ?? ''}'.trim();
+  String present(String s) => RegExp(r'^(null|undefined)$', caseSensitive: false).hasMatch(s) ? '' : s;
+  final name = present(billCustomerNameSeed(bill['customer']));
+  final gstin = present('${bill['customer_gstin'] ?? ''}'.trim());
   return [
-    'Customer Name: ${name.isEmpty ? 'Guest' : name}',
+    name.isEmpty ? 'Name:' : 'Name: $name',
     if (gstin.isNotEmpty) 'Customer GSTIN: $gstin',
   ];
 }

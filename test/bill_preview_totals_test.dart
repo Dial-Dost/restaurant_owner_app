@@ -251,11 +251,18 @@ String _previewAmount(WidgetTester tester, String label) {
 
 /// Every figure painted on the preview, so a test can assert about the whole
 /// sheet rather than one row it remembered to look at.
+///
+/// BARE AS WELL AS PRICED. The paper prints the item columns and the ladder as
+/// plain figures ("549.90") and puts the currency on the Grand Total alone, and
+/// the preview now does the same — so a helper that only collected "₹…" would
+/// let a waived charge back onto the sheet unseen. Returned without the symbol.
 List<String> _previewFigures(WidgetTester tester) => [
       for (final t in tester.widgetList<Text>(
           find.descendant(of: find.byType(Dialog), matching: find.byType(Text))))
-        if ((t.data ?? '').startsWith('₹')) t.data!,
+        if (RegExp(r'^₹?[+-]?\d+\.\d{2}$').hasMatch(t.data ?? '')) t.data!.replaceFirst('₹', ''),
     ];
+
+final Finder _serviceChargeNote = find.byKey(const ValueKey('bill-preview-service-charge-note'));
 
 void main() {
   group('the bill preview renders the server ladder and derives nothing', () {
@@ -266,20 +273,23 @@ void main() {
         ' server\'s own grand total', (tester) async {
       await _mount(tester, _taxLineBill(waived: false));
       await _openPreview(tester);
-      final withCharge = _previewAmount(tester, 'Grand total');
+      final withCharge = _previewAmount(tester, 'Grand Total');
       expect(withCharge, '₹6323.86',
           reason: 'the preview must print grand_total as the server sent it');
-      // The charge is visible as what it is on this shape: a tax line.
-      expect(find.descendant(
-              of: find.byType(Dialog), matching: find.text('Service Charge (10%)')),
-          findsOneWidget);
+      // The charge is visible as what it is on this shape: a tax line, labelled
+      // as the paper labels it.
+      expect(_previewAmount(tester, 'Service Charge 10%'), '549.90');
+      // And the guest is being charged for service, so the paper's disclaimer
+      // is on the sheet — on THIS shape too, where `service_charge` is 0.
+      expect(_serviceChargeNote, findsOneWidget,
+          reason: 'a tax-line charge is a charge; the disclaimer must follow it');
 
       await tester.tap(find.text('Cancel'));
       await tester.pumpAndSettle();
 
       await _mount(tester, _taxLineBill(waived: true));
       await _openPreview(tester);
-      final waived = _previewAmount(tester, 'Grand total');
+      final waived = _previewAmount(tester, 'Grand Total');
       expect(waived, '₹5773.96',
           reason: 'the waived bill\'s grand total, as the server computed it');
 
@@ -297,15 +307,16 @@ void main() {
       await _mount(tester, _taxLineBill(waived: true));
       await _openPreview(tester);
 
-      expect(
-          find.descendant(
-              of: find.byType(Dialog), matching: find.text('Service Charge (10%)')),
-          findsNothing,
+      // ONE row names the charge, and it carries no figure: "Opted-out", the
+      // paper's own word. A second "Service Charge 10%" row would be the waived
+      // charge still billed as a tax line — _previewAmount insists on exactly one.
+      expect(_previewAmount(tester, 'Service Charge 10%'), 'Opted-out',
           reason: 'the waived charge must not still be billed as a tax line');
-      expect(_previewAmount(tester, 'Service charge'), 'waived');
       expect(find.text('Service charge waived on this bill.'), findsOneWidget);
-      expect(_previewFigures(tester), isNot(contains('₹549.90')),
+      expect(_previewFigures(tester), isNot(contains('549.90')),
           reason: 'a waived charge must not be priced anywhere on the receipt');
+      expect(_serviceChargeNote, findsNothing,
+          reason: 'no voluntary-charge disclaimer on a bill that charges none');
     });
 
     // THE RULE ITSELF, pinned independently of any particular tax shape: the
@@ -321,8 +332,95 @@ void main() {
       await _mount(tester, bill);
       await _openPreview(tester);
 
-      expect(_previewAmount(tester, 'Grand total'), '₹6300.00');
-      expect(_previewAmount(tester, 'Subtotal'), '₹5499.00');
+      expect(_previewAmount(tester, 'Grand Total'), '₹6300.00');
+      expect(_previewAmount(tester, 'Sub Total'), '5499.00');
+    });
+  });
+
+  // THE CLIENT'S PRINTED BILL IS THE REFERENCE, and escpos.ts now follows it
+  // block for block. A preview laid out differently is previewing a different
+  // slip, so the order of the blocks and the column the figures sit in are
+  // pinned here — without pinning a pixel.
+  group('the bill preview is laid out the way the paper is', () {
+    Finder inPreview(Finder f) => find.descendant(of: find.byType(Dialog), matching: f);
+
+    // The disclaimer follows the CHARGE, in both shapes — the paper's
+    // `service_charge_applied` — never one leg of it, and never a waived bill.
+    test('the service-charge disclaimer follows a charge in either shape, and never a waiver', () {
+      // restaurant_percent: the charge is its own field.
+      expect(m.billPrintsServiceChargeNote({'service_charge': 400.0, 'taxes': const []}), isTrue);
+      // tax_line: `service_charge` is 0 and the charge is a tax line.
+      expect(m.billPrintsServiceChargeNote(_taxLineBill(waived: false)), isTrue);
+      expect(m.billPrintsServiceChargeNote({'service_charge': 0, 'taxes': [{'name': 'service  charge', 'percentage': 5, 'amount': 20}]}), isTrue);
+      // No charge configured at all: statutory taxes only.
+      expect(m.billPrintsServiceChargeNote({'service_charge': 0.0, 'taxes': _statutoryTaxes}), isFalse);
+      // A live waiver took it off, in either shape.
+      expect(m.billPrintsServiceChargeNote(_taxLineBill(waived: true)), isFalse);
+      expect(m.billPrintsServiceChargeNote({'service_charge': 400.0, 'service_charge_waived': true}), isFalse);
+    });
+
+    testWidgets('header, name slot, date, item table, ladder, total, disclaimer, QR — in that order',
+        (tester) async {
+      await _mount(tester, _taxLineBill(waived: false));
+      await _openPreview(tester);
+      double y(Finder f) {
+        expect(inPreview(f), findsOneWidget, reason: '$f is not on the preview');
+        return tester.getTopLeft(inPreview(f)).dy;
+      }
+
+      final order = <Finder>[
+        find.text('Gaia Test'),
+        find.text('Name:'),
+        find.text('Dine In: T1'),
+        find.text('Amount'),
+        find.text('Paneer Tikka'),
+        find.text('Sub Total'),
+        find.text('SGST 2.5%'),
+        find.text('Grand Total'),
+        _serviceChargeNote,
+        find.byKey(const ValueKey('bill-preview-qr')),
+      ];
+      for (var i = 1; i < order.length; i++) {
+        expect(y(order[i]), greaterThan(y(order[i - 1])),
+            reason: '${order[i]} must come after ${order[i - 1]}');
+      }
+      // The paper's headings and labels, word for word.
+      for (final label in ['Item', 'Qty.', 'Price', 'Amount', 'Total Qty: 3']) {
+        expect(inPreview(find.text(label)), findsOneWidget, reason: '"$label" is missing');
+      }
+      expect(inPreview(find.textContaining('Thanks')), findsNothing,
+          reason: 'the paper has no Thanks line now');
+      // The table is bold on the Date row; the Grand Total is the biggest figure.
+      expect(tester.widget<Text>(inPreview(find.text('Dine In: T1'))).style?.fontWeight, FontWeight.bold);
+      final grand = tester.widget<Text>(inPreview(find.text('₹6323.86'))).style!;
+      final sub = DefaultTextStyle.of(tester.element(inPreview(find.text('5499.00')))).style
+          .merge(tester.widget<Text>(inPreview(find.text('5499.00'))).style);
+      expect(grand.fontWeight, FontWeight.w800);
+      expect(grand.fontSize!, greaterThan(sub.fontSize!));
+    });
+
+    testWidgets('every figure right-aligns on the one Amount column', (tester) async {
+      await _mount(tester, _taxLineBill(waived: false));
+      await _openPreview(tester);
+      double right(Finder f) => tester.getTopRight(f).dx;
+      // The heading, a line amount (320 x 2), the ladder rungs and the grand
+      // total all end at the same x — the right edge of the Amount column.
+      final edge = right(inPreview(find.text('Amount')));
+      for (final figure in ['640.00', '5499.00', '549.90', '₹6323.86']) {
+        expect(right(inPreview(find.text(figure))), moreOrLessEquals(edge, epsilon: 0.5),
+            reason: '"$figure" is out of the Amount column');
+      }
+      // SGST and CGST are both 137.48.
+      for (final e in inPreview(find.text('137.48')).evaluate()) {
+        expect(tester.getTopRight(find.byElementPredicate((x) => x == e)).dx, moreOrLessEquals(edge, epsilon: 0.5));
+      }
+      // ...and a ladder label ENDS before its figure's column, well in from the
+      // left margin: right-aligned, as the paper's ladder is.
+      expect(right(inPreview(find.text('Grand Total'))),
+          lessThanOrEqualTo(tester.getTopLeft(inPreview(find.text('₹6323.86'))).dx + 0.5));
+      expect(tester.getTopLeft(inPreview(find.text('Sub Total'))).dx,
+          greaterThan(tester.getTopLeft(inPreview(find.text('Item'))).dx),
+          reason: 'the ladder label is right-aligned, not left');
     });
   });
 

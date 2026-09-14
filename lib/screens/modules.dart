@@ -9076,11 +9076,16 @@ class _TableSheetState extends State<_TableSheet> {
   // Fetch the current bill and show a receipt-style preview before anything is
   // sent to the thermal printer. "Print" in the dialog fires the same
   // server-side /print/bill call as before; "Cancel" prints nothing.
-  // Legal entity, address lines, GSTIN — in the order the printed bill lays
-  // them out, and each included ONLY when the tenant actually has one. A
+  // Legal entity, address lines, phone, GSTIN — in the order the printed bill
+  // lays them out, and each included ONLY when the tenant actually has one. A
   // restaurant with no GSTIN gets a clean header, never a stray "GSTN :".
   // Mirrors the same rule in escpos.ts, which renders the real paper.
-  Future<List<String>> _billHeaderLines() async {
+  //
+  // The same two reads also say which ROLL the paper is cut from (58mm lays the
+  // item table out in narrower columns and prints no margins), the tenant's
+  // sentence above the QR, and whether the QR prints at all — nothing more is
+  // fetched for any of them, they were already in these answers.
+  Future<_BillPaper> _billPaper() async {
     try {
       final results = await Future.wait([
         widget.rest.getMap('/restaurant/settings'),
@@ -9096,11 +9101,23 @@ class _TableSheetState extends State<_TableSheet> {
       for (final l in _s(profile, 'outlet_add', '').split(RegExp(r'\r?\n'))) {
         if (l.trim().isNotEmpty) lines.add(l.trim());
       }
+      // The outlet's own number, under the address and above the GSTIN — where
+      // escpos.ts prints "Ph : …" off the same `outlet_phone`.
+      final phone = _s(profile, 'outlet_phone', '').trim();
+      if (phone.isNotEmpty) lines.add('Ph : $phone');
       final gstin = _s(settings, 'bill_gstin', '').trim();
       if (gstin.isNotEmpty) lines.add('GSTN : $gstin');
-      return lines;
+      return (
+        headerLines: lines,
+        narrow: _s(settings, 'bill_paper_width', '80mm') == '58mm',
+        qrNote: _s(settings, 'bill_qr_note', '').trim(),
+        qrNoteDefault: _s(settings, 'bill_qr_note_default', '').trim(),
+        showQr: billShowsQr(settings),
+      );
     } catch (_) {
-      return const <String>[];
+      // An unreadable settings answer previews the DEFAULT paper, and the
+      // default carries the QR — see [billShowsQr].
+      return (headerLines: const <String>[], narrow: false, qrNote: '', qrNoteDefault: '', showQr: true);
     }
   }
 
@@ -9122,7 +9139,7 @@ class _TableSheetState extends State<_TableSheet> {
     // just the trading name. Best-effort on purpose: this is a PREVIEW of a bill
     // the server renders, so a settings/profile hiccup must degrade to the old
     // name-only header rather than block the print.
-    final headerLines = await _billHeaderLines();
+    final paper = await _billPaper();
     // 5.1 — and the LOGO, which this preview never drew. The logo the roll
     // prints (GET /restaurant/logo/bill: the SVG bill logo or the branding PNG,
     // fitted and thresholded exactly as the printer gets it), falling back to
@@ -9141,9 +9158,19 @@ class _TableSheetState extends State<_TableSheet> {
       builder: (_) => _BillPreviewDialog(
         bill: bill!,
         restaurantName: widget.profile.restaurantName,
-        headerLines: headerLines,
+        headerLines: paper.headerLines,
         logo: logo,
         tableName: _name,
+        narrow: paper.narrow,
+        qrNote: paper.qrNote.isNotEmpty ? paper.qrNote : paper.qrNoteDefault,
+        // The owner's "Print QR code on the bill" switch. Off, /print/bill
+        // sends the renderer no feedback URL and the paper ends at the total
+        // (or the disclaimer), so the preview must end there too.
+        showQr: paper.showQr,
+        // The paper's "Cashier:" is whoever sends the print — /print/bill reads
+        // the caller's employee record — which is the person signed in here.
+        cashier: widget.profile.firstName.trim(),
+        printedAt: RestaurantTime.nowWall(),
         // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
         // another till may have printed it since this sheet opened. The same
         // tri-state C3 uses, so an older backend falls back to this device's
@@ -10708,6 +10735,11 @@ class _TableSheetState extends State<_TableSheet> {
 /// The bill logo as PNG bytes off a `{logo_base64}` response — the shape both
 /// GET /restaurant/logo/bill and GET /restaurant/logo answer with — or null when
 /// there is none or it is not base64. Tolerates a `data:` URL prefix.
+///
+/// The `width` / `height` /restaurant/logo/bill sends beside it are the raster's
+/// size in printer dots, which the PNG's own header already carries, so they
+/// are not read here: [_BillPreviewDialog] draws those pixels as dots, at the
+/// paper's scale and never enlarged.
 @visibleForTesting
 Uint8List? billLogoBytes(dynamic response) {
   if (response is! Map) return null;
@@ -10723,6 +10755,86 @@ Uint8List? billLogoBytes(dynamic response) {
   }
 }
 
+/// What the bill preview reads off GET /restaurant/settings and GET
+/// /restaurant/profile besides the bill itself: the identity lines under the
+/// name, which roll the paper is cut from, the sentence above the QR (the
+/// tenant's own and the server's default), and whether the QR block prints at
+/// all. See [_BillPreviewDialog].
+typedef _BillPaper = ({List<String> headerLines, bool narrow, String qrNote, String qrNoteDefault, bool showQr});
+
+/// DOES THE CUSTOMER BILL CARRY THE FEEDBACK / VALET QR — the owner's
+/// `bill_show_qr` switch (migration 047), read off a GET /restaurant/settings
+/// answer. Both the Settings card and the bill preview read it through here, so
+/// the two can never disagree about a tenant.
+///
+/// DEFAULT ON, AND A MISSING KEY READS AS ON. The column is NULL for every
+/// restaurant that predates the migration, GetRestaurantSettings maps NULL to
+/// true, and an older backend that has never heard of the key omits it. So this
+/// is `!= false`, never `== true`: the two differ for precisely the tenants who
+/// have never been asked the question, and those tenants' paper has always
+/// carried the QR. routes/bills.ts gates the print the same way.
+@visibleForTesting
+bool billShowsQr(Map settings) => settings['bill_show_qr'] != false;
+
+/// The POST /restaurant/settings body the "Bill details" card saves.
+///
+/// EVERY KEY IS SENT, EMPTY OR NOT. '' is how a text field is CLEARED (clearing
+/// the note restores the built-in valet line), and the backend presence-checks
+/// rather than truthiness-checks for exactly this reason. `bill_show_qr` is
+/// always an explicit boolean because only a boolean writes — anything else is
+/// read as "not in this request" and leaves the stored switch alone.
+///
+/// The note is sent even while the QR is off. It is not printed then, but it is
+/// the owner's sentence and turning the QR back on should bring it back, not a
+/// blank that silently fell back to the default.
+@visibleForTesting
+Map<String, dynamic> billDetailsSettingsBody({
+  required String legalName,
+  required String gstin,
+  required String qrNote,
+  required bool showQr,
+}) =>
+    {
+      'bill_legal_name': legalName.trim(),
+      'bill_gstin': gstin.trim(),
+      'bill_qr_note': qrNote.trim(),
+      'bill_show_qr': showQr,
+    };
+
+/// The sentence the paper prints straight under the grand total whenever the
+/// guest is being charged for service — routes/bills.ts's `serviceChargeNote`,
+/// word for word, which is also the sentence the web print page carries. The
+/// SERVER owns the wording and decides when it prints; this copy exists only so
+/// the preview shows the footer the paper will, and changes when that one does.
+const String billServiceChargeNote =
+    'A Voluntary Service Charge is included to support our staff. If you prefer '
+    'not to contribute, please inform your server before payment and it will be removed.';
+
+/// The line above the QR when the tenant has set none and the settings read
+/// carried no `bill_qr_note_default` either — escpos.ts `DEFAULT_BILL_QR_NOTE`.
+const String _billQrNoteFallback = 'For calling Valet kindly scan the below QR code';
+
+/// DOES THIS OPEN BILL CHARGE THE GUEST FOR SERVICE — in EITHER shape? The
+/// paper's disclaimer hangs off exactly that (routes/bills.ts hands escpos.ts
+/// `serviceChargeNote` iff `service_charge_applied`), and so does the preview's.
+///
+/// Asking only about `service_charge` would repeat F2's root cause 3 on this
+/// screen: a tenant carrying the charge as a line in Outlets.default_tax has
+/// `service_charge` = 0 while the guest is charged, because the charge arrives
+/// among `taxes`. The name test is SERVICE_CHARGE_NAME in billing_math.ts — the
+/// one matcher the server bills by — and this is the same predicate as the web
+/// print page's `billChargesForService`. A live waiver took the charge off both
+/// legs before this bill was computed, so a waived bill never carries the
+/// sentence; its paper prints "Opted-out" instead.
+@visibleForTesting
+bool billPrintsServiceChargeNote(Map bill) {
+  if (bill['service_charge_waived'] == true) return false;
+  if (_numOf(bill['service_charge']) > 0) return true;
+  final serviceLine = RegExp(r'service\s*charge', caseSensitive: false);
+  return ((bill['taxes'] as List?) ?? const []).any(
+      (t) => t is Map && serviceLine.hasMatch('${t['name'] ?? ''}') && _numOf(t['amount']) > 0);
+}
+
 /// Receipt-style preview of a table's bill, shown before it is sent to the
 /// thermal printer. Renders the same data web/Flutter already display
 /// (/bill-for-table). Returns `true` from the dialog when the user taps Print.
@@ -10734,12 +10846,29 @@ Uint8List? billLogoBytes(dynamic response) {
 /// total comes to disagree with the settled one"). A second implementation of
 /// the totals ladder, in a second language, is how the paper and the till come
 /// to disagree — and this one already had. See [build].
+///
+/// IT IS LAID OUT THE WAY THE PAPER IS, block for block (escpos.ts, kind
+/// "bill"), because the client's own printed bill is the reference both follow:
+/// the logo at two thirds of the roll; the name bold at body size over the legal
+/// name, address, phone and GSTIN; a solid rule; the `Name:` slot; Date with the
+/// table in bold, then Cashier on the left and Bill No. on the right; a HEAVY
+/// rule either side of the Item / Qty. / Price / Amount table; the ladder
+/// right-aligned on the Amount column; Round off and a larger bold Grand Total
+/// between thin rules; then the disclaimer in bold and the QR. The paper's white
+/// margins are kept too — the text sits inside the roll's edges, not against the
+/// edge of the sheet.
+///
+/// Layout still does the aligning, in the app's proportional type: the columns
+/// are the renderer's column COUNTS turned into shares of the text area, so a
+/// figure sits under the heading it belongs to on every platform without a
+/// monospace font.
 class _BillPreviewDialog extends StatelessWidget {
   final Map bill;
   final String restaurantName;
-  // Legal entity / address / GSTIN, already resolved and already filtered to the
-  // ones this tenant has. Empty for a tenant that has set none, in which case
-  // the header is just the trading name — same as before these fields existed.
+  // Legal entity / address / phone / GSTIN, already resolved and already
+  // filtered to the ones this tenant has. Empty for a tenant that has set none,
+  // in which case the header is just the trading name — same as before these
+  // fields existed.
   final List<String> headerLines;
 
   /// The bill logo as PNG bytes, or null when the tenant has none. See
@@ -10756,6 +10885,30 @@ class _BillPreviewDialog extends StatelessWidget {
   /// previewing a different slip. False for a first print, which carries no
   /// banner on paper or here.
   final bool reprint;
+
+  /// True when the tenant prints on the 58mm roll (`bill_paper_width`): 32
+  /// columns, no margins, the narrow item table. False is the 80mm roll, which
+  /// is also what an unreadable setting means on the server.
+  final bool narrow;
+
+  /// The sentence above the QR — the tenant's own, or the server's default.
+  /// Empty falls back to [_billQrNoteFallback], as escpos.ts does.
+  final String qrNote;
+
+  /// Whether the paper ends with the QR block — the sentence, the code, and
+  /// the rule that separates them from the disclaimer. False when the owner has
+  /// switched the QR off ([billShowsQr]): /print/bill then hands escpos.ts no
+  /// feedback URL, and the renderer prints that whole block only when it has
+  /// one. True is the default paper.
+  final bool showQr;
+
+  /// Who the paper names as the cashier. Empty prints no "Cashier:" label, the
+  /// same rule the renderer obeys for an unknown one.
+  final String cashier;
+
+  /// The restaurant wall clock the "Date:" line shows; null means now.
+  final DateTime? printedAt;
+
   const _BillPreviewDialog({
     required this.bill,
     required this.restaurantName,
@@ -10763,39 +10916,144 @@ class _BillPreviewDialog extends StatelessWidget {
     this.logo,
     required this.tableName,
     this.reprint = false,
+    this.narrow = false,
+    this.qrNote = '',
+    this.showQr = true,
+    this.cashier = '',
+    this.printedAt,
   });
 
   static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
   static double _round2(double v) => (v * 100).roundToDouble() / 100;
 
-  // A single receipt line: label on the left, amount right-aligned. Layout does
-  // the aligning (no monospace font needed, so it looks right on every platform).
-  Widget _row(String left, String right, {bool bold = false, Color? color}) {
-    final style = TextStyle(fontSize: 13, height: 1.3, color: color, fontWeight: bold ? FontWeight.bold : FontWeight.normal);
+  /// A percentage as the renderer's template literal prints it: "10", "2.5".
+  static String _pct(double p) => p % 1 == 0 ? '${p.toInt()}' : '$p';
+
+  // ------------------------------------------------------------ the geometry
+
+  /// Printer dots per Font A column — escpos.ts `DOTS_PER_COL` (576 / 48).
+  static const int _dotsPerCol = 12;
+
+  /// Font A columns across the bill's text area — escpos.ts `W`: the 80mm
+  /// roll's 48 less `billMarginCols`' 2 either side, the 58mm roll's 32 with
+  /// none.
+  int get _cols => narrow ? 32 : 44;
+
+  /// escpos.ts `billColumns(W)` — Item, Qty., Price, Amount — summing to
+  /// [_cols]. The totals ladder right-aligns on the same Amount column.
+  ({int item, int qty, int price, int amount}) get _table =>
+      narrow ? (item: 11, qty: 4, price: 8, amount: 9) : (item: 20, qty: 5, price: 9, amount: 10);
+
+  /// The white either side of the text, as a share of the paper's width. An
+  /// 80mm roll prints 72mm (576 dots) and the bill keeps 2 columns (3mm) more
+  /// inside that each side: 7mm of 80. A 58mm roll prints 48mm and keeps no
+  /// margin: 5mm of 58.
+  double get _edgeShare => narrow ? 5 / 58 : 7 / 80;
+
+  /// The roll's dots across (bill_logo.ts `BILL_LOGO_DOTS`).
+  int get _rollDots => narrow ? 384 : 576;
+
+  // ------------------------------------------------------------------ the ink
+
+  static const double _body = 12.5;
+  static const Color _inkColor = Colors.black87;
+  static const TextStyle _ink = TextStyle(fontSize: _body, height: 1.3, color: _inkColor);
+
+  /// Figures in even widths, so a column of amounts lines up digit for digit
+  /// the way the printer's fixed-pitch font lines them up.
+  static const TextStyle _figures = TextStyle(
+      fontSize: _body, height: 1.3, color: _inkColor, fontFeatures: [FontFeature.tabularFigures()]);
+
+  /// A SOLID RULE, as the paper now draws its separators (escpos.ts `billRule`):
+  /// a thin stroke between blocks and one twice as heavy either side of the item
+  /// table, full ink, across the text area and not into the margins. Never the
+  /// theme's divider — that is white-on-dark and would vanish on paper.
+  static Widget _rule({bool thick = false}) => Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        height: thick ? 2.4 : 1.2,
+        color: _inkColor,
+      );
+
+  /// A left run and a right run on one line, the right one flush with the text
+  /// area's edge — escpos.ts `twoCol`. [boldRight] is the paper's `ESC E` on
+  /// the right-hand run only (the table on the Date row).
+  static Widget _twoCol(String left, String right, {bool boldRight = false}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 1),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Flexible(child: Text(left)),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(right,
+                  textAlign: TextAlign.right,
+                  style: boldRight ? const TextStyle(fontWeight: FontWeight.bold) : null),
+            ),
+          ],
+        ),
+      );
+
+  /// A figure in its column, right-aligned. Scaled down rather than wrapped
+  /// when a five-figure amount is wider than its share of a narrow sheet: a
+  /// figure broken across two lines is a different figure.
+  static Widget _figure(String s, [TextStyle style = _figures]) => FittedBox(
+        fit: BoxFit.scaleDown,
+        alignment: Alignment.centerRight,
+        child: Text(s, maxLines: 1, style: style),
+      );
+
+  /// One line of the item table — the heading or a dish. The name wraps inside
+  /// its column with a column of gutter before Qty., as `wrapText(…, COL_ITEM
+  /// - 1)` wraps it on the paper, and its continuation lines stay under it.
+  Widget _itemRow(double col, String item, String qty, String price, String amount) {
+    final t = _table;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 1.5),
+      padding: const EdgeInsets.symmetric(vertical: 1),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Expanded(child: Text(left, style: style)),
-        const SizedBox(width: 12),
-        Text(right, style: style, textAlign: TextAlign.right),
+        Expanded(flex: t.item, child: Padding(padding: EdgeInsets.only(right: col), child: Text(item))),
+        Expanded(flex: t.qty, child: _figure(qty)),
+        Expanded(flex: t.price, child: _figure(price)),
+        Expanded(flex: t.amount, child: _figure(amount)),
       ]),
     );
   }
 
-  // Hairline rule for the paper receipt (theme dividers are white-on-dark and
-  // would vanish on the paper-white artifact).
-  static Widget get _paperRule => Container(
-        margin: const EdgeInsets.symmetric(vertical: 8),
-        height: 1,
-        color: const Color(0x22000000),
-      );
+  /// One rung of the totals ladder, as escpos.ts `ladder` lays it out: the label
+  /// RIGHT-ALIGNED against the Amount column, the figure right-aligned inside
+  /// that column under the line amounts it sums. The figure's cell grows past
+  /// the column (with a column of space before it) when the figure is wider, as
+  /// `max(AMT, value.length + 1)` does on the paper. Several [labels] share the
+  /// label cell a few columns apart — "Total Qty: 19   Sub Total".
+  Widget _ladder(double col, List<String> labels, String value, {TextStyle? style}) {
+    final s = style ?? _ink;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+        Expanded(
+          child: labels.length == 1
+              ? Text(labels.single, textAlign: TextAlign.right, style: s)
+              : Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: 3 * col,
+                  children: [for (final l in labels) Text(l, style: s)],
+                ),
+        ),
+        Container(
+          constraints: BoxConstraints(minWidth: _table.amount * col),
+          padding: EdgeInsets.only(left: col),
+          alignment: Alignment.centerRight,
+          child: Text(value, maxLines: 1, style: s.merge(const TextStyle(fontFeatures: [FontFeature.tabularFigures()]))),
+        ),
+      ]),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     // PAPER ARTIFACT: the receipt body deliberately stays white with black
     // ink — it mirrors what the thermal printer produces. Only the dialog
     // chrome around it is dark.
-    const inkFaint = Colors.black54;
     final items = (bill['items'] as List?) ?? const [];
     // EVERY RUNG BELOW IS THE SERVER'S NUMBER, RENDERED VERBATIM. Nothing here
     // is derived, re-based or re-rounded.
@@ -10823,17 +11081,40 @@ class _BillPreviewDialog extends StatelessWidget {
     // `taxes`), so this boolean — not the absence of a charge line — is the only
     // truthful way to say the charge was taken off.
     final serviceChargeWaived = bill['service_charge_waived'] == true;
-    final taxes = (bill['taxes'] as List?) ?? const [];
+    // Only the lines that carry money, as escpos.ts filters `taxLines`.
+    final taxes = ((bill['taxes'] as List?) ?? const []).whereType<Map>().where((t) => _n(t['amount']) > 0).toList();
     final grandTotal = _n(bill['grand_total'] ?? bill['total_amt']);
-    final covers = bill['covers'];
+    // A round-off the billing layer DISCLOSED, printed only when it is not zero
+    // — the renderer's rule for a supplied grand total. The open-bill read
+    // carries none today, so neither does this sheet: nothing is re-rounded here.
+    final roundOff = _n(bill['round_off']);
+    final showRoundOff = bill['round_off'] != null && (roundOff * 100).round() != 0;
     final billNo = _s(bill, 'bill_no', '');
-    // The customer slot — `Customer Name:` / `Customer GSTIN:`.
+    // The customer slot — `Name:` / `Customer GSTIN:`.
     final customerLines = billCustomerLines(bill);
+    // The label the paper gives the charge line. The configured percentage
+    // while the charge is on; on a waived bill the payload's percent is the
+    // restaurant_percent leg and is 0 on a tax-line tenant, so the percentage the
+    // waiver was priced at names it instead. A label, never a figure.
+    final waiver = bill['service_charge_waiver'];
+    final scPct = _n(bill['service_charge_percent']) > 0
+        ? _n(bill['service_charge_percent'])
+        : (waiver is Map ? _n(waiver['basis_percent']) : 0.0);
+    final scLabel = scPct > 0 ? 'Service Charge ${_pct(scPct)}%' : 'Service Charge';
+    // Quantities as the paper counts them (a whole number, at least one a line).
+    // A count of dishes, not money.
+    final totalQty = items.fold<int>(0, (s, it) => s + math.max(1, _n((it as Map)['quantity'] ?? 1).round()));
+    final subText = subtotal.toStringAsFixed(2);
+    final stamp = printedAt ?? RestaurantTime.nowWall();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final date = '${two(stamp.day)}/${two(stamp.month)}/${stamp.year} ${two(stamp.hour)}:${two(stamp.minute)}';
+    final chargesService = billPrintsServiceChargeNote(bill);
+    final note = qrNote.trim().isEmpty ? _billQrNoteFallback : qrNote.trim();
 
     return Dialog(
       backgroundColor: Colors.transparent,
       child: Container(
-        width: 380,
+        width: 400,
         constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.85),
         padding: const EdgeInsets.all(18),
         decoration: BoxDecoration(
@@ -10844,149 +11125,231 @@ class _BillPreviewDialog extends StatelessWidget {
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           const SectionHeader(title: 'Bill preview'),
           Flexible(
-            child: Container(
-              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-              child: SingleChildScrollView(
-                child: DefaultTextStyle(
-                  style: const TextStyle(fontSize: 13, height: 1.3, color: Colors.black87),
-                  child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                    // ROUND 2 ITEM 4 — REPRINT, above everything including the
-                    // logo, because that is where the roll prints it. Large, bold
-                    // and boxed so it cannot be read past on a copy turned toward
-                    // a guest.
-                    if (reprint) ...[
-                      Container(
-                        key: const ValueKey('bill-preview-reprint'),
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        decoration: BoxDecoration(border: Border.all(color: Colors.black87, width: 2)),
-                        child: const Text('REPRINT',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                                fontSize: 24, fontWeight: FontWeight.w900, letterSpacing: 4, color: Colors.black)),
-                      ),
-                      const SizedBox(height: 8),
-                    ],
-                    // 5.1 — the logo across the top, where the roll prints it. Up to
-                    // 72px tall and the width of the slip, so a wordmark reads.
-                    if (logo != null) ...[
-                      Center(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxHeight: 72),
-                          child: Image.memory(
-                            logo!,
-                            key: const ValueKey('bill-preview-logo'),
-                            fit: BoxFit.contain,
-                            gaplessPlayback: true,
-                            // A logo that will not decode is left off, not drawn
-                            // as a broken-image box on a paper-styled preview.
-                            errorBuilder: (_, _, _) => const SizedBox.shrink(),
+            child: LayoutBuilder(builder: (context, box) {
+              // The sheet is the roll; the text area is the roll less its white
+              // edges. `col` is one Font A column of that area in pixels, and
+              // `dotsPerPx` turns the printer's dots into this sheet's pixels —
+              // never below 1, so nothing is ever drawn larger than it arrived.
+              final edge = box.maxWidth * _edgeShare;
+              final area = math.max(1.0, box.maxWidth - 2 * edge);
+              final col = area / _cols;
+              final dotsPerPx = math.max(1.0, _cols * _dotsPerCol / area);
+              return Container(
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(10)),
+                padding: EdgeInsets.fromLTRB(edge, 14, edge, 18),
+                child: SingleChildScrollView(
+                  child: DefaultTextStyle(
+                    style: _ink,
+                    child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                      // ROUND 2 ITEM 4 — REPRINT, above everything including the
+                      // logo, because that is where the roll prints it. Large, bold
+                      // and boxed so it cannot be read past on a copy turned toward
+                      // a guest.
+                      if (reprint) ...[
+                        Container(
+                          key: const ValueKey('bill-preview-reprint'),
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          decoration: BoxDecoration(border: Border.all(color: Colors.black87, width: 2)),
+                          child: const Text('REPRINT',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  fontSize: 24, fontWeight: FontWeight.w900, letterSpacing: 4, color: Colors.black)),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      // 5.1 — the logo across the top, where the roll prints it,
+                      // at the size the roll prints it. GET /restaurant/logo/bill
+                      // answers with the raster the printer receives, already
+                      // fitted inside two thirds of the roll and 240 dots tall
+                      // (bill_logo.ts), so its pixels ARE dots: `scale` draws one
+                      // dot as 1/dotsPerPx of a pixel and the logo takes the same
+                      // share of this sheet it takes of the paper. The same box
+                      // fits the branding-PNG fallback, which arrives unfitted,
+                      // the way the roll would fit it. Contained and never
+                      // enlarged — a one-bit raster blown up is a blur.
+                      if (logo != null) ...[
+                        Center(
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxWidth: math.min(area, _rollDots * 2 / 3 / dotsPerPx),
+                              maxHeight: 240 / dotsPerPx,
+                            ),
+                            child: Image.memory(
+                              logo!,
+                              key: const ValueKey('bill-preview-logo'),
+                              scale: dotsPerPx,
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                              // A logo that will not decode is left off, not drawn
+                              // as a broken-image box on a paper-styled preview.
+                              errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 6),
-                    ],
-                    // Header — restaurant + table + optional bill no / customer.
-                    Center(
-                      child: Text(restaurantName,
+                        // The blank line the renderer feeds after the raster.
+                        const SizedBox(height: _body * 1.3),
+                      ],
+                      // The restaurant name, BOLD AT BODY SIZE — the size of the
+                      // address under it, as the paper now prints it, and not the
+                      // headline it used to be over a logo that already names the
+                      // restaurant.
+                      Text(restaurantName,
                           textAlign: TextAlign.center,
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
-                    ),
-                    // Registered entity, address, GSTIN — only the ones set.
-                    // 5.1: in full ink at body size. They were 11px black54 —
-                    // the faintest type on the sheet, for the lines the
-                    // requirement names as the ones that must be clearly visible.
-                    if (headerLines.isNotEmpty) ...[
-                      const SizedBox(height: 2),
+                          style: const TextStyle(fontSize: _body, fontWeight: FontWeight.bold, color: _inkColor)),
+                      // Registered entity, address, phone, GSTIN — only the ones
+                      // set. 5.1: in full ink at body size, centred like the name.
+                      // They were 11px black54 once — the faintest type on the
+                      // sheet, for the lines the requirement names as the ones that
+                      // must be clearly visible.
                       for (final l in headerLines)
+                        Text(l, textAlign: TextAlign.center, style: const TextStyle(fontSize: _body, color: _inkColor)),
+                      _rule(),
+                      // ROUND 2 ITEM 1 — THE CUSTOMER SLOT, where the client's real
+                      // bill has it: its own ruled-off block straight under the
+                      // restaurant header and above the date / cashier block.
+                      // "Name: <name>", or a bare "Name:" for a walk-in exactly as
+                      // the paper leaves the slot blank; "Customer GSTIN:" only
+                      // when set. See [billCustomerLines].
+                      for (final l in customerLines)
+                        Text(l,
+                            key: ValueKey('bill-preview-customer-${l.startsWith('Customer GSTIN') ? 'gstin' : 'name'}'),
+                            style: _ink),
+                      _rule(),
+                      // The date and the table on one line, the table in bold —
+                      // it is what a server matches the slip to. Then Cashier on
+                      // the left and Bill No. on the right, the client's order;
+                      // either alone prints alone, and neither prints a bare label.
+                      _twoCol('Date: $date', 'Dine In: ${tableName.isEmpty ? 'N/A' : tableName}', boldRight: true),
+                      if (cashier.isNotEmpty && billNo.isNotEmpty)
+                        _twoCol('Cashier: $cashier', 'Bill No.: $billNo')
+                      else if (billNo.isNotEmpty)
+                        Text('Bill No.: $billNo')
+                      else if (cashier.isNotEmpty)
+                        Text('Cashier: $cashier'),
+                      _rule(thick: true),
+                      // The item table between its two heavy rules.
+                      //
+                      // THE KITCHEN NOTE IS NOT DRAWN HERE, and this dialog is the
+                      // reason the rule needs restating on the client at all.
+                      //
+                      // The thermal renderer stopped printing it on the bill in
+                      // 1.9.0 (escpos.ts, the block in its bill item loop): a note
+                      // is an instruction to the chef — "no salt", "allergy:
+                      // peanuts" — and on a guest's copy it is at best noise on a
+                      // tax document and at worst a medical detail handed across a
+                      // table. This sheet is the LAST THING SOMEONE SEES BEFORE
+                      // TAPPING PRINT, is styled as paper on purpose, and is
+                      // routinely turned toward the guest to confirm the total. It
+                      // showing a line the slip does not is the same disclosure
+                      // through a different surface, plus a preview that lies
+                      // about what is about to come out.
+                      //
+                      // The note is NOT lost: it still prints on the kitchen
+                      // docket, and the waiter's running-bill sheet
+                      // (widgets/table_bill.dart) still shows it, because there
+                      // the reader is staff and the allergy is the point.
+                      _itemRow(col, 'Item', 'Qty.', 'Price', 'Amount'),
+                      _rule(thick: true),
+                      ...items.map((it) {
+                        final m = it as Map;
+                        final qty = _n(m['quantity'] ?? 1);
+                        final price = _n(m['price']);
+                        // The price point rides with the dish, as escpos.ts
+                        // `itemLabel` prints it: "Paneer Tikka (Half)".
+                        final variation = '${m['variation'] ?? ''}'.trim();
+                        final name = _s(m, 'name');
+                        return _itemRow(
+                          col,
+                          variation.isEmpty ? name : '$name ($variation)',
+                          '${qty % 1 == 0 ? qty.toInt() : qty}',
+                          price.toStringAsFixed(2),
+                          _round2(price * qty).toStringAsFixed(2),
+                        );
+                      }),
+                      _rule(thick: true),
+                      // THE LADDER, in the right-hand block. "Total Qty: N   Sub
+                      // Total" is one rung when it fits the text area and two on
+                      // the 58mm roll, by the paper's own test.
+                      if ('Total Qty: $totalQty   Sub Total'.length <= _cols - math.max(_table.amount, subText.length + 1))
+                        _ladder(col, ['Total Qty: $totalQty', 'Sub Total'], subText)
+                      else ...[
+                        _ladder(col, ['Total Qty: $totalQty'], ''),
+                        _ladder(col, ['Sub Total'], subText),
+                      ],
+                      if (discount > 0)
+                        _ladder(col, [_s(bill, 'coupon_code', '').trim().isEmpty ? 'Discount' : 'Coupon ${_s(bill, 'coupon_code')}'],
+                            '-${discount.toStringAsFixed(2)}'),
+                      if (serviceCharge > 0) _ladder(col, [scLabel], serviceCharge.toStringAsFixed(2)),
+                      // WHY THE CHARGE IS ZERO, rather than leaving the guest and
+                      // the waiter to work it out from a line that is simply
+                      // absent — the line escpos.ts prints as "Opted-out", worded
+                      // as it does. Never a figure: on a tax_line tenant the
+                      // amount that came off is a difference between two ladders,
+                      // not a rung, and this sheet does not compute differences.
+                      if (serviceChargeWaived) _ladder(col, [scLabel], 'Opted-out'),
+                      ...taxes.map((m) {
+                        final pct = _n(m['percentage']);
+                        final label = pct > 0 ? '${_s(m, 'name', 'Tax')} ${_pct(pct)}%' : _s(m, 'name', 'Tax');
+                        return _ladder(col, [label], _n(m['amount']).toStringAsFixed(2));
+                      }),
+                      _rule(),
+                      if (showRoundOff)
+                        _ladder(col, ['Round off'], '${roundOff > 0 ? '+' : ''}${roundOff.toStringAsFixed(2)}'),
+                      // The one figure bigger than the rest: bold and tall, as the
+                      // paper's double-height Grand Total row is.
+                      _ladder(col, ['Grand Total'], _money(grandTotal),
+                          style: const TextStyle(fontSize: 17, height: 1.25, fontWeight: FontWeight.w800, color: Colors.black)),
+                      _rule(),
+                      // THE FOOTER. The disclaimer first, bold, straight under the
+                      // total it is about — a guest reads it before deciding what
+                      // to pay — and only when the guest is being charged for
+                      // service ([billPrintsServiceChargeNote]).
+                      if (chargesService)
+                        Text(billServiceChargeNote,
+                            key: const ValueKey('bill-preview-service-charge-note'),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: _body, fontWeight: FontWeight.bold, color: _inkColor)),
+                      // Then the QR, under the tenant's sentence. A STAND-IN, not
+                      // a code: the link is minted by the server at print time
+                      // (feedbackUrlForTable — the table's waiter and outlet), and
+                      // a scannable square drawn from a guess is a square a guest
+                      // could scan. The old "Thanks" line is gone from the paper,
+                      // so it is gone from here.
+                      //
+                      // ALL OF IT, OR NONE OF IT. With the owner's QR switch off
+                      // the paper has no sentence, no code, and no rule between
+                      // them and the disclaimer either — escpos.ts draws that rule
+                      // inside the same `if (opts.feedbackUrl)` — so the sheet ends
+                      // exactly where the roll is cut.
+                      if (showQr) ...[
+                        if (chargesService) _rule(),
+                        Text(note, key: const ValueKey('bill-preview-qr-note'), textAlign: TextAlign.center),
+                        const SizedBox(height: 6),
                         Center(
-                          child: Text(l,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
+                          child: Container(
+                            key: const ValueKey('bill-preview-qr'),
+                            width: 92,
+                            height: 92,
+                            decoration: BoxDecoration(border: Border.all(color: Colors.black26)),
+                            child: const Icon(Icons.qr_code_2, size: 64, color: Colors.black38),
+                          ),
                         ),
-                    ],
-                    // ROUND 2 ITEM 1 — THE CUSTOMER SLOT, where the client's real
-                    // bill has it: its own ruled-off block straight under the
-                    // restaurant header and above the table / bill-no block.
-                    // "Customer Name:" always ("Guest" when unnamed, as the paper
-                    // prints it), "Customer GSTIN:" only when set. This replaces
-                    // the bare name line that used to sit under the bill number.
-                    _paperRule,
-                    for (final l in customerLines)
-                      Text(l,
-                          key: ValueKey('bill-preview-customer-${l.startsWith('Customer GSTIN') ? 'gstin' : 'name'}'),
-                          style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
-                    _paperRule,
-                    Center(
-                      child: Text(
-                        [
-                          'Table $tableName',
-                          if (covers != null) '$covers cover(s)',
-                          if (billNo.isNotEmpty) 'Bill #$billNo',
-                        ].join('  ·  '),
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 12, color: inkFaint),
-                      ),
-                    ),
-                    _paperRule,
-                    // Item lines: "name ×qty" on the left, line amount on the right.
-                    // THE KITCHEN NOTE IS NOT DRAWN HERE, and this dialog is the
-                    // reason the rule needs restating on the client at all.
-                    //
-                    // The thermal renderer stopped printing it on the bill in
-                    // 1.9.0 (escpos.ts, the block in its bill item loop): a note
-                    // is an instruction to the chef — "no salt", "allergy:
-                    // peanuts" — and on a guest's copy it is at best noise on a
-                    // tax document and at worst a medical detail handed across a
-                    // table. This sheet is the LAST THING SOMEONE SEES BEFORE
-                    // TAPPING PRINT, is styled as paper on purpose, and is
-                    // routinely turned toward the guest to confirm the total. It
-                    // showing a line the slip does not is the same disclosure
-                    // through a different surface, plus a preview that lies
-                    // about what is about to come out.
-                    //
-                    // The note is NOT lost: it still prints on the kitchen
-                    // docket, and the waiter's running-bill sheet
-                    // (widgets/table_bill.dart) still shows it, because there
-                    // the reader is staff and the allergy is the point.
-                    ...items.map((it) {
-                      final m = it as Map;
-                      final qty = _n(m['quantity'] ?? 1);
-                      final price = _n(m['price']);
-                      final name = _s(m, 'name');
-                      return _row('$name  ×${qty % 1 == 0 ? qty.toInt() : qty}', _money(_round2(price * qty)));
-                    }),
-                    _paperRule,
-                    _row('Subtotal', _money(subtotal)),
-                    if (discount > 0) _row('Discount', '− ${_money(discount)}'),
-                    if (serviceCharge > 0) _row('Service charge', _money(serviceCharge)),
-                    // WHY THE CHARGE IS ZERO, rather than leaving the guest and
-                    // the waiter to work it out from a line that is simply
-                    // absent — the same line the bill block on the table sheet
-                    // prints, and the same one escpos.ts prints as "Opted out".
-                    // Never a figure: on a tax_line tenant the amount that came
-                    // off is a difference between two ladders, not a rung, and
-                    // this sheet does not compute differences.
-                    if (serviceChargeWaived) _row('Service charge', 'waived'),
-                    ...taxes.map((t) {
-                      final m = t as Map;
-                      final pct = _n(m['percentage']);
-                      final label = pct > 0 ? '${_s(m, 'name', 'Tax')} (${pct % 1 == 0 ? pct.toInt() : pct}%)' : _s(m, 'name', 'Tax');
-                      return _row(label, _money(_n(m['amount'])));
-                    }),
-                    _paperRule,
-                    _row('Grand total', _money(grandTotal), bold: true),
-                    if (serviceChargeWaived)
-                      const Padding(
-                        padding: EdgeInsets.only(top: 8),
-                        child: Text('Service charge waived on this bill.',
-                            style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: inkFaint)),
-                      ),
-                  ]),
+                      ],
+                    ]),
+                  ),
                 ),
-              ),
-            ),
+              );
+            }),
           ),
+          // Staff-facing, OFF the paper: the slip itself says "Opted-out" and no
+          // more, but the person about to hand it over should know the charge
+          // came off by a recorded waiver rather than by accident.
+          if (serviceChargeWaived)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text('Service charge waived on this bill.',
+                  style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: AppColors.textSecondary)),
+            ),
           const SizedBox(height: 14),
           Row(mainAxisAlignment: MainAxisAlignment.end, children: [
             ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(context, false)),
@@ -22800,9 +23163,10 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       else
         StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
     ]),
-    // ROUND 2 ITEM 1 — `Customer Name:` and `Customer GSTIN:` directly under the
-    // header and above the date, the slot the printed bill carries them in. They
-    // replace the bare name chip.
+    // ROUND 2 ITEM 1 — `Name:` and `Customer GSTIN:` directly under the header
+    // and above the date, the slot the printed bill carries them in, worded as
+    // the paper words them (a walk-in's slot is a bare `Name:`, as on the
+    // paper). They replace the bare name chip.
     for (final l in billCustomerLines(bill)) ...[
       const SizedBox(height: 4),
       Text(l, style: text.bodyMedium),
@@ -30409,6 +30773,20 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           'feedback_config': settings['feedback_config'] ?? {},
           'bill_logo_svg': settings['bill_logo_svg'] ?? '',
           'bill_paper_width': settings['bill_paper_width'] ?? '80mm',
+          // The "Bill details" card. THESE WERE NEVER COPIED IN when that card
+          // shipped (1.7.4): it read all five off this map, found none of them,
+          // and opened blank on every tenant — so pressing Save wrote '' over a
+          // legal name, GSTIN and QR sentence the owner had already set. The QR
+          // switch saves in that same POST, which would have made the wipe the
+          // price of flipping it.
+          'bill_legal_name': settings['bill_legal_name'] ?? '',
+          'bill_gstin': settings['bill_gstin'] ?? '',
+          'bill_qr_note': settings['bill_qr_note'] ?? '',
+          'bill_qr_note_default': settings['bill_qr_note_default'] ?? '',
+          'bill_qr_note_max': settings['bill_qr_note_max'] ?? 120,
+          // Whether the customer bill prints its QR. Absent reads as ON — see
+          // [billShowsQr].
+          'bill_show_qr': billShowsQr(settings),
           // Walk-in queue: whether waiting guests see the menu / pre-order.
           'queue_show_menu': brand['queue_show_menu'] ?? settings['queue_show_menu'] ?? true,
           // Whether guests must enter the per-table 4-digit OTP before ordering.
@@ -30525,6 +30903,7 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
               initialQrNote: _s(m, 'bill_qr_note', ''),
               qrNoteDefault: _s(m, 'bill_qr_note_default', ''),
               qrNoteMax: (m['bill_qr_note_max'] is num) ? (m['bill_qr_note_max'] as num).toInt() : 120,
+              initialShowQr: m['bill_show_qr'] != false,
               reload: reload,
             ),
             const SizedBox(height: AppSpacing.xxl),
@@ -30794,6 +31173,17 @@ class _BillLogoCardState extends State<_BillLogoCard> {
 // every tenant's paper. Clearing this box restores that built-in line rather
 // than printing nothing, so a restaurant that never opens this card sees its
 // receipt unchanged.
+//
+// THE QR ITSELF CAN BE SWITCHED OFF (migration 047) — for a tenant with no valet
+// and no use for feedback, whose guests were being handed a code that leads
+// nowhere they care about. Off, the paper ends at the total (or the disclaimer):
+// no sentence and no code. It saves with the rest of this card rather than on
+// the tap like the Ordering switches, because it and the sentence are one
+// decision about the bottom of the bill. The sentence box is DISABLED, not
+// hidden, while the QR is off: the owner's wording stays visible and is still
+// saved, so turning the QR back on brings it back.
+//
+// Admin-only, like every other write on POST /restaurant/settings.
 class _BillIdentityCard extends StatefulWidget {
   final RestClient rest;
   final String initialLegalName;
@@ -30804,6 +31194,9 @@ class _BillIdentityCard extends StatefulWidget {
   // written down again here, so this card can never disagree with escpos.ts.
   final String qrNoteDefault;
   final int qrNoteMax;
+  // `bill_show_qr`, already resolved through [billShowsQr] — so a tenant whose
+  // settings carry no such key arrives here as true.
+  final bool initialShowQr;
   final VoidCallback reload;
   const _BillIdentityCard({
     required this.rest,
@@ -30812,6 +31205,7 @@ class _BillIdentityCard extends StatefulWidget {
     required this.initialQrNote,
     required this.qrNoteDefault,
     required this.qrNoteMax,
+    this.initialShowQr = true,
     required this.reload,
   });
   @override
@@ -30822,6 +31216,7 @@ class _BillIdentityCardState extends State<_BillIdentityCard> {
   late final TextEditingController _legalName;
   late final TextEditingController _gstin;
   late final TextEditingController _qrNote;
+  late bool _showQr = widget.initialShowQr;
   bool _busy = false;
 
   @override
@@ -30844,14 +31239,17 @@ class _BillIdentityCardState extends State<_BillIdentityCard> {
     final messenger = ScaffoldMessenger.of(context);
     setState(() => _busy = true);
     try {
-      // Sent even when empty — '' is how a field is CLEARED, and clearing the
-      // note restores the built-in valet line. The backend presence-checks
-      // rather than truthiness-checks for exactly this reason.
-      await widget.rest.post('/restaurant/settings', {
-        'bill_legal_name': _legalName.text.trim(),
-        'bill_gstin': _gstin.text.trim(),
-        'bill_qr_note': _qrNote.text.trim(),
-      });
+      // Every field, empty or not, and the QR switch as an explicit boolean —
+      // see [billDetailsSettingsBody] for why each is sent.
+      await widget.rest.post(
+        '/restaurant/settings',
+        billDetailsSettingsBody(
+          legalName: _legalName.text,
+          gstin: _gstin.text,
+          qrNote: _qrNote.text,
+          showQr: _showQr,
+        ),
+      );
       messenger.showSnackBar(const SnackBar(content: Text('Bill details saved.')));
       widget.reload();
     } catch (e) {
@@ -30896,18 +31294,50 @@ class _BillIdentityCardState extends State<_BillIdentityCard> {
           ),
         ),
         const SizedBox(height: AppSpacing.lg),
+        // The QR switch, in the Ordering switches' row idiom: title and caption
+        // on the left, the compact switch on the right. Unlike those it does not
+        // save on the tap — it rides the Save below with the sentence it governs.
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text('Print QR code on the bill', style: text.titleSmall),
+              const SizedBox(height: 3),
+              Text('The feedback / valet QR at the bottom of every customer bill.', style: text.bodySmall),
+            ]),
+          ),
+          const SizedBox(width: AppSpacing.md),
+          SizedBox(
+            height: 24,
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: Switch(
+                key: const ValueKey('bill-show-qr-switch'),
+                value: _showQr,
+                onChanged: _busy ? null : (v) => setState(() => _showQr = v),
+              ),
+            ),
+          ),
+        ]),
+        const SizedBox(height: AppSpacing.lg),
         Text('MESSAGE ABOVE THE QR CODE', style: text.labelSmall),
         const SizedBox(height: 6),
         TextField(
+          key: const ValueKey('bill-qr-note-field'),
           controller: _qrNote,
+          // Disabled rather than hidden while the QR is off: nothing prints above
+          // a code that is not there, but the wording is kept (and saved) for
+          // the day it is switched back on.
+          enabled: _showQr,
           minLines: 2,
           maxLines: 3,
           maxLength: widget.qrNoteMax,
           decoration: InputDecoration(
             hintText: widget.qrNoteDefault.isNotEmpty ? widget.qrNoteDefault : 'Scan the QR code below',
-            helperText: widget.qrNoteDefault.isNotEmpty
-                ? 'Leave blank to use the default: "${widget.qrNoteDefault}"'
-                : 'Leave blank to use the built-in default.',
+            helperText: !_showQr
+                ? 'Not printed while the QR code is off.'
+                : widget.qrNoteDefault.isNotEmpty
+                    ? 'Leave blank to use the default: "${widget.qrNoteDefault}"'
+                    : 'Leave blank to use the built-in default.',
             helperMaxLines: 3,
             counterText: '$noteLen/${widget.qrNoteMax}',
             isDense: true,
