@@ -7,6 +7,7 @@ import 'package:restaurant_owner_app/screens/modules.dart' as m;
 import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/widgets/charts.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
@@ -695,15 +696,76 @@ void main() {
     expect(bars.map((b) => b.value), ['₹11000.00', '₹8430.50', '₹3250.40']);
     expect(find.text('6 bill(s) · 48.5%'), findsOneWidget);
     // The bar is the share of today, not the size against the largest mode.
-    expect(bars[2].fraction, closeTo(3250.4 / 22680.9, 1e-9));
+    expect(bars[2].fraction, closeTo(3250.4 / 22680.9, 1e-12));
     // A refund gets its own line, with what survived it.
     expect(find.text('6 bill(s) · 37.2% · − ₹120.00 refunded · ₹8310.50 net'), findsOneWidget);
-    // And the split note, because the bill counts now add to more than 14.
-    expect(find.textContaining('1 bill(s) paid across more than one method'), findsOneWidget);
+    // And the split note — which claims only that each part counts under its
+    // own method. "Adds up to more than the bills settled" is false the moment
+    // a released ₹0 table is in the tag's count and has no row.
+    expect(find.text('1 bill(s) paid across more than one method; each part counts under its own method.'), findsOneWidget);
+    expect(find.textContaining('add up to more than'), findsNothing);
     expect(find.textContaining('could not be put under a payment method'), findsNothing);
+    expect(find.textContaining('split amounts do not add up'), findsNothing);
   });
 
-  testWidgets('the Cash row is the Cash collection tile', (tester) async {
+  testWidgets("the bars divide by the server's Today's gross, not a re-sum of the rows", (tester) async {
+    // The rows add to 22680.90; the gross is a paisa away so a block that summed
+    // its own rows draws a different fraction. The server guarantees the two
+    // agree (mis_report_agreement.test.ts) — the paisa only tells them apart.
+    final api = _FakeApi({
+      '/analytics/headline': _headline(over: {
+        'today_gross': {'value': 22680.91, 'label': "Today's gross sale", 'hint': 'Settled today, tax inclusive.'},
+      }),
+    });
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    final card = tester.widget<HBarRow>(find.ancestor(of: find.text('Card'), matching: find.byType(HBarRow)));
+    expect(card.fraction, closeTo(3250.4 / 22680.91, 1e-12));
+    expect(card.fraction, isNot(closeTo(3250.4 / 22680.9, 1e-12)));
+  });
+
+  testWidgets('residuals that cancel to ₹0.00 across bills are still flagged, off the row', (tester) async {
+    // ₹50 short on one split, ₹50 over on another: today_unallocated is 0 and so
+    // is the row's amount. Its two bills are what say something is wrong.
+    final api = _FakeApi({
+      '/analytics/headline': _headline(over: {
+        'today_by_method': [
+          {'method': 'Cash', 'bills': 2, 'amount': 1250, 'share_pct': 62.5, 'refund': 0, 'net_amount': 1250},
+          {'method': 'Upi', 'bills': 2, 'amount': 750, 'share_pct': 37.5, 'refund': 0, 'net_amount': 750},
+          {'method': 'Unallocated', 'bills': 2, 'amount': 0, 'share_pct': 0, 'refund': 0, 'net_amount': 0},
+        ],
+        'today_gross': {'value': 2000, 'label': "Today's gross sale", 'hint': 'x'},
+        'cash_collection': {'value': 1250, 'label': 'Cash collection', 'hint': 'x'},
+        'today_split_bills': 2,
+        'today_unallocated': 0,
+      }),
+    });
+    final rest = await _signIn(api);
+    _wideWindow(tester);
+
+    await tester.pumpWidget(_host(m.overviewModule(rest, rest.auth.profile!)));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(
+      find.text("2 bills' split amounts do not add up to their totals and need looking at "
+          '(the differences cancel out to ₹0.00 today).'),
+      findsOneWidget,
+    );
+    final row = tester.widget<HBarRow>(find.ancestor(of: find.text('Unallocated'), matching: find.byType(HBarRow)));
+    expect(row.value, '₹0.00');
+    expect(row.color, AppColors.warning);
+  });
+
+  testWidgets('the Cash row prints through the same money formatter as the Cash collection tile', (tester) async {
+    // FORMATTER PARITY only. That the two NUMBERS agree is the server's promise
+    // (cash_collection is read off these rows) and is proven in backend jest
+    // (mis_report_agreement.test.ts); this fixture hand-sets both, so all this
+    // can catch is the row and the tile formatting one value two ways.
     final api = _FakeApi({'/analytics/headline': _headline()});
     final rest = await _signIn(api);
     _wideWindow(tester);
@@ -776,7 +838,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(tester.takeException(), isNull);
-    expect(find.textContaining('₹200.00 could not be put under a payment method'), findsOneWidget);
+    expect(
+      find.text("₹200.00 could not be put under a payment method — 1 bill's split amounts do not add up to their "
+          'totals and need looking at.'),
+      findsOneWidget,
+    );
     final row = tester.widget<HBarRow>(find.ancestor(of: find.text('Unallocated'), matching: find.byType(HBarRow)));
     expect(row.fraction, 0, reason: 'a negative residual draws no bar');
   });

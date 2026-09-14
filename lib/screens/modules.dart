@@ -1411,6 +1411,15 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       : modes.fold<double>(0, (s, m) => s + _numOf(m['amount']));
   final splitBills = _int(h['today_split_bills']) ?? 0;
   final unallocated = _numOf(h['today_unallocated']);
+  // Bills whose split parts did not add back — the Unallocated row's own count.
+  // NOT the sum above: residuals net across bills, so ₹50 short on one split and
+  // ₹50 over on another is ₹0.00 there, and two bills still need looking at.
+  // The server never filters this row for that reason.
+  final unallocatedRow = modes.where((m) => '${m['method']}'.trim() == 'Unallocated');
+  final unallocatedBills = unallocatedRow.isEmpty ? 0 : (_int(unallocatedRow.first['bills']) ?? 0);
+  final whose = unallocatedBills == 0
+      ? "those bills'"
+      : (unallocatedBills == 1 ? "1 bill's" : "$unallocatedBills bills'");
   final today = '${h['today'] ?? ''}';
 
   // The server's share, else computed; a dash — never 0% — with nothing to
@@ -1476,22 +1485,28 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     // One across on a phone, two or three on wider windows — the web's
     // 1 / 2 / 3 grid, keyed off the headline's own column count.
     _dashGrid(rows, columns >= 6 ? 3 : (columns >= 3 ? 2 : 1)),
+    // Says only what is always true. The counts do NOT reliably add up to more
+    // than "N bill(s) settled": that tag counts a released ₹0 table, which has no
+    // row here.
     if (splitBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
       Text(
-        '$splitBills bill(s) paid across more than one method, so the bill counts add up to more than the '
-        'bills settled.',
+        '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
         style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
       ),
     ],
     // LOUD: the one line that means something is wrong. It should always be 0,
     // and it is wrong in EITHER direction — a split whose parts exceed the bill
-    // books a negative residual.
-    if (unallocated != 0) ...[
+    // books a negative residual — and wrong even when the residuals cancel. Same
+    // words as the web's unallocatedWarning.
+    if (unallocated != 0 || unallocatedBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
       Text(
-        "${_money(unallocated.abs())} could not be put under a payment method — those bills' split "
-        'amounts do not add up to their totals and need looking at.',
+        unallocated != 0
+            ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
+                'do not add up to their totals and need looking at.'
+            : '$whose split amounts do not add up to their totals and need looking at '
+                '(the differences cancel out to ${_money(0)} today).',
         style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
       ),
     ],
@@ -1527,8 +1542,8 @@ Future<void> _headlineMethodSheet(
       if (method == 'Unallocated') ...[
         const SizedBox(height: AppSpacing.sm),
         Text(
-          'Money whose split-payment parts do not add up to the bill total. It should always be zero; '
-          'the bills behind it need looking at.',
+          'Money whose split-payment parts do not add up to the bill total. Short on one bill and over on '
+          'another can net to ₹0.00, so every bill counted here needs looking at, whatever the amount.',
           style: text.bodySmall!.copyWith(color: AppColors.warning),
         ),
       ],
