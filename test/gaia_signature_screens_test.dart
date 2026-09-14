@@ -30,6 +30,7 @@ import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/widgets/date_range_picker.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_tabs.dart';
+import 'package:restaurant_owner_app/ui/widgets/section_header.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 class _FakeApi extends ApiClient {
@@ -303,7 +304,22 @@ void main() {
         (tester) async {
       await _mount(tester, (r) => m.analyticsModule(r, r.auth.profile!), _analyticsRoutes(),
           system: DesignSystem.gaia);
-      expect(find.byType(DateRangeChip), findsOneWidget);
+      // The top picker, pinned on its own: exactly one full-size chip, outside
+      // every section header. Counting chips is not enough since the Kitchen and
+      // Actionable insights headers carry live copies (they were static pills),
+      // and those alone would satisfy "a chip is on screen".
+      final top = find.byWidgetPredicate((w) => w is DateRangeChip && !w.dense, description: 'the top DateRangeChip');
+      expect(top, findsOneWidget, reason: 'the page-level window picker is gone');
+      expect(find.ancestor(of: top, matching: find.byType(SectionHeader)), findsNothing);
+      // The header copies: dense, inside a header, and on the ONE module window.
+      final inHeaders = find.descendant(of: find.byType(SectionHeader), matching: find.byType(DateRangeChip));
+      expect(inHeaders, findsNWidgets(2), reason: 'Kitchen and Actionable insights');
+      expect(find.byType(DateRangeChip), findsNWidgets(3), reason: 'a chip outside both the top and a header');
+      final window = tester.widget<DateRangeChip>(top).value.label();
+      for (final c in tester.widgetList<DateRangeChip>(inHeaders)) {
+        expect(c.dense, isTrue, reason: 'a header copy must be the dense chip');
+        expect(c.value.label(), window, reason: 'a header chip is on a different window from the top picker');
+      }
       expect(find.byType(ForkTabs), findsOneWidget);
     });
 
