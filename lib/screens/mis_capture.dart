@@ -159,15 +159,24 @@ String _captureError(Object e) {
 
 /// Whether a table's open bill has a service charge that could be taken off.
 ///
-/// TWO SHAPES, because the fleet runs both: `Restaurant.service_charge` puts a
+/// THE SERVER SAYS SO when it can: `service_charge_basis` is the resolver's own
+/// answer to "which shape carries this outlet's charge", and "none" is the one
+/// value that means there is nothing to remove. Guessing is what this used to
+/// do, and guessing by NAME is a rule the two clients spelled differently from
+/// the server.
+///
+/// THE FALLBACK IS FOR A BACKEND THAT PREDATES THE FIELD, and it reads both
+/// shapes, because the fleet runs both: `Restaurant.service_charge` puts a
 /// number in `service_charge`, while a "Service Charge" line inside
 /// `Outlets.default_tax` puts it among the tax lines instead. Offering the
 /// control on an outlet that charges neither would be a control that 400s.
 bool _billHasServiceCharge(Map bill) {
+  final basis = bill['service_charge_basis'];
+  if (basis is String && basis.isNotEmpty) return basis != 'none';
   final direct = (num.tryParse('${bill['service_charge'] ?? 0}') ?? 0).toDouble();
   if (direct > 0) return true;
   for (final t in (bill['taxes'] as List?) ?? const []) {
-    if (t is Map && '${t['name'] ?? ''}'.toLowerCase().contains('service charge')) {
+    if (t is Map && _serviceChargeLineName.hasMatch('${t['name'] ?? ''}')) {
       final amt = (num.tryParse('${t['amount'] ?? 0}') ?? 0).toDouble();
       if (amt > 0) return true;
     }
@@ -1033,14 +1042,115 @@ Future<({String kind, String reason})?> misCancelReason(
 }
 
 // ============================================================================
-// 036 — SERVICE CHARGE WAIVER: take the charge off an open bill
+// 036 — SERVICE CHARGE WAIVER: take the charge off an open bill, and print it
 // ============================================================================
+//
+// ONE CONTROL, NOT TWO (client item 6: "reprint without service charge and
+// waive service charge should be merged as one option instead of being 2
+// separate steps").
+//
+// Since the paper was made to equal the drawer, the RECORDED WAIVER is the only
+// thing that takes the charge off a bill, so the old "Reprint (no service
+// charge)" in the bill-ops row could not do its job on its own: its dialog sent
+// the user to "Waive service charge" here, the waiver then ended without a
+// print, and pressing the two in the wrong order spent a full-charge copy. On a
+// live floor that was a refused print, a waiver and a reprint, 3 to 30 seconds
+// apart, table after table.
+//
+// Both halves are now ONE server call, POST /bills/service-charge-waiver/print,
+// which answers every refusal before it writes anything, records the waiver
+// exactly as the waiver route does, and prints from the bill as it stands after
+// that commit. This app decides nothing about money here: which of the two
+// happened, and the totals either side, are the server's answer, read back.
 
-/// The waiver block on the table sheet: either the control to take the charge
-/// off, or the live waiver with the control to put it back.
+/// The service charge on an open bill, in rupees, whichever shape carries it.
 ///
-/// Nothing at all when this outlet charges no service charge — offering to waive
-/// something that does not exist is a control that would 400 on tap.
+/// The HEADLINE of the removal form, and nothing else — never a figure the
+/// guest is charged. `service_charge` is only the restaurant_percent leg and is
+/// 0 on every tenant carrying the charge as a tax line (most of the fleet), so a
+/// headline read from it alone showed nothing on exactly the bills people
+/// remove the charge from. The tax-line leg is matched the way the server
+/// matches it (`/service\s*charge/i`), so "ServiceCharge" counts too.
+double misServiceChargeOnBill(Map bill) {
+  var total = _numOf(bill['service_charge']);
+  for (final t in (bill['taxes'] as List?) ?? const []) {
+    if (t is Map && _serviceChargeLineName.hasMatch('${t['name'] ?? ''}')) {
+      total += _numOf(t['amount']);
+    }
+  }
+  return (total * 100).roundToDouble() / 100;
+}
+
+final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive: false);
+
+/// WHAT TO TELL SOMEBODY AFTER "Remove service charge & print", given what the
+/// server did.
+///
+/// A pure function of the response, because the defect this family of messages
+/// has already had once was a SENTENCE that disagreed with the paper — the
+/// numbers were right and the snackbar promised a total the printer did not
+/// produce. So every branch says only what the server reported:
+///
+///   * the waiver landed and the bill printed — the two payable totals;
+///   * an existing waiver was reprinted — the total on the paper;
+///   * the waiver landed and the PRINT FAILED — that the charge is off, that
+///     no paper came out, and what to press, shown long enough to be read while
+///     somebody is already walking to a printer that is not printing;
+///   * the paper somehow carries the charge (the waiver was put back between
+///     the commit and the print) — that, and never "removed".
+///
+/// The web dashboard's `serviceChargeRemovalSentence` says the same words.
+({String message, Duration shown}) serviceChargeRemovalOutcome(Object? response) {
+  final r = response is Map ? response : const {};
+  final created = r['waiver_created'] == true;
+  final printed = r['printed'] == true;
+  final before = r['grand_total_before'];
+  final after = r['grand_total_after'];
+  final hasTotals = before != null && after != null;
+  if (printed && r['service_charge_removed'] == false) {
+    return (
+      message: 'Printed WITH the service charge — the waiver was put back before the bill printed.',
+      shown: const Duration(seconds: 8),
+    );
+  }
+  if (!printed) {
+    final why = '${r['print_error'] ?? ''}'.trim();
+    final notPrinted = 'did not print${why.isEmpty ? '' : ': $why'}. Press Print bill.';
+    // Only what the reply proves: a waiver it names is off the bill; a reply
+    // that names none proves nothing about the charge, only about the paper.
+    if (created && hasTotals) {
+      return (
+        message: 'Service charge removed (${_money(before)} → ${_money(after)}), but the bill $notPrinted',
+        shown: const Duration(seconds: 8),
+      );
+    }
+    return (
+      message: created || r['waiver'] is Map
+          ? 'The service charge is off this bill, but the bill $notPrinted'
+          : 'The bill $notPrinted',
+      shown: const Duration(seconds: 8),
+    );
+  }
+  if (created && hasTotals) {
+    return (
+      message: 'Service charge removed — total ${_money(before)} → ${_money(after)}. Printing bill…',
+      shown: const Duration(seconds: 4),
+    );
+  }
+  return (
+    message: after != null
+        ? 'Reprinting without the service charge — total ${_money(after)}.'
+        : 'Reprinting without the service charge…',
+    shown: const Duration(seconds: 3),
+  );
+}
+
+/// The waiver block on the table sheet: either the one control that takes the
+/// charge off and prints, or the live waiver with its reprint and the control
+/// to put the charge back.
+///
+/// Nothing at all when this outlet charges no service charge — offering to
+/// remove something that does not exist is a control that would 400 on tap.
 Widget misServiceChargeBlock(
   BuildContext context, {
   required RestClient rest,
@@ -1104,9 +1214,20 @@ Widget misServiceChargeBlock(
               'authorised by ${_s(w, 'authorised_by_username')}',
               style: text.bodySmall!.copyWith(fontStyle: FontStyle.italic)),
           const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: ForkButton.ghost(
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+            // THE REPRINT THAT USED TO LIVE IN THE BILL-OPS ROW, where it could
+            // not take anything off. Here it can only ever reprint what the
+            // waiver above already took off, so it needs no permission beyond
+            // printing — the server reprints a waived bill for anyone who may
+            // print it, and records no second waiver.
+            _ScBusyButton(
+              key: const ValueKey('sc-reprint-without-charge'),
+              label: 'Reprint without the charge',
+              icon: Icons.print_outlined,
+              run: () => _reprintWithoutServiceCharge(context,
+                  rest: rest, tableName: tableName, onChanged: onChanged),
+            ),
+            ForkButton.ghost(
               key: const ValueKey('sc-waiver-reverse'),
               label: 'Put the charge back',
               icon: Icons.undo,
@@ -1116,7 +1237,7 @@ Widget misServiceChargeBlock(
                   : () => _reverseServiceChargeWaiver(context,
                       rest: rest, waiverId: '${w['id']}', onChanged: onChanged),
             ),
-          ),
+          ]),
           if (!may)
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -1130,36 +1251,79 @@ Widget misServiceChargeBlock(
 
   return Padding(
     padding: const EdgeInsets.only(top: AppSpacing.md),
-    child: Row(children: [
-      ForkButton.ghost(
-        key: const ValueKey('sc-waiver-apply'),
-        label: 'Waive service charge',
+    // A Wrap, not a Row: the label is longer than the one it replaced, and on a
+    // 390dp phone a Row hands its button unbounded width to overflow into. The
+    // sentence beside an inert control drops under it when there is no room.
+    child: Wrap(crossAxisAlignment: WrapCrossAlignment.center, spacing: AppSpacing.sm, runSpacing: 6, children: [
+      _ScBusyButton(
+        key: const ValueKey('sc-remove-and-print'),
+        label: 'Remove service charge & print',
         icon: Icons.money_off_csred_outlined,
-        dense: true,
-        // Disabled rather than hidden: a waiter needs to know the control EXISTS
-        // so they fetch a manager, instead of arguing with a guest about a screen
-        // that appears to have no such option.
-        onPressed: !may
+        // Disabled rather than hidden: a cashier or captain needs to know the
+        // control EXISTS so they fetch a manager, instead of arguing with a
+        // guest about a screen that appears to have no such option.
+        run: !may
             ? null
-            : () => _waiveServiceCharge(context,
+            : () => _removeServiceChargeAndPrint(context,
                 rest: rest,
                 profile: profile,
                 bill: bill,
                 tableName: tableName,
                 onChanged: onChanged),
       ),
-      if (!may) ...[
-        const SizedBox(width: AppSpacing.sm),
-        Expanded(
-          child: Text(_noPermission('waive a service charge'),
-              style: text.bodySmall!.copyWith(color: AppColors.textTertiary)),
-        ),
-      ],
+      if (!may)
+        Text(_noPermission('remove a service charge'),
+            style: text.bodySmall!.copyWith(color: AppColors.textTertiary)),
     ]),
   );
 }
 
-Future<void> _waiveServiceCharge(
+/// A ghost button that is inert while its own action runs.
+///
+/// Both service-charge actions post a request that PRINTS, and a second tap
+/// while the first is on the wire is a second copy of the guest's bill marked
+/// REPRINT. The server cannot tell a double tap from a real second request (a
+/// repeated request for paper is a request for more paper), so the tap is
+/// refused here, for as long as the first one is running.
+class _ScBusyButton extends StatefulWidget {
+  const _ScBusyButton({super.key, required this.label, required this.icon, required this.run});
+
+  final String label;
+  final IconData icon;
+
+  /// Null = present but inert (no permission).
+  final Future<void> Function()? run;
+
+  @override
+  State<_ScBusyButton> createState() => _ScBusyButtonState();
+}
+
+class _ScBusyButtonState extends State<_ScBusyButton> {
+  bool _busy = false;
+
+  Future<void> _press() async {
+    final run = widget.run;
+    if (run == null || _busy) return;
+    setState(() => _busy = true);
+    try {
+      await run();
+    } finally {
+      // The sheet reloads underneath this (a waived bill swaps this button for
+      // the waiver card), so the widget may be gone by the time it returns.
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => ForkButton.ghost(
+        label: widget.label,
+        icon: widget.icon,
+        dense: true,
+        onPressed: widget.run == null || _busy ? null : _press,
+      );
+}
+
+Future<void> _removeServiceChargeAndPrint(
   BuildContext context, {
   required RestClient rest,
   required Profile profile,
@@ -1168,16 +1332,18 @@ Future<void> _waiveServiceCharge(
   required VoidCallback onChanged,
 }) async {
   final messenger = ScaffoldMessenger.of(context);
-  final charge = _numOf(bill['service_charge']);
+  final charge = misServiceChargeOnBill(bill);
   final answer = await showDialog<_CaptureReason>(
     context: context,
     builder: (_) => _CaptureReasonDialog(
-      title: 'Waive service charge',
+      title: 'Remove service charge & print',
       headline: charge > 0 ? _money(charge) : null,
-      subtitle: 'The charge comes off this OPEN bill. Where tax rides on the charge the '
-          'total falls by more than the charge itself, and the next screen says by how much. '
-          'A settled bill cannot be waived — that is a refund.',
-      confirmLabel: 'Take it off',
+      subtitle: 'The charge comes off this OPEN bill and the bill prints straight away without it. '
+          'Where tax rides on the charge the total falls by more than the charge itself, and you '
+          'are told both totals. A settled bill cannot be changed — that is a refund.',
+      confirmLabel: 'Remove & print',
+      // "Guest asked" leads the list: nine of the first eleven waivers recorded
+      // in production were exactly that, so the commonest case is one tap.
       kinds: _scWaiverKinds,
       needsAuthoriser: true,
       suggestedAuthoriser: profile.employeeUsername,
@@ -1185,7 +1351,7 @@ Future<void> _waiveServiceCharge(
   );
   if (answer == null) return;
   try {
-    final res = await rest.post('/bills/service-charge-waiver', {
+    final res = await rest.post('/bills/service-charge-waiver/print', {
       // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
       // bill and mints one when the table has none, which is the case a guest
       // asks about before the bill has been raised.
@@ -1194,20 +1360,56 @@ Future<void> _waiveServiceCharge(
       'reason': answer.reason,
       'authorised_by': answer.authorisedBy,
     });
-    // The two payable totals, each rounded to the rupee — what the guest was
-    // asked for before the waiver and is asked for now. Not the differenced
-    // pre-round figures the waiver records, which can be off their gap by under
-    // a rupee.
-    final before = res is Map ? _numOf(res['grand_total_before']) : 0.0;
-    final after = res is Map ? _numOf(res['grand_total_after']) : 0.0;
-    messenger.showSnackBar(SnackBar(
-      content: Text(before > 0
-          ? 'Service charge waived — the total goes from ${_money(before)} to ${_money(after)}.'
-          : 'Service charge waived.'),
-    ));
+    final outcome = serviceChargeRemovalOutcome(res);
+    messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
+  } catch (e) {
+    // Offline is OutboxPolicy's billing sentence and nothing was recorded. A
+    // timeout is not so clear — the waiver may have landed — which is why the
+    // bill is reloaded below whatever happened: the card that comes back is
+    // the answer.
+    messenger.showSnackBar(SnackBar(content: Text(_captureError(e))));
+  } finally {
     onChanged();
+  }
+}
+
+/// Reprint a bill whose charge a recorded waiver has already taken off.
+///
+/// Confirmation only, and no figures in it: the same server route is called
+/// with no kind and no reason, and it reprints the existing waiver — no second
+/// row, no second audit line. The total goes in the snackbar afterwards, from
+/// the server's reply, because that is the total that was printed.
+Future<void> _reprintWithoutServiceCharge(
+  BuildContext context, {
+  required RestClient rest,
+  required String tableName,
+  required VoidCallback onChanged,
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      title: const Text('Reprint without the service charge?'),
+      content: const Text(
+        'The bill prints again with the recorded waiver applied — the total the guest pays. '
+        'It is marked as a reprint.',
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Reprint')),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  try {
+    final res = await rest.post('/bills/service-charge-waiver/print', {'table_name': tableName});
+    final outcome = serviceChargeRemovalOutcome(res);
+    messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text(_captureError(e))));
+  } finally {
+    onChanged();
   }
 }
 
