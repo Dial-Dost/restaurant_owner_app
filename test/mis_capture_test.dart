@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -65,6 +67,15 @@ class _FakeApi extends ApiClient {
   String failOn = '';
   String failMessage = 'refused';
 
+  /// What a write to an exact path answers, when the default `{success: true}`
+  /// is not what the screen needs to read back.
+  final Map<String, Object?> replies = <String, Object?>{};
+
+  /// When set, a write whose path contains [holdOn] waits for this to complete
+  /// — a request still on the wire, so a test can look at the screen meanwhile.
+  Completer<void>? hold;
+  String holdOn = '';
+
   @override
   Future<LoginResult> login(String restaurantName, String user, String password,
           {String? outletId}) async =>
@@ -93,7 +104,8 @@ class _FakeApi extends ApiClient {
     }
     if (method != 'GET') {
       writes.add((method: method, path: path, body: body));
-      return <String, dynamic>{'success': true};
+      if (hold != null && holdOn.isNotEmpty && path.contains(holdOn)) await hold!.future;
+      return replies.containsKey(path) ? replies[path] : <String, dynamic>{'success': true};
     }
     if (routes.containsKey(path)) return routes[path];
     // Longest matching prefix, so one route answers a query-carrying family.
@@ -174,8 +186,15 @@ Map<String, dynamic> _bill({
   double serviceCharge = 120.0,
   bool waived = false,
   double ncTotal = 0,
+  String? basis,
+  List<Map<String, dynamic>>? taxes,
+  int? printCount,
 }) =>
     {
+      'service_charge_basis': ?basis,
+      // The server's print ledger for this seating (GET /bill-for-table always
+      // sends it); absent unless a test is about it.
+      'print_count': ?printCount,
       'bill_id': 'bill-1',
       'table_id': 'tbl-1',
       'total_amt': 1200.0,
@@ -202,9 +221,10 @@ Map<String, dynamic> _bill({
               'reversed_at': null,
             }
           : null,
-      'taxes': const [
-        {'name': 'CGST', 'percentage': 2.5, 'amount': 30.0},
-      ],
+      'taxes': taxes ??
+          const [
+            {'name': 'CGST', 'percentage': 2.5, 'amount': 30.0},
+          ],
       'tax_total': 60.0,
       'grand_total': waived ? 1260.0 : 1380.0,
       'nc_total': ncTotal,
@@ -297,8 +317,16 @@ Future<void> _reveal(WidgetTester tester, Finder finder) async {
 
 /// The onPressed of the ForkButton carrying [key] — null means the control is
 /// present but deliberately inert.
-VoidCallback? _pressOf(WidgetTester tester, Key key) =>
-    tester.widget<ForkButton>(find.byKey(key)).onPressed;
+VoidCallback? _pressOf(WidgetTester tester, Key key) {
+  final found = find.byKey(key);
+  final w = tester.widget(found);
+  if (w is ForkButton) return w.onPressed;
+  // The service-charge actions wrap their ForkButton so they can go inert while
+  // their own request is on the wire; the key sits on the wrapper.
+  return tester
+      .widget<ForkButton>(find.descendant(of: found, matching: find.byType(ForkButton)))
+      .onPressed;
+}
 
 /// Fill the shared reason form and confirm it.
 Future<void> _fillReason(
@@ -674,7 +702,16 @@ void main() {
   // 036 — SERVICE CHARGE WAIVER
   // ==========================================================================
 
-  group('036 · waive the service charge', () {
+  group('036 · remove the service charge & print — one control', () {
+    // Client item 6: "reprint without service charge and waive service charge
+    // should be merged as one option instead of being 2 separate steps". The
+    // waiver used to end without a print, and the reprint that sat in the
+    // bill-ops row could not take the charge off by itself.
+
+    /// The one write the control makes, and only it.
+    List<({String method, String path, Object? body})> removals(_FakeApi api) =>
+        api.writes.where((w) => w.path == '/bills/service-charge-waiver/print').toList();
+
     testWidgets('nothing is offered on an outlet that charges none', (tester) async {
       await _mount(
         tester,
@@ -682,30 +719,171 @@ void main() {
         _tableRoutes(bill: _bill(serviceCharge: 0)),
       );
       await _openTable(tester);
-      // Offering to waive a charge that does not exist is a control that 400s.
-      expect(find.byKey(const ValueKey('sc-waiver-apply')), findsNothing);
+      // Offering to remove a charge that does not exist is a control that 400s.
+      expect(find.byKey(const ValueKey('sc-remove-and-print')), findsNothing);
       expect(find.byKey(const ValueKey('sc-waiver-reverse')), findsNothing);
     });
 
-    testWidgets('waiving posts the table, the kind, the reason and the second name',
+    testWidgets('the SERVER decides whether there is a charge: basis "none" hides it, "tax_line" shows it',
+        (tester) async {
+      // A figure in `service_charge` with the server saying "none" is not a
+      // charge this route can remove; the server's answer wins over a guess.
+      await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(basis: 'none')));
+      await _openTable(tester);
+      expect(find.byKey(const ValueKey('sc-remove-and-print')), findsNothing);
+
+      // A tax-line tenant: `service_charge` is 0 and the line is named in a way
+      // no substring test would catch. The server says tax_line; it is offered.
+      await _mount(
+        tester,
+        m.tablesModule,
+        _tableRoutes(
+          bill: _bill(serviceCharge: 0, basis: 'tax_line', taxes: const [
+            {'name': 'CGST', 'percentage': 2.5, 'amount': 30.0},
+            {'name': 'ServiceCharge', 'percentage': 10.0, 'amount': 120.0},
+          ]),
+        ),
+      );
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      expect(_pressOf(tester, const ValueKey('sc-remove-and-print')), isNotNull);
+    });
+
+    testWidgets('ONE request: the table, the kind, the reason and the second name — and no separate print',
         (tester) async {
       final api = await _mount(tester, m.tablesModule, _tableRoutes());
       await _openTable(tester);
-      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-apply')));
-      await tester.tap(find.byKey(const ValueKey('sc-waiver-apply')));
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
       await tester.pumpAndSettle();
+      expect(find.text('REMOVE SERVICE CHARGE & PRINT'), findsOneWidget);
 
       await _fillReason(tester, kind: 'goodwill', reason: 'Regular, long wait');
 
-      final body = api.bodyOf('/bills/service-charge-waiver') as Map?;
-      expect(body, isNotNull);
+      final sent = removals(api);
+      expect(sent, hasLength(1));
+      final body = sent.single.body as Map;
       // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
       // bill and mints one where the table has none — which is the case a guest
       // asks about before the bill has been raised.
-      expect(body!['table_name'], 'T1');
+      expect(body['table_name'], 'T1');
       expect(body['waiver_kind'], 'goodwill');
       expect(body['reason'], 'Regular, long wait');
       expect(body['authorised_by'], 'manager01');
+      // The two steps are ONE: no waiver-only write, no print of its own, and
+      // no print-time flag anywhere.
+      expect(api.writes.where((w) => w.path == '/bills/service-charge-waiver'), isEmpty);
+      expect(api.wrote('POST', '/print/bill'), isFalse);
+      expect(api.writes.any((w) => '${w.body}'.contains('no_service_charge')), isFalse);
+    });
+
+    testWidgets('"Guest asked" is already chosen — the commonest case is reason and confirm',
+        (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      // A reason is still required: it is the control document.
+      expect(_pressOf(tester, const ValueKey('capture-confirm')), isNull);
+      await _fillReason(tester, reason: 'Guest asked at the table');
+      expect((removals(api).single.body as Map)['waiver_kind'], 'guest_request');
+    });
+
+    testWidgets('the headline names the charge on a TAX-LINE bill too', (tester) async {
+      // `service_charge` is 0 on most of the fleet; a headline read from it
+      // alone showed nothing on exactly the bills this control is for.
+      await _mount(
+        tester,
+        m.tablesModule,
+        _tableRoutes(
+          bill: _bill(serviceCharge: 0, basis: 'tax_line', taxes: const [
+            {'name': 'CGST', 'percentage': 2.5, 'amount': 30.0},
+            {'name': 'Service Charge', 'percentage': 10.0, 'amount': 549.9},
+          ]),
+        ),
+      );
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      expect(find.text('₹549.90'), findsOneWidget);
+    });
+
+    testWidgets('the till is told both totals and that it is printing, then the bill is read again',
+        (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
+        'success': true, 'printed': true, 'waiver_created': true, 'service_charge_removed': true,
+        'grand_total_before': 1380, 'grand_total_after': 1260,
+      };
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: 'Guest asked');
+
+      expect(find.text('Service charge removed — total ₹1380.00 → ₹1260.00. Printing bill…'), findsOneWidget);
+      final posted = api.calls.indexOf('POST /bills/service-charge-waiver/print');
+      expect(posted, isNonNegative);
+      expect(api.calls.skip(posted + 1).any((c) => c.startsWith('GET /bill-for-table')), isTrue,
+          reason: 'the sheet must show the waiver the server just recorded');
+    });
+
+    testWidgets('a print that failed after the waiver landed says so', (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
+        'success': true, 'printed': false, 'print_error': 'No printer is online',
+        'waiver_created': true, 'grand_total_before': 1380, 'grand_total_after': 1260,
+      };
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: 'Guest asked');
+      expect(
+        find.text('Service charge removed (₹1380.00 → ₹1260.00), but the bill did not print: '
+            'No printer is online. Press Print bill.'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a refusal shows the server\'s sentence, and the bill is STILL read again',
+        (tester) async {
+      // A refusal or a timeout is not proof nothing landed; the card that comes
+      // back is the answer, so the sheet reloads in every outcome.
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      api.failOn = '/bills/service-charge-waiver/print';
+      api.failMessage = "No staff member 'ravi' in this outlet — authorised_by must name one.";
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: 'Guest asked', authoriser: 'ravi');
+      expect(find.textContaining("No staff member 'ravi' in this outlet"), findsOneWidget);
+      final posted = api.calls.indexOf('POST /bills/service-charge-waiver/print');
+      expect(api.calls.skip(posted + 1).any((c) => c.startsWith('GET /bill-for-table')), isTrue);
+    });
+
+    testWidgets('the control is inert while its request is on the wire — no second copy of the bill',
+        (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      api.hold = Completer<void>();
+      api.holdOn = '/service-charge-waiver/print';
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: 'Guest asked');
+
+      expect(removals(api), hasLength(1));
+      expect(_pressOf(tester, const ValueKey('sc-remove-and-print')), isNull,
+          reason: 'a second tap now would print a second copy marked REPRINT');
+
+      api.hold!.complete();
+      await tester.pumpAndSettle();
+      // The fake's bill is still un-waived, so the control comes back — usable.
+      expect(_pressOf(tester, const ValueKey('sc-remove-and-print')), isNotNull);
     });
 
     testWidgets('a waiter sees neither the control nor its explanation', (tester) async {
@@ -716,8 +894,8 @@ void main() {
           actions: const ['x'], role: 'waiter');
       await _openTable(tester);
       // See the note on the comp case: _reveal throws on a missing target.
-      expect(find.byKey(const ValueKey('sc-waiver-apply')), findsNothing);
-      expect(find.textContaining('Only a manager can waive a service charge'), findsNothing);
+      expect(find.byKey(const ValueKey('sc-remove-and-print')), findsNothing);
+      expect(find.textContaining('Only a manager can remove a service charge'), findsNothing);
     });
 
     testWidgets('a cashier still sees it inert, with the reason beside it', (tester) async {
@@ -726,9 +904,17 @@ void main() {
       await _mount(tester, m.tablesModule, _tableRoutes(),
           actions: const ['x'], role: 'cashier');
       await _openTable(tester);
-      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-apply')));
-      expect(_pressOf(tester, const ValueKey('sc-waiver-apply')), isNull);
-      expect(find.textContaining('Only a manager can waive a service charge'), findsOneWidget);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      expect(_pressOf(tester, const ValueKey('sc-remove-and-print')), isNull);
+      expect(find.textContaining('Only a manager can remove a service charge'), findsOneWidget);
+    });
+
+    testWidgets('the old two-step controls are gone', (tester) async {
+      await _mount(tester, m.tablesModule, _tableRoutes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      expect(find.text('Waive service charge'), findsNothing);
+      expect(find.text('Reprint (no service charge)'), findsNothing);
     });
 
     testWidgets('a live waiver shows BOTH figures, because tax rode on the charge',
@@ -752,6 +938,8 @@ void main() {
       // ("don't show service charge opted out when removed"). This card is
       // where a manager sees who took it off, and puts it back.
       expect(find.text('waived'), findsNothing);
+      // A waived bill offers no second removal.
+      expect(find.byKey(const ValueKey('sc-remove-and-print')), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('sc-waiver-reverse')));
       await tester.pumpAndSettle();
@@ -759,6 +947,70 @@ void main() {
       await _fillReason(tester, reason: 'Manager overruled it');
       final body = api.bodyOf('/bills/service-charge-waiver/w-1/reverse') as Map?;
       expect(body!['reason'], 'Manager overruled it');
+    });
+
+    testWidgets('a live waiver reprints through the same route: the table only, no second form',
+        (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 1)));
+      api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
+        'success': true, 'printed': true, 'waiver_created': false, 'service_charge_removed': true,
+        'grand_total_before': null, 'grand_total_after': 1260,
+      };
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-reprint-without-charge')));
+      expect(find.text('Reprint without the charge'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('sc-reprint-without-charge')));
+      await tester.pumpAndSettle();
+      // Confirmation only: no kind, no reason, no second name, no figures.
+      expect(find.byKey(const ValueKey('capture-reason')), findsNothing);
+      expect(find.byType(AlertDialog), findsOneWidget);
+      // The server has printed this bill before, so its paper WILL say REPRINT.
+      expect(find.textContaining('It is marked as a reprint.'), findsOneWidget);
+      await tester.tap(find.text('Reprint'));
+      await tester.pumpAndSettle();
+
+      final sent = removals(api);
+      expect(sent, hasLength(1));
+      expect(sent.single.body, {'table_name': 'T1'});
+      expect(api.wrote('POST', '/print/bill'), isFalse);
+      expect(find.text('Reprinting without the service charge — total ₹1260.00.'), findsOneWidget);
+    });
+
+    testWidgets('a waiver nobody has printed yet is PRINTED, and the dialog promises no REPRINT banner',
+        (tester) async {
+      // A 1.9.9 till's "Waive service charge" records without printing, and a
+      // removal whose print failed leaves the same bill: print_count 0. The
+      // server prints it with `reprint: print_count > 0`, so the paper has no
+      // banner — and the dialog used to say "It is marked as a reprint".
+      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 0)));
+      api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
+        'success': true, 'printed': true, 'waiver_created': false, 'service_charge_removed': true,
+        'grand_total_before': null, 'grand_total_after': 1260,
+      };
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-reprint-without-charge')));
+      expect(find.text('Print without the charge'), findsOneWidget);
+      expect(find.text('Reprint without the charge'), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('sc-reprint-without-charge')));
+      await tester.pumpAndSettle();
+      expect(find.text('Print without the service charge?'), findsOneWidget);
+      expect(find.textContaining('reprint'), findsNothing);
+      await tester.tap(find.widgetWithText(FilledButton, 'Print'));
+      await tester.pumpAndSettle();
+      expect((removals(api).single.body as Map), {'table_name': 'T1'});
+    });
+
+    testWidgets('a cashier may reprint a waived bill, and still may not put the charge back',
+        (tester) async {
+      // Reprinting what a waiver already took off needs no waive permission —
+      // the server reprints for anyone who may print — while putting money
+      // back on the bill is still the manager's act.
+      await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true)),
+          actions: const ['x'], role: 'cashier');
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-reprint-without-charge')));
+      expect(_pressOf(tester, const ValueKey('sc-reprint-without-charge')), isNotNull);
+      expect(_pressOf(tester, const ValueKey('sc-waiver-reverse')), isNull);
     });
   });
 
@@ -1297,6 +1549,9 @@ void main() {
         '/bills/counter',
         '/bills/service-charge-waiver',
         '/bills/service-charge-waiver/w1/reverse',
+        // Remove service charge & print: it can mint a bill number and it
+        // prints, so it is refused offline with the billing sentence.
+        '/bills/service-charge-waiver/print',
       ]) {
         final d = OutboxPolicy.decide('POST', path);
         expect(d.queueable, isFalse);
@@ -1374,8 +1629,8 @@ void main() {
         (tester) async {
       await _mount(tester, m.tablesModule, _tableRoutes(), width: 390, height: 900);
       await _openTable(tester);
-      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-apply')));
-      await tester.tap(find.byKey(const ValueKey('sc-waiver-apply')));
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull, reason: 'the reason form overflowed a phone');
       expect(find.byKey(const ValueKey('capture-reason')), findsOneWidget);

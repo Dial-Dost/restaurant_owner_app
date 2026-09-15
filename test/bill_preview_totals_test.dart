@@ -494,52 +494,51 @@ void main() {
     });
   });
 
-  group('the print-only reprint never rehearses a total nobody will pay', () {
-    // `no_service_charge` on POST /print/bill changes the PAPER and nothing
-    // else: no settle path reads it, so the guest is charged the full amount.
-    // Putting the smaller ladder on a paper-coloured sheet — which is what this
-    // button used to do — hands the till a receipt for a total that will not be
-    // taken. So this path shows no figures at all and names the mechanism that
-    // does change what the guest pays.
-    testWidgets('it confirms without money, then prints', (tester) async {
+  group('removing the service charge never rehearses a total nobody will pay', () {
+    // The print-only "Reprint (no service charge)" this group used to pin is
+    // gone (client item 6): the flag it sent could not take the charge off, and
+    // the waiver that could was a second, separate step. One control now does
+    // both through one server call, POST /bills/service-charge-waiver/print,
+    // and what this group still guards is the property it was written for: no
+    // receipt-shaped rehearsal of a smaller ladder on screen, on the tenant
+    // shape where that rehearsal used to be wrong, and no print-time flag.
+    testWidgets('it asks for the reason with no ladder, then makes ONE call and no flagged print',
+        (tester) async {
       final api = await _mount(tester, _taxLineBill(waived: false));
       await _openTable(tester);
-      await _reveal(tester, _button('Reprint (no service charge)'));
-      await tester.tap(_button('Reprint (no service charge)'));
+      expect(_button('Reprint (no service charge)'), findsNothing);
+      await _reveal(tester, _button('Remove service charge & print'));
+      await tester.tap(_button('Remove service charge & print'));
       await tester.pumpAndSettle();
 
       expect(find.text('Bill preview'), findsNothing,
-          reason: 'the receipt preview must not be used for a paper-only reprint');
-      expect(find.byType(AlertDialog), findsOneWidget);
-      final figures = [
-        for (final t in tester.widgetList<Text>(
-            find.descendant(of: find.byType(AlertDialog), matching: find.byType(Text))))
-          t.data ?? '',
-      ];
-      expect(figures.any((f) => f.contains('₹')), isFalse,
-          reason: 'no rupee figure may appear on the reprint confirmation');
-      // 4.1: the dialog states the outcome as a condition — the server removes
-      // the charge only when a waiver is recorded, and says so — rather than the
-      // old sentence this used to pin.
-      expect(find.textContaining('prints WITH the service charge'), findsOneWidget);
-      expect(find.descendant(of: find.byType(AlertDialog), matching: find.textContaining('Waive service charge')), findsOneWidget);
+          reason: 'the receipt preview must not be used to rehearse a removal');
+      // The one figure on the form is the CHARGE being removed — the tax line,
+      // on this shape, since `service_charge` is 0 — never a total.
+      expect(find.text('₹549.90'), findsOneWidget);
+      expect(find.text('₹5773.96'), findsNothing);
 
-      await tester.tap(find.text('Reprint'));
+      await tester.enterText(find.byKey(const ValueKey('capture-reason')), 'Guest asked');
       await tester.pumpAndSettle();
-      final prints = api.to('/print/bill').toList();
-      expect(prints, hasLength(1));
-      expect((prints.single.body as Map)['no_service_charge'], true);
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+
+      final removals = api.to('/bills/service-charge-waiver/print').toList();
+      expect(removals, hasLength(1));
+      expect((removals.single.body as Map)['table_name'], 'T1');
+      expect(api.to('/print/bill'), isEmpty);
+      expect(api.writes.any((w) => '${w.body}'.contains('no_service_charge')), isFalse);
     });
 
-    testWidgets('cancelling prints nothing', (tester) async {
+    testWidgets('cancelling writes nothing', (tester) async {
       final api = await _mount(tester, _taxLineBill(waived: false));
       await _openTable(tester);
-      await _reveal(tester, _button('Reprint (no service charge)'));
-      await tester.tap(_button('Reprint (no service charge)'));
+      await _reveal(tester, _button('Remove service charge & print'));
+      await tester.tap(_button('Remove service charge & print'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Cancel'));
       await tester.pumpAndSettle();
-      expect(api.to('/print/bill'), isEmpty);
+      expect(api.writes, isEmpty);
     });
   });
 }

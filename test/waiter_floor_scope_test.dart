@@ -258,7 +258,7 @@ void main() {
         'Release without payment', // 20
         'Edit seating', // 15
         'Merge', 'Split', 'Discount', 'Coupon', // 18
-        'Reprint (no service charge)', // 18
+        'Remove service charge & print', // 18, and V3's "completely hidden"
         'Refund',
         'Print QR', // 17
       ]) {
@@ -293,10 +293,13 @@ void main() {
       for (final kept in const [
         'Settle bill', 'Release without payment',
         'Merge', 'Split', 'Discount',
-        'Reprint (no service charge)', 'Refund', 'Print bill', 'Print QR',
+        // Client item 6 merged the old print-only "Reprint (no service charge)"
+        // into the waiver control: the owner keeps the act, under one name.
+        'Remove service charge & print', 'Refund', 'Print bill', 'Print QR',
       ]) {
         expect(labels, contains(kept), reason: '$kept went missing from an owner\'s sheet');
       }
+      expect(labels, isNot(contains('Reprint (no service charge)')));
       // The coupon button names the code when there is one, so match its stem.
       expect(labels.any((l) => l.startsWith('Coupon')), isTrue);
       expect(find.text('Waiter: Ravi K'), findsOneWidget);
