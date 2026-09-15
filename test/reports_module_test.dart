@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:excel/excel.dart' as xl;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,8 +13,10 @@ import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
+import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 /// Insights → Reports: the nine MIS / control reports.
@@ -194,6 +197,7 @@ const _voidKot = {
     {'key': 'voided_at', 'label': 'Voided', 'type': 'datetime'},
     {'key': 'order_id', 'label': 'KOT / Order', 'type': 'text'},
     {'key': 'table_name', 'label': 'Table', 'type': 'text'},
+    {'key': 'items_text', 'label': 'Items', 'type': 'text'},
     {'key': 'order_type', 'label': 'Type', 'type': 'text'},
     {'key': 'item_count', 'label': 'Lines', 'type': 'int', 'total': true},
     {'key': 'qty', 'label': 'Qty', 'type': 'int', 'total': true},
@@ -205,7 +209,12 @@ const _voidKot = {
       'order_id': 'order-9', 'kot_no': null, 'table_name': 'T7',
       'placed_at': '2026-08-01T12:00:00.000Z', 'voided_at': '2026-08-01T12:09:00.000Z',
       'voided_by': 'Ravi', 'order_type': 'Dine-in', 'item_count': 2, 'qty': 3,
-      'value': 540.0, 'items': [],
+      'value': 540.0,
+      'items_text': 'Paneer Tikka (Half) x2; Dal x1',
+      'items': [
+        {'name': 'Paneer Tikka', 'variation': 'Half', 'quantity': 2, 'price': 180.0},
+        {'name': 'Dal', 'variation': null, 'quantity': 1, 'price': 180.0},
+      ],
     },
   ],
   'totals': {'voids': 1, 'qty': 3, 'value': 540.0, 'item_count': 2},
@@ -889,6 +898,35 @@ void main() {
     expect(find.text('₹1200.00'), findsWidgets);
   });
 
+  // CLIENT ITEM 1, cross-client parity. The row this sheet opens from says Item
+  // total, Net and Gross; the web's drill-down for the same bill says Item total,
+  // Net and Gross. The sheet used to say "Items subtotal", "Taxable base" and
+  // "Grand total" — three names for the same three figures on the same screen.
+  // History keeps the receipt's words (money_drilldowns_test.dart pins "base").
+  testWidgets('the drill-down bill names its rungs Item total, Net and Gross — the words on the row', (tester) async {
+    await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    await tester.tap(find.text('101'));
+    await tester.pumpAndSettle();
+
+    final sheet = find.byType(BottomSheet);
+    expect(sheet, findsOneWidget);
+    Finder inSheet(String s) => find.descendant(of: sheet, matching: find.text(s));
+    // The figure on the same line as a label, so a word on the wrong number fails.
+    Finder rung(String label, String value) => find.descendant(
+          of: find.ancestor(of: inSheet(label), matching: find.byType(Row)).first,
+          matching: find.text(value),
+        );
+
+    expect(rung('Item total', '₹1300.00'), findsOneWidget);
+    expect(rung('Net', '₹1200.00'), findsOneWidget);
+    expect(rung('Gross', '₹1200.00'), findsOneWidget);
+    for (final receiptWord in const ['Items subtotal', 'Taxable base', 'Grand total']) {
+      expect(inSheet(receiptWord), findsNothing, reason: '"$receiptWord" is the receipt word, not the report word');
+    }
+    expect(inSheet('₹1200.00 net + ₹0.00 service + ₹0.00 tax = ₹1200.00'), findsOneWidget);
+  });
+
   testWidgets('a Void KOT row opens the ticket and its audit trail', (tester) async {
     final api = await _mount(tester);
     await _openTab(tester, 'Void KOT');
@@ -933,10 +971,14 @@ void main() {
     expect(find.text('₹2000.00'), findsWidgets, reason: 'sales summary grand total');
     // And the ladder that produces it, rung by rung.
     expect(find.text('Money ladder'), findsOneWidget);
-    for (final rung in const ['Gross', 'Discount', 'Net', 'Service charge', 'Tax', 'Round off', 'Grand total']) {
+    // The client's words: Item total at the top, Gross (the grand total) at the
+    // bottom. This fixture is an older backend's — `gross`, no `item_total` — so
+    // the top rung is read off the deprecated alias.
+    for (final rung in const ['Item total', 'Discount', 'Net', 'Service charge', 'Tax', 'Round off', 'Gross']) {
       expect(find.text(rung), findsWidgets, reason: '$rung rung missing');
     }
-    expect(find.text('₹1900.00'), findsWidgets, reason: 'gross');
+    expect(find.text('Grand total'), findsNothing);
+    expect(find.text('₹1900.00'), findsWidgets, reason: 'item total');
     expect(find.text('₹1800.00'), findsWidgets, reason: 'net');
 
     await _openTab(tester, 'Order Summary');
@@ -946,6 +988,32 @@ void main() {
     expect(find.text('₹2000.00'), findsWidgets, reason: 'settlement grand total');
     expect(find.text('Cash'), findsWidgets);
     expect(find.text('UPI'), findsWidgets);
+  });
+
+  // The ladder's top rung reads `item_total` when the server sends it — the
+  // deprecated `gross` alias only on an older backend — and its bottom rung is
+  // Gross, off grand_total. The alias is set to a different number here purely
+  // so the test can see which key the screen read.
+  testWidgets('the money ladder: Item total from item_total, Gross from grand_total', (tester) async {
+    final totals = {...(_salesSummary['totals'] as Map), 'item_total': 1900.0, 'gross': 1.0};
+    final api = _FakeApi(extra: {
+      '/reports/mis/sales-summary': {..._salesSummary, 'totals': totals},
+    });
+    await _mount(tester, api: api);
+    await _openTab(tester, 'Sales Summary');
+    final card = find.ancestor(of: find.text('Money ladder'), matching: find.byType(ForkCard)).first;
+    Finder inCard(String s) => find.descendant(of: card, matching: find.text(s));
+    expect(inCard('Item total'), findsOneWidget);
+    expect(inCard('₹1900.00'), findsOneWidget);
+    expect(inCard('₹1.00'), findsNothing, reason: 'the deprecated alias is not the rung when item_total is sent');
+    expect(inCard('Gross'), findsOneWidget);
+    expect(inCard('₹2000.00'), findsOneWidget);
+    expect(inCard('Grand total'), findsNothing);
+    // The tiles above it: GROSS is the grand total, NET the net.
+    expect(find.descendant(of: find.ancestor(of: find.text('GROSS'), matching: find.byType(ForkCard)).first,
+        matching: find.text('₹2000.00')), findsOneWidget);
+    expect(find.descendant(of: find.ancestor(of: find.text('NET'), matching: find.byType(ForkCard)).first,
+        matching: find.text('₹1800.00')), findsOneWidget);
   });
 
   testWidgets('unallocated settlement money is raised, not buried', (tester) async {
@@ -1076,6 +1144,52 @@ void main() {
     expect(utf8.decode(grabbed[ReportFormat.pdf]!.sublist(0, 5)), '%PDF-');
   });
 
+  // "Item names should show up properly in the void KOT reports in the Excel."
+  // The row always carried an `items` LIST, which is not a cell. The server now
+  // sends the names as one text column; nothing on this side names that column,
+  // so these prove it reaches the screen and both files purely because the
+  // server declared it, and that the file reads the restaurant clock.
+  testWidgets('Void KOT: the Items column reaches the screen, the CSV and the Excel as plain text',
+      (tester) async {
+    final grabbed = <ReportFormat, Uint8List>{};
+    ReportExporter.overrideDeliver = (bytes, filename, format) async {
+      grabbed[format] = bytes;
+      return const ReportExportResult('Saved');
+    };
+    await _mount(tester);
+    await _openTab(tester, 'Void KOT');
+    expect(find.text('Paneer Tikka (Half) x2; Dal x1'), findsWidgets);
+
+    for (final label in const ['Export CSV', 'Export Excel']) {
+      await tester.tap(find.byKey(const ValueKey('reports-export')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label));
+      await tester.pumpAndSettle();
+    }
+
+    final csv = utf8.decode(grabbed[ReportFormat.csv]!);
+    expect(csv, contains('KOT / Order,Table,Items,Type'));
+    expect(csv, contains('order-9,T7,Paneer Tikka (Half) x2; Dal x1,Dine-in'));
+    expect(csv, isNot(contains('{name:')), reason: 'the items list reached the file');
+    // 12:00 UTC is 17:30 in Kolkata: the restaurant clock, year first.
+    expect(csv, contains('2026-08-01 17:30,2026-08-01 17:39,order-9'));
+    expect(csv, isNot(contains('2026-08-01T12:00:00.000Z')));
+    expect(csv, isNot(contains('Aug 1, 17:30')), reason: 'a sheet cell with no year');
+
+    final sheet = xl.Excel.decodeBytes(grabbed[ReportFormat.excel]!).tables['Report']!;
+    final header = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'Items'));
+    final itemsAt = header.indexWhere((c) => '${c?.value}' == 'Items');
+    final placedAt = header.indexWhere((c) => '${c?.value}' == 'Placed');
+    final row = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'order-9'));
+    expect('${row[itemsAt]?.value}', 'Paneer Tikka (Half) x2; Dal x1');
+    expect('${row[placedAt]?.value}', '2026-08-01 17:30');
+    // AND IT OPENS READABLE. Excel spills text only into an EMPTY neighbour, and
+    // Type is never empty, so a column at Excel's default of about eight
+    // characters showed "Paneer T". The width is read back out of the file.
+    expect(sheet.getColumnWidth(itemsAt), greaterThanOrEqualTo('Paneer Tikka (Half) x2; Dal x1'.length));
+    expect(sheet.getColumnWidth(placedAt), greaterThanOrEqualTo('2026-08-01 17:30'.length));
+  });
+
   // --------------------------------------------------------------- phone ---
 
   testWidgets('on a phone the table becomes a card per row, every value beside its own label',
@@ -1193,6 +1307,86 @@ void main() {
       expect(misText(money, null, forSheet: true), '');
       expect(misText(pct, null), '—');
       expect(misText(text, null), '—');
+    });
+
+    test('an instant is the restaurant clock everywhere, and year first in a sheet', () {
+      // Generic by column TYPE: any report's datetime column, no key named.
+      const at = MisColumn(key: 'whenever', label: 'When', type: 'datetime');
+      const iso = '2026-09-14T13:06:36.104Z';
+      final screen = misText(at, iso);
+      expect(screen, RestaurantTime.short(iso));
+      expect(misText(at, iso, forPdf: true), screen);
+      // The sheet is not the screen's "Sep 14, 18:36": no year, and as text it
+      // sorts Sep 14 before Sep 2.
+      expect(misText(at, iso, forSheet: true), '2026-09-14 18:36', reason: 'the sheet carried the raw UTC instant or a yearless stamp');
+      expect(misText(at, null, forSheet: true), '', reason: 'a blank stays a blank');
+      // Not an instant: kept as sent, never blanked.
+      expect(misText(at, 'not-a-date', forSheet: true), 'not-a-date');
+    });
+
+    test('a sheet stamp sorts in date order as plain text, across a month and a year', () {
+      const at = MisColumn(key: 'whenever', label: 'When', type: 'datetime');
+      const instants = ['2026-09-02T04:30:00.000Z', '2026-09-14T04:30:00.000Z', '2025-09-14T04:30:00.000Z', '2026-10-01T04:30:00.000Z'];
+      final byText = [for (final i in instants) misText(at, i, forSheet: true)]..sort();
+      final byInstant = ([...instants]..sort()).map((i) => misText(at, i, forSheet: true)).toList();
+      expect(byText, byInstant);
+    });
+
+    test('the owner app and the web write the same sheet string for the same instant and zone', () {
+      // THE SAME TABLE is pinned in the web dashboard's
+      // src/lib/__tests__/mis-reports.test.ts (formatSheetDateTime). Change one
+      // and the other fails.
+      const parity = [
+        ['2026-09-14T13:06:36.104Z', 'Asia/Kolkata', '2026-09-14 18:36'],
+        ['2026-09-14T18:30:00.000Z', 'Asia/Kolkata', '2026-09-15 00:00'],
+        ['2026-01-15T17:00:00.000Z', 'America/New_York', '2026-01-15 12:00'],
+        ['2026-07-15T17:00:00.000Z', 'America/New_York', '2026-07-15 13:00'],
+      ];
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => RestaurantTime.adopt(RestaurantTime.defaultZone));
+      for (final row in parity) {
+        RestaurantTime.adopt(row[1]);
+        expect(RestaurantTime.sheet(row[0]), row[2], reason: '${row[0]} in ${row[1]}');
+      }
+    });
+
+    test('every sheet column is as wide as its widest cell, which Excel does not do for itself', () {
+      // A real ticket from the client's own day of voids (14 Sep), 115 characters.
+      const long = 'BOTTLE WATER x1; CRISP WRAPPED COTTAGE CHEESE x1; BAINGAN BHARTHA KULCHA x1; ENOKII TEMPURA x1; HOUSE FRIED RICE x1';
+      const items = MisColumn(key: 'items_text', label: 'Items', type: 'text');
+      const kind = MisColumn(key: 'order_type', label: 'Type', type: 'text');
+      final doc = MisReportDoc(
+        title: 'Void KOT',
+        columns: const [count, items, kind, money],
+        rows: const [
+          {'bills': 1, 'items_text': 'CANNED JUICE x1', 'order_type': 'dine_in', 'net': 225.0},
+          {'bills': 1, 'items_text': long, 'order_type': 'dine_in', 'net': 1234567.5},
+        ],
+        totals: const {'bills': 2, 'net': 1234792.5},
+        from: '2026-09-14',
+        to: '2026-09-14',
+        timezone: 'Asia/Kolkata',
+        outletLabel: 'Gaia',
+        // A long note in the preamble must not widen the table's first column.
+        notes: ['n' * 300],
+      );
+      expect(misSheetColumnWidths(doc), [
+        'TOTAL (whole period)'.length + 2,
+        long.length + 2,
+        misSheetMinWidth,
+        '1234792.50'.length + 2,
+      ]);
+      final sheet = xl.Excel.decodeBytes(misXlsx(doc)).tables['Report']!;
+      final header = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'Items'));
+      final itemsAt = header.indexWhere((c) => '${c?.value}' == 'Items');
+      expect(sheet.getColumnWidth(itemsAt), greaterThanOrEqualTo(long.length));
+      // Nothing past Excel's own limit, however long a cell is.
+      final huge = MisReportDoc(
+        title: 'X', columns: const [items], rows: [{'items_text': 'y' * 400}], totals: null,
+        from: '2026-09-14', to: '2026-09-14', timezone: 'Asia/Kolkata', outletLabel: 'Gaia', notes: const [],
+      );
+      expect(misSheetColumnWidths(huge), [misSheetMaxWidth]);
+      expect(misSheetMaxWidth, lessThan(255));
     });
 
     test('the CSV opens with its own provenance and closes with the window totals', () {

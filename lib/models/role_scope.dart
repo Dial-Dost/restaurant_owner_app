@@ -449,8 +449,8 @@ class FloorScope {
   /// that lets you drag a table into a section you cannot name.
   final bool arrangeFloor;
 
-  /// Merge, split, discount, coupon, reprint-without-service-charge and refund:
-  /// every control that changes or re-presents what the guest owes.
+  /// Merge, split, discount, coupon and refund: every control that changes or
+  /// re-presents what the guest owes.
   final bool billOps;
 
   /// The table's ordering QR block — the code, the URL and "Print QR". It is a
@@ -483,7 +483,7 @@ class FloorScope {
   /// of the screen: how full is the floor right now.
   final bool floorSummary;
 
-  /// "Comp an item" and "Waive service charge" — the two controls a waiter may
+  /// "Comp an item" and "Remove service charge & print" — the two controls a waiter may
   /// not operate but which, until now, they could SEE.
   ///
   /// THIS FLAG REVERSES A DELIBERATE DECISION AND THE REVERSAL IS THE CLIENT'S,

@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/gross_net.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -29,6 +30,7 @@ import '../services/printer_service.dart';
 import '../services/date_range.dart';
 import '../services/report_export.dart';
 import '../services/restaurant_time.dart';
+import '../services/time_slot.dart';
 import '../services/tz_offsets.dart';
 import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
@@ -45,6 +47,7 @@ import '../ui/widgets/section_header.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/stat_card.dart';
 import '../ui/widgets/status_chip.dart';
+import '../ui/widgets/time_slot_picker.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
 import '../models/payment_modes.dart';
@@ -1478,7 +1481,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       // figure overflowed a 360px phone by 99px once the day ran to eight
       // digits. A wrapping line cannot, and it is the web block's layout too.
       Text(
-        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} net' : ''}',
+        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: text.bodySmall!.copyWith(fontSize: 11),
@@ -1581,7 +1584,7 @@ Future<void> _headlineMethodSheet(
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
       _detailRow(context, 'Refunds', refund > 0 ? '− ${_money(refund)}' : _money(0)),
-      _detailRow(context, 'Net of refunds', _money(mode['net_amount'])),
+      _detailRow(context, kAfterRefunds, _money(mode['net_amount'])),
       if (method == 'Unallocated') ...[
         const SizedBox(height: AppSpacing.sm),
         Text(
@@ -8365,47 +8368,6 @@ bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
 /// claim about the floor.
 bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
 
-/// WHAT TO TELL SOMEBODY AFTER A THERMAL PRINT, given what the server did.
-///
-/// Pulled out of the widget so it can be tested, because the bug it fixes was
-/// not visible in any figure — the numbers were right everywhere and the
-/// SENTENCE was wrong, which is the kind of defect a screenshot does not catch
-/// and a person holding a receipt does.
-///
-/// `no_service_charge` no longer moves the printed total by itself: the server
-/// takes the charge off only where a waiver has been recorded against the bill,
-/// because a printed total lower than the settled one is a receipt the guest
-/// can hold up against a till that disagrees with it. The caller used to
-/// announce "Reprinting without service charge…" whatever came back, so the
-/// screen promised one total and the paper carried another.
-({String message, Duration shown}) thermalPrintOutcome({
-  required bool askedWithoutServiceCharge,
-  required bool removed,
-  required bool waiverRequired,
-}) {
-  if (!askedWithoutServiceCharge) {
-    return (message: 'Printing bill…', shown: const Duration(seconds: 3));
-  }
-  if (removed) {
-    return (message: 'Reprinting without the service charge…', shown: const Duration(seconds: 3));
-  }
-  if (waiverRequired) {
-    // Longer on screen than the others on purpose: this one asks the reader to
-    // go and do something, and it is competing with a printer that has already
-    // started. The mechanism is named because "it didn't work" leaves a waiter
-    // pressing the same button again.
-    return (
-      message: 'Printed WITH the service charge. Removing it needs a recorded '
-          'waiver — use “Waive service charge” on this sheet.',
-      shown: const Duration(seconds: 8),
-    );
-  }
-  // Neither removed nor a waiver asked for: there was no charge to take off.
-  // Say the ordinary thing rather than implying one came off a bill that never
-  // carried it.
-  return (message: 'Printing bill…', shown: const Duration(seconds: 3));
-}
-
 /// How strongly a table tile is washed with its state colour.
 ///
 /// One place to tune the floor's readability, because these three numbers are
@@ -9211,48 +9173,25 @@ class _TableSheetState extends State<_TableSheet> {
 
   bool get _isAdmin => widget.profile.role == 'admin' || widget.profile.roleAll.contains('admin');
 
-  // Server-side thermal reprint (optionally without service charge).
+  // Server-side thermal print of this table's bill.
   //
   // RETURNS WHETHER THE SERVER TOOK IT, because requirement C3 hangs a one-shot
   // rule off this call: a print that was refused (no printer, a 400, the line
   // down) is a print the waiter still has to make, and burning their single
   // attempt on it would leave them holding a table they cannot bill.
-  Future<bool> _thermalPrint(ScaffoldMessengerState messenger, {bool noServiceCharge = false}) async {
+  //
+  // NO "WITHOUT THE SERVICE CHARGE" HERE ANY MORE. That used to be a flag on
+  // this call, and the server stopped letting a flag lower a total: only a
+  // recorded waiver takes the charge off, so the flag could only ever print
+  // WITH it and say so. Taking the charge off and printing is now one control
+  // with one server call — "Remove service charge & print" in
+  // [misServiceChargeBlock] — and a bill that already carries a waiver prints
+  // without the charge from here too, because the server applies the waiver to
+  // every print.
+  Future<bool> _thermalPrint(ScaffoldMessengerState messenger) async {
     try {
-      final res = await widget.rest.post(
-          '/print/bill', {'table_name': _name, if (noServiceCharge) 'no_service_charge': true});
-
-      // WHETHER THE CHARGE CAME OFF IS THE SERVER'S ANSWER, NOT THIS BUTTON'S.
-      //
-      // THE BUG THIS CLOSES, reported from a live floor: "bills printed without
-      // a service charge show the same total as bills with one — correct in the
-      // preview, wrong on the paper."
-      //
-      // `no_service_charge` used to move the printed total on its own. It no
-      // longer does: the server takes the charge off only where a WAIVER has
-      // been recorded against the bill, because a printed total that is lower
-      // than the settled one is a receipt the guest can hold up against a till
-      // that disagrees with it. When there is no waiver it prints the full
-      // amount and says so in the response —
-      //
-      //     service_charge_removed: false
-      //     service_charge_waiver_required: true
-      //
-      // — and this method DISCARDED that answer and announced "Reprinting
-      // without service charge…" regardless. So the screen promised one total
-      // and the paper carried another, which is the worst shape this class of
-      // bug can take: the person reading the snackbar is the person handing
-      // over the receipt, and they have already stopped looking.
-      //
-      // Now the message is whatever actually happened, and when the charge
-      // stayed on it names the mechanism that takes it off rather than leaving
-      // the waiter to discover the button did nothing.
-      final outcome = thermalPrintOutcome(
-        askedWithoutServiceCharge: noServiceCharge,
-        removed: res is Map && res['service_charge_removed'] == true,
-        waiverRequired: res is Map && res['service_charge_waiver_required'] == true,
-      );
-      messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
+      await widget.rest.post('/print/bill', {'table_name': _name});
+      messenger.showSnackBar(const SnackBar(content: Text('Printing bill…'), duration: Duration(seconds: 3)));
       return true;
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -9424,72 +9363,6 @@ class _TableSheetState extends State<_TableSheet> {
     if (confirmed == true) {
       await _thermalPrint(messenger);
     }
-  }
-
-  /// Reprint the bill WITHOUT the service charge — the older, print-only route.
-  ///
-  /// DELIBERATELY NOT THE RECEIPT PREVIEW, and the reason is a money bug.
-  /// `no_service_charge` is a flag on POST /print/bill: it changes the PAPER and
-  /// nothing else. No settle path reads it, so the guest is still charged the
-  /// full amount. Showing a receipt-shaped sheet full of the smaller ladder —
-  /// which is what this button used to do, and which [_BillPreviewDialog] used
-  /// to derive in Dart, wrongly, on exactly the tenants that ship by default —
-  /// hands the till a rehearsal of a total nobody is going to pay, styled as
-  /// paper and routinely turned toward the guest.
-  ///
-  /// So this path shows NO FIGURES AT ALL. It confirms the action, names the
-  /// consequence, and points at the mechanism that actually takes the charge
-  /// off: the recorded waiver (migration 036), which sits on this same sheet,
-  /// records who allowed it, and reduces the printed bill AND the settled one
-  /// because openBillChargeConfig is read by both.
-  ///
-  /// The POST is unchanged — whether that flag survives at all is the server's
-  /// call, not this screen's.
-  Future<void> _reprintWithoutServiceCharge(ScaffoldMessengerState messenger) async {
-    Map? bill;
-    try {
-      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
-      if (r is Map) bill = r;
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-      return;
-    }
-    final lines = (bill?['items'] as List?) ?? const [];
-    if (lines.isEmpty) {
-      messenger.showSnackBar(const SnackBar(content: Text('No open bill to print for this table.')));
-      return;
-    }
-    if (!mounted) return;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: const Text('Reprint without the service charge?'),
-        // WHAT THIS PROMISED WAS NO LONGER TRUE. It said "this changes the
-        // printed bill only", which described the flag before the server
-        // stopped honouring it on an un-waived bill. On a table with no
-        // recorded waiver the charge now stays on the paper too, so the dialog
-        // was promising a reprint the server would decline — and the snackbar
-        // afterwards said it had worked.
-        //
-        // Stated as a condition rather than a promise, because which of the two
-        // happens depends on something the person tapping this can check and
-        // change: whether a waiver has been recorded.
-        content: const Text(
-          'If a waiver has been recorded against this bill, the charge comes off '
-          'the reprint. If it has not, the bill prints WITH the service charge '
-          'and nothing changes.\n\n'
-          'To actually take the charge off, use “Waive service charge” on this '
-          'sheet: it is recorded against the bill, names who allowed it, and the '
-          'total drops on the paper, on screen and in the till.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Reprint')),
-        ],
-      ),
-    );
-    if (ok == true) await _thermalPrint(messenger, noServiceCharge: true);
   }
 
   /// Print the table's bill WITHOUT putting it on screen first.
@@ -10558,10 +10431,12 @@ class _TableSheetState extends State<_TableSheet> {
               ),
               const SizedBox(height: 14),
               Wrap(spacing: 8, runSpacing: 8, children: [
-                // ITEM 18: merge, split, discount, coupon and the
-                // reprint-without-service-charge, plus the admin refund that
-                // already sat beside them. Every one of them changes or
-                // re-presents what the guest owes.
+                // ITEM 18: merge, split, discount and coupon, plus the admin
+                // refund that already sat beside them. Every one of them changes
+                // or re-presents what the guest owes. The reprint without the
+                // service charge that used to sit here is part of the waiver
+                // block above now (client item 6): on its own it could not take
+                // the charge off, and it was one of two steps that are one act.
                 //
                 // "Print bill" used to lead this list. 6.7 moved it, with the
                 // same gate and the same preview-first handler, to the top of the
@@ -10600,12 +10475,6 @@ class _TableSheetState extends State<_TableSheet> {
                 // 6.5's "Edit guest name" used to lead this wrap. Round 2 item 1
                 // moved it, with the same gate, to the top of the sheet — see
                 // [_billCustomerHeader].
-                ForkButton.ghost(
-                  label: 'Reprint (no service charge)',
-                  icon: Icons.money_off,
-                  dense: true,
-                  onPressed: () => _reprintWithoutServiceCharge(messenger),
-                ),
                 ForkButton.ghost(
                   label: _bn('discount') > 0 ? 'Edit discount' : 'Discount',
                   icon: Icons.percent,
@@ -21517,7 +21386,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           kv('Gross sales', _pnl['gross_sales']),
           kv('Refunds', _pnl['refunds']),
           kv('Tax collected (pass-through)', _pnl['tax_collected']),
-          kv('Net revenue (ex-tax)', _pnl['net_revenue']),
+          kv('Revenue ex-tax (after refunds)', _pnl['net_revenue']),
           kv('Total expenses', _pnl['total_expenses']),
           kv('Net profit', _pnl['net_profit'], bold: true),
           pw.SizedBox(height: 16),
@@ -21531,9 +21400,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           pw.SizedBox(height: 16),
           pw.Text('Sales', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
           pw.Divider(),
-          kv('Total sales', _sales['total_sales']),
-          kv('Bills', _sales['bill_count'] ?? 0),
-          kv('Net sales (after refunds)', _sales['net_sales'], bold: true),
+          // Gross and Net in the client's words. The old "Net sales (after
+          // refunds)" line was Gross less refunds, tax and all — it is still
+          // here, named for what it is. Which key each line reads is decided
+          // (and tested) in models/gross_net.dart, not here.
+          for (final line in accountingSalesPdfLines(_sales)) kv(line.label, line.value, bold: line.bold),
         ]));
     await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
   }
@@ -21571,21 +21442,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     final refunds = _n(_sales['total_refund']);
     final bills = _n(_sales['bill_count']).round();
     final methods = ((_sales['by_method'] as List?) ?? const []).whereType<Map>().toList();
+    final words = readAccountingSales(_sales);
     return _detailSheet(
       context,
-      eyebrow: 'Net sales · $_windowLabel',
-      title: _money(_sales['net_sales']),
+      eyebrow: '${words.headlineLabel} · $_windowLabel',
+      title: _money(words.headlineValue),
       children: [
         _detailRow(context, 'Gross sales', _money(gross), trailing: _billsWord(bills)),
         _detailRow(context, 'Refunds', refunds > 0 ? '− ${_money(refunds)}' : _money(0)),
-        _detailRow(context, 'Net sales', _money(_sales['net_sales'])),
+        _detailRow(context, 'Gross after refunds', _money(_sales['net_sales'])),
         _detailRow(context, 'Average bill', bills > 0 ? _money(gross / bills) : '—'),
         _sheetHead('What sits inside gross sales'),
         _detailRow(context, 'Tax collected', _money(_sales['total_tax'])),
         _detailRow(context, 'Service charge', _money(_sales['total_service_charge'])),
+        if (billRoundOff(words.roundOff) != null)
+          _detailRow(context, 'Round off', billRoundOffMoney(billRoundOff(words.roundOff)!)),
+        if (words.netSales != null) _detailRow(context, 'Net sales', _money(words.netSales)),
         _sheetNote('Gross sales is what guests actually paid, so it still carries both. The tax is '
             'pass-through — it is owed onward to the government. The service charge is NOT tax: the '
             'restaurant keeps it, and the reports count it as income.'),
+        _sheetNote('Net sales is the item total less discounts — before service charge, tax and '
+            'round off, and before refunds — the figure the Sales Summary calls Net.'),
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
@@ -21674,13 +21551,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         _detailRow(context, 'Gross sales', _money(_pnl['gross_sales'])),
         _detailRow(context, 'Refunds', '− ${_money(_pnl['refunds'])}'),
         _detailRow(context, 'Tax kept out', '− ${_money(_pnl['tax_collected'])}'),
-        _detailRow(context, 'Net revenue (ex-tax)', _money(_pnl['net_revenue'])),
+        _detailRow(context, 'Revenue ex-tax (after refunds)', _money(_pnl['net_revenue'])),
         _detailRow(context, 'Expenses', '− ${_money(_pnl['total_expenses'])}'),
         _detailRow(context, 'Net profit', _money(net)),
         _sheetHead('Read this carefully'),
         _detailRow(context, 'Service charge earned', _money(_pnl['service_charge'])),
         _sheetNote('Tax is subtracted because it is pass-through — collected for the government, '
-            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside net '
+            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside '
             'revenue above, and the line here is only telling you how much of that revenue it was.'),
       ],
     );
@@ -21748,7 +21625,9 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (estimated > 0)
           _sheetNote('${estimated.round()} bill(s) stored the discount as a bare percentage, so the '
               'money value is reconstructed and the totals above are approximate.'),
-        _sheetNote('Bill totals are already stored NET of discount, so every sales, tax and profit '
+        // "after", not "net of": Net is the defined word for the item total less
+        // discounts (models/gross_net.dart), and these bill totals are Gross.
+        _sheetNote('Bill totals are already stored after discount, so every sales, tax and profit '
             'figure on this page reflects these. Never subtract this again.'),
         for (final n in notes) _sheetNote(n),
       ],
@@ -21982,9 +21861,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         // the tax sheet is careful to name the service charge separately — it is
         // income, not a levy, and the two must never read as one bucket.
         _dashGrid([
+          // NET, in the client's word: after discount, before service charge,
+          // tax and round off. This card used to show net_sales — Gross less
+          // refunds, tax and all — under this caption; that figure is on the
+          // sheet behind it, named for what it is.
           StatCard(
-            value: money(_n(_sales['net_sales'])),
-            caption: 'NET SALES',
+            value: money(readAccountingSales(_sales).headlineValue ?? 0),
+            caption: readAccountingSales(_sales).headlineLabel.toUpperCase(),
             footer: detailsFooter(),
             onTap: _netSalesSheet,
           ),
@@ -22072,7 +21955,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           ForkCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               SectionHeader(title: 'Discounts & offers', padding: const EdgeInsets.only(bottom: 6)),
-              Text('Bill totals are stored net of discount — sales above already reflect these.',
+              Text('Bill totals are stored after discount — sales above already reflect these.',
                   style: text.bodySmall),
               const SizedBox(height: AppSpacing.sm),
               moneyRow(
@@ -23375,7 +23258,13 @@ class _ClosedBillSheet extends StatelessWidget {
   }
 }
 
-Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
+/// [reportWords] is for the Reports drill-down (`_misOpenBill`): the row it opens
+/// from calls these figures Item total, Net and Gross (client item 1), so the
+/// ladder here says the same — as the web's MIS drill-down does. History and the
+/// settled-bill browser keep the receipt's words ("Items subtotal", "Taxable
+/// base", "Grand total"), because there the thing being read IS the receipt.
+/// Only the words change; every figure is the same key either way.
+Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bool reportWords = false}) {
   final text = Theme.of(context).textTheme;
   final items = ((bill['items'] as List?) ?? const []).map((e) => e as Map).toList();
   // `taxes[]` carries the per-rate lines ONLY — the service charge has its own
@@ -23504,7 +23393,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         ],
       ]),
     card('Money', [
-      if (subtotal > 0) money('Items subtotal', _money(subtotal)),
+      if (subtotal > 0) money(reportWords ? kItemTotal : 'Items subtotal', _money(subtotal)),
       if (discount > 0)
         money('Discount', '− ${_money(discount)}',
             sub: coupon.isEmpty
@@ -23512,10 +23401,12 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
                 : 'Coupon $coupon · ${_s(bill, 'discount_type', 'coupon')}',
             tint: AppColors.success),
       rule(),
-      money('Taxable base', _money(taxable)),
+      money(reportWords ? kNet : 'Taxable base', _money(taxable)),
       if (service != 0)
         money('Service charge', _money(service),
-            sub: servicePct > 0 ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of the taxable base' : null),
+            sub: servicePct > 0
+                ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of ${reportWords ? 'net' : 'the taxable base'}'
+                : null),
       // Taxes are listed rate by rate. The service charge above is deliberately
       // NOT one of them.
       for (final t in taxes)
@@ -23523,7 +23414,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
       if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
-      money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      money(reportWords ? kGross : 'Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
       const SizedBox(height: 6),
       Row(children: [
         Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
@@ -23531,7 +23422,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax'
+            '${_money(taxable)} ${reportWords ? 'net' : 'base'} + ${_money(service)} service + ${_money(taxTotal)} tax'
             '${roundOff == null ? '' : ' ${roundOff < 0 ? '−' : '+'} ${_money(roundOff.abs())} round off'} = ${_money(grand)}',
             style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
           ),

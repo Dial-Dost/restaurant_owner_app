@@ -6,7 +6,10 @@
 // 034-039 finally gave data to: NC Summary, Service Charge Deny, Group Summary,
 // Variation Summary, Tip Summary and Counter Summary. Backed by /reports/mis/*,
 // all GETs, all read-only — nothing on this screen writes, so nothing on it can
-// reach the offline outbox.
+// reach the offline outbox. The one exception is the "Manage sessions" sheet,
+// which replaces the restaurant's saved time slots (PUT /reports/mis/time-slots):
+// a settings write, offered only to a caller the server marks `can_edit`, and
+// not on the outbox allowlist, so it is online-only by construction.
 //
 // WHY THIS IS A `part` OF modules.dart AND NOT ITS OWN LIBRARY. The drill-down
 // from a Discount or an Order Summary row has to open THE SAME BILL BODY the
@@ -145,6 +148,7 @@ void misResetReportMemory() {
   _misOpenTab = 0;
   _misHiddenColumns.clear();
   _misBucket = 'day';
+  TimeSlotMemory.reset();
 }
 
 // ------------------------------------------------------------- the module ----
@@ -162,6 +166,78 @@ class _ReportsView extends StatefulWidget {
 class _ReportsViewState extends State<_ReportsView> {
   DateRange _range = DateRangeMemory.of('reports');
   late int _tab = _misOpenTab.clamp(0, _misReports.length - 1);
+
+  // WHICH PART OF THE DAY. Remembered like the range. It is only SENT once the
+  // presets route has answered (or answered earlier this session): a remembered
+  // "Lunch" against a server that cannot slice would be a filter the chip claims
+  // and the numbers ignore, so until then there is no chip and the day is whole.
+  TimeSlotSelection _slot = TimeSlotMemory.of('reports');
+  late TimeSlotCatalogue? _slots = TimeSlotMemory.catalogueFor(widget.rest.outboxRes ?? '');
+
+  TimeSlotSelection get _effectiveSlot => _slots == null ? TimeSlotSelection.allDay : _slot;
+
+  /// The bucket actually sent: the two newer segments exist only where the
+  /// presets route does, and one the server cannot answer goes as day-wise.
+  String get _effectiveBucket =>
+      timeWiseOptions(_slots != null).any((b) => b.$1 == _misBucket) ? _misBucket : 'day';
+
+  @override
+  void initState() {
+    super.initState();
+    // Off the read cache after the first visit, like every other GET here.
+    widget.rest.getMap('/reports/mis/time-slots').then((m) {
+      final cat = TimeSlotCatalogue.fromJson(m);
+      if (!mounted || cat == null) return;
+      TimeSlotMemory.rememberCatalogue(widget.rest.outboxRes ?? '', cat);
+      setState(() {
+        _slots = cat;
+        _setSlotInState(_slot.reconcile(cat.slots));
+      });
+    }).catchError((_) {});
+  }
+
+  void _setSlotInState(TimeSlotSelection next) {
+    _slot = next;
+    TimeSlotMemory.remember('reports', next);
+  }
+
+  void _setSlot(TimeSlotSelection next) => setState(() => _setSlotInState(next));
+
+  /// A tapped hour-of-day or session row: that slot, read day by day — the
+  /// question an owner asks the instant 1pm or Dinner looks wrong. It REPLACES
+  /// the slot, which is only the same as narrowing because the pane offers the
+  /// tap solely where the two agree ([slotRowOpensExactly]).
+  void _narrowToSlot(TimeSlotSelection next) => setState(() {
+        _setSlotInState(next);
+        _misBucket = 'day';
+      });
+
+  Future<TimeSlotSaveOutcome> _saveSlots(List<TimeSlotDraft> drafts) async {
+    try {
+      final res = await widget.rest.put('/reports/mis/time-slots', slotDraftsBody(drafts));
+      final cat = TimeSlotCatalogue.fromJson(res);
+      if (cat == null) {
+        return (saved: null, error: 'The server saved the sessions but sent back a list this screen cannot read — reload to see them.');
+      }
+      if (!mounted) return (saved: cat, error: null);
+      TimeSlotMemory.rememberCatalogue(widget.rest.outboxRes ?? '', cat);
+      setState(() {
+        _slots = cat;
+        _setSlotInState(_slot.reconcile(cat.slots));
+      });
+      return (saved: cat, error: null);
+    } on ApiException catch (e) {
+      // The server's own sentence ("Lunch and Brunch overlap…") is the point.
+      return (saved: null, error: e.message);
+    } catch (e) {
+      return (
+        saved: null,
+        error: isUnreachableError(e)
+            ? "Couldn't save — this device can't reach the restaurant server. Reconnect and try again."
+            : 'Could not save the sessions: $e',
+      );
+    }
+  }
 
   final TextEditingController _searchCtl = TextEditingController(text: '');
   Timer? _searchDebounce;
@@ -237,17 +313,30 @@ class _ReportsViewState extends State<_ReportsView> {
     final nav = ModuleNavigator.of(context);
     final outletId = widget.rest.auth.selectedOutletId ?? '';
 
+    // The slot as a QUESTION, not as a URL: `slot=lunch` is the same request
+    // before and after Manage sessions moves Lunch's hours, and "By session" is
+    // built from every preset even with All day picked. Keyed on the bare
+    // selection, a save left the pane mounted on the old answer — see
+    // [slotDefinitionKey]. The bucket is the one sent, and only one report takes it.
+    final slotQuestion = slotDefinitionKey(
+      _effectiveSlot,
+      _slots?.slots ?? const [],
+      bucket: report.key == 'sales_summary' ? _effectiveBucket : null,
+    );
     final pane = _MisReportPane(
       // Remount on every dimension of the question: a pane holding rows for one
       // window must never be reused under the label of another.
-      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_misBucket-$outletId'),
+      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_effectiveBucket-$slotQuestion-$outletId'),
       rest: widget.rest,
       profile: widget.profile,
       report: report,
       range: _range,
       search: _search,
-      bucket: _misBucket,
+      bucket: _effectiveBucket,
+      slot: _effectiveSlot,
+      presets: _slots?.slots ?? const [],
       onRange: _setRange,
+      onSlot: _narrowToSlot,
     );
 
     return Padding(
@@ -275,12 +364,22 @@ class _ReportsViewState extends State<_ReportsView> {
   }
 
   Widget _toolbar(BuildContext context, _MisReport report, bool narrow, ModuleNavigator? nav) {
+    final slotPhrase = _effectiveSlot.phrase(_slots?.slots ?? const []);
     return Wrap(
       spacing: AppSpacing.sm,
       runSpacing: AppSpacing.sm,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         DateRangeChip(value: _range, onChanged: _setRange, dense: true),
+        if (_slots != null)
+          TimeSlotChip(
+            key: const ValueKey('reports-slot'),
+            value: _slot,
+            presets: _slots!.slots,
+            canEdit: _slots!.canEdit,
+            onChanged: _setSlot,
+            onSave: _saveSlots,
+          ),
         _outletControl(context, nav),
         // WHICH CLOCK this tab is cut on. Fifteen reports over one date range do
         // NOT all answer the same question about the same days: a comp is dated
@@ -290,11 +389,13 @@ class _ReportsViewState extends State<_ReportsView> {
         InfoChip(
           key: const ValueKey('reports-basis'),
           icon: Icons.schedule,
-          label: report.basis == _misBasisSettled
-              ? 'Dated on settlement'
-              : report.basis == _misBasisOrdered
-                  ? 'Dated on order placement'
-                  : 'Dated on ${report.basis}',
+          label: (report.basis == _misBasisSettled
+                  ? 'Dated on settlement'
+                  : report.basis == _misBasisOrdered
+                      ? 'Dated on order placement'
+                      : 'Dated on ${report.basis}') +
+              // …and within which hours of each day, when a slot is on.
+              (slotPhrase == null ? '' : ' · $slotPhrase'),
         ),
         if (report.searchable)
         SizedBox(
@@ -341,9 +442,9 @@ class _ReportsViewState extends State<_ReportsView> {
         if (report.key == 'sales_summary')
           _MisSegment(
             key: const ValueKey('reports-bucket'),
-            options: const ['day', 'hour'],
-            labels: const ['Day-wise', 'Hour-wise'],
-            selected: _misBucket,
+            options: [for (final b in timeWiseOptions(_slots != null)) b.$1],
+            labels: [for (final b in timeWiseOptions(_slots != null)) b.$2],
+            selected: _effectiveBucket,
             onSelected: (v) => setState(() => _misBucket = v),
           ),
       ],
@@ -464,7 +565,8 @@ class _MisSegment extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppRadius.chip),
         border: Border.all(color: AppColors.border),
       ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
+      // A Wrap, not a Row: four options are wider than a 360dp phone.
+      child: Wrap(children: [
         for (var i = 0; i < options.length; i++)
           GestureDetector(
             onTap: () => onSelected(options[i]),
@@ -499,7 +601,7 @@ class _MisSegment extends StatelessWidget {
 /// so two rows of one report legitimately differ. Anything that describes
 /// drill-down to the reader is computed from this, so the description and the
 /// behaviour cannot disagree.
-enum _MisRowOpen { none, bill, kot, day, outlet }
+enum _MisRowOpen { none, bill, kot, day, hour, session, outlet }
 
 class _MisReportPane extends StatefulWidget {
   const _MisReportPane({
@@ -510,7 +612,10 @@ class _MisReportPane extends StatefulWidget {
     required this.range,
     required this.search,
     required this.bucket,
+    required this.slot,
+    required this.presets,
     required this.onRange,
+    required this.onSlot,
   });
 
   final RestClient rest;
@@ -519,7 +624,12 @@ class _MisReportPane extends StatefulWidget {
   final DateRange range;
   final String search;
   final String bucket;
+
+  /// The slot SENT (all day until the presets route has answered).
+  final TimeSlotSelection slot;
+  final List<TimeSlotPreset> presets;
   final ValueChanged<DateRange> onRange;
+  final ValueChanged<TimeSlotSelection> onSlot;
 
   @override
   State<_MisReportPane> createState() => _MisReportPaneState();
@@ -566,6 +676,12 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
     ));
   }
 
+  /// The slot this pane asked for, in words (null for all day).
+  String? get _slotPhrase => widget.slot.phrase(widget.presets);
+
+  /// The slot the server actually cut these rows under (null = all day).
+  AppliedTimeSlot? get _appliedSlot => AppliedTimeSlot.fromMeta(_meta);
+
   // ---- wire ----------------------------------------------------------------
 
   String _url({required int limit, required int offset}) {
@@ -577,6 +693,9 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       parts.add('search=${Uri.encodeQueryComponent(widget.search)}');
     }
     if (widget.report.key == 'sales_summary') parts.add('bucket=${widget.bucket}');
+    // Every report takes the slot; all day adds nothing, so the URL (and its
+    // read-cache entry) is exactly what it was before slots existed.
+    parts.addAll(widget.slot.queryParts);
     if (widget.report.paged) {
       parts..add('limit=$limit')..add('offset=$offset');
     }
@@ -798,6 +917,7 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
         outletLabel: _outletLabel,
         notes: _notes,
         truncatedAt: swept.truncated,
+        timeSlot: AppliedTimeSlot.fromMeta(_meta),
       );
       final result = await ReportExporter.export(doc, format);
       if (!mounted) return;
@@ -836,12 +956,33 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
     if (_s(row, 'bill_id', '').isNotEmpty) return _MisRowOpen.bill;
     if (_s(row, 'order_id', '').isNotEmpty) return _MisRowOpen.kot;
     // The Sales Summary's day rows narrow the window to that day — the question
-    // an owner asks the instant a day looks wrong. Hour rows cannot: the window
-    // is a pair of calendar DAYS, so an hour has nothing to narrow to.
+    // an owner asks the instant a day looks wrong — and keep the slot, because
+    // "Dinner on the 14th" is still a question about Dinner. Date x hour rows
+    // cannot: the window is a pair of calendar DAYS, so a dated hour has nothing
+    // to narrow to.
     if (widget.report.key == 'sales_summary' &&
         widget.bucket == 'day' &&
         isDayKey(_s(row, 'bucket', ''))) {
       return _MisRowOpen.day;
+    }
+    // An hour-of-day row becomes that hour as a custom slot, and a session row
+    // becomes that saved session — each then read day by day. Opening one
+    // REPLACES the slot the rows were cut under, so it is offered only where the
+    // replacement counts exactly what the row did: a Lunch row that under
+    // 16:00–19:00 held only 16:00–17:00, or a 01:00 row of a night counted on
+    // the evening before, would open onto a different total. Judged against the
+    // slot the SERVER applied to these rows (`meta.time_slot`), not the picker.
+    if (widget.report.key == 'sales_summary' && widget.bucket == 'hour_of_day') {
+      final hour = hourOfDaySlot(_s(row, 'bucket', ''));
+      if (hour != null && slotRowOpensExactly(hour.from, hour.to, _appliedSlot)) {
+        return _MisRowOpen.hour;
+      }
+    }
+    if (widget.report.key == 'sales_summary' && widget.bucket == 'session') {
+      final preset = sessionRowPreset(_s(row, 'bucket', ''), widget.presets);
+      if (preset != null && slotRowOpensExactly(preset.start, preset.end, _appliedSlot)) {
+        return _MisRowOpen.session;
+      }
     }
     // An Executive Summary outlet row switches the whole app to that branch,
     // which is what "why is Kalyani Nagar down" actually needs. A reader who
@@ -867,6 +1008,12 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       case _MisRowOpen.day:
         final day = _s(row, 'bucket', '');
         return () => widget.onRange(DateRange.normalized(day, day));
+      case _MisRowOpen.hour:
+        final hour = hourOfDaySlot(_s(row, 'bucket', ''));
+        return hour == null ? null : () => widget.onSlot(hour);
+      case _MisRowOpen.session:
+        final preset = sessionRowPreset(_s(row, 'bucket', ''), widget.presets);
+        return preset == null ? null : () => widget.onSlot(TimeSlotSelection.preset(preset.id));
       case _MisRowOpen.outlet:
         final id = _s(row, 'outlet_id', '');
         // Re-read rather than trusting the classifier's: the closure outlives
@@ -901,6 +1048,21 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       kinds.add(k);
     }
     if (open == 0) {
+      // Hours and sessions that open under All day but not under this slot
+      // (see [slotRowOpensExactly]): say which setting brings the taps back,
+      // rather than leaving a reader who tapped them yesterday to guess.
+      final applied = _appliedSlot;
+      final cut = widget.bucket == 'hour_of_day'
+          ? 'an hour'
+          : widget.bucket == 'session'
+              ? 'a session'
+              : null;
+      if (widget.report.key == 'sales_summary' && cut != null && applied != null) {
+        return (
+          icon: Icons.filter_alt_outlined,
+          label: 'Rows here are cut to ${applied.phrase} — choose All day to open $cut',
+        );
+      }
       return (
         icon: Icons.functions,
         label: 'Each row totals many bills — no single one to open',
@@ -912,6 +1074,8 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
             _MisRowOpen.bill => 'its full bill',
             _MisRowOpen.kot => 'its kitchen ticket',
             _MisRowOpen.day => 'that day on its own',
+            _MisRowOpen.hour => 'that hour, day by day',
+            _MisRowOpen.session => 'that session, day by day',
             _MisRowOpen.outlet => 'that branch',
             _MisRowOpen.none => 'it',
           };
@@ -971,7 +1135,8 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               title: 'Nothing in this period',
               caption: (widget.report.searchable && widget.search.isNotEmpty)
                   ? 'No rows match "${widget.search}" in this period.'
-                  : '${widget.report.title} has no rows between ${widget.range.from} and ${widget.range.to}.',
+                  : '${widget.report.title} has no rows between ${widget.range.from} and ${widget.range.to}'
+                      '${_slotPhrase == null ? '' : ' in $_slotPhrase'}.',
             )
           : compact
               ? _MisCardList(
@@ -1105,7 +1270,10 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
   Widget _footer(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final window = (_meta['window'] as Map?) ?? const {};
-    final clamped = window['clamped'] == true;
+    // A LIST, not a flag: `clamped == true` never fired, so a window the server
+    // really had shortened was never flagged here.
+    final clamp = clampNotices(window['clamped']);
+    final applied = AppliedTimeSlot.fromMeta(_meta);
     final shown = _rows.length;
     return Wrap(
       spacing: AppSpacing.md,
@@ -1126,12 +1294,23 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
             dense: true,
             onPressed: _appending ? null : _loadMore,
           ),
-        if (clamped)
+        if (clamp.range)
           StatusChip(
-            label: 'Range clamped to ${window['days'] ?? '?'} days by the server',
+            key: const ValueKey('reports-clamp'),
+            label: 'Range shortened to ${window['from'] ?? '?'} – ${window['to'] ?? '?'}',
             color: AppColors.warning,
             dense: true,
           ),
+        if (clamp.slot != null)
+          StatusChip(
+            key: const ValueKey('reports-slot-clamp'),
+            label: clamp.slot!,
+            color: AppColors.warning,
+            dense: true,
+          ),
+        // What the SERVER cut on — never the chip's value.
+        if (applied != null)
+          InfoChip(key: const ValueKey('reports-slot-applied'), icon: Icons.access_time, label: applied.phrase),
         InfoChip(icon: Icons.public, label: '${_meta['timezone'] ?? RestaurantTime.zone}'),
       ],
     );
@@ -1175,8 +1354,12 @@ Widget _misTiles(List<Widget> tiles) => Padding(
 /// The money ladder, spelled out.
 ///
 /// This is the backend's pinned composition rendered verbatim —
-/// `gross − discount = net + service charge + tax + round off = grand total` —
-/// and every one of the fifteen derives from it. Showing it, rather than only its
+/// `item total − discount = net + service charge + tax + round off = gross` —
+/// and every one of the fifteen derives from it. The words are the client's
+/// (models/gross_net.dart): Gross is the grand total, Net is after discount and
+/// before the charges, and the top rung is the Item total. The top rung reads
+/// `item_total`, falling back to the deprecated `gross` alias on an older
+/// backend — never `grand_total`. Showing it, rather than only its
 /// end, is what lets an owner see WHERE two reports would have to differ before
 /// they could disagree.
 Widget _misLadderCard(BuildContext context, Map ladder) {
@@ -1204,9 +1387,9 @@ Widget _misLadderCard(BuildContext context, Map ladder) {
       SectionHeader(title: 'Money ladder', padding: const EdgeInsets.only(bottom: 4)),
       Text('Every report in this pack derives from this one composition.', style: text.bodySmall),
       const SizedBox(height: AppSpacing.sm),
-      line('Gross', ladder['gross']),
+      line(kItemTotal, itemTotalOf(ladder)),
       line('Discount', ladder['discount'], prefix: '−'),
-      line('Net', ladder['net'], prefix: '=', strong: true, rule: true),
+      line(kNet, ladder['net'], prefix: '=', strong: true, rule: true),
       line('Service charge', ladder['service_charge'], prefix: '+'),
       line('Tax', ladder['tax'], prefix: '+'),
       // Signed like every other round-off on a bill screen: the rung is a SUM of
@@ -1214,7 +1397,7 @@ Widget _misLadderCard(BuildContext context, Map ladder) {
       // "+ Round off ₹-3.45". Always drawn, like every rung of the ladder.
       line('Round off', _numOf(ladder['round_off']).abs(),
           prefix: _numOf(ladder['round_off']) < 0 ? '−' : '+'),
-      line('Grand total', ladder['grand_total'], prefix: '=', strong: true, rule: true),
+      line(kGross, ladder['grand_total'], prefix: '=', strong: true, rule: true),
       if (_numOf(ladder['refund']) > 0) line('Refunds', ladder['refund'], prefix: '−'),
     ]),
   );
@@ -1230,8 +1413,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Items', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          // Item total only: Gross and Net are bill figures and cannot be put
+          // on a dish honestly (the always-equal Net tile is gone).
+          _misStat(context, kItemTotal, _money(totals['gross_amount']), sub: 'before any discount'),
           _misStat(context, 'Bill-level discount', _money(d['bill_level_discount']),
               sub: 'not spread across lines'),
         ]),
@@ -1241,9 +1425,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Discounted bills', '${_int(totals['discounted_bills']) ?? 0}'),
           _misStat(context, 'Given away', _money(totals['discount_amount']), tint: AppColors.warning),
-          _misStat(context, '% of gross', misPercent(totals['discount_pct_of_gross'])),
-          _misStat(context, 'Gross', _money(totals['gross'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total'])),
+          _misStat(context, '% of item total', misPercent(discountPctOf(totals)), sub: 'of everything sold'),
+          _misStat(context, kItemTotal, _money(itemTotalOf(totals)), sub: 'discounted bills'),
+          _misStat(context, kGross, _money(totals['grand_total']), sub: 'discounted bills'),
         ]),
       ];
     case 'void_kot':
@@ -1267,8 +1451,8 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     case 'sales_summary':
       return [
         _misTiles([
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi, sub: 'what guests paid'),
+          _misStat(context, kNet, _money(totals['net']), sub: 'before SC, tax, round off'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
           _misStat(context, 'ABV', _money(totals['abv']), sub: 'tax-inclusive'),
@@ -1282,9 +1466,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kNet, _money(totals['net'])),
           _misStat(context, 'Tax', _money(totals['tax'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'ABV', _money(totals['abv'])),
         ]),
       ];
@@ -1294,11 +1478,11 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       final prev = (d['previous'] as Map?) ?? const {};
       return [
         _misTiles([
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'vs previous', misPercent(growth['grand_total']),
               sub: _money(prev['grand_total']),
               tint: _misGrowthColor(growth['grand_total'])),
-          _misStat(context, 'Net', _money(totals['net']), sub: misPercent(growth['net'])),
+          _misStat(context, kNet, _money(totals['net']), sub: misPercent(growth['net'])),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}', sub: misPercent(growth['bills'])),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}', sub: misPercent(growth['covers'])),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax · ${misPercent(growth['apc'])}'),
@@ -1318,8 +1502,8 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Parties', '${_int(totals['parties']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
-          _misStat(context, 'Net', _money(totals['net'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kNet, _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax'),
         ]),
       ];
@@ -1328,7 +1512,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Collected', _money(totals['amount']), tint: AppColors.copperHi),
           _misStat(context, 'Refunds', _money(totals['refund'])),
-          _misStat(context, 'Net taken', _money(totals['net_amount'])),
+          _misStat(context, kAfterRefunds, _money(totals['net_amount']), sub: 'tax still in'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Split-tender bills', '${_int(totals['split_bills']) ?? 0}'),
         ]),
@@ -1405,8 +1589,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Groups', '${_int(totals['groups']) ?? 0}'),
           _misStat(context, 'Items', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          _misStat(context, kItemTotal, _money(totals['gross_amount'])),
           _misStat(context, 'Bill-level discount', _money(d['bill_level_discount']),
               sub: 'not spread across lines'),
         ]),
@@ -1418,11 +1601,10 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Dishes with sizes', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Variations', '${_int(totals['variations']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          _misStat(context, kItemTotal, _money(totals['gross_amount'])),
           // The size of the subset, so a small number is visibly small rather
           // than mistaken for the whole menu's takings.
-          _misStat(context, 'Whole menu gross', _money(d['window_gross']),
+          _misStat(context, 'Whole menu item total', _money(d['window_gross']),
               sub: 'Item Wise, same window'),
         ]),
       ];
@@ -1463,15 +1645,15 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       ];
 
     // The Sales Summary's own bill set, re-cut by till — so the ladder is shown
-    // in full: the sum of these rows IS the grand total on the Sales Summary,
+    // in full: the sum of these rows IS the Gross on the Sales Summary,
     // and the rungs are how a reader checks that rather than takes it on trust.
     case 'counter_summary':
       return [
         _misTiles([
           _misStat(context, 'Tills', '${_int(totals['counters']) ?? 0}'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kNet, _money(totals['net'])),
           _misStat(context, 'Cash sessions', '${_int(totals['sessions']) ?? 0}'),
           _misStat(context, 'Cash variance', _money(totals['variance']),
               sub: 'counted − expected',
@@ -1628,7 +1810,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'group_summary') {
     chips.add(StatusChip(
-      label: 'Gross ties to Item Wise for the same window — the same lines, re-cut',
+      label: 'Item total ties to Item Wise for the same window — the same lines, re-cut',
       color: AppColors.info,
       dense: true,
     ));
@@ -1679,7 +1861,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'counter_summary') {
     chips.add(StatusChip(
-      label: 'These rows sum to the Sales Summary grand total — the same bills, cut by the till that rang them',
+      label: 'These rows sum to the Sales Summary Gross — the same bills, cut by the till that rang them',
       color: AppColors.info,
       dense: true,
     ));
@@ -2230,7 +2412,9 @@ void _misOpenBill(BuildContext context, RestClient rest, String billId, String t
           child: AsyncView<Map<String, dynamic>>(
             load: () => rest.getMap('/reports/mis/bill/$billId'),
             builder: (ctx, bill, reload) =>
-                SingleChildScrollView(child: _closedBillBody(ctx, bill, title)),
+                // reportWords: the row this opened from says Item total / Net /
+                // Gross, and so does the web's drill-down for the same bill.
+                SingleChildScrollView(child: _closedBillBody(ctx, bill, title, reportWords: true)),
           ),
         ),
       ),

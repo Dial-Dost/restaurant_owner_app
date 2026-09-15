@@ -192,6 +192,10 @@ Map<String, dynamic> _accountingRoutes({
         'total_service_charge': _serviceCharge,
         'total_refund': 2500.00,
         'total_refunded_tax': 300.00,
+        // Net: the item total less discounts, before service charge, tax and
+        // round off. 409733.92 − 18000 tax − 31733.92 service charge − 0 round off.
+        'total_net': 360000.00,
+        'total_round_off': 0.0,
         'net_sales': 407233.92,
         'bill_count': 100,
         'by_day': [
@@ -431,7 +435,7 @@ void main() {
 
       // NET PROFIT → the walk from gross sales down to profit.
       await _tap(tester, _tileCard('NET PROFIT'));
-      expect(_sheetText('Net revenue (ex-tax)'), findsOneWidget);
+      expect(_sheetText('Revenue ex-tax (after refunds)'), findsOneWidget);
       expect(_sheetText('Tax kept out'), findsOneWidget);
       expect(_sheetText('Net profit'), findsOneWidget);
       await _closeSheet(tester);
@@ -469,6 +473,36 @@ void main() {
       await _reveal(tester, find.text('GST breakdown'));
       expect(find.text('Service charge — not tax'), findsOneWidget);
       expect(find.textContaining('excluded from every rate above'), findsOneWidget);
+    });
+
+    // GROSS AND NET, in the client's words. NET SALES is total_net — after
+    // discount, before service charge, tax and round off — not net_sales, which
+    // is Gross less refunds with the tax still in and used to sit on this card.
+    testWidgets('NET SALES is the Net (total_net), and Gross after refunds is named for what it is',
+        (tester) async {
+      _size(tester, 1200);
+      await _mount(tester, m.accountingModule, _accountingRoutes());
+      expect(find.descendant(of: _tileCard('NET SALES'), matching: find.text('₹360000', findRichText: true)), findsOneWidget);
+      expect(find.text('₹407234', findRichText: true), findsNothing, reason: 'net_sales must not headline as Net');
+
+      await _tap(tester, _tileCard('NET SALES'));
+      expect(_sheetText('₹360000.00'), findsNWidgets(2), reason: 'the sheet title and its Net sales row');
+      expect(_sheetText('Gross sales'), findsOneWidget);
+      expect(_sheetText('₹409733.92'), findsOneWidget);
+      expect(_sheetText('Gross after refunds'), findsOneWidget);
+      expect(_sheetText('₹407233.92'), findsOneWidget);
+      expect(_sheetText('Net sales'), findsOneWidget);
+      await _closeSheet(tester);
+    });
+
+    testWidgets('on a backend with no total_net the card says Gross after refunds, never Net',
+        (tester) async {
+      _size(tester, 1200);
+      final routes = _accountingRoutes();
+      (routes['/reports/sales'] as Map).remove('total_net');
+      await _mount(tester, m.accountingModule, routes);
+      expect(find.text('NET SALES'), findsNothing);
+      expect(find.descendant(of: _tileCard('GROSS AFTER REFUNDS'), matching: find.text('₹407234', findRichText: true)), findsOneWidget);
     });
 
     testWidgets('the net-sales sheet keeps tax and service charge apart inside gross', (tester) async {
@@ -536,7 +570,9 @@ void main() {
       await _tap(tester, find.text('Total given'));
       expect(find.text('Bills discounted'), findsOneWidget);
       expect(find.text('12 of 100'), findsOneWidget);
-      expect(find.textContaining('already stored NET of discount'), findsOneWidget);
+      expect(find.textContaining('already stored after discount'), findsOneWidget);
+      // Not "net of": Net is the item total less discounts, and these are Gross.
+      expect(find.textContaining(RegExp('net of discount', caseSensitive: false)), findsNothing);
       await _closeSheet(tester);
 
       await _tap(tester, find.text('MONSOON20'));

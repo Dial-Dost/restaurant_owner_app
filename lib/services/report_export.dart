@@ -44,6 +44,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 
 import 'restaurant_time.dart';
+import 'time_slot.dart';
 
 // ----------------------------------------------------------------- columns --
 
@@ -139,9 +140,16 @@ String misText(MisColumn c, Object? v, {bool forSheet = false, bool forPdf = fal
     case 'datetime':
       final s = '${v ?? ''}'.trim();
       if (s.isEmpty) return forSheet ? '' : '—';
-      // Sheets get the raw ISO instant: it sorts correctly and can be parsed
-      // back. Screens get the restaurant's own wall clock.
-      return forSheet ? s : RestaurantTime.short(s);
+      // The restaurant's own wall clock on EVERY surface, the sheet included.
+      // Sheets used to get the raw ISO instant, and an owner opening the Excel
+      // read a void rung at 18:36 as "2026-09-14T13:06:36.104Z", which is 1 pm
+      // to anyone who is not converting from UTC in their head. The zone is
+      // stated in the file's own preamble. The screen and the PDF read
+      // `Sep 14, 18:36`; a sheet gets `2026-09-14 18:36`, which carries the year
+      // and sorts in date order (RestaurantTime.sheet says why). A value that is
+      // not an instant comes back as it was sent, so a malformed stamp is still
+      // visible.
+      return forSheet ? RestaurantTime.sheet(s) : RestaurantTime.short(s);
     case 'date':
       final s = '${v ?? ''}'.trim();
       if (s.isEmpty) return forSheet ? '' : '—';
@@ -169,6 +177,7 @@ class MisReportDoc {
     required this.outletLabel,
     required this.notes,
     this.truncatedAt,
+    this.timeSlot,
   });
 
   final String title;
@@ -192,10 +201,18 @@ class MisReportDoc {
   /// file says so on its own face instead of quietly being short.
   final int? truncatedAt;
 
+  /// The part of each day the SERVER cut this on (`meta.time_slot`). Null = all day.
+  final AppliedTimeSlot? timeSlot;
+
   /// Filename stem — report, scope and window, so two exports of the same
-  /// report cannot be confused once they are sitting in a Downloads folder.
+  /// report cannot be confused once they are sitting in a Downloads folder. A
+  /// slot adds `_lunch-1200-1700` (the web's suffix, character for character);
+  /// all day adds nothing, so every earlier filename is unchanged.
   String get fileStem =>
-      '${_slug(title)}_${_slug(outletLabel)}_${from}_to_$to';
+      '${_slug(title)}_${_slug(outletLabel)}_${from}_to_$to${timeSlot?.fileSuffix ?? ''}';
+
+  /// The heading on the filed copy: `Sales Summary — Lunch (12:00–17:00)`.
+  String get displayTitle => timeSlot == null ? title : '$title — ${timeSlot!.phrase}';
 
   static String _slug(String s) => s
       .toLowerCase()
@@ -208,11 +225,16 @@ class MisReportDoc {
         ['Report', title],
         ['Outlet', outletLabel],
         ['Period', '$from to $to (both days included)'],
+        ['Time slot', timeSlotProvenance(timeSlot)],
         ['Timezone', timezone],
         ['Generated', RestaurantTime.stampNow()],
         ['Rows', truncatedAt == null ? '${rows.length}' : '${rows.length} (truncated at $truncatedAt)'],
       ];
 }
+
+/// The first cell of every export's TOTALS row. The totals are the WINDOW's,
+/// never the page's, and the label says so.
+const String _misTotalLabel = 'TOTAL (whole period)';
 
 // -------------------------------------------------------------------- CSV ----
 
@@ -253,7 +275,7 @@ String misCsv(MisReportDoc doc) {
     b.write(_csvRow([
       for (var i = 0; i < doc.columns.length; i++)
         i == 0
-            ? 'TOTAL (whole period)'
+            ? _misTotalLabel
             // Only the columns the SERVER marks summable carry a total. An
             // average or a share has no meaningful column sum, and printing one
             // would be a number nobody could reproduce.
@@ -264,6 +286,53 @@ String misCsv(MisReportDoc doc) {
 }
 
 // ------------------------------------------------------------------ Excel ----
+
+/// A spreadsheet column is never narrower than this, in characters.
+const int misSheetMinWidth = 10;
+
+/// Nor wider than this. Excel refuses a column wider than 255 characters.
+const int misSheetMaxWidth = 250;
+
+/// THE WIDTH OF EACH TABLE COLUMN IN THE SHEET, in characters: its widest cell
+/// (header, rows and the TOTALS row, as the sheet writes them) plus two, never
+/// under [misSheetMinWidth] and never over [misSheetMaxWidth].
+///
+/// WHY. The excel package writes no widths of its own, so every column opened at
+/// Excel's default of about eight characters. Excel lets text spill into the next
+/// cell only when that cell is empty, and the Void KOT Items column has a Type
+/// cell beside it on every row, so "CANNED JUICE x1" opened as "CANNED J" and a
+/// ticket with three dishes showed its first word. A column as wide as its widest
+/// cell reads whole when the file opens, with no wrapping to depend on.
+///
+/// Only the table is measured. The provenance and the notes above it sit in
+/// rows whose next cell is empty, so they spill across as they should, and a
+/// long note must not make the first column of the table a screen wide.
+///
+/// The web dashboard sizes its sheet by the same rule (`sheetColumnWidths`), so a
+/// file from either client opens the same.
+List<int> misSheetColumnWidths(MisReportDoc doc) {
+  final widest = [for (final c in doc.columns) c.label.length];
+  void measure(int i, String text) {
+    if (text.length > widest[i]) widest[i] = text.length;
+  }
+
+  for (final r in doc.rows) {
+    for (var i = 0; i < doc.columns.length; i++) {
+      measure(i, misText(doc.columns[i], r[doc.columns[i].key], forSheet: true));
+    }
+  }
+  final t = doc.totals;
+  if (t != null && doc.columns.isNotEmpty) {
+    measure(0, _misTotalLabel);
+    for (var i = 1; i < doc.columns.length; i++) {
+      if (doc.columns[i].total) measure(i, misText(doc.columns[i], t[doc.columns[i].key], forSheet: true));
+    }
+  }
+  return [
+    for (final w in widest)
+      (w + 2).clamp(misSheetMinWidth, misSheetMaxWidth),
+  ];
+}
 
 /// XLSX with the same content as the CSV, but typed: money/percent/int land as
 /// real numbers so the column sums, filters and charts in the sheet.
@@ -309,11 +378,17 @@ Uint8List misXlsx(MisReportDoc doc) {
     sheet.appendRow([
       for (var i = 0; i < doc.columns.length; i++)
         i == 0
-            ? xl.TextCellValue('TOTAL (whole period)')
+            ? xl.TextCellValue(_misTotalLabel)
             : (doc.columns[i].total
                 ? cell(doc.columns[i], t[doc.columns[i].key])
                 : xl.TextCellValue('')),
     ]);
+  }
+
+  // Every column as wide as its widest cell; see misSheetColumnWidths.
+  final widths = misSheetColumnWidths(doc);
+  for (var i = 0; i < widths.length; i++) {
+    sheet.setColumnWidth(i, widths[i].toDouble());
   }
 
   final bytes = book.encode();
@@ -363,7 +438,7 @@ Future<Uint8List> misPdf(MisReportDoc doc) async {
     data.add([
       for (var i = 0; i < doc.columns.length; i++)
         i == 0
-            ? 'TOTAL (whole period)'
+            ? _misTotalLabel
             : (doc.columns[i].total
                 ? pdfSafe(misText(doc.columns[i], t[doc.columns[i].key], forPdf: true))
                 : ''),
@@ -374,7 +449,7 @@ Future<Uint8List> misPdf(MisReportDoc doc) async {
     pageFormat: PdfPageFormat.a4.landscape,
     margin: const pw.EdgeInsets.all(22),
     build: (ctx) => [
-      pw.Text(pdfSafe(doc.title), style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
+      pw.Text(pdfSafe(doc.displayTitle), style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
       pw.SizedBox(height: 4),
       for (final line in doc.preamble)
         pw.Text(pdfSafe('${line[0]}: ${line[1]}'), style: const pw.TextStyle(fontSize: 8)),
