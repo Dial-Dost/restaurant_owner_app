@@ -6,7 +6,10 @@
 // 034-039 finally gave data to: NC Summary, Service Charge Deny, Group Summary,
 // Variation Summary, Tip Summary and Counter Summary. Backed by /reports/mis/*,
 // all GETs, all read-only — nothing on this screen writes, so nothing on it can
-// reach the offline outbox.
+// reach the offline outbox. The one exception is the "Manage sessions" sheet,
+// which replaces the restaurant's saved time slots (PUT /reports/mis/time-slots):
+// a settings write, offered only to a caller the server marks `can_edit`, and
+// not on the outbox allowlist, so it is online-only by construction.
 //
 // WHY THIS IS A `part` OF modules.dart AND NOT ITS OWN LIBRARY. The drill-down
 // from a Discount or an Order Summary row has to open THE SAME BILL BODY the
@@ -145,6 +148,7 @@ void misResetReportMemory() {
   _misOpenTab = 0;
   _misHiddenColumns.clear();
   _misBucket = 'day';
+  TimeSlotMemory.reset();
 }
 
 // ------------------------------------------------------------- the module ----
@@ -162,6 +166,76 @@ class _ReportsView extends StatefulWidget {
 class _ReportsViewState extends State<_ReportsView> {
   DateRange _range = DateRangeMemory.of('reports');
   late int _tab = _misOpenTab.clamp(0, _misReports.length - 1);
+
+  // WHICH PART OF THE DAY. Remembered like the range. It is only SENT once the
+  // presets route has answered (or answered earlier this session): a remembered
+  // "Lunch" against a server that cannot slice would be a filter the chip claims
+  // and the numbers ignore, so until then there is no chip and the day is whole.
+  TimeSlotSelection _slot = TimeSlotMemory.of('reports');
+  late TimeSlotCatalogue? _slots = TimeSlotMemory.catalogueFor(widget.rest.outboxRes ?? '');
+
+  TimeSlotSelection get _effectiveSlot => _slots == null ? TimeSlotSelection.allDay : _slot;
+
+  /// The bucket actually sent: the two newer segments exist only where the
+  /// presets route does, and one the server cannot answer goes as day-wise.
+  String get _effectiveBucket =>
+      timeWiseOptions(_slots != null).any((b) => b.$1 == _misBucket) ? _misBucket : 'day';
+
+  @override
+  void initState() {
+    super.initState();
+    // Off the read cache after the first visit, like every other GET here.
+    widget.rest.getMap('/reports/mis/time-slots').then((m) {
+      final cat = TimeSlotCatalogue.fromJson(m);
+      if (!mounted || cat == null) return;
+      TimeSlotMemory.rememberCatalogue(widget.rest.outboxRes ?? '', cat);
+      setState(() {
+        _slots = cat;
+        _setSlotInState(_slot.reconcile(cat.slots));
+      });
+    }).catchError((_) {});
+  }
+
+  void _setSlotInState(TimeSlotSelection next) {
+    _slot = next;
+    TimeSlotMemory.remember('reports', next);
+  }
+
+  void _setSlot(TimeSlotSelection next) => setState(() => _setSlotInState(next));
+
+  /// A tapped hour-of-day or session row: that slot, read day by day — the
+  /// question an owner asks the instant 1pm or Dinner looks wrong.
+  void _narrowToSlot(TimeSlotSelection next) => setState(() {
+        _setSlotInState(next);
+        _misBucket = 'day';
+      });
+
+  Future<TimeSlotSaveOutcome> _saveSlots(List<TimeSlotDraft> drafts) async {
+    try {
+      final res = await widget.rest.put('/reports/mis/time-slots', slotDraftsBody(drafts));
+      final cat = TimeSlotCatalogue.fromJson(res);
+      if (cat == null) {
+        return (saved: null, error: 'The server saved the sessions but sent back a list this screen cannot read — reload to see them.');
+      }
+      if (!mounted) return (saved: cat, error: null);
+      TimeSlotMemory.rememberCatalogue(widget.rest.outboxRes ?? '', cat);
+      setState(() {
+        _slots = cat;
+        _setSlotInState(_slot.reconcile(cat.slots));
+      });
+      return (saved: cat, error: null);
+    } on ApiException catch (e) {
+      // The server's own sentence ("Lunch and Brunch overlap…") is the point.
+      return (saved: null, error: e.message);
+    } catch (e) {
+      return (
+        saved: null,
+        error: isUnreachableError(e)
+            ? "Couldn't save — this device can't reach the restaurant server. Reconnect and try again."
+            : 'Could not save the sessions: $e',
+      );
+    }
+  }
 
   final TextEditingController _searchCtl = TextEditingController(text: '');
   Timer? _searchDebounce;
@@ -240,14 +314,17 @@ class _ReportsViewState extends State<_ReportsView> {
     final pane = _MisReportPane(
       // Remount on every dimension of the question: a pane holding rows for one
       // window must never be reused under the label of another.
-      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_misBucket-$outletId'),
+      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_effectiveBucket-${_effectiveSlot.key}-$outletId'),
       rest: widget.rest,
       profile: widget.profile,
       report: report,
       range: _range,
       search: _search,
-      bucket: _misBucket,
+      bucket: _effectiveBucket,
+      slot: _effectiveSlot,
+      presets: _slots?.slots ?? const [],
       onRange: _setRange,
+      onSlot: _narrowToSlot,
     );
 
     return Padding(
@@ -275,12 +352,22 @@ class _ReportsViewState extends State<_ReportsView> {
   }
 
   Widget _toolbar(BuildContext context, _MisReport report, bool narrow, ModuleNavigator? nav) {
+    final slotPhrase = _effectiveSlot.phrase(_slots?.slots ?? const []);
     return Wrap(
       spacing: AppSpacing.sm,
       runSpacing: AppSpacing.sm,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         DateRangeChip(value: _range, onChanged: _setRange, dense: true),
+        if (_slots != null)
+          TimeSlotChip(
+            key: const ValueKey('reports-slot'),
+            value: _slot,
+            presets: _slots!.slots,
+            canEdit: _slots!.canEdit,
+            onChanged: _setSlot,
+            onSave: _saveSlots,
+          ),
         _outletControl(context, nav),
         // WHICH CLOCK this tab is cut on. Fifteen reports over one date range do
         // NOT all answer the same question about the same days: a comp is dated
@@ -290,11 +377,13 @@ class _ReportsViewState extends State<_ReportsView> {
         InfoChip(
           key: const ValueKey('reports-basis'),
           icon: Icons.schedule,
-          label: report.basis == _misBasisSettled
-              ? 'Dated on settlement'
-              : report.basis == _misBasisOrdered
-                  ? 'Dated on order placement'
-                  : 'Dated on ${report.basis}',
+          label: (report.basis == _misBasisSettled
+                  ? 'Dated on settlement'
+                  : report.basis == _misBasisOrdered
+                      ? 'Dated on order placement'
+                      : 'Dated on ${report.basis}') +
+              // …and within which hours of each day, when a slot is on.
+              (slotPhrase == null ? '' : ' · $slotPhrase'),
         ),
         if (report.searchable)
         SizedBox(
@@ -341,9 +430,9 @@ class _ReportsViewState extends State<_ReportsView> {
         if (report.key == 'sales_summary')
           _MisSegment(
             key: const ValueKey('reports-bucket'),
-            options: const ['day', 'hour'],
-            labels: const ['Day-wise', 'Hour-wise'],
-            selected: _misBucket,
+            options: [for (final b in timeWiseOptions(_slots != null)) b.$1],
+            labels: [for (final b in timeWiseOptions(_slots != null)) b.$2],
+            selected: _effectiveBucket,
             onSelected: (v) => setState(() => _misBucket = v),
           ),
       ],
@@ -464,7 +553,8 @@ class _MisSegment extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppRadius.chip),
         border: Border.all(color: AppColors.border),
       ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
+      // A Wrap, not a Row: four options are wider than a 360dp phone.
+      child: Wrap(children: [
         for (var i = 0; i < options.length; i++)
           GestureDetector(
             onTap: () => onSelected(options[i]),
@@ -499,7 +589,7 @@ class _MisSegment extends StatelessWidget {
 /// so two rows of one report legitimately differ. Anything that describes
 /// drill-down to the reader is computed from this, so the description and the
 /// behaviour cannot disagree.
-enum _MisRowOpen { none, bill, kot, day, outlet }
+enum _MisRowOpen { none, bill, kot, day, hour, session, outlet }
 
 class _MisReportPane extends StatefulWidget {
   const _MisReportPane({
@@ -510,7 +600,10 @@ class _MisReportPane extends StatefulWidget {
     required this.range,
     required this.search,
     required this.bucket,
+    required this.slot,
+    required this.presets,
     required this.onRange,
+    required this.onSlot,
   });
 
   final RestClient rest;
@@ -519,7 +612,12 @@ class _MisReportPane extends StatefulWidget {
   final DateRange range;
   final String search;
   final String bucket;
+
+  /// The slot SENT (all day until the presets route has answered).
+  final TimeSlotSelection slot;
+  final List<TimeSlotPreset> presets;
   final ValueChanged<DateRange> onRange;
+  final ValueChanged<TimeSlotSelection> onSlot;
 
   @override
   State<_MisReportPane> createState() => _MisReportPaneState();
@@ -566,6 +664,9 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
     ));
   }
 
+  /// The slot this pane asked for, in words (null for all day).
+  String? get _slotPhrase => widget.slot.phrase(widget.presets);
+
   // ---- wire ----------------------------------------------------------------
 
   String _url({required int limit, required int offset}) {
@@ -577,6 +678,9 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       parts.add('search=${Uri.encodeQueryComponent(widget.search)}');
     }
     if (widget.report.key == 'sales_summary') parts.add('bucket=${widget.bucket}');
+    // Every report takes the slot; all day adds nothing, so the URL (and its
+    // read-cache entry) is exactly what it was before slots existed.
+    parts.addAll(widget.slot.queryParts);
     if (widget.report.paged) {
       parts..add('limit=$limit')..add('offset=$offset');
     }
@@ -798,6 +902,7 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
         outletLabel: _outletLabel,
         notes: _notes,
         truncatedAt: swept.truncated,
+        timeSlot: AppliedTimeSlot.fromMeta(_meta),
       );
       final result = await ReportExporter.export(doc, format);
       if (!mounted) return;
@@ -836,12 +941,26 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
     if (_s(row, 'bill_id', '').isNotEmpty) return _MisRowOpen.bill;
     if (_s(row, 'order_id', '').isNotEmpty) return _MisRowOpen.kot;
     // The Sales Summary's day rows narrow the window to that day — the question
-    // an owner asks the instant a day looks wrong. Hour rows cannot: the window
-    // is a pair of calendar DAYS, so an hour has nothing to narrow to.
+    // an owner asks the instant a day looks wrong — and keep the slot, because
+    // "Dinner on the 14th" is still a question about Dinner. Date x hour rows
+    // cannot: the window is a pair of calendar DAYS, so a dated hour has nothing
+    // to narrow to.
     if (widget.report.key == 'sales_summary' &&
         widget.bucket == 'day' &&
         isDayKey(_s(row, 'bucket', ''))) {
       return _MisRowOpen.day;
+    }
+    // An hour-of-day row becomes that hour as a custom slot, and a session row
+    // becomes that saved session — each then read day by day.
+    if (widget.report.key == 'sales_summary' &&
+        widget.bucket == 'hour_of_day' &&
+        hourOfDaySlot(_s(row, 'bucket', '')) != null) {
+      return _MisRowOpen.hour;
+    }
+    if (widget.report.key == 'sales_summary' &&
+        widget.bucket == 'session' &&
+        sessionRowPreset(_s(row, 'bucket', ''), widget.presets) != null) {
+      return _MisRowOpen.session;
     }
     // An Executive Summary outlet row switches the whole app to that branch,
     // which is what "why is Kalyani Nagar down" actually needs. A reader who
@@ -867,6 +986,12 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       case _MisRowOpen.day:
         final day = _s(row, 'bucket', '');
         return () => widget.onRange(DateRange.normalized(day, day));
+      case _MisRowOpen.hour:
+        final hour = hourOfDaySlot(_s(row, 'bucket', ''));
+        return hour == null ? null : () => widget.onSlot(hour);
+      case _MisRowOpen.session:
+        final preset = sessionRowPreset(_s(row, 'bucket', ''), widget.presets);
+        return preset == null ? null : () => widget.onSlot(TimeSlotSelection.preset(preset.id));
       case _MisRowOpen.outlet:
         final id = _s(row, 'outlet_id', '');
         // Re-read rather than trusting the classifier's: the closure outlives
@@ -912,6 +1037,8 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
             _MisRowOpen.bill => 'its full bill',
             _MisRowOpen.kot => 'its kitchen ticket',
             _MisRowOpen.day => 'that day on its own',
+            _MisRowOpen.hour => 'that hour, day by day',
+            _MisRowOpen.session => 'that session, day by day',
             _MisRowOpen.outlet => 'that branch',
             _MisRowOpen.none => 'it',
           };
@@ -971,7 +1098,8 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               title: 'Nothing in this period',
               caption: (widget.report.searchable && widget.search.isNotEmpty)
                   ? 'No rows match "${widget.search}" in this period.'
-                  : '${widget.report.title} has no rows between ${widget.range.from} and ${widget.range.to}.',
+                  : '${widget.report.title} has no rows between ${widget.range.from} and ${widget.range.to}'
+                      '${_slotPhrase == null ? '' : ' in $_slotPhrase'}.',
             )
           : compact
               ? _MisCardList(
@@ -1105,7 +1233,10 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
   Widget _footer(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final window = (_meta['window'] as Map?) ?? const {};
-    final clamped = window['clamped'] == true;
+    // A LIST, not a flag: `clamped == true` never fired, so a window the server
+    // really had shortened was never flagged here.
+    final clamp = clampNotices(window['clamped']);
+    final applied = AppliedTimeSlot.fromMeta(_meta);
     final shown = _rows.length;
     return Wrap(
       spacing: AppSpacing.md,
@@ -1126,12 +1257,23 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
             dense: true,
             onPressed: _appending ? null : _loadMore,
           ),
-        if (clamped)
+        if (clamp.range)
           StatusChip(
-            label: 'Range clamped to ${window['days'] ?? '?'} days by the server',
+            key: const ValueKey('reports-clamp'),
+            label: 'Range shortened to ${window['from'] ?? '?'} – ${window['to'] ?? '?'}',
             color: AppColors.warning,
             dense: true,
           ),
+        if (clamp.slot != null)
+          StatusChip(
+            key: const ValueKey('reports-slot-clamp'),
+            label: clamp.slot!,
+            color: AppColors.warning,
+            dense: true,
+          ),
+        // What the SERVER cut on — never the chip's value.
+        if (applied != null)
+          InfoChip(key: const ValueKey('reports-slot-applied'), icon: Icons.access_time, label: applied.phrase),
         InfoChip(icon: Icons.public, label: '${_meta['timezone'] ?? RestaurantTime.zone}'),
       ],
     );
