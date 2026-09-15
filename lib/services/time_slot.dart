@@ -350,7 +350,7 @@ class AppliedTimeSlot {
   /// `_lunch-1200-1700`, the same suffix the web export and the server's CSV
   /// write: lower-case a-z/0-9 slug, 32 at most, `slot` when nothing survives.
   String get fileSuffix {
-    var slug = _foldLatin(label.toLowerCase())
+    var slug = _foldLatin(label)
         .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
         .replaceAll(RegExp(r'^-+'), '');
     if (slug.length > 32) slug = slug.substring(0, 32);
@@ -359,16 +359,33 @@ class AppliedTimeSlot {
     return '_${slug.isEmpty ? 'slot' : slug}-${hhmm(start)}-${hhmm(end)}';
   }
 
-  /// The server slugs through Unicode NFKD, which Dart's core library does not
-  /// ship. The accented Latin letters a restaurant name actually uses are folded
-  /// by hand so "Café" is `cafe` on all three; anything else falls to `-` alike.
-  static String _foldLatin(String s) {
-    const from = 'àáâãäåçèéêëìíîïñòóôõöùúûüýÿ';
-    const to = 'aaaaaaceeeeiiiinooooouuuuyy';
+  /// [label] lower-cased and put through Unicode NFKD the way the server and the
+  /// web do it (`toLowerCase().normalize('NFKD')`), which Dart's core library
+  /// does not ship.
+  ///
+  /// NFKD KEEPS THE ACCENT as a separate combining mark, and that mark then
+  /// becomes `-` like any other character outside a-z/0-9. So "Déjeuner" is
+  /// `de-jeuner` on the server, not `dejeuner`, and "Café" is `cafe` only because
+  /// its trailing `-` is trimmed. Each accented letter here therefore becomes its
+  /// base letter PLUS a `-`; writing the bare letter named one export two ways.
+  ///
+  /// Exact for all of Latin-1 Supplement and Latin Extended-A (U+00A0–U+017F),
+  /// pinned character by character in time_slot_test against the server's rule.
+  /// A character past U+017F that NFKD would decompose still falls to `-`.
+  static String _foldLatin(String label) {
+    // JavaScript lower-cases 'İ' to 'i' plus a combining dot; Dart drops the dot.
+    final s = label.replaceAll('İ', 'i\u0307').toLowerCase();
+    const from = 'àáâãäåçèéêëìíîïñòóôõöùúûüýÿāăąćĉċčďēĕėęěĝğġģĥĩīĭįĵķĺļľńņňōŏőŕŗřśŝşšţťũūŭůűųŵŷźżž';
+    const to = 'aaaaaaceeeeiiiinooooouuuuyyaaaccccdeeeeegggghiiiijklllnnnooorrrssssttuuuuuuwyzzz';
+    // Compatibility forms NFKD rewrites to other letters or digits.
+    const compat = {
+      'ª': 'a', 'º': 'o', '¹': '1', '²': '2', '³': '3', '¼': '1-4', '½': '1-2', '¾': '3-4',
+      'ĳ': 'ij', 'ŀ': 'l-', 'ŉ': '-n', 'ſ': 's',
+    };
     final b = StringBuffer();
     for (final ch in s.split('')) {
       final i = from.indexOf(ch);
-      b.write(i < 0 ? ch : to[i]);
+      b.write(i >= 0 ? '${to[i]}-' : compat[ch] ?? ch);
     }
     return b.toString();
   }
