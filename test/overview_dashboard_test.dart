@@ -699,7 +699,8 @@ void main() {
     // The bar is the share of today, not the size against the largest mode.
     expect(bars[2].fraction, closeTo(3250.4 / 22680.9, 1e-12));
     // A refund gets its own line, with what survived it.
-    expect(find.text('6 bill(s) · 37.2% · − ₹120.00 refunded · ₹8310.50 net'), findsOneWidget);
+    // "after refunds", never "net": Net means before service charge and tax.
+    expect(find.text('6 bill(s) · 37.2% · − ₹120.00 refunded · ₹8310.50 after refunds'), findsOneWidget);
     // And the split note — which claims only that each part counts under its
     // own method. "Adds up to more than the bills settled" is false the moment
     // a released ₹0 table is in the tag's count and has no row.

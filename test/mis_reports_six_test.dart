@@ -555,7 +555,7 @@ void main() {
     await _mount(tester);
     await _openTab(tester, 'Variation Summary');
 
-    expect(find.text('WHOLE MENU GROSS'), findsOneWidget);
+    expect(find.text('WHOLE MENU ITEM TOTAL'), findsOneWidget);
     expect(find.text('Item Wise, same window'), findsOneWidget);
     expect(find.textContaining('Only dishes that HAVE sizes appear'), findsOneWidget);
     // Sold-at against configured price is the finding this report exists for.
@@ -589,6 +589,7 @@ void main() {
     await _mount(tester);
     await _openTab(tester, 'Tip Summary');
     expect(find.text('Money ladder'), findsNothing);
+    expect(find.text('Gross'), findsNothing);
     expect(find.text('Grand total'), findsNothing);
   });
 
@@ -601,7 +602,7 @@ void main() {
 
     // The ladder is how a reader CHECKS the claim rather than taking it.
     expect(find.text('Money ladder'), findsOneWidget);
-    expect(find.textContaining('sum to the Sales Summary grand total'), findsOneWidget);
+    expect(find.textContaining('sum to the Sales Summary Gross'), findsOneWidget);
     expect(find.text('₹2000.00'), findsWidgets);
 
     // Every bill lands somewhere: the unattributed bucket is a row, not a drop.

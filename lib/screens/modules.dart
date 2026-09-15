@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/gross_net.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -1478,7 +1479,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       // figure overflowed a 360px phone by 99px once the day ran to eight
       // digits. A wrapping line cannot, and it is the web block's layout too.
       Text(
-        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} net' : ''}',
+        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: text.bodySmall!.copyWith(fontSize: 11),
@@ -1581,7 +1582,7 @@ Future<void> _headlineMethodSheet(
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
       _detailRow(context, 'Refunds', refund > 0 ? '− ${_money(refund)}' : _money(0)),
-      _detailRow(context, 'Net of refunds', _money(mode['net_amount'])),
+      _detailRow(context, kAfterRefunds, _money(mode['net_amount'])),
       if (method == 'Unallocated') ...[
         const SizedBox(height: AppSpacing.sm),
         Text(
@@ -21517,7 +21518,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           kv('Gross sales', _pnl['gross_sales']),
           kv('Refunds', _pnl['refunds']),
           kv('Tax collected (pass-through)', _pnl['tax_collected']),
-          kv('Net revenue (ex-tax)', _pnl['net_revenue']),
+          kv('Revenue ex-tax (after refunds)', _pnl['net_revenue']),
           kv('Total expenses', _pnl['total_expenses']),
           kv('Net profit', _pnl['net_profit'], bold: true),
           pw.SizedBox(height: 16),
@@ -21531,9 +21532,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           pw.SizedBox(height: 16),
           pw.Text('Sales', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
           pw.Divider(),
-          kv('Total sales', _sales['total_sales']),
-          kv('Bills', _sales['bill_count'] ?? 0),
-          kv('Net sales (after refunds)', _sales['net_sales'], bold: true),
+          // Gross and Net in the client's words. The old "Net sales (after
+          // refunds)" line was Gross less refunds, tax and all — it is still
+          // here, named for what it is. Which key each line reads is decided
+          // (and tested) in models/gross_net.dart, not here.
+          for (final line in accountingSalesPdfLines(_sales)) kv(line.label, line.value, bold: line.bold),
         ]));
     await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
   }
@@ -21571,21 +21574,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     final refunds = _n(_sales['total_refund']);
     final bills = _n(_sales['bill_count']).round();
     final methods = ((_sales['by_method'] as List?) ?? const []).whereType<Map>().toList();
+    final words = readAccountingSales(_sales);
     return _detailSheet(
       context,
-      eyebrow: 'Net sales · $_windowLabel',
-      title: _money(_sales['net_sales']),
+      eyebrow: '${words.headlineLabel} · $_windowLabel',
+      title: _money(words.headlineValue),
       children: [
         _detailRow(context, 'Gross sales', _money(gross), trailing: _billsWord(bills)),
         _detailRow(context, 'Refunds', refunds > 0 ? '− ${_money(refunds)}' : _money(0)),
-        _detailRow(context, 'Net sales', _money(_sales['net_sales'])),
+        _detailRow(context, 'Gross after refunds', _money(_sales['net_sales'])),
         _detailRow(context, 'Average bill', bills > 0 ? _money(gross / bills) : '—'),
         _sheetHead('What sits inside gross sales'),
         _detailRow(context, 'Tax collected', _money(_sales['total_tax'])),
         _detailRow(context, 'Service charge', _money(_sales['total_service_charge'])),
+        if (billRoundOff(words.roundOff) != null)
+          _detailRow(context, 'Round off', billRoundOffMoney(billRoundOff(words.roundOff)!)),
+        if (words.netSales != null) _detailRow(context, 'Net sales', _money(words.netSales)),
         _sheetNote('Gross sales is what guests actually paid, so it still carries both. The tax is '
             'pass-through — it is owed onward to the government. The service charge is NOT tax: the '
             'restaurant keeps it, and the reports count it as income.'),
+        _sheetNote('Net sales is the item total less discounts — before service charge, tax and '
+            'round off, and before refunds — the figure the Sales Summary calls Net.'),
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
@@ -21674,13 +21683,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         _detailRow(context, 'Gross sales', _money(_pnl['gross_sales'])),
         _detailRow(context, 'Refunds', '− ${_money(_pnl['refunds'])}'),
         _detailRow(context, 'Tax kept out', '− ${_money(_pnl['tax_collected'])}'),
-        _detailRow(context, 'Net revenue (ex-tax)', _money(_pnl['net_revenue'])),
+        _detailRow(context, 'Revenue ex-tax (after refunds)', _money(_pnl['net_revenue'])),
         _detailRow(context, 'Expenses', '− ${_money(_pnl['total_expenses'])}'),
         _detailRow(context, 'Net profit', _money(net)),
         _sheetHead('Read this carefully'),
         _detailRow(context, 'Service charge earned', _money(_pnl['service_charge'])),
         _sheetNote('Tax is subtracted because it is pass-through — collected for the government, '
-            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside net '
+            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside '
             'revenue above, and the line here is only telling you how much of that revenue it was.'),
       ],
     );
@@ -21748,7 +21757,9 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (estimated > 0)
           _sheetNote('${estimated.round()} bill(s) stored the discount as a bare percentage, so the '
               'money value is reconstructed and the totals above are approximate.'),
-        _sheetNote('Bill totals are already stored NET of discount, so every sales, tax and profit '
+        // "after", not "net of": Net is the defined word for the item total less
+        // discounts (models/gross_net.dart), and these bill totals are Gross.
+        _sheetNote('Bill totals are already stored after discount, so every sales, tax and profit '
             'figure on this page reflects these. Never subtract this again.'),
         for (final n in notes) _sheetNote(n),
       ],
@@ -21982,9 +21993,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         // the tax sheet is careful to name the service charge separately — it is
         // income, not a levy, and the two must never read as one bucket.
         _dashGrid([
+          // NET, in the client's word: after discount, before service charge,
+          // tax and round off. This card used to show net_sales — Gross less
+          // refunds, tax and all — under this caption; that figure is on the
+          // sheet behind it, named for what it is.
           StatCard(
-            value: money(_n(_sales['net_sales'])),
-            caption: 'NET SALES',
+            value: money(readAccountingSales(_sales).headlineValue ?? 0),
+            caption: readAccountingSales(_sales).headlineLabel.toUpperCase(),
             footer: detailsFooter(),
             onTap: _netSalesSheet,
           ),
@@ -22072,7 +22087,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           ForkCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               SectionHeader(title: 'Discounts & offers', padding: const EdgeInsets.only(bottom: 6)),
-              Text('Bill totals are stored net of discount — sales above already reflect these.',
+              Text('Bill totals are stored after discount — sales above already reflect these.',
                   style: text.bodySmall),
               const SizedBox(height: AppSpacing.sm),
               moneyRow(
@@ -23375,7 +23390,13 @@ class _ClosedBillSheet extends StatelessWidget {
   }
 }
 
-Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
+/// [reportWords] is for the Reports drill-down (`_misOpenBill`): the row it opens
+/// from calls these figures Item total, Net and Gross (client item 1), so the
+/// ladder here says the same — as the web's MIS drill-down does. History and the
+/// settled-bill browser keep the receipt's words ("Items subtotal", "Taxable
+/// base", "Grand total"), because there the thing being read IS the receipt.
+/// Only the words change; every figure is the same key either way.
+Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bool reportWords = false}) {
   final text = Theme.of(context).textTheme;
   final items = ((bill['items'] as List?) ?? const []).map((e) => e as Map).toList();
   // `taxes[]` carries the per-rate lines ONLY — the service charge has its own
@@ -23504,7 +23525,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         ],
       ]),
     card('Money', [
-      if (subtotal > 0) money('Items subtotal', _money(subtotal)),
+      if (subtotal > 0) money(reportWords ? kItemTotal : 'Items subtotal', _money(subtotal)),
       if (discount > 0)
         money('Discount', '− ${_money(discount)}',
             sub: coupon.isEmpty
@@ -23512,10 +23533,12 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
                 : 'Coupon $coupon · ${_s(bill, 'discount_type', 'coupon')}',
             tint: AppColors.success),
       rule(),
-      money('Taxable base', _money(taxable)),
+      money(reportWords ? kNet : 'Taxable base', _money(taxable)),
       if (service != 0)
         money('Service charge', _money(service),
-            sub: servicePct > 0 ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of the taxable base' : null),
+            sub: servicePct > 0
+                ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of ${reportWords ? 'net' : 'the taxable base'}'
+                : null),
       // Taxes are listed rate by rate. The service charge above is deliberately
       // NOT one of them.
       for (final t in taxes)
@@ -23523,7 +23546,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
       if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
-      money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      money(reportWords ? kGross : 'Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
       const SizedBox(height: 6),
       Row(children: [
         Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
@@ -23531,7 +23554,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax'
+            '${_money(taxable)} ${reportWords ? 'net' : 'base'} + ${_money(service)} service + ${_money(taxTotal)} tax'
             '${roundOff == null ? '' : ' ${roundOff < 0 ? '−' : '+'} ${_money(roundOff.abs())} round off'} = ${_money(grand)}',
             style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
           ),

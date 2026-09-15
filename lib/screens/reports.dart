@@ -1175,8 +1175,12 @@ Widget _misTiles(List<Widget> tiles) => Padding(
 /// The money ladder, spelled out.
 ///
 /// This is the backend's pinned composition rendered verbatim —
-/// `gross − discount = net + service charge + tax + round off = grand total` —
-/// and every one of the fifteen derives from it. Showing it, rather than only its
+/// `item total − discount = net + service charge + tax + round off = gross` —
+/// and every one of the fifteen derives from it. The words are the client's
+/// (models/gross_net.dart): Gross is the grand total, Net is after discount and
+/// before the charges, and the top rung is the Item total. The top rung reads
+/// `item_total`, falling back to the deprecated `gross` alias on an older
+/// backend — never `grand_total`. Showing it, rather than only its
 /// end, is what lets an owner see WHERE two reports would have to differ before
 /// they could disagree.
 Widget _misLadderCard(BuildContext context, Map ladder) {
@@ -1204,9 +1208,9 @@ Widget _misLadderCard(BuildContext context, Map ladder) {
       SectionHeader(title: 'Money ladder', padding: const EdgeInsets.only(bottom: 4)),
       Text('Every report in this pack derives from this one composition.', style: text.bodySmall),
       const SizedBox(height: AppSpacing.sm),
-      line('Gross', ladder['gross']),
+      line(kItemTotal, itemTotalOf(ladder)),
       line('Discount', ladder['discount'], prefix: '−'),
-      line('Net', ladder['net'], prefix: '=', strong: true, rule: true),
+      line(kNet, ladder['net'], prefix: '=', strong: true, rule: true),
       line('Service charge', ladder['service_charge'], prefix: '+'),
       line('Tax', ladder['tax'], prefix: '+'),
       // Signed like every other round-off on a bill screen: the rung is a SUM of
@@ -1214,7 +1218,7 @@ Widget _misLadderCard(BuildContext context, Map ladder) {
       // "+ Round off ₹-3.45". Always drawn, like every rung of the ladder.
       line('Round off', _numOf(ladder['round_off']).abs(),
           prefix: _numOf(ladder['round_off']) < 0 ? '−' : '+'),
-      line('Grand total', ladder['grand_total'], prefix: '=', strong: true, rule: true),
+      line(kGross, ladder['grand_total'], prefix: '=', strong: true, rule: true),
       if (_numOf(ladder['refund']) > 0) line('Refunds', ladder['refund'], prefix: '−'),
     ]),
   );
@@ -1230,8 +1234,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Items', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          // Item total only: Gross and Net are bill figures and cannot be put
+          // on a dish honestly (the always-equal Net tile is gone).
+          _misStat(context, kItemTotal, _money(totals['gross_amount']), sub: 'before any discount'),
           _misStat(context, 'Bill-level discount', _money(d['bill_level_discount']),
               sub: 'not spread across lines'),
         ]),
@@ -1241,9 +1246,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Discounted bills', '${_int(totals['discounted_bills']) ?? 0}'),
           _misStat(context, 'Given away', _money(totals['discount_amount']), tint: AppColors.warning),
-          _misStat(context, '% of gross', misPercent(totals['discount_pct_of_gross'])),
-          _misStat(context, 'Gross', _money(totals['gross'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total'])),
+          _misStat(context, '% of item total', misPercent(discountPctOf(totals)), sub: 'of everything sold'),
+          _misStat(context, kItemTotal, _money(itemTotalOf(totals)), sub: 'discounted bills'),
+          _misStat(context, kGross, _money(totals['grand_total']), sub: 'discounted bills'),
         ]),
       ];
     case 'void_kot':
@@ -1267,8 +1272,8 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     case 'sales_summary':
       return [
         _misTiles([
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi, sub: 'what guests paid'),
+          _misStat(context, kNet, _money(totals['net']), sub: 'before SC, tax, round off'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
           _misStat(context, 'ABV', _money(totals['abv']), sub: 'tax-inclusive'),
@@ -1282,9 +1287,9 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kNet, _money(totals['net'])),
           _misStat(context, 'Tax', _money(totals['tax'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'ABV', _money(totals['abv'])),
         ]),
       ];
@@ -1294,11 +1299,11 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       final prev = (d['previous'] as Map?) ?? const {};
       return [
         _misTiles([
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'vs previous', misPercent(growth['grand_total']),
               sub: _money(prev['grand_total']),
               tint: _misGrowthColor(growth['grand_total'])),
-          _misStat(context, 'Net', _money(totals['net']), sub: misPercent(growth['net'])),
+          _misStat(context, kNet, _money(totals['net']), sub: misPercent(growth['net'])),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}', sub: misPercent(growth['bills'])),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}', sub: misPercent(growth['covers'])),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax · ${misPercent(growth['apc'])}'),
@@ -1318,8 +1323,8 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Parties', '${_int(totals['parties']) ?? 0}'),
           _misStat(context, 'Covers', '${_int(totals['covers']) ?? 0}'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
-          _misStat(context, 'Net', _money(totals['net'])),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kNet, _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax'),
         ]),
       ];
@@ -1328,7 +1333,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         _misTiles([
           _misStat(context, 'Collected', _money(totals['amount']), tint: AppColors.copperHi),
           _misStat(context, 'Refunds', _money(totals['refund'])),
-          _misStat(context, 'Net taken', _money(totals['net_amount'])),
+          _misStat(context, kAfterRefunds, _money(totals['net_amount']), sub: 'tax still in'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Split-tender bills', '${_int(totals['split_bills']) ?? 0}'),
         ]),
@@ -1405,8 +1410,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Groups', '${_int(totals['groups']) ?? 0}'),
           _misStat(context, 'Items', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          _misStat(context, kItemTotal, _money(totals['gross_amount'])),
           _misStat(context, 'Bill-level discount', _money(d['bill_level_discount']),
               sub: 'not spread across lines'),
         ]),
@@ -1418,11 +1422,10 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Dishes with sizes', '${_int(totals['items']) ?? 0}'),
           _misStat(context, 'Variations', '${_int(totals['variations']) ?? 0}'),
           _misStat(context, 'Qty sold', '${_int(totals['qty']) ?? 0}'),
-          _misStat(context, 'Gross', _money(totals['gross_amount'])),
-          _misStat(context, 'Net', _money(totals['net_amount'])),
+          _misStat(context, kItemTotal, _money(totals['gross_amount'])),
           // The size of the subset, so a small number is visibly small rather
           // than mistaken for the whole menu's takings.
-          _misStat(context, 'Whole menu gross', _money(d['window_gross']),
+          _misStat(context, 'Whole menu item total', _money(d['window_gross']),
               sub: 'Item Wise, same window'),
         ]),
       ];
@@ -1463,15 +1466,15 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       ];
 
     // The Sales Summary's own bill set, re-cut by till — so the ladder is shown
-    // in full: the sum of these rows IS the grand total on the Sales Summary,
+    // in full: the sum of these rows IS the Gross on the Sales Summary,
     // and the rungs are how a reader checks that rather than takes it on trust.
     case 'counter_summary':
       return [
         _misTiles([
           _misStat(context, 'Tills', '${_int(totals['counters']) ?? 0}'),
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
-          _misStat(context, 'Grand total', _money(totals['grand_total']), tint: AppColors.copperHi),
-          _misStat(context, 'Net', _money(totals['net'])),
+          _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi),
+          _misStat(context, kNet, _money(totals['net'])),
           _misStat(context, 'Cash sessions', '${_int(totals['sessions']) ?? 0}'),
           _misStat(context, 'Cash variance', _money(totals['variance']),
               sub: 'counted − expected',
@@ -1628,7 +1631,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'group_summary') {
     chips.add(StatusChip(
-      label: 'Gross ties to Item Wise for the same window — the same lines, re-cut',
+      label: 'Item total ties to Item Wise for the same window — the same lines, re-cut',
       color: AppColors.info,
       dense: true,
     ));
@@ -1679,7 +1682,7 @@ List<Widget> _misFlags(BuildContext context, _MisReport report, Map<String, dyna
 
   if (report.key == 'counter_summary') {
     chips.add(StatusChip(
-      label: 'These rows sum to the Sales Summary grand total — the same bills, cut by the till that rang them',
+      label: 'These rows sum to the Sales Summary Gross — the same bills, cut by the till that rang them',
       color: AppColors.info,
       dense: true,
     ));
@@ -2230,7 +2233,9 @@ void _misOpenBill(BuildContext context, RestClient rest, String billId, String t
           child: AsyncView<Map<String, dynamic>>(
             load: () => rest.getMap('/reports/mis/bill/$billId'),
             builder: (ctx, bill, reload) =>
-                SingleChildScrollView(child: _closedBillBody(ctx, bill, title)),
+                // reportWords: the row this opened from says Item total / Net /
+                // Gross, and so does the web's drill-down for the same bill.
+                SingleChildScrollView(child: _closedBillBody(ctx, bill, title, reportWords: true)),
           ),
         ),
       ),
