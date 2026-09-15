@@ -1145,6 +1145,40 @@ final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive:
   );
 }
 
+/// THE WAIVED CARD'S PRINT CONTROL AND ITS CONFIRMATION, in words that match the
+/// paper that will come out.
+///
+/// The server stamps REPRINT on a bill only when its ledger already counts a
+/// print of this seating's bill (`reprint: bill.print_count > 0` in
+/// printOpenTableBill). A waiver can sit on a bill nobody has printed: an
+/// installed 1.9.9 till's "Waive service charge" still records without
+/// printing, and a removal whose print failed leaves the same state. The dialog
+/// used to say "It is marked as a reprint" on exactly those bills, and the paper
+/// came out without the banner — the sentence-disagrees-with-the-paper defect
+/// [serviceChargeRemovalOutcome] exists to prevent.
+///
+/// So the words follow [serverBillPrintState]: only the server's `true` says
+/// reprint and promises the banner. `false` and "no answer" say print, which is
+/// true either way, and promise nothing about a banner. The web dashboard's
+/// `serviceChargeWaivedPrintLabel` uses the same labels.
+({String label, String title, String body, String confirm}) serviceChargeWaivedPrintCopy(Map bill) {
+  if (serverBillPrintState(bill) == true) {
+    return (
+      label: 'Reprint without the charge',
+      title: 'Reprint without the service charge?',
+      body: 'The bill prints again with the recorded waiver applied — the total the guest pays. '
+          'It is marked as a reprint.',
+      confirm: 'Reprint',
+    );
+  }
+  return (
+    label: 'Print without the charge',
+    title: 'Print without the service charge?',
+    body: 'The bill prints with the recorded waiver applied — the total the guest pays.',
+    confirm: 'Print',
+  );
+}
+
 /// The waiver block on the table sheet: either the one control that takes the
 /// charge off and prints, or the live waiver with its reprint and the control
 /// to put the charge back.
@@ -1178,6 +1212,7 @@ Widget misServiceChargeBlock(
 
   if (waived) {
     final w = waiver;
+    final printCopy = serviceChargeWaivedPrintCopy(bill);
     return Padding(
       padding: const EdgeInsets.only(top: AppSpacing.md),
       child: ForkCard(
@@ -1219,13 +1254,14 @@ Widget misServiceChargeBlock(
             // not take anything off. Here it can only ever reprint what the
             // waiver above already took off, so it needs no permission beyond
             // printing — the server reprints a waived bill for anyone who may
-            // print it, and records no second waiver.
+            // print it, and records no second waiver. "Reprint" or "Print" by
+            // the server's print ledger: see serviceChargeWaivedPrintCopy.
             _ScBusyButton(
               key: const ValueKey('sc-reprint-without-charge'),
-              label: 'Reprint without the charge',
+              label: printCopy.label,
               icon: Icons.print_outlined,
               run: () => _reprintWithoutServiceCharge(context,
-                  rest: rest, tableName: tableName, onChanged: onChanged),
+                  rest: rest, tableName: tableName, copy: printCopy, onChanged: onChanged),
             ),
             ForkButton.ghost(
               key: const ValueKey('sc-waiver-reverse'),
@@ -1373,16 +1409,19 @@ Future<void> _removeServiceChargeAndPrint(
   }
 }
 
-/// Reprint a bill whose charge a recorded waiver has already taken off.
+/// Print a bill whose charge a recorded waiver has already taken off.
 ///
 /// Confirmation only, and no figures in it: the same server route is called
 /// with no kind and no reason, and it reprints the existing waiver — no second
 /// row, no second audit line. The total goes in the snackbar afterwards, from
-/// the server's reply, because that is the total that was printed.
+/// the server's reply, because that is the total that was printed. The words
+/// are [serviceChargeWaivedPrintCopy]'s, so the dialog only promises a REPRINT
+/// banner when the server's ledger says the paper will carry one.
 Future<void> _reprintWithoutServiceCharge(
   BuildContext context, {
   required RestClient rest,
   required String tableName,
+  required ({String label, String title, String body, String confirm}) copy,
   required VoidCallback onChanged,
 }) async {
   final messenger = ScaffoldMessenger.of(context);
@@ -1390,14 +1429,11 @@ Future<void> _reprintWithoutServiceCharge(
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: AppColors.surface,
-      title: const Text('Reprint without the service charge?'),
-      content: const Text(
-        'The bill prints again with the recorded waiver applied — the total the guest pays. '
-        'It is marked as a reprint.',
-      ),
+      title: Text(copy.title),
+      content: Text(copy.body),
       actions: [
         TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Reprint')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text(copy.confirm)),
       ],
     ),
   );

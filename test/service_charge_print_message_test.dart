@@ -23,6 +23,11 @@
 //     and stays on screen long enough to be read;
 //   * a paper that carries the charge after all is never described as removed.
 //
+// And the waived card's own print control, whose confirmation said "It is marked
+// as a reprint" on bills the server had never printed — so the paper came out
+// with no REPRINT banner under a dialog that promised one. Its words now follow
+// the server's print ledger (serviceChargeWaivedPrintCopy).
+//
 // The web dashboard's `serviceChargeRemovalSentence` (src/lib/mis-capture.ts)
 // says the same words; its suite pins the same cases.
 
@@ -110,6 +115,39 @@ void main() {
       expect(r.message, 'The bill did not print. Press Print bill.');
       // It proves nothing about the charge, so it says nothing about it.
       expect(r.message, isNot(contains('service charge')));
+    });
+  });
+
+  group('serviceChargeWaivedPrintCopy — "reprint" only when the paper will say so', () {
+    test('printed before (print_count > 0): Reprint, and the banner is promised', () {
+      final c = m.serviceChargeWaivedPrintCopy({'print_count': 2, 'bill_printed_at': '2026-09-15T13:02:00Z'});
+      expect(c.label, 'Reprint without the charge');
+      expect(c.title, 'Reprint without the service charge?');
+      expect(c.body, contains('It is marked as a reprint.'));
+      expect(c.confirm, 'Reprint');
+    });
+
+    test('THE BUG: a waiver nobody printed (print_count 0) is a first print, with no banner promised', () {
+      // A 1.9.9 till's "Waive service charge" records without printing, and a
+      // removal whose print failed leaves the same bill. The server prints it
+      // with `reprint: print_count > 0` — false — so the paper has no banner.
+      final c = m.serviceChargeWaivedPrintCopy({'print_count': 0, 'bill_printed_at': null, 'printed_at': null});
+      expect(c.label, 'Print without the charge');
+      expect(c.title, 'Print without the service charge?');
+      expect(c.body, isNot(contains('reprint')));
+      expect(c.body, isNot(contains('again')));
+      expect(c.confirm, 'Print');
+    });
+
+    test('a first-print instant alone is the server saying printed', () {
+      expect(m.serviceChargeWaivedPrintCopy({'bill_printed_at': '2026-09-15T13:02:00Z'}).label,
+          'Reprint without the charge');
+    });
+
+    test('no print state at all promises nothing about a banner', () {
+      final c = m.serviceChargeWaivedPrintCopy(const {});
+      expect(c.label, 'Print without the charge');
+      expect(c.body, isNot(contains('reprint')));
     });
   });
 

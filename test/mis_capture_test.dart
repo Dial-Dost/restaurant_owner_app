@@ -188,9 +188,13 @@ Map<String, dynamic> _bill({
   double ncTotal = 0,
   String? basis,
   List<Map<String, dynamic>>? taxes,
+  int? printCount,
 }) =>
     {
       'service_charge_basis': ?basis,
+      // The server's print ledger for this seating (GET /bill-for-table always
+      // sends it); absent unless a test is about it.
+      'print_count': ?printCount,
       'bill_id': 'bill-1',
       'table_id': 'tbl-1',
       'total_amt': 1200.0,
@@ -947,18 +951,21 @@ void main() {
 
     testWidgets('a live waiver reprints through the same route: the table only, no second form',
         (tester) async {
-      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true)));
+      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 1)));
       api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
         'success': true, 'printed': true, 'waiver_created': false, 'service_charge_removed': true,
         'grand_total_before': null, 'grand_total_after': 1260,
       };
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('sc-reprint-without-charge')));
+      expect(find.text('Reprint without the charge'), findsOneWidget);
       await tester.tap(find.byKey(const ValueKey('sc-reprint-without-charge')));
       await tester.pumpAndSettle();
       // Confirmation only: no kind, no reason, no second name, no figures.
       expect(find.byKey(const ValueKey('capture-reason')), findsNothing);
       expect(find.byType(AlertDialog), findsOneWidget);
+      // The server has printed this bill before, so its paper WILL say REPRINT.
+      expect(find.textContaining('It is marked as a reprint.'), findsOneWidget);
       await tester.tap(find.text('Reprint'));
       await tester.pumpAndSettle();
 
@@ -967,6 +974,30 @@ void main() {
       expect(sent.single.body, {'table_name': 'T1'});
       expect(api.wrote('POST', '/print/bill'), isFalse);
       expect(find.text('Reprinting without the service charge — total ₹1260.00.'), findsOneWidget);
+    });
+
+    testWidgets('a waiver nobody has printed yet is PRINTED, and the dialog promises no REPRINT banner',
+        (tester) async {
+      // A 1.9.9 till's "Waive service charge" records without printing, and a
+      // removal whose print failed leaves the same bill: print_count 0. The
+      // server prints it with `reprint: print_count > 0`, so the paper has no
+      // banner — and the dialog used to say "It is marked as a reprint".
+      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 0)));
+      api.replies['/bills/service-charge-waiver/print'] = <String, dynamic>{
+        'success': true, 'printed': true, 'waiver_created': false, 'service_charge_removed': true,
+        'grand_total_before': null, 'grand_total_after': 1260,
+      };
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-reprint-without-charge')));
+      expect(find.text('Print without the charge'), findsOneWidget);
+      expect(find.text('Reprint without the charge'), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('sc-reprint-without-charge')));
+      await tester.pumpAndSettle();
+      expect(find.text('Print without the service charge?'), findsOneWidget);
+      expect(find.textContaining('reprint'), findsNothing);
+      await tester.tap(find.widgetWithText(FilledButton, 'Print'));
+      await tester.pumpAndSettle();
+      expect((removals(api).single.body as Map), {'table_name': 'T1'});
     });
 
     testWidgets('a cashier may reprint a waived bill, and still may not put the charge back',
