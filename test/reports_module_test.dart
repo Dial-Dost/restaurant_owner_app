@@ -14,6 +14,7 @@ import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 /// Insights → Reports: the nine MIS / control reports.
@@ -933,10 +934,14 @@ void main() {
     expect(find.text('₹2000.00'), findsWidgets, reason: 'sales summary grand total');
     // And the ladder that produces it, rung by rung.
     expect(find.text('Money ladder'), findsOneWidget);
-    for (final rung in const ['Gross', 'Discount', 'Net', 'Service charge', 'Tax', 'Round off', 'Grand total']) {
+    // The client's words: Item total at the top, Gross (the grand total) at the
+    // bottom. This fixture is an older backend's — `gross`, no `item_total` — so
+    // the top rung is read off the deprecated alias.
+    for (final rung in const ['Item total', 'Discount', 'Net', 'Service charge', 'Tax', 'Round off', 'Gross']) {
       expect(find.text(rung), findsWidgets, reason: '$rung rung missing');
     }
-    expect(find.text('₹1900.00'), findsWidgets, reason: 'gross');
+    expect(find.text('Grand total'), findsNothing);
+    expect(find.text('₹1900.00'), findsWidgets, reason: 'item total');
     expect(find.text('₹1800.00'), findsWidgets, reason: 'net');
 
     await _openTab(tester, 'Order Summary');
@@ -946,6 +951,32 @@ void main() {
     expect(find.text('₹2000.00'), findsWidgets, reason: 'settlement grand total');
     expect(find.text('Cash'), findsWidgets);
     expect(find.text('UPI'), findsWidgets);
+  });
+
+  // The ladder's top rung reads `item_total` when the server sends it — the
+  // deprecated `gross` alias only on an older backend — and its bottom rung is
+  // Gross, off grand_total. The alias is set to a different number here purely
+  // so the test can see which key the screen read.
+  testWidgets('the money ladder: Item total from item_total, Gross from grand_total', (tester) async {
+    final totals = {...(_salesSummary['totals'] as Map), 'item_total': 1900.0, 'gross': 1.0};
+    final api = _FakeApi(extra: {
+      '/reports/mis/sales-summary': {..._salesSummary, 'totals': totals},
+    });
+    await _mount(tester, api: api);
+    await _openTab(tester, 'Sales Summary');
+    final card = find.ancestor(of: find.text('Money ladder'), matching: find.byType(ForkCard)).first;
+    Finder inCard(String s) => find.descendant(of: card, matching: find.text(s));
+    expect(inCard('Item total'), findsOneWidget);
+    expect(inCard('₹1900.00'), findsOneWidget);
+    expect(inCard('₹1.00'), findsNothing, reason: 'the deprecated alias is not the rung when item_total is sent');
+    expect(inCard('Gross'), findsOneWidget);
+    expect(inCard('₹2000.00'), findsOneWidget);
+    expect(inCard('Grand total'), findsNothing);
+    // The tiles above it: GROSS is the grand total, NET the net.
+    expect(find.descendant(of: find.ancestor(of: find.text('GROSS'), matching: find.byType(ForkCard)).first,
+        matching: find.text('₹2000.00')), findsOneWidget);
+    expect(find.descendant(of: find.ancestor(of: find.text('NET'), matching: find.byType(ForkCard)).first,
+        matching: find.text('₹1800.00')), findsOneWidget);
   });
 
   testWidgets('unallocated settlement money is raised, not buried', (tester) async {

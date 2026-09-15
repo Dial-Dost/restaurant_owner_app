@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/gross_net.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -1478,7 +1479,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       // figure overflowed a 360px phone by 99px once the day ran to eight
       // digits. A wrapping line cannot, and it is the web block's layout too.
       Text(
-        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} net' : ''}',
+        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: text.bodySmall!.copyWith(fontSize: 11),
@@ -1581,7 +1582,7 @@ Future<void> _headlineMethodSheet(
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
       _detailRow(context, 'Refunds', refund > 0 ? '− ${_money(refund)}' : _money(0)),
-      _detailRow(context, 'Net of refunds', _money(mode['net_amount'])),
+      _detailRow(context, kAfterRefunds, _money(mode['net_amount'])),
       if (method == 'Unallocated') ...[
         const SizedBox(height: AppSpacing.sm),
         Text(
@@ -21517,7 +21518,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           kv('Gross sales', _pnl['gross_sales']),
           kv('Refunds', _pnl['refunds']),
           kv('Tax collected (pass-through)', _pnl['tax_collected']),
-          kv('Net revenue (ex-tax)', _pnl['net_revenue']),
+          kv('Revenue ex-tax (after refunds)', _pnl['net_revenue']),
           kv('Total expenses', _pnl['total_expenses']),
           kv('Net profit', _pnl['net_profit'], bold: true),
           pw.SizedBox(height: 16),
@@ -21531,9 +21532,14 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           pw.SizedBox(height: 16),
           pw.Text('Sales', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
           pw.Divider(),
-          kv('Total sales', _sales['total_sales']),
+          // Gross and Net in the client's words (models/gross_net.dart). The
+          // old "Net sales (after refunds)" line was Gross less refunds, tax
+          // and all — it is still here, named for what it is.
+          kv('Gross sales', _sales['total_sales']),
           kv('Bills', _sales['bill_count'] ?? 0),
-          kv('Net sales (after refunds)', _sales['net_sales'], bold: true),
+          kv('Gross after refunds', _sales['net_sales']),
+          if (readAccountingSales(_sales).netSales != null)
+            kv('Net sales', _sales['total_net'], bold: true),
         ]));
     await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
   }
@@ -21571,21 +21577,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     final refunds = _n(_sales['total_refund']);
     final bills = _n(_sales['bill_count']).round();
     final methods = ((_sales['by_method'] as List?) ?? const []).whereType<Map>().toList();
+    final words = readAccountingSales(_sales);
     return _detailSheet(
       context,
-      eyebrow: 'Net sales · $_windowLabel',
-      title: _money(_sales['net_sales']),
+      eyebrow: '${words.headlineLabel} · $_windowLabel',
+      title: _money(words.headlineValue),
       children: [
         _detailRow(context, 'Gross sales', _money(gross), trailing: _billsWord(bills)),
         _detailRow(context, 'Refunds', refunds > 0 ? '− ${_money(refunds)}' : _money(0)),
-        _detailRow(context, 'Net sales', _money(_sales['net_sales'])),
+        _detailRow(context, 'Gross after refunds', _money(_sales['net_sales'])),
         _detailRow(context, 'Average bill', bills > 0 ? _money(gross / bills) : '—'),
         _sheetHead('What sits inside gross sales'),
         _detailRow(context, 'Tax collected', _money(_sales['total_tax'])),
         _detailRow(context, 'Service charge', _money(_sales['total_service_charge'])),
+        if (billRoundOff(words.roundOff) != null)
+          _detailRow(context, 'Round off', billRoundOffMoney(billRoundOff(words.roundOff)!)),
+        if (words.netSales != null) _detailRow(context, 'Net sales', _money(words.netSales)),
         _sheetNote('Gross sales is what guests actually paid, so it still carries both. The tax is '
             'pass-through — it is owed onward to the government. The service charge is NOT tax: the '
             'restaurant keeps it, and the reports count it as income.'),
+        _sheetNote('Net sales is the item total less discounts — before service charge, tax and '
+            'round off, and before refunds — the figure the Sales Summary calls Net.'),
         if (methods.isNotEmpty) ...[
           _sheetHead('By payment method'),
           for (final m in methods)
@@ -21674,13 +21686,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         _detailRow(context, 'Gross sales', _money(_pnl['gross_sales'])),
         _detailRow(context, 'Refunds', '− ${_money(_pnl['refunds'])}'),
         _detailRow(context, 'Tax kept out', '− ${_money(_pnl['tax_collected'])}'),
-        _detailRow(context, 'Net revenue (ex-tax)', _money(_pnl['net_revenue'])),
+        _detailRow(context, 'Revenue ex-tax (after refunds)', _money(_pnl['net_revenue'])),
         _detailRow(context, 'Expenses', '− ${_money(_pnl['total_expenses'])}'),
         _detailRow(context, 'Net profit', _money(net)),
         _sheetHead('Read this carefully'),
         _detailRow(context, 'Service charge earned', _money(_pnl['service_charge'])),
         _sheetNote('Tax is subtracted because it is pass-through — collected for the government, '
-            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside net '
+            'never revenue. The service charge is the opposite: it is NOT tax, it stays inside '
             'revenue above, and the line here is only telling you how much of that revenue it was.'),
       ],
     );
@@ -21982,9 +21994,13 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         // the tax sheet is careful to name the service charge separately — it is
         // income, not a levy, and the two must never read as one bucket.
         _dashGrid([
+          // NET, in the client's word: after discount, before service charge,
+          // tax and round off. This card used to show net_sales — Gross less
+          // refunds, tax and all — under this caption; that figure is on the
+          // sheet behind it, named for what it is.
           StatCard(
-            value: money(_n(_sales['net_sales'])),
-            caption: 'NET SALES',
+            value: money(readAccountingSales(_sales).headlineValue ?? 0),
+            caption: readAccountingSales(_sales).headlineLabel.toUpperCase(),
             footer: detailsFooter(),
             onTap: _netSalesSheet,
           ),
