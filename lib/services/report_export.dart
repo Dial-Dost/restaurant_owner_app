@@ -44,6 +44,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 
 import 'restaurant_time.dart';
+import 'time_slot.dart';
 
 // ----------------------------------------------------------------- columns --
 
@@ -176,6 +177,7 @@ class MisReportDoc {
     required this.outletLabel,
     required this.notes,
     this.truncatedAt,
+    this.timeSlot,
   });
 
   final String title;
@@ -199,10 +201,18 @@ class MisReportDoc {
   /// file says so on its own face instead of quietly being short.
   final int? truncatedAt;
 
+  /// The part of each day the SERVER cut this on (`meta.time_slot`). Null = all day.
+  final AppliedTimeSlot? timeSlot;
+
   /// Filename stem — report, scope and window, so two exports of the same
-  /// report cannot be confused once they are sitting in a Downloads folder.
+  /// report cannot be confused once they are sitting in a Downloads folder. A
+  /// slot adds `_lunch-1200-1700` (the web's suffix, character for character);
+  /// all day adds nothing, so every earlier filename is unchanged.
   String get fileStem =>
-      '${_slug(title)}_${_slug(outletLabel)}_${from}_to_$to';
+      '${_slug(title)}_${_slug(outletLabel)}_${from}_to_$to${timeSlot?.fileSuffix ?? ''}';
+
+  /// The heading on the filed copy: `Sales Summary — Lunch (12:00–17:00)`.
+  String get displayTitle => timeSlot == null ? title : '$title — ${timeSlot!.phrase}';
 
   static String _slug(String s) => s
       .toLowerCase()
@@ -215,6 +225,7 @@ class MisReportDoc {
         ['Report', title],
         ['Outlet', outletLabel],
         ['Period', '$from to $to (both days included)'],
+        ['Time slot', timeSlotProvenance(timeSlot)],
         ['Timezone', timezone],
         ['Generated', RestaurantTime.stampNow()],
         ['Rows', truncatedAt == null ? '${rows.length}' : '${rows.length} (truncated at $truncatedAt)'],
@@ -438,7 +449,7 @@ Future<Uint8List> misPdf(MisReportDoc doc) async {
     pageFormat: PdfPageFormat.a4.landscape,
     margin: const pw.EdgeInsets.all(22),
     build: (ctx) => [
-      pw.Text(pdfSafe(doc.title), style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
+      pw.Text(pdfSafe(doc.displayTitle), style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
       pw.SizedBox(height: 4),
       for (final line in doc.preamble)
         pw.Text(pdfSafe('${line[0]}: ${line[1]}'), style: const pw.TextStyle(fontSize: 8)),
