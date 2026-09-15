@@ -560,12 +560,17 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
 
   /// 6.8 — the order's own fields, which ride in the header above the Send
   /// button: a takeaway's customer name / phone / address, and the kitchen note.
+  ///
+  /// ITEM 5 — off while a send is out, for the menu rows' reason (see [_row]):
+  /// [_send] reads them once, before it posts, so a word typed into the kitchen
+  /// note during "Sending…" would be shown on the pad and never reach the ticket.
   Widget _orderFields() => Padding(
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
             if (!widget.isDineIn) ...[
               TextField(
                 controller: _custCtrl,
+                enabled: !_sending,
                 decoration: const InputDecoration(
                   prefixIcon: Icon(Icons.person_outline),
                   hintText: 'Customer name (optional)',
@@ -576,6 +581,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
               const SizedBox(height: 8),
               TextField(
                 controller: _phoneCtrl,
+                enabled: !_sending,
                 keyboardType: TextInputType.number,
                 inputFormatters: mobile10Formatters(),
                 maxLength: 10,
@@ -593,6 +599,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
               if (widget.isDelivery) ...[
                 TextField(
                   controller: _addrCtrl,
+                  enabled: !_sending,
                   minLines: 1,
                   maxLines: 2,
                   decoration: const InputDecoration(
@@ -607,6 +614,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
             ],
             TextField(
               controller: _noteCtrl,
+              enabled: !_sending,
               minLines: 1,
               maxLines: 2,
               decoration: const InputDecoration(
@@ -740,6 +748,14 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     final qty = _cart[id] ?? 0;
     final note = (_itemNotes[id] ?? '').trim();
     final held = _itemHold.contains(id);
+    // ITEM 5 — NOTHING ON THE MENU CHANGES THE ORDER WHILE IT IS ON ITS WAY.
+    // [_send] takes its lines before it posts and closes the pad when the post
+    // lands, so a dish added (or a quantity, hold or note changed) while the
+    // button reads "Sending…" was drawn on the pad, counted, and never sent —
+    // and the pad closed on it without a word. The waiter believed it had gone
+    // to the kitchen. Every control on the row is off until the send settles; a
+    // send that fails turns them back on with the cart as it was.
+    final locked = _sending;
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: ForkCard(
@@ -766,24 +782,24 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                       icon: Icon(Icons.front_hand_outlined,
                           size: 20, color: held ? AppColors.warning : AppColors.textTertiary),
                       tooltip: held ? 'Course held — tap to release' : 'Hold course (fire later from the KDS)',
-                      onPressed: () => _toggleHold(id),
+                      onPressed: locked ? null : () => _toggleHold(id),
                     ),
                     IconButton(
                       icon: Icon(Icons.sticky_note_2_outlined,
                           size: 20, color: note.isNotEmpty ? AppColors.copperHi : AppColors.textTertiary),
                       tooltip: note.isNotEmpty ? 'Edit note' : 'Add note',
-                      onPressed: () => _editItemNote(id, '${m['name']}'),
+                      onPressed: locked ? null : () => _editItemNote(id, '${m['name']}'),
                     ),
                     IconButton(
                         icon: Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
-                        onPressed: () => _setQty(id, -1)),
+                        onPressed: locked ? null : () => _setQty(id, -1)),
                     Text('$qty',
                         style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
                     IconButton(
                         icon: Icon(Icons.add_circle_outline, color: AppColors.copperHi),
-                        onPressed: () => _setQty(id, 1)),
+                        onPressed: locked ? null : () => _setQty(id, 1)),
                   ])
-                : FilledButton.tonal(onPressed: () => _setQty(id, 1), child: const Text('Add')),
+                : FilledButton.tonal(onPressed: locked ? null : () => _setQty(id, 1), child: const Text('Add')),
           ]),
           if (qty > 0 && (note.isNotEmpty || held))
             Padding(

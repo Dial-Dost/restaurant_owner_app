@@ -32,6 +32,9 @@ import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 ///   * NO MONEY ON A WAITER'S REVIEW (item 19 / C4), and all of it for an owner.
 ///   * A dish the menu dropped blocks the send with a sentence, instead of
 ///     leaving the button on "Sending…" for good.
+///   * NOTHING CHANGES THE ORDER WHILE IT IS ON ITS WAY. The send takes its
+///     lines before it posts and closes the pad when it lands, so a dish added
+///     in the "Sending…" window was shown, counted, and never sent.
 
 // ------------------------------------------------------------------ the fake
 
@@ -49,6 +52,10 @@ class _FakeApi extends ApiClient {
 
   /// While true, every WRITE dies in transport, as a dropped Wi-Fi does.
   bool writesOffline = false;
+
+  /// While set, every WRITE is answered with this refusal — the server heard
+  /// it and said no, so nothing is queued and the pad stays open.
+  ApiException? writeRefusal;
 
   @override
   Future<LoginResult> login(String restaurantName, String user, String password,
@@ -76,6 +83,7 @@ class _FakeApi extends ApiClient {
     if (gate != null) await gate!.future;
     if (method != 'GET') {
       if (writesOffline) throw const SocketException('Network is unreachable');
+      if (writeRefusal != null) throw writeRefusal!;
       writes.add((method: method, path: path, body: body));
       return <String, dynamic>{'success': true};
     }
@@ -360,6 +368,56 @@ void main() {
     });
   });
 
+  // ============================== 2b. a note written from inside the review
+
+  testWidgets('a note edited INSIDE the review is read back at once, and is the note that is sent',
+      (tester) async {
+    // Every other note in this file is written on the menu row before the review
+    // opens. This is the waiter reading the order back and the guest saying
+    // "make the Dish 2 extra spicy": the sheet must show the new words the moment
+    // the note is saved, or the waiter reads back the old ones.
+    final (api, host) = await _pumpPad(tester);
+    await _add(tester, 'Dish 1');
+    await _add(tester, 'Dish 2');
+    await _openReview(tester);
+
+    Finder sheetLine(String text) =>
+        find.ancestor(of: _inSheet(find.text(text)), matching: find.byType(ForkCard)).first;
+    Future<void> writeNote(String note) async {
+      await tester.tap(find.descendant(
+          of: sheetLine('1 × Dish 2'), matching: find.widgetWithIcon(IconButton, Icons.sticky_note_2_outlined)));
+      await tester.pumpAndSettle();
+      expect(find.text('Note for Dish 2'), findsOneWidget, reason: 'the note icon in the review opened no editor');
+      await tester.enterText(find.byType(TextField).last, note);
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(_sheet, findsOneWidget, reason: 'saving a note must not close the review');
+    }
+
+    await writeNote('extra spicy');
+    expect(_inSheet(find.text('extra spicy')), findsOneWidget, reason: 'the review did not redraw with the new note');
+    expect(api.writes, isEmpty);
+
+    // Changed again, from the sheet: the old words go, the new ones are read back.
+    await writeNote('less spicy');
+    expect(_inSheet(find.text('extra spicy')), findsNothing, reason: 'the review still reads back the old note');
+    expect(_inSheet(find.text('less spicy')), findsOneWidget);
+    // And it is the pad's note, not the sheet's: the menu row carries it too.
+    await tester.tap(find.byKey(const ValueKey('order-review-back')));
+    await tester.pumpAndSettle();
+    expect(find.descendant(of: _card('Dish 2'), matching: find.text('less spicy')), findsOneWidget);
+
+    await _openReview(tester);
+    await tester.tap(_sendToKitchen);
+    await tester.pumpAndSettle();
+    expect(api.to('/orders'), hasLength(1));
+    expect((api.to('/orders').single.body as Map)['items'], [
+      {'id': 'mi-1', 'name': 'Dish 1', 'price': 101.0, 'quantity': 1},
+      {'id': 'mi-2', 'name': 'Dish 2', 'price': 102.0, 'quantity': 1, 'note': 'less spicy'},
+    ]);
+    expect(host.result, isTrue);
+  });
+
   // =========================================== 3. Send to kitchen: ONE order
 
   group('Send to kitchen', () {
@@ -524,7 +582,77 @@ void main() {
     });
   });
 
-  // ======================================================== 5. on a phone
+  // ========================================= 5. while the order is on its way
+
+  group('while the order is on its way', () {
+    IconButton rowIcon(WidgetTester tester, String dish, IconData icon) => tester.widget<IconButton>(
+        find.descendant(of: _card(dish), matching: find.widgetWithIcon(IconButton, icon)));
+    Finder addOn(String dish) => find.descendant(of: _card(dish), matching: find.widgetWithText(FilledButton, 'Add'));
+    const carted = [
+      Icons.add_circle_outline,
+      Icons.remove_circle_outline,
+      Icons.front_hand_outlined,
+      Icons.sticky_note_2_outlined,
+    ];
+    final kitchenNote = find.widgetWithText(TextField, 'Note for the kitchen (e.g. no onions)…');
+
+    testWidgets('nothing on the menu or in the note changes it — a dish added then would never have been sent',
+        (tester) async {
+      final (api, host) = await _pumpPad(tester);
+      await _add(tester, 'Dish 1');
+
+      api.gate = Completer<void>();
+      await tester.tap(_send);
+      await tester.pump();
+      expect(find.text('Sending…'), findsOneWidget, reason: 'precondition: the POST is still out');
+      expect(api.writes, isEmpty);
+
+      for (final icon in carted) {
+        expect(rowIcon(tester, 'Dish 1', icon).onPressed, isNull, reason: '$icon on a carted dish is live while sending');
+      }
+      expect(_enabled(tester, addOn('Dish 2')), isFalse, reason: 'Add is live on a cart that is already on its way');
+      expect(tester.widget<TextField>(kitchenNote).enabled, isFalse);
+
+      // The waiter tries anyway: nothing joins the order.
+      await tester.tap(addOn('Dish 2'), warnIfMissed: false);
+      await tester.tap(find.descendant(of: _card('Dish 1'), matching: find.byIcon(Icons.add_circle_outline)),
+          warnIfMissed: false);
+      await tester.pump();
+      expect(addOn('Dish 2'), findsOneWidget, reason: 'Dish 2 joined an order that had already left');
+      expect(find.descendant(of: _card('Dish 1'), matching: find.text('1')), findsOneWidget);
+
+      api.gate!.complete();
+      api.gate = null;
+      await tester.pumpAndSettle();
+      expect(api.to('/orders'), hasLength(1));
+      expect((api.to('/orders').single.body as Map)['items'], [
+        {'id': 'mi-1', 'name': 'Dish 1', 'price': 101.0, 'quantity': 1},
+      ]);
+      expect(host.result, isTrue);
+    });
+
+    testWidgets('a send the server refuses unlocks the pad, with the cart as it was', (tester) async {
+      final (api, host) = await _pumpPad(tester);
+      await _add(tester, 'Dish 1', times: 2);
+      api.writeRefusal = ApiException('Table T1 is not occupied', 400);
+
+      await tester.tap(_send);
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Table T1 is not occupied'), findsWidgets);
+      expect(host.closed, isFalse);
+
+      // Not wedged: every control is live again, and nothing was lost.
+      for (final icon in carted) {
+        expect(rowIcon(tester, 'Dish 1', icon).onPressed, isNotNull, reason: '$icon stayed locked after a refusal');
+      }
+      expect(_enabled(tester, addOn('Dish 2')), isTrue);
+      expect(tester.widget<TextField>(kitchenNote).enabled, isTrue);
+      expect(_enabled(tester, _send), isTrue);
+      expect(_sendLabel(tester), startsWith('Send order · 2 items'));
+    });
+  });
+
+  // ======================================================== 6. on a phone
 
   testWidgets('360px, an owner, twelve dishes: nothing overflows and the whole figure is there',
       (tester) async {
@@ -544,7 +672,7 @@ void main() {
     expect(tester.getRect(_sendToKitchen).right, lessThanOrEqualTo(360));
   });
 
-  // ================================================ 6. the wiring, in source
+  // ================================================ 7. the wiring, in source
 
   test('the sheet never sends; the pad sends after it closes, from the same lines', () {
     final src = File('lib/screens/order_entry.dart').readAsStringSync();
