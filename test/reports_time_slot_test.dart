@@ -12,6 +12,7 @@ import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/services/time_slot.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
@@ -239,16 +240,29 @@ void main() {
   tearDown(() => ReportExporter.overrideDeliver = null);
 
   testWidgets('no presets route: no Session chip, no new segments, and no slot on the wire', (tester) async {
+    // Even with "Dinner" remembered from earlier in the session: a filter the
+    // server cannot apply must not be sent as though it were one.
+    TimeSlotMemory.remember('reports', TimeSlotSelection.preset('dinner'));
     final api = await _mount(tester, api: _SlotApi(slotsRoute: false));
     expect(find.byKey(const ValueKey('reports-slot')), findsNothing);
     await _openTab(tester, 'Sales Summary');
     expect(find.text('Hour-wise'), findsOneWidget);
     expect(find.text('By session'), findsNothing);
     expect(find.text('By hour of day'), findsNothing);
-    for (final call in api.gets.where((c) => c.startsWith('/reports/mis/') && !c.startsWith('/reports/mis/time-slots'))) {
+    final reportCalls =
+        api.gets.where((c) => c.startsWith('/reports/mis/') && !c.startsWith('/reports/mis/time-slots')).toList();
+    expect(reportCalls, isNotEmpty);
+    for (final call in reportCalls) {
       expect(call, isNot(contains('slot=')));
       expect(call, isNot(contains('time_from')));
     }
+  });
+
+  testWidgets('a session remembered from earlier comes back with the chip, on the first request', (tester) async {
+    TimeSlotMemory.remember('reports', TimeSlotSelection.preset('dinner'));
+    final api = await _mount(tester);
+    expect(_text(tester, find.byKey(const ValueKey('reports-slot'))), contains('Dinner · 18:00–24:00'));
+    expect(api.lastCallTo('/reports/mis/item-wise'), contains('slot=dinner'));
   });
 
   testWidgets('the chip offers All day, each preset and Custom… — Manage sessions only with can_edit',
