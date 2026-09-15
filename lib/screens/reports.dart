@@ -204,7 +204,9 @@ class _ReportsViewState extends State<_ReportsView> {
   void _setSlot(TimeSlotSelection next) => setState(() => _setSlotInState(next));
 
   /// A tapped hour-of-day or session row: that slot, read day by day — the
-  /// question an owner asks the instant 1pm or Dinner looks wrong.
+  /// question an owner asks the instant 1pm or Dinner looks wrong. It REPLACES
+  /// the slot, which is only the same as narrowing because the pane offers the
+  /// tap solely where the two agree ([slotRowOpensExactly]).
   void _narrowToSlot(TimeSlotSelection next) => setState(() {
         _setSlotInState(next);
         _misBucket = 'day';
@@ -311,10 +313,20 @@ class _ReportsViewState extends State<_ReportsView> {
     final nav = ModuleNavigator.of(context);
     final outletId = widget.rest.auth.selectedOutletId ?? '';
 
+    // The slot as a QUESTION, not as a URL: `slot=lunch` is the same request
+    // before and after Manage sessions moves Lunch's hours, and "By session" is
+    // built from every preset even with All day picked. Keyed on the bare
+    // selection, a save left the pane mounted on the old answer — see
+    // [slotDefinitionKey]. The bucket is the one sent, and only one report takes it.
+    final slotQuestion = slotDefinitionKey(
+      _effectiveSlot,
+      _slots?.slots ?? const [],
+      bucket: report.key == 'sales_summary' ? _effectiveBucket : null,
+    );
     final pane = _MisReportPane(
       // Remount on every dimension of the question: a pane holding rows for one
       // window must never be reused under the label of another.
-      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_effectiveBucket-${_effectiveSlot.key}-$outletId'),
+      key: ValueKey('mis-${report.key}-${_range.from}-${_range.to}-$_search-$_effectiveBucket-$slotQuestion-$outletId'),
       rest: widget.rest,
       profile: widget.profile,
       report: report,
@@ -667,6 +679,9 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
   /// The slot this pane asked for, in words (null for all day).
   String? get _slotPhrase => widget.slot.phrase(widget.presets);
 
+  /// The slot the server actually cut these rows under (null = all day).
+  AppliedTimeSlot? get _appliedSlot => AppliedTimeSlot.fromMeta(_meta);
+
   // ---- wire ----------------------------------------------------------------
 
   String _url({required int limit, required int offset}) {
@@ -951,16 +966,23 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       return _MisRowOpen.day;
     }
     // An hour-of-day row becomes that hour as a custom slot, and a session row
-    // becomes that saved session — each then read day by day.
-    if (widget.report.key == 'sales_summary' &&
-        widget.bucket == 'hour_of_day' &&
-        hourOfDaySlot(_s(row, 'bucket', '')) != null) {
-      return _MisRowOpen.hour;
+    // becomes that saved session — each then read day by day. Opening one
+    // REPLACES the slot the rows were cut under, so it is offered only where the
+    // replacement counts exactly what the row did: a Lunch row that under
+    // 16:00–19:00 held only 16:00–17:00, or a 01:00 row of a night counted on
+    // the evening before, would open onto a different total. Judged against the
+    // slot the SERVER applied to these rows (`meta.time_slot`), not the picker.
+    if (widget.report.key == 'sales_summary' && widget.bucket == 'hour_of_day') {
+      final hour = hourOfDaySlot(_s(row, 'bucket', ''));
+      if (hour != null && slotRowOpensExactly(hour.from, hour.to, _appliedSlot)) {
+        return _MisRowOpen.hour;
+      }
     }
-    if (widget.report.key == 'sales_summary' &&
-        widget.bucket == 'session' &&
-        sessionRowPreset(_s(row, 'bucket', ''), widget.presets) != null) {
-      return _MisRowOpen.session;
+    if (widget.report.key == 'sales_summary' && widget.bucket == 'session') {
+      final preset = sessionRowPreset(_s(row, 'bucket', ''), widget.presets);
+      if (preset != null && slotRowOpensExactly(preset.start, preset.end, _appliedSlot)) {
+        return _MisRowOpen.session;
+      }
     }
     // An Executive Summary outlet row switches the whole app to that branch,
     // which is what "why is Kalyani Nagar down" actually needs. A reader who
@@ -1026,6 +1048,21 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
       kinds.add(k);
     }
     if (open == 0) {
+      // Hours and sessions that open under All day but not under this slot
+      // (see [slotRowOpensExactly]): say which setting brings the taps back,
+      // rather than leaving a reader who tapped them yesterday to guess.
+      final applied = _appliedSlot;
+      final cut = widget.bucket == 'hour_of_day'
+          ? 'an hour'
+          : widget.bucket == 'session'
+              ? 'a session'
+              : null;
+      if (widget.report.key == 'sales_summary' && cut != null && applied != null) {
+        return (
+          icon: Icons.filter_alt_outlined,
+          label: 'Rows here are cut to ${applied.phrase} — choose All day to open $cut',
+        );
+      }
       return (
         icon: Icons.functions,
         label: 'Each row totals many bills — no single one to open',

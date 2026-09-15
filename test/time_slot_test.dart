@@ -84,6 +84,39 @@ void main() {
       expect(TimeSlotSelection.custom('22:00', '02:00').key, 'custom:22:00-02:00');
       expect(TimeSlotSelection.preset('lunch'), TimeSlotSelection.preset('lunch'));
     });
+
+    test("the pane is keyed on what a pick MEANS: a preset's hours and name, and every preset for By session", () {
+      final lunch = TimeSlotSelection.preset('lunch');
+      final moved = [const TimeSlotPreset(id: 'lunch', label: 'Lunch', start: '12:00', end: '15:00'), _defaults[1]];
+      final renamed = [const TimeSlotPreset(id: 'lunch', label: 'Brunch', start: '12:00', end: '17:00'), _defaults[1]];
+      final dinnerMoved = [_defaults[0], const TimeSlotPreset(id: 'dinner', label: 'Dinner', start: '19:00', end: '24:00')];
+      // The URL cannot tell the old Lunch from the new one…
+      expect(lunch.queryParts, ['slot=lunch']);
+      expect(lunch.key, 'preset:lunch');
+      // …so the key the pane remounts on carries the hours and the name.
+      expect(slotDefinitionKey(lunch, _defaults), 'preset:lunch@12:00-17:00/Lunch');
+      expect(slotDefinitionKey(lunch, moved), 'preset:lunch@12:00-15:00/Lunch');
+      expect(slotDefinitionKey(lunch, renamed), 'preset:lunch@12:00-17:00/Brunch');
+      expect(slotDefinitionKey(lunch, dinnerMoved), 'preset:lunch@12:00-17:00/Lunch',
+          reason: "another session's edit is not this pick's question");
+      expect(slotDefinitionKey(TimeSlotSelection.allDay, moved), 'all');
+      expect(slotDefinitionKey(TimeSlotSelection.custom('22:00', '02:00'), moved), 'custom:22:00-02:00');
+
+      // By session: its rows ARE the presets, so the whole list keys it — All
+      // day included. The same string as the web's slotDefinitionKey.
+      final all = slotDefinitionKey(TimeSlotSelection.allDay, _defaults, bucket: 'session');
+      expect(all, 'all#[["lunch","Lunch","12:00","17:00"],["dinner","Dinner","18:00","24:00"]]');
+      expect(slotDefinitionKey(TimeSlotSelection.allDay, moved, bucket: 'session'), isNot(all));
+      expect(slotDefinitionKey(TimeSlotSelection.allDay, renamed, bucket: 'session'), isNot(all));
+      expect(slotDefinitionKey(TimeSlotSelection.allDay, _defaults.sublist(0, 1), bucket: 'session'), isNot(all));
+      final custom = TimeSlotSelection.custom('16:00', '19:00');
+      expect(slotDefinitionKey(custom, dinnerMoved, bucket: 'session'),
+          isNot(slotDefinitionKey(custom, _defaults, bucket: 'session')),
+          reason: '16:00–19:00 by session carries a sliver of Dinner');
+      for (final bucket in const ['day', 'hour', 'hour_of_day', null]) {
+        expect(slotDefinitionKey(TimeSlotSelection.allDay, moved, bucket: bucket), 'all', reason: '$bucket');
+      }
+    });
   });
 
   group('the words — identical on the web', () {
@@ -183,6 +216,45 @@ void main() {
       expect(sessionRowPreset('Outside sessions', _defaults), isNull);
       // Renamed since the report was built: not silently matched to the wrong one.
       expect(sessionRowPreset('Supper (18:00-24:00)', _defaults), isNull);
+    });
+
+    test('a row opens only where its own slot counts exactly what the row did', () {
+      AppliedTimeSlot custom(String from, String to) => AppliedTimeSlot(
+          id: null, label: 'Custom', start: from, end: to, crossesMidnight: crossesMidnight(from, to), source: 'custom');
+
+      // All day: any hour or session inside one day…
+      expect(slotRowOpensExactly('13:00', '14:00', null), isTrue);
+      expect(slotRowOpensExactly('23:00', '24:00', null), isTrue);
+      expect(slotRowOpensExactly('12:00', '17:00', null), isTrue);
+      // …but not a session crossing midnight: the row is cut on calendar days,
+      // and that session on its own moves every small hour to the evening before.
+      expect(slotRowOpensExactly('18:00', '02:00', null), isFalse);
+
+      // A slot inside one day: rows inside it open, rows reaching past it do not.
+      expect(slotRowOpensExactly('12:00', '17:00', _lunch), isTrue);
+      expect(slotRowOpensExactly('13:00', '14:00', _lunch), isTrue);
+      expect(slotRowOpensExactly('20:00', '21:00', _lunch), isFalse);
+      expect(slotRowOpensExactly('16:00', '17:00', custom('16:00', '19:00')), isTrue);
+      expect(slotRowOpensExactly('12:00', '17:00', custom('16:00', '19:00')), isFalse,
+          reason: 'this Lunch row held only 16:00–17:00; all of Lunch is a bigger total');
+      expect(slotRowOpensExactly('18:00', '24:00', custom('16:00', '19:00')), isFalse);
+      expect(slotRowOpensExactly('23:00', '24:00', custom('18:00', '00:00')), isTrue, reason: 'an END of 00:00 is midnight');
+
+      // Crossing midnight: the evening is on its own day under both, so it opens…
+      expect(slotRowOpensExactly('22:00', '23:00', _late), isTrue);
+      expect(slotRowOpensExactly('23:00', '24:00', _late), isTrue);
+      // …the small hours are the day before's under the slot, the same day's alone.
+      expect(slotRowOpensExactly('01:00', '02:00', _late), isFalse);
+      expect(slotRowOpensExactly('00:00', '01:00', _late), isFalse);
+      // A session crossing midnight inside it opens: both put a night on the day it starts.
+      expect(slotRowOpensExactly('22:00', '02:00', _late), isTrue);
+      expect(slotRowOpensExactly('23:00', '01:00', _late), isTrue);
+      expect(slotRowOpensExactly('21:00', '01:00', _late), isFalse);
+      expect(slotRowOpensExactly('23:00', '03:00', _late), isFalse);
+
+      // Nothing unreadable is ever a control.
+      expect(slotRowOpensExactly('noon', '14:00', null), isFalse);
+      expect(slotRowOpensExactly('13:00', '13:00', null), isFalse);
     });
   });
 

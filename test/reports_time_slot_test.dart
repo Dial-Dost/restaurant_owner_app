@@ -24,11 +24,14 @@ import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 /// it, answering per the agreed contract. What these pin is the screen's half:
 ///   * no route, no chip, and not one slot parameter on the wire;
 ///   * the chip's options, and "Manage sessions" only for `can_edit`;
-///   * a pick rides on EVERY report request and remounts the pane;
+///   * a pick rides on EVERY report request and remounts the pane — and so
+///     does a SAVE that changes what the pick means under the same URL (the
+///     picked session's hours or name; any preset, for "By session");
 ///   * custom times are validated before they are sent;
 ///   * the editor PUTs the whole list and shows the server's own 400 sentence;
 ///   * the Sales Summary's four segments, and the rows that narrow into a slot
-///     — while a day row narrows the dates and KEEPS the slot;
+///     — only where opening one counts exactly what the row did — while a day
+///     row narrows the dates and KEEPS the slot;
 ///   * the export names the slot the server applied, in its filename and
 ///     preamble;
 ///   * the clamp chip reads a LIST (`clamped == true` never fired);
@@ -56,6 +59,9 @@ class _SlotApi extends ApiClient {
 
   /// `meta.window.clamped` on every report.
   List<String> clamped = const [];
+
+  /// The Sales Summary's `hour_of_day` rows.
+  List<String> hourRows = const ['13:00-14:00', '20:00-21:00'];
 
   final List<String> calls = <String>[];
   final List<Object?> puts = <Object?>[];
@@ -135,12 +141,12 @@ class _SlotApi extends ApiClient {
     final rows = switch (key) {
       'sales_summary' => switch (bucket) {
           'hour_of_day' => [
-              {'bucket': '13:00-14:00', 'bills': 2},
-              {'bucket': '20:00-21:00', 'bills': 1},
+              for (final h in hourRows) {'bucket': h, 'bills': 1},
             ],
+          // Built from the presets HELD, as the server builds them: a save
+          // renames and retimes these rows under an unchanged URL.
           'session' => [
-              {'bucket': 'Lunch (12:00-17:00)', 'bills': 2},
-              {'bucket': 'Dinner (18:00-24:00)', 'bills': 1},
+              for (final s in slots) {'bucket': '${s['label']} (${s['start']}-${s['end']})', 'bills': 1},
               {'bucket': 'Outside sessions', 'bills': 1},
             ],
           'hour' => [
@@ -222,6 +228,28 @@ Future<void> _pick(WidgetTester tester, String option) async {
 
 String _text(WidgetTester tester, Finder within) =>
     tester.widgetList<Text>(find.descendant(of: within, matching: find.byType(Text))).map((t) => t.data ?? '').join(' ');
+
+/// Opens Manage sessions, types [fields] (editor key -> text) and saves.
+Future<void> _saveSessions(WidgetTester tester, Map<String, String> fields) async {
+  await _openChip(tester);
+  await tester.tap(find.byKey(const ValueKey('slot-manage')));
+  await tester.pumpAndSettle();
+  for (final f in fields.entries) {
+    await tester.enterText(find.byKey(ValueKey(f.key)), f.value);
+  }
+  await tester.tap(find.byKey(const ValueKey('slot-edit-save')));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _pickCustom(WidgetTester tester, String from, String to) async {
+  await _openChip(tester);
+  await tester.tap(find.byKey(const ValueKey('slot-option-custom')));
+  await tester.pumpAndSettle();
+  await tester.enterText(find.byKey(const ValueKey('slot-custom-from')), from);
+  await tester.enterText(find.byKey(const ValueKey('slot-custom-to')), to);
+  await tester.tap(find.byKey(const ValueKey('slot-custom-apply')));
+  await tester.pumpAndSettle();
+}
 
 Future<void> _tapRow(WidgetTester tester, String cell) async {
   await tester.ensureVisible(find.text(cell).first);
@@ -438,6 +466,117 @@ void main() {
     final call = api.lastCallTo('/reports/mis/sales-summary');
     expect(call, contains('from=2026-08-01&to=2026-08-01'));
     expect(call, contains('slot=dinner'), reason: '"Dinner on the 1st" is still a question about Dinner');
+  });
+
+  testWidgets('saving new hours — or a new name — for the PICKED session re-asks the report under them',
+      (tester) async {
+    String? name;
+    ReportExporter.overrideDeliver = (b, filename, format) async {
+      name = filename;
+      return const ReportExportResult('Saved');
+    };
+    final api = await _mount(tester);
+    await _pick(tester, 'lunch');
+    int itemWiseGets() => api.gets.where((c) => c.startsWith('/reports/mis/item-wise')).length;
+    final before = itemWiseGets();
+
+    await _saveSessions(tester, {'slot-edit-end-0': '15:00'});
+    // `slot=lunch` is the URL it was — and it is asked again, because the
+    // server now reads it as 12:00–15:00. Kept mounted, the pane showed the old
+    // Lunch's rows and footer under a toolbar naming the new one.
+    expect(itemWiseGets(), before + 1, reason: "the same URL is a new question once Lunch's hours move");
+    expect(api.lastCallTo('/reports/mis/item-wise'), contains('slot=lunch'));
+    expect(_text(tester, find.byKey(const ValueKey('reports-basis'))), 'Dated on order placement · Lunch (12:00–15:00)');
+    expect(_text(tester, find.byKey(const ValueKey('reports-slot-applied'))), 'Lunch (12:00–15:00)',
+        reason: 'the footer names what the server applied, and it applied the new hours');
+
+    // The export is built off that same fresh payload: its name agrees with its rows.
+    await tester.tap(find.byKey(const ValueKey('reports-export')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Export CSV'));
+    await tester.pumpAndSettle();
+    expect(name, endsWith('_lunch-1200-1500.csv'));
+
+    // A rename alone re-asks too: the footer and the filename are spelled from the name.
+    final beforeRename = itemWiseGets(); // the export's sweep was a GET of its own
+    await _saveSessions(tester, {'slot-edit-name-0': 'Brunch'});
+    expect(itemWiseGets(), beforeRename + 1);
+    expect(_text(tester, find.byKey(const ValueKey('reports-slot-applied'))), 'Brunch (12:00–15:00)');
+  });
+
+  testWidgets('"By session" re-asks when any session is saved, All day included — its rows are the sessions',
+      (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Sales Summary');
+    await tester.tap(find.text('By session'));
+    await tester.pumpAndSettle();
+    expect(find.text('Lunch (12:00-17:00)'), findsWidgets);
+    int salesGets() => api.gets.where((c) => c.startsWith('/reports/mis/sales-summary')).length;
+    final before = salesGets();
+
+    await _saveSessions(tester, {'slot-edit-end-0': '15:00'});
+    expect(salesGets(), before + 1, reason: 'All day picked, so nothing on the wire changed — but the rows did');
+    final call = api.lastCallTo('/reports/mis/sales-summary');
+    expect(call, contains('bucket=session'));
+    expect(call, isNot(contains('slot=')));
+    expect(find.text('Lunch (12:00-15:00)'), findsWidgets);
+    expect(find.text('Lunch (12:00-17:00)'), findsNothing, reason: 'no row from before the save is left standing');
+
+    // Day-wise over All day is not built from the sessions: a save there asks nothing.
+    await tester.tap(find.text('Day-wise'));
+    await tester.pumpAndSettle();
+    final dayBefore = salesGets();
+    await _saveSessions(tester, {'slot-edit-end-0': '16:00'});
+    expect(salesGets(), dayBefore);
+  });
+
+  testWidgets('under a slot, a session row reaching past it does not open — its drill-down would be a bigger total',
+      (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Sales Summary');
+    await _pickCustom(tester, '16:00', '19:00');
+    await tester.tap(find.text('By session'));
+    await tester.pumpAndSettle();
+    // Lunch here is only 16:00–17:00 and Dinner only 18:00–19:00; opening
+    // either as a session would read its whole 12:00–17:00 or 18:00–24:00.
+    expect(_text(tester, find.byKey(const ValueKey('reports-drill'))),
+        'Rows here are cut to 16:00–19:00 — choose All day to open a session');
+    final n = api.gets.length;
+    await _tapRow(tester, 'Lunch (12:00-17:00)');
+    expect(api.gets.length, n);
+    expect(_text(tester, find.byKey(const ValueKey('reports-slot'))), contains('Custom · 16:00–19:00'),
+        reason: 'the slot the reader chose is not swapped for a wider one');
+
+    // Inside the pick it still opens: Lunch's own row, under Lunch.
+    await _pick(tester, 'lunch');
+    expect(_text(tester, find.byKey(const ValueKey('reports-drill'))),
+        'Some rows open that session, day by day · 2 of 3 rows name none');
+    await _tapRow(tester, 'Lunch (12:00-17:00)');
+    final call = api.lastCallTo('/reports/mis/sales-summary');
+    expect(call, contains('slot=lunch'));
+    expect(call, contains('bucket=day'));
+  });
+
+  testWidgets('under a slot crossing midnight, the small-hours rows do not open — they count on the day before',
+      (tester) async {
+    final api = await _mount(tester, api: _SlotApi()..hourRows = const ['22:00-23:00', '01:00-02:00']);
+    await _openTab(tester, 'Sales Summary');
+    await _pickCustom(tester, '22:00', '02:00');
+    await tester.tap(find.text('By hour of day'));
+    await tester.pumpAndSettle();
+    expect(_text(tester, find.byKey(const ValueKey('reports-drill'))),
+        'Some rows open that hour, day by day · 1 of 2 rows name none');
+
+    // Over 1–15 Aug this row is 2–16 Aug 01:xx; a plain 01:00–02:00 is 1–15 Aug.
+    final n = api.gets.length;
+    await _tapRow(tester, '01:00-02:00');
+    expect(api.gets.length, n);
+
+    // The evening sits on its own day under both, so it opens.
+    await _tapRow(tester, '22:00-23:00');
+    final call = api.lastCallTo('/reports/mis/sales-summary');
+    expect(call, contains('time_from=22%3A00&time_to=23%3A00'));
+    expect(call, contains('bucket=day'));
   });
 
   testWidgets('the export names the slot the server applied — filename and preamble', (tester) async {

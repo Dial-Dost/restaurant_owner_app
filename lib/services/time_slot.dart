@@ -32,6 +32,8 @@
 /// every rule without pumping a widget.
 library;
 
+import 'dart:convert';
+
 /// The server's ceiling on saved sessions.
 const int kMaxTimeSlots = 8;
 
@@ -260,6 +262,40 @@ class TimeSlotSelection {
   String toString() => 'TimeSlotSelection($key)';
 }
 
+/// What a selection MEANS right now, as a string: its [TimeSlotSelection.key],
+/// plus everything the server builds its answer from that the request itself
+/// does not carry. The Reports pane is keyed on this, not on the bare key.
+///
+/// `slot=lunch` is the same URL before and after an owner moves Lunch from
+/// 12:00–17:00 to 12:00–15:00, so a pane keyed only on the request would stay
+/// mounted with the old Lunch's rows, totals and `meta.time_slot` while the
+/// toolbar phrased the new Lunch — and an export would sweep its rows on the
+/// new hours under the old TOTAL row and filename. So a picked preset's hours
+/// are in the key, and its NAME, because the footer chip, the export's "Time
+/// slot" row and its filename are spelled from the name the server applied.
+///
+/// [bucket] is the cut actually SENT (null where the report takes none). "By
+/// session" goes further than the pick: its rows ARE the presets — "Lunch
+/// (12:00-17:00)", "Dinner (18:00-24:00)", then Outside sessions — whatever is
+/// picked, All day included, where the pick alone keys as plain `all`. Saving
+/// any preset reshapes that table under an unchanged URL, so for that cut the
+/// whole list is part of the question.
+///
+/// The web's `slotDefinitionKey` builds the same string.
+String slotDefinitionKey(TimeSlotSelection sel, List<TimeSlotPreset> presets, {String? bucket}) {
+  var pick = sel.key;
+  if (sel.kind == TimeSlotKind.preset) {
+    for (final p in presets) {
+      if (p.id == sel.id) {
+        pick = '$pick@${p.start}-${p.end}/${p.label}';
+        break;
+      }
+    }
+  }
+  if (bucket != 'session') return pick;
+  return '$pick#${jsonEncode([for (final p in presets) [p.id, p.label, p.start, p.end]])}';
+}
+
 // ---------------------------------------------- what the server applied ------
 
 /// `meta.time_slot`, read. Null means all day.
@@ -409,6 +445,44 @@ TimeSlotPreset? sessionRowPreset(String bucket, List<TimeSlotPreset> presets) {
     if (p.start == m.group(2) && p.end == m.group(3) && p.label == label) return p;
   }
   return null;
+}
+
+/// May a Sales Summary row covering [start]–[end] — one hour of the day, or one
+/// saved session — be opened AS that slot, day by day, when the report on
+/// screen was cut under [applied] (`meta.time_slot`; null = all day)?
+///
+/// Opening a row REPLACES the slot; it cannot intersect two. So a row may only
+/// open when the replacement counts exactly what the row counted, instant for
+/// instant and on the same business day — otherwise the drill-down's total is a
+/// different number from the row that was tapped. Two ways that breaks:
+///
+///   * THE ROW REACHES PAST THE SLOT. Custom 16:00–19:00 "By session" has a
+///     "Lunch (12:00-17:00)" row that holds only 16:00–17:00; opening Lunch
+///     reads 12:00–17:00, a bigger figure.
+///   * THE ROW IS COUNTED ON ANOTHER DAY. Under a slot crossing midnight every
+///     small hour belongs to the evening before (the server's service-day
+///     rule), so over 1–15 Aug the "01:00-02:00" row of 22:00–02:00 is 2–16 Aug;
+///     a plain 01:00–02:00 slot over 1–15 Aug is 1–15 Aug. And the reverse: a
+///     session that itself crosses midnight, cut on all-day calendar days,
+///     holds 1 Aug's small hours that the session opened on its own gives to
+///     31 Jul.
+///
+/// Hence: under all day a row opens unless it crosses midnight; under a slot
+/// inside one day it opens when it lies inside that slot; under a crossing slot
+/// it opens when it lies in the slot's evening (before midnight), or when it
+/// crosses midnight itself inside the slot — then both put a night on the day
+/// it starts.
+bool slotRowOpensExactly(String start, String end, AppliedTimeSlot? applied) {
+  final a = parseClock(start);
+  final b = parseEndClock(end);
+  if (a == null || b == null || a == b) return false;
+  final rowCrosses = b < a;
+  if (applied == null) return !rowCrosses;
+  final s = parseClock(applied.start);
+  final e = parseEndClock(applied.end);
+  if (s == null || e == null || s == e) return false;
+  if (e > s) return !rowCrosses && a >= s && b <= e;
+  return rowCrosses ? a >= s && b <= e : a >= s;
 }
 
 // -------------------------------------------------------------- the editor ----
