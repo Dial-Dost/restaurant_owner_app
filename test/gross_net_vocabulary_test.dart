@@ -73,6 +73,33 @@ void main() {
     });
   });
 
+  // The printed Accounting PDF is the copy that gets filed. Its Sales block was
+  // inline kv(...) calls, and pointing its "Net sales" line at net_sales — the
+  // exact complaint — passed every suite, because the only guard checked that an
+  // old caption string was gone.
+  group('accountingSalesPdfLines', () {
+    Map<String, dynamic> byLabel(List<SalesPdfLine> lines) => {for (final l in lines) l.label: l.value};
+
+    test('Net sales prints total_net, Gross after refunds prints net_sales, Gross sales prints total_sales', () {
+      final lines = accountingSalesPdfLines(
+          {'total_sales': 6137, 'total_net': 5835, 'total_refund': 60, 'net_sales': 6077, 'bill_count': 3});
+      expect(lines.map((l) => l.label), ['Gross sales', 'Bills', 'Gross after refunds', 'Net sales']);
+      final v = byLabel(lines);
+      expect(v['Gross sales'], 6137);
+      expect(v['Gross after refunds'], 6077);
+      expect(v['Net sales'], 5835);
+      expect(v['Net sales'], isNot(6077), reason: 'net_sales is Gross less refunds, tax still in');
+      expect(v['Bills'], 3);
+      expect(lines.singleWhere((l) => l.bold).label, 'Net sales');
+    });
+
+    test('an older backend without total_net prints no Net sales line at all, rather than borrowing the word', () {
+      final lines = accountingSalesPdfLines({'total_sales': 6137, 'total_refund': 60, 'net_sales': 6077});
+      expect(lines.map((l) => l.label), ['Gross sales', 'Bills', 'Gross after refunds']);
+      expect(byLabel(lines)['Bills'], 0);
+    });
+  });
+
   // ---------------------------------------------------------------- wiring --
 
   group('the report tiles say the words through the model', () {
@@ -129,6 +156,33 @@ void main() {
       expect(src, contains("'Revenue ex-tax (after refunds)'"));
       expect(src, isNot(contains("'Net of refunds'")));
       expect(src, isNot(contains("} net' : ''}")));
+    });
+
+    test('the PDF Sales block is the tested lines, and prints no Sales line of its own', () {
+      expect(src, contains('for (final line in accountingSalesPdfLines(_sales)) kv(line.label, line.value, bold: line.bold)'));
+      expect(src, isNot(contains("kv('Net sales'")));
+      expect(src, isNot(contains("kv('Gross after refunds'")));
+      expect(src, isNot(contains("kv('Gross sales', _sales")));
+    });
+
+    test('no discount note calls the bill totals "net of discount" — Net is a defined word, and those totals are Gross', () {
+      expect(src.toLowerCase(), isNot(contains('net of discount')));
+      expect(src, contains('Bill totals are already stored after discount'));
+      expect(src, contains('Bill totals are stored after discount'));
+    });
+  });
+
+  // The Reports drill-down reuses History's bill body; the flag is what makes it
+  // say the report words. reports_module_test.dart reads the rendered sheet.
+  group('the Reports drill-down speaks the report words', () {
+    final modules = source('lib/screens/modules.dart');
+    final reports = source('lib/screens/reports.dart');
+
+    test('_misOpenBill asks for them, and the body maps each receipt word to its report word', () {
+      expect(reports, contains('_closedBillBody(ctx, bill, title, reportWords: true)'));
+      expect(modules, contains("money(reportWords ? kItemTotal : 'Items subtotal', _money(subtotal))"));
+      expect(modules, contains("money(reportWords ? kNet : 'Taxable base', _money(taxable))"));
+      expect(modules, contains("money(reportWords ? kGross : 'Grand total', _money(grand)"));
     });
   });
 }

@@ -81,6 +81,32 @@ class AccountingSalesFigures {
   double? get headlineValue => netSales ?? grossAfterRefunds;
 }
 
+/// One line of the printed Accounting PDF's Sales block.
+class SalesPdfLine {
+  const SalesPdfLine(this.label, this.value, {this.bold = false});
+  final String label;
+
+  /// The server's raw value, formatted by the PDF's own `kv`.
+  final dynamic value;
+  final bool bold;
+}
+
+/// The Sales block of the Accounting PDF, as (label, value) lines off the
+/// accounting Sales report.
+///
+/// PURE and here, not inline in the PDF builder, because the PDF is the copy
+/// that gets filed and nothing else pinned which key its lines read: pointing
+/// "Net sales" back at `net_sales` — Gross less refunds, tax and all, which is
+/// exactly the client's complaint — passed every suite. "Net sales" is printed
+/// only when the server sent `total_net`; an older backend's PDF says what it
+/// has rather than borrowing the word.
+List<SalesPdfLine> accountingSalesPdfLines(Map sales) => [
+      SalesPdfLine('Gross sales', sales['total_sales']),
+      SalesPdfLine('Bills', sales['bill_count'] ?? 0),
+      SalesPdfLine('Gross after refunds', sales['net_sales']),
+      if (readAccountingSales(sales).netSales != null) SalesPdfLine('Net sales', sales['total_net'], bold: true),
+    ];
+
 AccountingSalesFigures readAccountingSales(Map? sales) => AccountingSalesFigures(
       grossSales: _numOrNull(sales?['total_sales']),
       netSales: _numOrNull(sales?['total_net']),

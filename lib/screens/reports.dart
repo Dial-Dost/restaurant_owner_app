@@ -2233,7 +2233,9 @@ void _misOpenBill(BuildContext context, RestClient rest, String billId, String t
           child: AsyncView<Map<String, dynamic>>(
             load: () => rest.getMap('/reports/mis/bill/$billId'),
             builder: (ctx, bill, reload) =>
-                SingleChildScrollView(child: _closedBillBody(ctx, bill, title)),
+                // reportWords: the row this opened from says Item total / Net /
+                // Gross, and so does the web's drill-down for the same bill.
+                SingleChildScrollView(child: _closedBillBody(ctx, bill, title, reportWords: true)),
           ),
         ),
       ),

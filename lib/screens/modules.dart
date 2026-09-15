@@ -21532,14 +21532,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           pw.SizedBox(height: 16),
           pw.Text('Sales', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
           pw.Divider(),
-          // Gross and Net in the client's words (models/gross_net.dart). The
-          // old "Net sales (after refunds)" line was Gross less refunds, tax
-          // and all — it is still here, named for what it is.
-          kv('Gross sales', _sales['total_sales']),
-          kv('Bills', _sales['bill_count'] ?? 0),
-          kv('Gross after refunds', _sales['net_sales']),
-          if (readAccountingSales(_sales).netSales != null)
-            kv('Net sales', _sales['total_net'], bold: true),
+          // Gross and Net in the client's words. The old "Net sales (after
+          // refunds)" line was Gross less refunds, tax and all — it is still
+          // here, named for what it is. Which key each line reads is decided
+          // (and tested) in models/gross_net.dart, not here.
+          for (final line in accountingSalesPdfLines(_sales)) kv(line.label, line.value, bold: line.bold),
         ]));
     await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
   }
@@ -21760,7 +21757,9 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         if (estimated > 0)
           _sheetNote('${estimated.round()} bill(s) stored the discount as a bare percentage, so the '
               'money value is reconstructed and the totals above are approximate.'),
-        _sheetNote('Bill totals are already stored NET of discount, so every sales, tax and profit '
+        // "after", not "net of": Net is the defined word for the item total less
+        // discounts (models/gross_net.dart), and these bill totals are Gross.
+        _sheetNote('Bill totals are already stored after discount, so every sales, tax and profit '
             'figure on this page reflects these. Never subtract this again.'),
         for (final n in notes) _sheetNote(n),
       ],
@@ -22088,7 +22087,7 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
           ForkCard(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               SectionHeader(title: 'Discounts & offers', padding: const EdgeInsets.only(bottom: 6)),
-              Text('Bill totals are stored net of discount — sales above already reflect these.',
+              Text('Bill totals are stored after discount — sales above already reflect these.',
                   style: text.bodySmall),
               const SizedBox(height: AppSpacing.sm),
               moneyRow(
@@ -23391,7 +23390,13 @@ class _ClosedBillSheet extends StatelessWidget {
   }
 }
 
-Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
+/// [reportWords] is for the Reports drill-down (`_misOpenBill`): the row it opens
+/// from calls these figures Item total, Net and Gross (client item 1), so the
+/// ladder here says the same — as the web's MIS drill-down does. History and the
+/// settled-bill browser keep the receipt's words ("Items subtotal", "Taxable
+/// base", "Grand total"), because there the thing being read IS the receipt.
+/// Only the words change; every figure is the same key either way.
+Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bool reportWords = false}) {
   final text = Theme.of(context).textTheme;
   final items = ((bill['items'] as List?) ?? const []).map((e) => e as Map).toList();
   // `taxes[]` carries the per-rate lines ONLY — the service charge has its own
@@ -23520,7 +23525,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         ],
       ]),
     card('Money', [
-      if (subtotal > 0) money('Items subtotal', _money(subtotal)),
+      if (subtotal > 0) money(reportWords ? kItemTotal : 'Items subtotal', _money(subtotal)),
       if (discount > 0)
         money('Discount', '− ${_money(discount)}',
             sub: coupon.isEmpty
@@ -23528,10 +23533,12 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
                 : 'Coupon $coupon · ${_s(bill, 'discount_type', 'coupon')}',
             tint: AppColors.success),
       rule(),
-      money('Taxable base', _money(taxable)),
+      money(reportWords ? kNet : 'Taxable base', _money(taxable)),
       if (service != 0)
         money('Service charge', _money(service),
-            sub: servicePct > 0 ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of the taxable base' : null),
+            sub: servicePct > 0
+                ? '${servicePct.toStringAsFixed(servicePct % 1 == 0 ? 0 : 2)}% of ${reportWords ? 'net' : 'the taxable base'}'
+                : null),
       // Taxes are listed rate by rate. The service charge above is deliberately
       // NOT one of them.
       for (final t in taxes)
@@ -23539,7 +23546,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
       if (taxes.isNotEmpty || taxTotal != 0) money('Tax total', _money(taxTotal)),
       if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
-      money('Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      money(reportWords ? kGross : 'Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
       const SizedBox(height: 6),
       Row(children: [
         Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
@@ -23547,7 +23554,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle) {
         const SizedBox(width: 6),
         Expanded(
           child: Text(
-            '${_money(taxable)} base + ${_money(service)} service + ${_money(taxTotal)} tax'
+            '${_money(taxable)} ${reportWords ? 'net' : 'base'} + ${_money(service)} service + ${_money(taxTotal)} tax'
             '${roundOff == null ? '' : ' ${roundOff < 0 ? '−' : '+'} ${_money(roundOff.abs())} round off'} = ${_money(grand)}',
             style: text.bodySmall!.copyWith(color: balances ? AppColors.textTertiary : AppColors.danger),
           ),

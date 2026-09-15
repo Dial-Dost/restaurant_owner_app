@@ -890,6 +890,35 @@ void main() {
     expect(find.text('₹1200.00'), findsWidgets);
   });
 
+  // CLIENT ITEM 1, cross-client parity. The row this sheet opens from says Item
+  // total, Net and Gross; the web's drill-down for the same bill says Item total,
+  // Net and Gross. The sheet used to say "Items subtotal", "Taxable base" and
+  // "Grand total" — three names for the same three figures on the same screen.
+  // History keeps the receipt's words (money_drilldowns_test.dart pins "base").
+  testWidgets('the drill-down bill names its rungs Item total, Net and Gross — the words on the row', (tester) async {
+    await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    await tester.tap(find.text('101'));
+    await tester.pumpAndSettle();
+
+    final sheet = find.byType(BottomSheet);
+    expect(sheet, findsOneWidget);
+    Finder inSheet(String s) => find.descendant(of: sheet, matching: find.text(s));
+    // The figure on the same line as a label, so a word on the wrong number fails.
+    Finder rung(String label, String value) => find.descendant(
+          of: find.ancestor(of: inSheet(label), matching: find.byType(Row)).first,
+          matching: find.text(value),
+        );
+
+    expect(rung('Item total', '₹1300.00'), findsOneWidget);
+    expect(rung('Net', '₹1200.00'), findsOneWidget);
+    expect(rung('Gross', '₹1200.00'), findsOneWidget);
+    for (final receiptWord in const ['Items subtotal', 'Taxable base', 'Grand total']) {
+      expect(inSheet(receiptWord), findsNothing, reason: '"$receiptWord" is the receipt word, not the report word');
+    }
+    expect(inSheet('₹1200.00 net + ₹0.00 service + ₹0.00 tax = ₹1200.00'), findsOneWidget);
+  });
+
   testWidgets('a Void KOT row opens the ticket and its audit trail', (tester) async {
     final api = await _mount(tester);
     await _openTab(tester, 'Void KOT');

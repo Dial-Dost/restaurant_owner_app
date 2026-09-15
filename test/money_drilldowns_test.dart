@@ -570,7 +570,9 @@ void main() {
       await _tap(tester, find.text('Total given'));
       expect(find.text('Bills discounted'), findsOneWidget);
       expect(find.text('12 of 100'), findsOneWidget);
-      expect(find.textContaining('already stored NET of discount'), findsOneWidget);
+      expect(find.textContaining('already stored after discount'), findsOneWidget);
+      // Not "net of": Net is the item total less discounts, and these are Gross.
+      expect(find.textContaining(RegExp('net of discount', caseSensitive: false)), findsNothing);
       await _closeSheet(tester);
 
       await _tap(tester, find.text('MONSOON20'));
