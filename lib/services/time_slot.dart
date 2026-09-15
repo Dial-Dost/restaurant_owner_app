@@ -57,6 +57,14 @@ int? parseClock(Object? text, {bool allow24 = false}) {
   return h * 60 + min;
 }
 
+/// An END time in minutes, with `00:00` read as midnight (1440) — the server's
+/// rule, so "12:00 to 00:00" is until midnight and never an empty or a day-long
+/// crossing slot. Null when unreadable.
+int? parseEndClock(Object? text) {
+  final m = parseClock(text, allow24: true);
+  return m == 0 ? 1440 : m;
+}
+
 /// Minutes -> `HH:mm`. 1440 is `24:00`.
 String formatClock(int minutes) {
   final total = minutes.clamp(0, 1440);
@@ -73,7 +81,7 @@ String clockRange(String start, String end) => '$start–$end';
 String? validateCustomSlot(String from, String to) {
   final start = parseClock(from);
   if (start == null) return 'Start time must be a 24-hour time between 00:00 and 23:59.';
-  final end = parseClock(to, allow24: true);
+  final end = parseEndClock(to);
   if (end == null) return 'End time must be a 24-hour time between 00:00 and 24:00.';
   if (start == end) return 'Start and end are the same time — choose two different times.';
   return null;
@@ -82,7 +90,7 @@ String? validateCustomSlot(String from, String to) {
 /// A slot whose end is earlier than its start runs past midnight.
 bool crossesMidnight(String from, String to) {
   final start = parseClock(from);
-  final end = parseClock(to, allow24: true);
+  final end = parseEndClock(to);
   return start != null && end != null && end < start;
 }
 
@@ -172,7 +180,7 @@ class TimeSlotSelection {
   factory TimeSlotSelection.custom(String from, String to) {
     if (validateCustomSlot(from, to) != null) return allDay;
     final start = parseClock(from)!;
-    final end = parseClock(to, allow24: true)!;
+    final end = parseEndClock(to)!;
     if (start == 0 && end == 1440) return allDay;
     return TimeSlotSelection._(TimeSlotKind.custom, from: formatClock(start), to: formatClock(end));
   }
@@ -303,15 +311,30 @@ class AppliedTimeSlot {
         : base;
   }
 
-  /// `_lunch-1200-1700`, the same suffix the web export writes.
+  /// `_lunch-1200-1700`, the same suffix the web export and the server's CSV
+  /// write: lower-case a-z/0-9 slug, 32 at most, `slot` when nothing survives.
   String get fileSuffix {
-    final slug = label
-        .toLowerCase()
+    var slug = _foldLatin(label.toLowerCase())
         .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
-        .replaceAll(RegExp(r'^-+'), '')
-        .replaceAll(RegExp(r'-+$'), '');
+        .replaceAll(RegExp(r'^-+'), '');
+    if (slug.length > 32) slug = slug.substring(0, 32);
+    slug = slug.replaceAll(RegExp(r'-+$'), '');
     String hhmm(String s) => s.replaceAll(RegExp(r'[^0-9]'), '');
-    return '_${slug.isEmpty ? '' : '$slug-'}${hhmm(start)}-${hhmm(end)}';
+    return '_${slug.isEmpty ? 'slot' : slug}-${hhmm(start)}-${hhmm(end)}';
+  }
+
+  /// The server slugs through Unicode NFKD, which Dart's core library does not
+  /// ship. The accented Latin letters a restaurant name actually uses are folded
+  /// by hand so "Café" is `cafe` on all three; anything else falls to `-` alike.
+  static String _foldLatin(String s) {
+    const from = 'àáâãäåçèéêëìíîïñòóôõöùúûüýÿ';
+    const to = 'aaaaaaceeeeiiiinooooouuuuyy';
+    final b = StringBuffer();
+    for (final ch in s.split('')) {
+      final i = from.indexOf(ch);
+      b.write(i < 0 ? ch : to[i]);
+    }
+    return b.toString();
   }
 }
 
@@ -415,7 +438,7 @@ String? validateSlotDrafts(List<TimeSlotDraft> drafts) {
       return '$which: a session needs a name of 1 to $kMaxTimeSlotLabel characters.';
     }
     if (parseClock(d.start) == null) return '$which: start time must be between 00:00 and 23:59.';
-    final end = parseClock(d.end, allow24: true);
+    final end = parseEndClock(d.end);
     if (end == null) return '$which: end time must be between 00:00 and 24:00.';
     if (parseClock(d.start) == end) return '$which: start and end cannot be the same time.';
   }
@@ -430,9 +453,7 @@ Map<String, dynamic> slotDraftsBody(List<TimeSlotDraft> drafts) => {
             if (d.id != null && d.id!.isNotEmpty) 'id': d.id,
             'label': d.label.trim(),
             'start': parseClock(d.start) == null ? d.start.trim() : formatClock(parseClock(d.start)!),
-            'end': parseClock(d.end, allow24: true) == null
-                ? d.end.trim()
-                : formatClock(parseClock(d.end, allow24: true)!),
+            'end': parseEndClock(d.end) == null ? d.end.trim() : formatClock(parseEndClock(d.end)!),
           },
       ],
     };

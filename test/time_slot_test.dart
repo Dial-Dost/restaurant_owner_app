@@ -36,6 +36,9 @@ void main() {
       for (final junk in ['25:00', '12:60', '1200', '', 'noon', '24:01', ' 12:3 ']) {
         expect(parseClock(junk, allow24: true), isNull, reason: junk);
       }
+      // An END of 00:00 is midnight, as the server reads it.
+      expect(parseEndClock('00:00'), 1440);
+      expect(parseEndClock('02:00'), 120);
       expect(formatClock(570), '09:30');
       expect(formatClock(1440), '24:00');
     });
@@ -49,6 +52,7 @@ void main() {
       expect(validateCustomSlot('13:00', '13:00'), 'Start and end are the same time — choose two different times.');
       expect(crossesMidnight('22:00', '02:00'), isTrue);
       expect(crossesMidnight('18:00', '24:00'), isFalse);
+      expect(crossesMidnight('18:00', '00:00'), isFalse);
     });
 
     test('00:00–24:00 is exactly all day, and junk is all day rather than a clamp', () {
@@ -56,6 +60,9 @@ void main() {
       final c = TimeSlotSelection.custom('9:00', '13:30');
       expect((c.from, c.to), ('09:00', '13:30'));
       expect(TimeSlotSelection.custom('x', '13:30').isAllDay, isTrue);
+      // "12:00 to 00:00" is until midnight, sent as 24:00; 00:00 to 00:00 is the whole day.
+      expect(TimeSlotSelection.custom('12:00', '00:00').key, 'custom:12:00-24:00');
+      expect(TimeSlotSelection.custom('00:00', '00:00'), TimeSlotSelection.allDay);
       expect(TimeSlotSelection.preset('all').isAllDay, isTrue);
       expect(TimeSlotSelection.preset(' ').isAllDay, isTrue);
     });
@@ -189,6 +196,7 @@ void main() {
           isNull);
       expect(validateSlotDrafts(const [TimeSlotDraft(label: 'Dinner', start: '18:00', end: '24:00')]), isNull);
       expect(validateSlotDrafts(const [TimeSlotDraft(label: 'Whole day', start: '00:00', end: '24:00')]), isNull);
+      expect(validateSlotDrafts(const [TimeSlotDraft(label: 'Evening', start: '18:00', end: '00:00')]), isNull);
       expect(validateSlotDrafts(const [TimeSlotDraft(label: '  ', start: '12:00', end: '17:00')]),
           'Session 1: a session needs a name of 1 to 24 characters.');
       expect(validateSlotDrafts(const [TimeSlotDraft(label: 'Lunch', start: '25:00', end: '17:00')]),
@@ -208,7 +216,7 @@ void main() {
       expect(
         slotDraftsBody(const [
           TimeSlotDraft(id: 'lunch', label: ' Brunch ', start: '11:00', end: '15:00'),
-          TimeSlotDraft(label: 'Late', start: '9:05', end: '24:00'),
+          TimeSlotDraft(label: 'Late', start: '9:05', end: '00:00'),
         ]),
         {
           'slots': [
@@ -247,6 +255,13 @@ void main() {
       const odd = AppliedTimeSlot(
           id: 'x', label: 'Late / Night "Bar"', start: '12:00', end: '17:00', crossesMidnight: false, source: 'preset');
       expect(odd.fileSuffix, '_late-night-bar-1200-1700');
+      // The server's slug rules: accents folded, and `slot` when nothing survives.
+      const cafe = AppliedTimeSlot(
+          id: 'x', label: 'Café', start: '12:00', end: '17:00', crossesMidnight: false, source: 'preset');
+      expect(cafe.fileSuffix, '_cafe-1200-1700');
+      const hindi = AppliedTimeSlot(
+          id: 'x', label: 'दोपहर', start: '12:00', end: '17:00', crossesMidnight: false, source: 'preset');
+      expect(hindi.fileSuffix, '_slot-1200-1700');
     });
 
     test('the file names its slot in the preamble and the heading', () {
