@@ -139,9 +139,13 @@ String misText(MisColumn c, Object? v, {bool forSheet = false, bool forPdf = fal
     case 'datetime':
       final s = '${v ?? ''}'.trim();
       if (s.isEmpty) return forSheet ? '' : '—';
-      // Sheets get the raw ISO instant: it sorts correctly and can be parsed
-      // back. Screens get the restaurant's own wall clock.
-      return forSheet ? s : RestaurantTime.short(s);
+      // The restaurant's own wall clock on EVERY surface, the sheet included.
+      // Sheets used to get the raw ISO instant, and an owner opening the Excel
+      // read a void rung at 18:36 as "2026-09-14T13:06:36.104Z", which is 1 pm
+      // to anyone who is not converting from UTC in their head. The zone is
+      // stated in the file's own preamble. A value that is not an instant comes
+      // back as it was sent, so a malformed stamp is still visible.
+      return RestaurantTime.short(s);
     case 'date':
       final s = '${v ?? ''}'.trim();
       if (s.isEmpty) return forSheet ? '' : '—';

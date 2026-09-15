@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:excel/excel.dart' as xl;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,7 @@ import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
+import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
@@ -194,6 +196,7 @@ const _voidKot = {
     {'key': 'voided_at', 'label': 'Voided', 'type': 'datetime'},
     {'key': 'order_id', 'label': 'KOT / Order', 'type': 'text'},
     {'key': 'table_name', 'label': 'Table', 'type': 'text'},
+    {'key': 'items_text', 'label': 'Items', 'type': 'text'},
     {'key': 'order_type', 'label': 'Type', 'type': 'text'},
     {'key': 'item_count', 'label': 'Lines', 'type': 'int', 'total': true},
     {'key': 'qty', 'label': 'Qty', 'type': 'int', 'total': true},
@@ -205,7 +208,12 @@ const _voidKot = {
       'order_id': 'order-9', 'kot_no': null, 'table_name': 'T7',
       'placed_at': '2026-08-01T12:00:00.000Z', 'voided_at': '2026-08-01T12:09:00.000Z',
       'voided_by': 'Ravi', 'order_type': 'Dine-in', 'item_count': 2, 'qty': 3,
-      'value': 540.0, 'items': [],
+      'value': 540.0,
+      'items_text': 'Paneer Tikka (Half) x2; Dal x1',
+      'items': [
+        {'name': 'Paneer Tikka', 'variation': 'Half', 'quantity': 2, 'price': 180.0},
+        {'name': 'Dal', 'variation': null, 'quantity': 1, 'price': 180.0},
+      ],
     },
   ],
   'totals': {'voids': 1, 'qty': 3, 'value': 540.0, 'item_count': 2},
@@ -1076,6 +1084,47 @@ void main() {
     expect(utf8.decode(grabbed[ReportFormat.pdf]!.sublist(0, 5)), '%PDF-');
   });
 
+  // "Item names should show up properly in the void KOT reports in the Excel."
+  // The row always carried an `items` LIST, which is not a cell. The server now
+  // sends the names as one text column; nothing on this side names that column,
+  // so these prove it reaches the screen and both files purely because the
+  // server declared it, and that the file reads the restaurant clock.
+  testWidgets('Void KOT: the Items column reaches the screen, the CSV and the Excel as plain text',
+      (tester) async {
+    final grabbed = <ReportFormat, Uint8List>{};
+    ReportExporter.overrideDeliver = (bytes, filename, format) async {
+      grabbed[format] = bytes;
+      return const ReportExportResult('Saved');
+    };
+    await _mount(tester);
+    await _openTab(tester, 'Void KOT');
+    expect(find.text('Paneer Tikka (Half) x2; Dal x1'), findsWidgets);
+
+    for (final label in const ['Export CSV', 'Export Excel']) {
+      await tester.tap(find.byKey(const ValueKey('reports-export')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label));
+      await tester.pumpAndSettle();
+    }
+
+    final csv = utf8.decode(grabbed[ReportFormat.csv]!);
+    expect(csv, contains('KOT / Order,Table,Items,Type'));
+    expect(csv, contains('order-9,T7,Paneer Tikka (Half) x2; Dal x1,Dine-in'));
+    expect(csv, isNot(contains('{name:')), reason: 'the items list reached the file');
+    // 12:00 UTC is 17:30 in Kolkata, written the way the grid writes it.
+    expect(csv, contains(RestaurantTime.short('2026-08-01T12:00:00.000Z')));
+    expect(csv, contains('Aug 1, 17:30'));
+    expect(csv, isNot(contains('2026-08-01T12:00:00.000Z')));
+
+    final sheet = xl.Excel.decodeBytes(grabbed[ReportFormat.excel]!).tables['Report']!;
+    final header = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'Items'));
+    final itemsAt = header.indexWhere((c) => '${c?.value}' == 'Items');
+    final placedAt = header.indexWhere((c) => '${c?.value}' == 'Placed');
+    final row = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'order-9'));
+    expect('${row[itemsAt]?.value}', 'Paneer Tikka (Half) x2; Dal x1');
+    expect('${row[placedAt]?.value}', 'Aug 1, 17:30');
+  });
+
   // --------------------------------------------------------------- phone ---
 
   testWidgets('on a phone the table becomes a card per row, every value beside its own label',
@@ -1193,6 +1242,19 @@ void main() {
       expect(misText(money, null, forSheet: true), '');
       expect(misText(pct, null), '—');
       expect(misText(text, null), '—');
+    });
+
+    test('an instant is the restaurant clock on screen, in the sheet and in the PDF alike', () {
+      // Generic by column TYPE: any report's datetime column, no key named.
+      const at = MisColumn(key: 'whenever', label: 'When', type: 'datetime');
+      const iso = '2026-09-14T13:06:36.104Z';
+      final screen = misText(at, iso);
+      expect(screen, RestaurantTime.short(iso));
+      expect(misText(at, iso, forSheet: true), screen, reason: 'the sheet carried the raw UTC instant');
+      expect(misText(at, iso, forPdf: true), screen);
+      expect(misText(at, null, forSheet: true), '', reason: 'a blank stays a blank');
+      // Not an instant: kept as sent, never blanked.
+      expect(misText(at, 'not-a-date', forSheet: true), 'not-a-date');
     });
 
     test('the CSV opens with its own provenance and closes with the window totals', () {
