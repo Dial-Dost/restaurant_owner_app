@@ -183,6 +183,22 @@ class RestaurantTime {
     return '${_months[d.month - 1]} ${d.day}, ${_two(d.hour)}:${_two(d.minute)}';
   }
 
+  /// `2026-06-26 14:05` — an instant as a SPREADSHEET cell: the restaurant's
+  /// wall clock, year first.
+  ///
+  /// Not [short]. `Jun 26, 14:05` has no year, and a report window can span
+  /// two, so one cell could stand for two dates; and as text it sorts `Sep 14`
+  /// before `Sep 2`. Year-first with the full year sorts correctly even as plain
+  /// text, and Excel reads it as the same date in every locale. The web
+  /// dashboard writes the identical string for the same instant and zone
+  /// (`formatSheetDateTime` in its src/lib/tz.ts), so a file from either client
+  /// agrees cell for cell.
+  static String sheet(String iso) {
+    final d = wallOf(iso);
+    if (d == null) return iso;
+    return '${d.year.toString().padLeft(4, '0')}-${_two(d.month)}-${_two(d.day)} ${_two(d.hour)}:${_two(d.minute)}';
+  }
+
   /// `26/06/26 · 14:05` — reservations and other dense rows.
   static String dmy(String iso) {
     final d = wallOf(iso);

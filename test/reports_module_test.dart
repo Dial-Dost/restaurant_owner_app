@@ -1111,10 +1111,10 @@ void main() {
     expect(csv, contains('KOT / Order,Table,Items,Type'));
     expect(csv, contains('order-9,T7,Paneer Tikka (Half) x2; Dal x1,Dine-in'));
     expect(csv, isNot(contains('{name:')), reason: 'the items list reached the file');
-    // 12:00 UTC is 17:30 in Kolkata, written the way the grid writes it.
-    expect(csv, contains(RestaurantTime.short('2026-08-01T12:00:00.000Z')));
-    expect(csv, contains('Aug 1, 17:30'));
+    // 12:00 UTC is 17:30 in Kolkata: the restaurant clock, year first.
+    expect(csv, contains('2026-08-01 17:30,2026-08-01 17:39,order-9'));
     expect(csv, isNot(contains('2026-08-01T12:00:00.000Z')));
+    expect(csv, isNot(contains('Aug 1, 17:30')), reason: 'a sheet cell with no year');
 
     final sheet = xl.Excel.decodeBytes(grabbed[ReportFormat.excel]!).tables['Report']!;
     final header = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'Items'));
@@ -1122,7 +1122,12 @@ void main() {
     final placedAt = header.indexWhere((c) => '${c?.value}' == 'Placed');
     final row = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'order-9'));
     expect('${row[itemsAt]?.value}', 'Paneer Tikka (Half) x2; Dal x1');
-    expect('${row[placedAt]?.value}', 'Aug 1, 17:30');
+    expect('${row[placedAt]?.value}', '2026-08-01 17:30');
+    // AND IT OPENS READABLE. Excel spills text only into an EMPTY neighbour, and
+    // Type is never empty, so a column at Excel's default of about eight
+    // characters showed "Paneer T". The width is read back out of the file.
+    expect(sheet.getColumnWidth(itemsAt), greaterThanOrEqualTo('Paneer Tikka (Half) x2; Dal x1'.length));
+    expect(sheet.getColumnWidth(placedAt), greaterThanOrEqualTo('2026-08-01 17:30'.length));
   });
 
   // --------------------------------------------------------------- phone ---
@@ -1244,17 +1249,84 @@ void main() {
       expect(misText(text, null), '—');
     });
 
-    test('an instant is the restaurant clock on screen, in the sheet and in the PDF alike', () {
+    test('an instant is the restaurant clock everywhere, and year first in a sheet', () {
       // Generic by column TYPE: any report's datetime column, no key named.
       const at = MisColumn(key: 'whenever', label: 'When', type: 'datetime');
       const iso = '2026-09-14T13:06:36.104Z';
       final screen = misText(at, iso);
       expect(screen, RestaurantTime.short(iso));
-      expect(misText(at, iso, forSheet: true), screen, reason: 'the sheet carried the raw UTC instant');
       expect(misText(at, iso, forPdf: true), screen);
+      // The sheet is not the screen's "Sep 14, 18:36": no year, and as text it
+      // sorts Sep 14 before Sep 2.
+      expect(misText(at, iso, forSheet: true), '2026-09-14 18:36', reason: 'the sheet carried the raw UTC instant or a yearless stamp');
       expect(misText(at, null, forSheet: true), '', reason: 'a blank stays a blank');
       // Not an instant: kept as sent, never blanked.
       expect(misText(at, 'not-a-date', forSheet: true), 'not-a-date');
+    });
+
+    test('a sheet stamp sorts in date order as plain text, across a month and a year', () {
+      const at = MisColumn(key: 'whenever', label: 'When', type: 'datetime');
+      const instants = ['2026-09-02T04:30:00.000Z', '2026-09-14T04:30:00.000Z', '2025-09-14T04:30:00.000Z', '2026-10-01T04:30:00.000Z'];
+      final byText = [for (final i in instants) misText(at, i, forSheet: true)]..sort();
+      final byInstant = ([...instants]..sort()).map((i) => misText(at, i, forSheet: true)).toList();
+      expect(byText, byInstant);
+    });
+
+    test('the owner app and the web write the same sheet string for the same instant and zone', () {
+      // THE SAME TABLE is pinned in the web dashboard's
+      // src/lib/__tests__/mis-reports.test.ts (formatSheetDateTime). Change one
+      // and the other fails.
+      const parity = [
+        ['2026-09-14T13:06:36.104Z', 'Asia/Kolkata', '2026-09-14 18:36'],
+        ['2026-09-14T18:30:00.000Z', 'Asia/Kolkata', '2026-09-15 00:00'],
+        ['2026-01-15T17:00:00.000Z', 'America/New_York', '2026-01-15 12:00'],
+        ['2026-07-15T17:00:00.000Z', 'America/New_York', '2026-07-15 13:00'],
+      ];
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      addTearDown(() => RestaurantTime.adopt(RestaurantTime.defaultZone));
+      for (final row in parity) {
+        RestaurantTime.adopt(row[1]);
+        expect(RestaurantTime.sheet(row[0]), row[2], reason: '${row[0]} in ${row[1]}');
+      }
+    });
+
+    test('every sheet column is as wide as its widest cell, which Excel does not do for itself', () {
+      // A real ticket from the client's own day of voids (14 Sep), 115 characters.
+      const long = 'BOTTLE WATER x1; CRISP WRAPPED COTTAGE CHEESE x1; BAINGAN BHARTHA KULCHA x1; ENOKII TEMPURA x1; HOUSE FRIED RICE x1';
+      const items = MisColumn(key: 'items_text', label: 'Items', type: 'text');
+      const kind = MisColumn(key: 'order_type', label: 'Type', type: 'text');
+      final doc = MisReportDoc(
+        title: 'Void KOT',
+        columns: const [count, items, kind, money],
+        rows: const [
+          {'bills': 1, 'items_text': 'CANNED JUICE x1', 'order_type': 'dine_in', 'net': 225.0},
+          {'bills': 1, 'items_text': long, 'order_type': 'dine_in', 'net': 1234567.5},
+        ],
+        totals: const {'bills': 2, 'net': 1234792.5},
+        from: '2026-09-14',
+        to: '2026-09-14',
+        timezone: 'Asia/Kolkata',
+        outletLabel: 'Gaia',
+        // A long note in the preamble must not widen the table's first column.
+        notes: ['n' * 300],
+      );
+      expect(misSheetColumnWidths(doc), [
+        'TOTAL (whole period)'.length + 2,
+        long.length + 2,
+        misSheetMinWidth,
+        '1234792.50'.length + 2,
+      ]);
+      final sheet = xl.Excel.decodeBytes(misXlsx(doc)).tables['Report']!;
+      final header = sheet.rows.firstWhere((r) => r.any((c) => '${c?.value}' == 'Items'));
+      final itemsAt = header.indexWhere((c) => '${c?.value}' == 'Items');
+      expect(sheet.getColumnWidth(itemsAt), greaterThanOrEqualTo(long.length));
+      // Nothing past Excel's own limit, however long a cell is.
+      final huge = MisReportDoc(
+        title: 'X', columns: const [items], rows: [{'items_text': 'y' * 400}], totals: null,
+        from: '2026-09-14', to: '2026-09-14', timezone: 'Asia/Kolkata', outletLabel: 'Gaia', notes: const [],
+      );
+      expect(misSheetColumnWidths(huge), [misSheetMaxWidth]);
+      expect(misSheetMaxWidth, lessThan(255));
     });
 
     test('the CSV opens with its own provenance and closes with the window totals', () {
