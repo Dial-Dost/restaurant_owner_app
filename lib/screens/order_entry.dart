@@ -1,7 +1,9 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
+import '../models/order_draft.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../services/outbox.dart';
@@ -75,6 +77,14 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   final Map<String, String> _itemNotes = {}; // per-item kitchen note (by menu id)
   final Set<String> _itemHold = {}; // held courses (fired later from the KDS)
   final Map<String, Map> _itemsById = {};
+  // ITEM 5 — the name each carted dish had when it was added, so a dish a menu
+  // refresh drops can still be named in the refusal and in the review.
+  final Map<String, String> _cartNames = {};
+  // ITEM 5 — bumped on every change to the draft (quantity, note, hold, and a
+  // menu refresh that can take a carted dish off the menu). The review sheet is
+  // its own route and does not rebuild with this screen, so it listens to this
+  // and redraws from the pad's ONE draft — never from a copy of it.
+  final ValueNotifier<int> _draftRev = ValueNotifier<int>(0);
   final TextEditingController _noteCtrl = TextEditingController();
   final TextEditingController _custCtrl = TextEditingController();
   final TextEditingController _phoneCtrl = TextEditingController();
@@ -179,6 +189,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _addrCtrl.dispose();
     _coversCtrl.dispose();
     _menuScroll.dispose();
+    _draftRev.dispose();
     super.dispose();
   }
 
@@ -202,6 +213,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         _applyMenu(items);
         markCacheLive();
       });
+      _draftRev.value++;
     } catch (e) {
       if (!mounted || !cacheGenIs(gen)) return;
       // A saved menu already on screen survives a failed refresh — the waiter
@@ -220,8 +232,25 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   String? get _phoneError => widget.isDineIn ? null : validateOptionalMobile10(_phoneCtrl.text);
 
   double _price(String id) => (_itemsById[id]?['price'] as num?)?.toDouble() ?? 0;
-  double get _total => _cart.entries.fold(0.0, (s, e) => s + _price(e.key) * e.value);
+  double get _total => orderDraftTotal(_draft);
   int get _count => _cart.values.fold(0, (s, q) => s + q);
+
+  /// ITEM 5 — the unsent order as lines: what the review reads back to the guest
+  /// and, through [orderDraftPayload], exactly what [_send] posts.
+  List<OrderDraftLine> get _draft => orderDraftLines(
+        cart: _cart,
+        notes: _itemNotes,
+        held: _itemHold,
+        itemsById: _itemsById,
+        knownNames: _cartNames,
+      );
+
+  void _toggleHold(String id) {
+    setState(() {
+      if (!_itemHold.remove(id)) _itemHold.add(id);
+    });
+    _draftRev.value++;
+  }
 
   void _setQty(String id, int delta) {
     // 6.8 — HOLD THE MENU STILL UNDER THE WAITER'S THUMB. The note and the Send
@@ -237,10 +266,16 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       if (q <= 0) {
         _cart.remove(id);
         _itemHold.remove(id);
+        _cartNames.remove(id);
+        // The refusal below named a dish the menu dropped; it is out of the cart.
+        if (!_itemsById.containsKey(id)) _error = null;
       } else {
         _cart[id] = q;
+        final name = _itemsById[id]?['name'];
+        if (name != null) _cartNames[id] = '$name';
       }
     });
+    _draftRev.value++;
     if (wasEmpty != (_count == 0)) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !_menuScroll.hasClients) return;
@@ -253,9 +288,18 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
 
   Future<void> _send() async {
     if (_cart.isEmpty) return;
+    // ITEM 5 — THE LINES ARE BUILT HERE, FIRST, before a dialog is asked or the
+    // sending flag is raised. They used to be built after `_sending = true` with
+    // `_itemsById[id]!`, outside the try: a menu refresh that dropped a carted
+    // dish threw there and left the button on "Sending…" for good.
+    final lines = _draft;
     // Block the send rather than letting the server reject it.
-    if (_phoneError != null) {
-      setState(() => _error = _phoneError);
+    final blocked = orderDraftBlock(lines, phoneError: _phoneError);
+    if (blocked != null) {
+      setState(() => _error = blocked);
+      // A dish the menu dropped has no row left on the menu to remove it from;
+      // the review is the one place it still shows.
+      if (_phoneError == null) unawaited(_openReview());
       return;
     }
     // COVERS BEFORE ANYTHING IS SENT, and before the sending flag is raised —
@@ -278,23 +322,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       _error = null;
     });
     final p = widget.rest.auth.profile;
-    final items = _cart.entries.map((e) {
-      final m = _itemsById[e.key]!;
-      final note = (_itemNotes[e.key] ?? '').trim();
-      return {
-        'id': e.key,
-        'name': m['name'],
-        'price': m['price'],
-        'quantity': e.value,
-        if (note.isNotEmpty) 'note': note,
-        // Course hold-and-fire: the kitchen fires held items on demand.
-        if (_itemHold.contains(e.key)) 'course_hold': true,
-      };
-    }).toList();
+    final total = orderDraftTotal(lines);
     final base = <String, dynamic>{
-      'items': items,
-      'subtotal': _total,
-      'total': _total,
+      'items': orderDraftPayload(lines),
+      'subtotal': total,
+      'total': total,
       'taxes': [],
       'applyServiceCharge': false,
       'status': 'Preparing',
@@ -441,7 +473,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 ]),
               ),
             ),
-            if (_count > 0) _sendButton(),
+            if (_count > 0) _sendBar(),
           ]),
         ),
         Expanded(
@@ -589,24 +621,86 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
 
   /// 6.8 — "Send order", directly under the order's fields and outside the
   /// header's scroll, so it is always on screen while the cart has anything in it.
-  Widget _sendButton() => Padding(
+  ///
+  /// ITEM 5 — and "View order" beside it, IN THE SAME ROW, so the header is no
+  /// taller than 6.8 measured it and the menu under the waiter's thumb does not
+  /// move. The review is optional: "Send order" is still the one-tap send it
+  /// shipped as. The View label never says "Send order" — that phrase is how the
+  /// pad's send is found, and it must stay unique on the screen.
+  ///
+  /// The Send label is scaled down, never cut, on a phone: "₹1,278.00" losing
+  /// its last digits to an ellipsis is a different figure, not a shorter one.
+  Widget _sendBar() => Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-        child: SizedBox(
-          width: double.infinity,
-          child: FilledButton(
-            key: const ValueKey('order-send'),
-            onPressed: _sending || _phoneError != null ? null : _send,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Text(_sending
-                  ? 'Sending…'
-                  : _showsMoney
-                      ? 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'
-                      : 'Send order · $_count item${_count > 1 ? 's' : ''}'),
+        child: Row(children: [
+          OutlinedButton.icon(
+            key: const ValueKey('order-review'),
+            onPressed: _sending ? null : _openReview,
+            icon: const Icon(Icons.receipt_long_outlined, size: 18),
+            label: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: Text('View order'),
             ),
           ),
-        ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: FilledButton(
+              key: const ValueKey('order-send'),
+              onPressed: _sending || _phoneError != null ? null : _send,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(_sending
+                      ? 'Sending…'
+                      : _showsMoney
+                          ? 'Send order · $_count item${_count > 1 ? 's' : ''} · ₹${_total.toStringAsFixed(2)}'
+                          : 'Send order · $_count item${_count > 1 ? 's' : ''}'),
+                ),
+              ),
+            ),
+          ),
+        ]),
       );
+
+  /// ITEM 5 — "View order": the unsent draft, to be read back to the guest.
+  ///
+  /// THE SHEET NEVER SENDS. It answers true ("Send to kitchen") or false, and the
+  /// send happens HERE, after it has closed. [_send] ends by popping the pad off
+  /// its own context; run with the sheet still on top, that pop takes the SHEET
+  /// instead, the pad stays open with the cart live, and the obvious next tap
+  /// posts the same order again under a new idempotency key — a second order the
+  /// server cannot collapse, on a bill that is the sum of its orders. Sending
+  /// after the close also leaves the covers question, and its "cancel leaves the
+  /// pad as found", exactly as they were.
+  Future<void> _openReview() async {
+    if (_count == 0) return;
+    final go = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: AppColors.surface,
+      builder: (_) => _OrderReviewSheet(
+        revision: _draftRev,
+        title: widget.isDineIn
+            ? '${widget.tableName}'
+            : widget.isDelivery
+                ? 'Delivery'
+                : 'Takeaway',
+        draft: () => _draft,
+        showsMoney: _showsMoney,
+        kitchenNote: _noteCtrl.text.trim(),
+        customer: widget.isDineIn ? '' : _custCtrl.text.trim(),
+        phone: widget.isDineIn ? '' : _phoneCtrl.text.trim(),
+        address: widget.isDelivery ? _addrCtrl.text.trim() : '',
+        phoneError: _phoneError,
+        onQty: _setQty,
+        onNote: _editItemNote,
+        onHold: _toggleHold,
+      ),
+    );
+    if (go == true && mounted) await _send();
+  }
 
   Future<void> _editItemNote(String id, String name) async {
     final ctrl = TextEditingController(text: _itemNotes[id] ?? '');
@@ -638,6 +732,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         _itemNotes[id] = note;
       }
     });
+    _draftRev.value++;
   }
 
   Widget _row(Map m) {
@@ -671,9 +766,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                       icon: Icon(Icons.front_hand_outlined,
                           size: 20, color: held ? AppColors.warning : AppColors.textTertiary),
                       tooltip: held ? 'Course held — tap to release' : 'Hold course (fire later from the KDS)',
-                      onPressed: () => setState(() {
-                        if (!_itemHold.remove(id)) _itemHold.add(id);
-                      }),
+                      onPressed: () => _toggleHold(id),
                     ),
                     IconButton(
                       icon: Icon(Icons.sticky_note_2_outlined,
@@ -714,4 +807,229 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       ),
     );
   }
+}
+
+/// ITEM 5 — "Review order": the unsent draft, read back to the guest before it
+/// reaches the kitchen.
+///
+/// ONLY THE DRAFT. What the table already has is on the running-bill sheet and
+/// the KOT blocks; mixing sent and unsent lines here would have the waiter read
+/// the guest dishes that are already cooking as if they were new.
+///
+/// EDITS GO THROUGH THE PAD'S OWN HANDLERS ([onQty], [onNote], [onHold]), and
+/// the list is redrawn from the pad's one draft whenever [revision] ticks. A
+/// private copy of the cart in here would drift from the pad, and the pad's
+/// handlers carry rules a copy would lose (a course's hold goes when its dish
+/// does; the menu under the thumb is held still).
+///
+/// ITEM 19 / C4 — this is the "list of ordered dishes" the waiter rule names, so
+/// for a waiter every amount goes, per line and in total. The dish, quantity,
+/// hold and note are the ticket and all stay.
+class _OrderReviewSheet extends StatelessWidget {
+  const _OrderReviewSheet({
+    required this.revision,
+    required this.title,
+    required this.draft,
+    required this.showsMoney,
+    required this.kitchenNote,
+    required this.customer,
+    required this.phone,
+    required this.address,
+    required this.phoneError,
+    required this.onQty,
+    required this.onNote,
+    required this.onHold,
+  });
+
+  final ValueListenable<int> revision;
+  final String title;
+  final List<OrderDraftLine> Function() draft;
+  final bool showsMoney;
+  final String kitchenNote;
+  final String customer;
+  final String phone;
+  final String address;
+  final String? phoneError;
+  final void Function(String id, int delta) onQty;
+  final Future<void> Function(String id, String name) onNote;
+  final void Function(String id) onHold;
+
+  /// A quantity change, and the sheet's own exit when it empties the order —
+  /// there is nothing left to read back or send.
+  void _change(BuildContext context, String id, int delta) {
+    onQty(id, delta);
+    if (draft().isEmpty) Navigator.pop(context, false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return SafeArea(
+      child: Padding(
+        key: const ValueKey('order-review-sheet'),
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        child: ValueListenableBuilder<int>(
+          valueListenable: revision,
+          builder: (context, _, _) {
+            final lines = draft();
+            final blocked = orderDraftBlock(lines, phoneError: phoneError);
+            final summary = showsMoney
+                ? '${orderDraftSummary(lines)} · ₹${orderDraftTotal(lines).toStringAsFixed(2)}'
+                : orderDraftSummary(lines);
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('Review order · $title', style: text.titleLarge),
+                const SizedBox(height: 4),
+                Text('Read it back to the guest, then send.', style: text.bodySmall),
+                const SizedBox(height: 12),
+                Text(summary, key: const ValueKey('order-review-summary'), style: text.titleSmall),
+                const SizedBox(height: 12),
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (final l in lines) _line(context, l),
+                        if (kitchenNote.isNotEmpty) _detail(context, Icons.sticky_note_2_outlined, kitchenNote),
+                        if (customer.isNotEmpty) _detail(context, Icons.person_outline, customer),
+                        if (phone.isNotEmpty) _detail(context, Icons.phone_outlined, phone),
+                        if (address.isNotEmpty) _detail(context, Icons.location_on_outlined, address),
+                      ],
+                    ),
+                  ),
+                ),
+                if (blocked != null && lines.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(blocked,
+                        key: const ValueKey('order-review-blocked'),
+                        style: text.bodySmall!.copyWith(color: AppColors.danger)),
+                  ),
+                const SizedBox(height: 12),
+                // Scaled down, never cut, however narrow the phone or large its
+                // text: both of these are the only two ways out of the sheet.
+                Row(children: [
+                  Expanded(
+                    child: TextButton(
+                      key: const ValueKey('order-review-back'),
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const FittedBox(fit: BoxFit.scaleDown, child: Text('Back to menu')),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton(
+                      key: const ValueKey('order-review-send'),
+                      onPressed: blocked == null ? () => Navigator.pop(context, true) : null,
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: FittedBox(fit: BoxFit.scaleDown, child: Text('Send to kitchen')),
+                      ),
+                    ),
+                  ),
+                ]),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _line(BuildContext context, OrderDraftLine l) {
+    final text = Theme.of(context).textTheme;
+    final amount = l.amount;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: ForkCard(
+        inset: true,
+        padding: const EdgeInsets.fromLTRB(14, 10, 6, 4),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(
+              child: Text('${l.quantity} × ${l.name}',
+                  style: text.bodyLarge!.copyWith(fontWeight: FontWeight.w600)),
+            ),
+            if (showsMoney && amount != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 10, right: 8),
+                child: Text('₹${amount.toStringAsFixed(2)}', style: text.titleSmall),
+              ),
+          ]),
+          if (!l.onMenu || l.held || l.note.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, right: 8),
+              child: Wrap(spacing: 8, runSpacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                if (!l.onMenu) StatusChip(label: 'No longer on the menu', color: AppColors.danger, dense: true),
+                if (l.held) StatusChip(label: 'HOLD', color: AppColors.warning, dense: true),
+                if (l.note.isNotEmpty)
+                  Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.sticky_note_2_outlined, size: 14, color: AppColors.textTertiary),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(l.note,
+                          style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: AppColors.textSecondary)),
+                    ),
+                  ]),
+              ]),
+            ),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            // A dish the menu no longer carries can only leave the order: it has
+            // no price to add another at, and nothing to hold or annotate for.
+            if (l.onMenu) ...[
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.front_hand_outlined,
+                    size: 20, color: l.held ? AppColors.warning : AppColors.textTertiary),
+                tooltip: l.held ? 'Course held — tap to release' : 'Hold course (fire later from the KDS)',
+                onPressed: () => onHold(l.menuId),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.sticky_note_2_outlined,
+                    size: 20, color: l.note.isNotEmpty ? AppColors.copperHi : AppColors.textTertiary),
+                tooltip: l.note.isNotEmpty ? 'Edit note' : 'Add note',
+                onPressed: () => onNote(l.menuId, l.name),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.remove_circle_outline, color: AppColors.textSecondary),
+                tooltip: 'One fewer',
+                onPressed: () => _change(context, l.menuId, -1),
+              ),
+              Text('${l.quantity}', style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.textPrimary)),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.add_circle_outline, color: AppColors.copperHi),
+                tooltip: 'One more',
+                onPressed: () => onQty(l.menuId, 1),
+              ),
+            ],
+            IconButton(
+              key: ValueKey('order-review-remove-${l.menuId}'),
+              visualDensity: VisualDensity.compact,
+              icon: Icon(Icons.delete_outline, color: AppColors.textSecondary),
+              tooltip: 'Remove from order',
+              onPressed: () => _change(context, l.menuId, -l.quantity),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  /// One of the order's own fields, read-only: the kitchen note, and a
+  /// takeaway's customer, phone and address.
+  Widget _detail(BuildContext context, IconData icon, String value) => Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 4),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(icon, size: 16, color: AppColors.textTertiary),
+          const SizedBox(width: 8),
+          Expanded(child: Text(value, style: Theme.of(context).textTheme.bodySmall)),
+        ]),
+      );
 }
