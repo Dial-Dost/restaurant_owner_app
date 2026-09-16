@@ -1449,6 +1449,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         ]),
       ];
     case 'sales_summary':
+      final salesNc = NcSettle.salesSummary(totals);
       return [
         _misTiles([
           _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi, sub: 'what guests paid'),
@@ -1459,6 +1460,16 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax'),
         ]),
         _misLadderCard(context, totals),
+        if (salesNc != null) ...[
+          const SizedBox(height: AppSpacing.md),
+          _misNcBeside(
+            context,
+            salesNc.bills,
+            salesNc.value,
+            'NC bills close at 0.00 and still count as bills (and their parties as covers), like a released '
+            'table; the value given away is pre-tax, dishes comped one by one included.',
+          ),
+        ],
         const SizedBox(height: AppSpacing.md),
       ];
     case 'order_summary':
@@ -1508,6 +1519,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
         ]),
       ];
     case 'settlement_summary':
+      final settleNc = NcSettle.settlementSummary(totals);
       return [
         _misTiles([
           _misStat(context, 'Collected', _money(totals['amount']), tint: AppColors.copperHi),
@@ -1516,6 +1528,16 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'Bills', '${_int(totals['bills']) ?? 0}'),
           _misStat(context, 'Split-tender bills', '${_int(totals['split_bills']) ?? 0}'),
         ]),
+        if (settleNc != null) ...[
+          _misNcBeside(
+            context,
+            settleNc.bills,
+            settleNc.value,
+            'The $kNcSettleLabel row reads 0.00 and moves no total; the value beside it is what was given away '
+            'in this window, before tax.',
+          ),
+          const SizedBox(height: AppSpacing.md),
+        ],
       ];
 
     // ---- the six that read migrations 034-039 -------------------------------
@@ -1528,6 +1550,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     case 'nc_summary':
       final kinds = (d['by_kind'] as List?) ?? const [];
       final reversed = _int(totals['reversed_entries']) ?? 0;
+      final scopes = NcSettle.byScope(d);
       return [
         _misTiles([
           _misStat(context, 'Comps', '${_int(totals['entries']) ?? 0}',
@@ -1550,6 +1573,11 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
               ),
         ]),
         if (kinds.isNotEmpty) const SizedBox(height: AppSpacing.md),
+        // Item = one dish comped; Bill = a line of a bill settled as NC.
+        if (scopes.isNotEmpty) _misBreakdownCard(context, 'Dish comps and NC bills', [
+          for (final sc in scopes) (label: sc.label, count: '${sc.entries}', value: _money(sc.loss)),
+        ]),
+        if (scopes.isNotEmpty) const SizedBox(height: AppSpacing.md),
       ];
 
     // The money the house chose NOT to charge. It never entered a sales figure,
@@ -1665,6 +1693,25 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     default:
       return const [];
   }
+}
+
+/// NC BESIDE THE MONEY (client item 5): the bills settled as non-chargeable and
+/// what was given away, in a card of its own under the figures — never a tile
+/// among them, because nothing here was collected. The web panel says the same.
+Widget _misNcBeside(BuildContext context, int bills, double value, String note) {
+  final text = Theme.of(context).textTheme;
+  return ForkCard(
+    key: const ValueKey('mis-nc-beside'),
+    inset: true,
+    padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text('${kNcSettleLabel.toUpperCase()} — NOT COLLECTED', style: text.labelSmall),
+      const SizedBox(height: 4),
+      Text(NcSettle.besideLine(bills, value, (v) => _money(v)), style: text.titleSmall),
+      const SizedBox(height: 4),
+      Text(note, style: text.bodySmall),
+    ]),
+  );
 }
 
 /// A named breakdown the server already computed — `by_kind`, `by_mode`,

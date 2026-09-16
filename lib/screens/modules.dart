@@ -51,6 +51,7 @@ import '../ui/widgets/time_slot_picker.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
 import '../models/payment_modes.dart';
+import '../models/nc_settle.dart';
 import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
@@ -1322,6 +1323,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
   final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone · $offset');
   final byMethod = _headlineByMethod(context, h, columns: columns);
+  final ncToday = _headlineNc(context, h);
 
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
@@ -1376,6 +1378,11 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
         if (byMethod != null) ...[
           const SizedBox(height: AppSpacing.lg),
           byMethod,
+        ],
+        // BESIDE the by-method block, never inside it (client item 5).
+        if (ncToday != null) ...[
+          const SizedBox(height: AppSpacing.lg),
+          ncToday,
         ],
       ]),
     ),
@@ -1528,6 +1535,36 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       ),
     ],
   ]);
+}
+
+/// NON-CHARGEABLE TODAY, under the by-method block (client item 5). A bill
+/// settled as NC took 0.00, so it has no row among the modes (the server drops
+/// ₹0 rows there), and folding its value into them would put money in the
+/// drawer that never came in. So it is its own labelled line — `today_nc`,
+/// server-authored — shown even on a day when no mode took anything. The web
+/// `headline-stats.tsx` draws the same line. Null when there is nothing today,
+/// or the payload is from a backend without it.
+Widget? _headlineNc(BuildContext context, Map h) {
+  final nc = NcSettle.headlineNc(h);
+  if (nc == null) return null;
+  final text = Theme.of(context).textTheme;
+  return Column(
+    key: const ValueKey('headline-nc'),
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+      const SizedBox(height: 4),
+      Text(NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v)), style: text.titleSmall),
+      if (nc.hint.isNotEmpty) ...[
+        const SizedBox(height: 3),
+        Text(nc.hint,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+      ],
+    ],
+  );
 }
 
 /// The Accounting window the by-method drill-down jumps to: the day the sheet
@@ -11041,7 +11078,6 @@ class _BillPreviewDialog extends StatelessWidget {
   });
 
   static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
-  static double _round2(double v) => (v * 100).roundToDouble() / 100;
 
   /// A percentage as the renderer's template literal prints it: "10", "2.5".
   static String _pct(double p) => p % 1 == 0 ? '${p.toInt()}' : '$p';
@@ -11219,6 +11255,9 @@ class _BillPreviewDialog extends StatelessWidget {
     final date = '${two(stamp.day)}/${two(stamp.month)}/${stamp.year} ${two(stamp.hour)}:${two(stamp.minute)}';
     final chargesService = billPrintsServiceChargeNote(bill);
     final note = qrNote.trim().isEmpty ? _billQrNoteFallback : qrNote.trim();
+    // What the comped lines were worth, disclosed under the total exactly as
+    // escpos.ts discloses it — never a rung of the ladder. Null with no comp.
+    final ncValue = NcSettle.paperNcValue(items);
 
     return Dialog(
       backgroundColor: Colors.transparent,
@@ -11367,12 +11406,15 @@ class _BillPreviewDialog extends StatelessWidget {
                         // `itemLabel` prints it: "Paneer Tikka (Half)".
                         final variation = '${m['variation'] ?? ''}'.trim();
                         final name = _s(m, 'name');
+                        // A COMPED LINE (migration 034) reads "<dish> (NC)" at
+                        // 0.00, as the paper prints it, so the Amount column
+                        // adds up to the Sub Total under it.
                         return _itemRow(
                           col,
-                          variation.isEmpty ? name : '$name ($variation)',
+                          NcSettle.lineLabel(variation.isEmpty ? name : '$name ($variation)', m['nc']),
                           '${qty % 1 == 0 ? qty.toInt() : qty}',
                           price.toStringAsFixed(2),
-                          _round2(price * qty).toStringAsFixed(2),
+                          NcSettle.lineAmount(price, qty, m['nc']).toStringAsFixed(2),
                         );
                       }),
                       _rule(thick: true),
@@ -11405,6 +11447,14 @@ class _BillPreviewDialog extends StatelessWidget {
                       _ladder(col, ['Grand Total'], _money(grandTotal),
                           style: const TextStyle(fontSize: 17, height: 1.25, fontWeight: FontWeight.w800, color: Colors.black)),
                       _rule(),
+                      // Beside the ladder, never in it — escpos.ts's order.
+                      if (ncValue != null) ...[
+                        KeyedSubtree(
+                          key: const ValueKey('bill-preview-nc-value'),
+                          child: _ladder(col, ['NC value (not charged)'], ncValue.toStringAsFixed(2)),
+                        ),
+                        _rule(),
+                      ],
                       // THE FOOTER. The disclaimer first, bold, straight under the
                       // total it is about — a guest reads it before deciding what
                       // to pay — and only when the guest is being charged for
@@ -22909,7 +22959,8 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
             Wrap(spacing: 6, runSpacing: 4, children: [
               if (when.isNotEmpty) InfoChip(icon: Icons.schedule, label: _fmtTime(when)),
               if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
-              if (method.isNotEmpty && method != '—') InfoChip(icon: Icons.payments_outlined, label: method),
+              if (method.isNotEmpty && method != '—')
+                InfoChip(icon: Icons.payments_outlined, label: NcSettle.isMethod(method) ? kNcSettleLabel : method),
               if (refunded) const InfoChip(icon: Icons.undo, label: 'Refunded'),
               // ROUND 2 ITEM 1 — who the bill was for, so a correction is visible
               // on the row it was made from.
@@ -23283,6 +23334,9 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
   final servicePct = _numOf(bill['service_charge_percent']);
   final coupon = _s(bill, 'coupon_code', '');
   final method = _s(bill, 'payment_method', '');
+  // The NC marker is not a mode and has one name everywhere (migration 052).
+  final methodShown = NcSettle.isMethod(method) ? kNcSettleLabel : method;
+  final ncSettled = NcSettle.settlement(bill);
   final covers = _int(bill['covers']);
   // What rounded the settled total to the rupee (backend migration 048), as
   // recorded at settle. Null on a bill that needed none or was settled before
@@ -23361,7 +23415,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       if (refunded)
         StatusChip(label: 'Refunded ${_money(bill['refund_amount'])}', color: AppColors.danger)
       else
-        StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
+        StatusChip(label: method.isEmpty ? 'Closed' : methodShown, color: AppColors.success),
     ]),
     // ROUND 2 ITEM 1 — `Name:` and `Customer GSTIN:` directly under the header
     // and above the date, the slot the printed bill carries them in, worded as
@@ -23385,7 +23439,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
         for (var i = 0; i < items.length; i++) ...[
           if (i > 0) rule(),
           money(
-            _s(items[i], 'name', 'Item'),
+            // A comped line is its own line at 0.00 — the paper's words.
+            NcSettle.lineLabel(_s(items[i], 'name', 'Item'), items[i]['nc']),
             _money(items[i]['line_total'] ?? (_numOf(items[i]['price']) * (_int(items[i]['quantity']) ?? 1))),
             sub: '${_int(items[i]['quantity']) ?? 1} × ${_money(items[i]['price'])}'
                 '${_s(items[i], 'note', '').isEmpty ? '' : ' · ${_s(items[i], 'note')}'}',
@@ -23415,6 +23470,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
       money(reportWords ? kGross : 'Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      // Beside the ladder, never in it: what the comped lines were worth.
+      if (_numOf(bill['nc_total']) > 0) money('NC value (not charged)', _money(bill['nc_total'])),
       const SizedBox(height: 6),
       Row(children: [
         Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
@@ -23430,7 +23487,21 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       ]),
     ]),
     card('Payment', [
-      money(method.isEmpty ? 'Method not recorded' : method, _money(grand)),
+      money(method.isEmpty ? 'Method not recorded' : methodShown, _money(grand)),
+      // A BILL SETTLED AS NC says why it took nothing, and on whose say-so.
+      if (ncSettled != null) ...[
+        rule(),
+        money(
+          'Settled as non-chargeable',
+          _money(ncSettled.value),
+          sub: '${ncSettled.kind.isEmpty ? '' : '${ncSettled.kind} · '}authorised by ${ncSettled.authorisedBy}'
+              '${ncSettled.reason.isEmpty ? '' : ' · ${ncSettled.reason}'} · given away, before tax',
+          tint: AppColors.warning,
+        ),
+        if ((ncSettled.wouldHaveCharged ?? 0) > 0)
+          money('Would have been (incl. tax)', _money(ncSettled.wouldHaveCharged),
+              sub: 'Information only — in no report'),
+      ],
       // Split payments: each part is its own tender, so they are named
       // individually rather than collapsed into the headline method.
       for (final sp in splits) ...[
