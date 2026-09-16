@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +10,8 @@ import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+
+import 'text_field_scan.dart';
 
 /// THE BOX MUST SHOW THE ROW IT BELONGS TO — found by the item 3 (2.0.1) sweep.
 ///
@@ -392,21 +392,34 @@ void main() {
 
   // --------------------------------------------------------- the wiring --
 
-  test('every editable list row with initialValue fields is keyed on its own identity', () {
-    final src = File('lib/screens/modules.dart').readAsStringSync();
-    for (final key in [
-      'key: ObjectKey(_taxes[i]),',
-      'key: ObjectKey(_recipe[i]),',
-      'key: ObjectKey(g),',
-      'key: ObjectKey(options[oi]),',
-      "key: ValueKey('poster-\${p['id']}'),",
-    ]) {
-      expect(src.contains(key), isTrue, reason: 'row key missing: $key');
-    }
-    // Seven initialValue fields live in keyed rows; a new one needs a key too.
-    // Comment lines are left out: the fix's own comments name the pattern.
-    final code = src.split('\n').where((l) => !l.trimLeft().startsWith('//')).join('\n');
-    expect(RegExp(r'TextFormField\(\s*initialValue:').allMatches(code).length, 7,
-        reason: 'a new TextFormField(initialValue:) in a list needs its row keyed — then update this count');
+  test('every initialValue box in the app is keyed on the row it edits', () {
+    // Read the way test/text_field_scan.dart reads: every file under lib/, the
+    // argument wherever it falls in the call (`TextFormField(key: k,
+    // initialValue: x)` counts), comments left out (the fix's own comments name
+    // the pattern). For each box, the nearest `key:` at or above it — its own,
+    // else the closest enclosing widget's — must be that row's own identity.
+    // A const key, a Form's key, or none at all is the bug back.
+    const expected = <String>[
+      r"lib/screens/modules.dart  initialValue: '${_recipe[i]['qty'] ?? ''}'  key: ObjectKey(_recipe[i])",
+      r"lib/screens/modules.dart  initialValue: '${g['name'] ?? ''}'  key: ObjectKey(g)",
+      r"lib/screens/modules.dart  initialValue: '${(options[oi] as Map)['name'] ?? ''}'  key: ObjectKey(options[oi])",
+      r"lib/screens/modules.dart  initialValue: '${(options[oi] as Map)['price'] ?? ''}'  key: ObjectKey(options[oi])",
+      r"lib/screens/modules.dart  initialValue: '${_taxes[i]['name']}'  key: ObjectKey(_taxes[i])",
+      r"lib/screens/modules.dart  initialValue: '${_taxes[i]['percentage']}'  key: ObjectKey(_taxes[i])",
+      r"lib/screens/modules.dart  initialValue: '${p['title'] ?? ''}'  key: ValueKey('poster-${p['id']}')",
+    ];
+    final fields = libTextFields;
+    expect(fields.length, greaterThan(100), reason: 'the scan must actually be reading the app');
+    final seeded = [
+      for (final f in fields)
+        if (f.args.containsKey('initialValue')) f,
+    ];
+    expect(
+      [for (final f in seeded) '${f.source.path}  initialValue: ${f.args['initialValue']}  key: ${f.nearestKey}'],
+      unorderedEquals(expected),
+      reason: 'a TextFormField(initialValue:) reads its text once. In a list, key its row on the row\'s own '
+          'data (ObjectKey of the map, or the record id; never a const), then add it here. Found at: '
+          '${seeded.map((f) => f.where).join(', ')}',
+    );
   });
 }

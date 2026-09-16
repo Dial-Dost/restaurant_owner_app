@@ -10,7 +10,10 @@ import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/outbox.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+
+import 'text_field_scan.dart';
 
 /// ITEM 3 (2.0.1) — "When searching for an item while adding order the clear
 /// text button does not clear the text, this needs to be fixed."
@@ -27,8 +30,10 @@ import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 ///   * the x empties the BOX, not just the filter, and the full menu is back;
 ///   * focus stays in the box, and the next word is a new search;
 ///   * clearing never touches the order being built;
-///   * and, as a sweep, no text field in the app offers a suffix button over
-///     text it does not own — the shape this bug had.
+///   * and, as a sweep (test/text_field_scan.dart), no clear button in the app
+///     sits in or beside a text field it cannot reach: no uncontrolled field
+///     with a suffix button, no uncontrolled field at all bar the keyed
+///     initialValue rows, and no onClear that skips its own controller.
 
 class _FakeApi extends ApiClient {
   _FakeApi(this.role);
@@ -168,40 +173,110 @@ void main() {
 
   // ------------------------------------------------------------ the sweep --
 
-  test('no text field in the app offers a suffix button over text it does not own', () {
-    // The bug's shape: a TextField/TextFormField with no `controller:` whose
-    // decoration carries a suffix button. Whatever that button does, it cannot
-    // reach the text in the box. A show/hide eye or a clear x both need the
-    // field to be controlled; a field that only has a plain suffix label
-    // (`suffixText`) is not a button and is not counted.
-    final ctor = RegExp(r'(?<![\w.])(TextField|TextFormField)\s*\(');
+  test('no text field in the app has a clear button that cannot reach its text', () {
+    // The bug's shape is text the button cannot reach. Read with
+    // test/text_field_scan.dart (every file under lib/, comments left out,
+    // each argument found wherever it falls), it can come back three ways:
+    //
+    //  1. a field with no `controller:` whose decoration carries a suffix
+    //     button. Whatever that button does, it cannot reach the box. A plain
+    //     suffix label (`suffixText`) is not a button and is not counted.
+    //  2. a field with no `controller:` and a button BESIDE it (a clear x in
+    //     the same Row, a reset elsewhere on the screen), which this scan could
+    //     not see from the field's own arguments. So no uncontrolled field is
+    //     allowed at all, except the `initialValue:` boxes in keyed list rows,
+    //     and those are pinned one by one, key and all, in
+    //     test/row_remove_keeps_fields_in_step_test.dart.
+    //  3. a box that is controlled, but through a widget whose x sits beside
+    //     the field and calls back for the clearing (GaiaSearchField, used by
+    //     the Guests book). The widget cannot clear the text itself, so every
+    //     call that passes `controller: X` and `onClear:` must clear that
+    //     same X in its onClear, inline or in the method it names.
     final offenders = <String>[];
-    var fields = 0;
-    for (final f in Directory('lib').listSync(recursive: true).whereType<File>()) {
-      if (!f.path.endsWith('.dart')) continue;
-      final src = f.readAsStringSync();
-      for (final m in ctor.allMatches(src)) {
-        var depth = 1;
-        var i = m.end;
-        while (i < src.length && depth > 0) {
-          final c = src[i];
-          if (c == '(' || c == '[' || c == '{') depth++;
-          if (c == ')' || c == ']' || c == '}') depth--;
-          i++;
-        }
-        final args = src.substring(m.end, i);
-        fields++;
-        final hasButton = RegExp(r'\bsuffix(Icon)?\s*:').hasMatch(args) &&
-            RegExp(r'\b(IconButton|ForkIconButton|onPressed|onTap)\b').hasMatch(args);
-        if (hasButton && !RegExp(r'\bcontroller\s*:').hasMatch(args)) {
-          final line = '\n'.allMatches(src.substring(0, m.start)).length + 1;
-          offenders.add('${f.path}:$line');
+    final fields = libTextFields;
+    for (final f in fields) {
+      if (f.args.containsKey('controller')) continue;
+      final hasButton = RegExp(r'\bsuffix(Icon)?\s*:').hasMatch(f.argText) &&
+          RegExp(r'\b(IconButton|ForkIconButton|onPressed|onTap)\b').hasMatch(f.argText);
+      if (hasButton) {
+        offenders.add('${f.where}: a suffix button over text the field does not own');
+      } else if (!f.args.containsKey('initialValue')) {
+        offenders.add('${f.where}: no controller, so no button beside it can clear or reset its text');
+      }
+    }
+    expect(fields.length, greaterThan(100), reason: 'the scan must actually be reading the app');
+    expect(fields.where((f) => f.args.containsKey('controller')).length, greaterThan(100));
+
+    var clearCalls = 0;
+    for (final s in libSources) {
+      for (final m in RegExp(r'(?<![\w.])onClear\s*:').allMatches(s.code)) {
+        final call = s.callAround(m.start);
+        final onClear = call?.args['onClear'];
+        final controller = call?.args['controller'];
+        if (onClear == null || controller == null) continue;
+        clearCalls++;
+        final body = RegExp(r'^[\w.]+$').hasMatch(onClear) ? s.bodyOf(onClear.split('.').last) ?? '' : onClear;
+        final clears = RegExp(RegExp.escape(controller) + r'''\s*\.\s*(clear\s*\(\s*\)|text\s*=\s*(''|""))''');
+        if (!clears.hasMatch(body)) {
+          offenders.add('${call!.where}: ${call.name}(controller: $controller) has an onClear that never clears $controller');
         }
       }
     }
-    expect(fields, greaterThan(50), reason: 'the scan must actually be reading the app');
-    expect(offenders, isEmpty, reason: 'uncontrolled field with a suffix button');
+    expect(clearCalls, greaterThanOrEqualTo(1), reason: 'the Guests book search is one; the scan must find it');
+    expect(offenders, isEmpty, reason: 'a clear button that cannot reach the text it sits by');
   });
+
+  testWidgets('the Gaia search box shows its x only while the box has text, and cannot clear it by itself', (tester) async {
+    // GaiaSearchField's x sits BESIDE its TextField and hands the clearing to
+    // the screen, which is why the sweep above reads every onClear. Here: the
+    // Guests book's wiring empties the box and the x goes; a callback that
+    // forgets the controller leaves the word, and the x, on screen.
+    final ctl = TextEditingController();
+    addTearDown(ctl.dispose);
+    final searched = <String>[];
+    Future<void> pump(VoidCallback onClear) async {
+      await tester.pumpWidget(MaterialApp(
+        theme: GaiaTheme.dark(),
+        home: Scaffold(
+          body: GaiaSearchField(
+            controller: ctl,
+            hint: 'Find a guest by name, phone or email',
+            onChanged: searched.add,
+            onClear: onClear,
+          ),
+        ),
+      ));
+    }
+
+    final field = find.byType(TextField);
+    final x = find.byIcon(Icons.close);
+    String box() => tester.widget<EditableText>(find.descendant(of: field, matching: find.byType(EditableText))).controller.text;
+
+    // As modules.dart wires it for the Guests book.
+    await pump(() {
+      ctl.clear();
+      searched.add('');
+    });
+    expect(x, findsNothing, reason: 'nothing to clear yet');
+    await tester.enterText(field, 'asha');
+    await tester.pump();
+    expect(x, findsOneWidget);
+    await tester.tap(x);
+    await tester.pump();
+    expect(box(), isEmpty);
+    expect(x, findsNothing);
+    expect(searched.last, '', reason: 'the list is searched again with nothing');
+    await tester.enterText(field, '${box()}r');
+    await tester.pump();
+    expect(box(), 'r', reason: 'the next word is a new search');
+
+    // A callback that only resets the search.
+    await pump(() => searched.add(''));
+    await tester.tap(x);
+    await tester.pump();
+    expect(box(), 'r');
+    expect(x, findsOneWidget);
+  }, variant: _platforms);
 
   test('the pad wires its search through the controller, both ways', () {
     final src = File('lib/screens/order_entry.dart').readAsStringSync();
