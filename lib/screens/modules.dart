@@ -56,6 +56,7 @@ import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
+import '../widgets/reprint_needed.dart';
 import '../widgets/outbox_chip.dart';
 import '../widgets/table_bill.dart';
 import 'order_entry.dart';
@@ -9550,8 +9551,16 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (dest == null || dest.isEmpty) return;
     try {
-      await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
-      messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      final res = await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
+      // CLIENT ITEM 6: moved onto a table whose bill is already printed — its
+      // paper is now short, and the line offers the reprint of THAT table.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: dest);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      } else if (mounted) {
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger, lead: 'Moved $name to Table $dest.');
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -9867,8 +9876,21 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (src == null || src.isEmpty) return;
     try {
-      await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
-      messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      final res = await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
+      // CLIENT ITEM 6: merged into this table after its bill was printed (the
+      // "same guests, one more round" case) — the paper is short until it is
+      // reprinted, and the line offers exactly that.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: _name);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      } else if (mounted) {
+        // This sheet IS that table: the reprint is its own Print, next-party
+        // line and all.
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger,
+            lead: 'Merged Table $src into $_name.',
+            printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -19531,11 +19553,10 @@ Widget _analyticsBody(
         double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
         String money(double v) => '₹${v.toStringAsFixed(0)}';
 
-        final revenueByTable = orders
-            .map((o) => (label: 'Table ${_s(o as Map, 'table_name', '—')}', value: num0(o['total'])))
-            .where((d) => d.value > 0)
-            .toList()
-          ..sort((a, b) => b.value.compareTo(a.value));
+        // TABLE-WISE (client item 6): a next-party seating at 12 is reported as
+        // 12, and each seating's money is added in under that label — the web
+        // dashboard's table-wise summary, grouped the same way.
+        final tableRevenue = revenueByTable(orders);
         final staffApc = incentives
             .map((e) => (label: _s(e as Map, 'employee_name', 'Staff'), value: num0(e['mean_apc'])))
             .where((d) => d.value > 0)
@@ -20695,16 +20716,16 @@ Widget _analyticsBody(
                 Gaia.of(context)
                     ? _strataShare(
                         context,
-                        revenueByTable.take(8).toList(),
+                        tableRevenue.take(8).toList(),
                         money,
-                        total: revenueByTable.fold<double>(0, (a, d) => a + d.value),
+                        total: tableRevenue.fold<double>(0, (a, d) => a + d.value),
                         remainderLabel: 'Other tables',
                         caption: 'Thickness is each table’s share of the'
                             ' period’s table revenue.',
                       )
-                    : _barChart(context, revenueByTable.take(8).toList(), money),
+                    : _barChart(context, tableRevenue.take(8).toList(), money),
                 onDownload: () => dl('revenue-by-table', const ['Table', 'Revenue'],
-                    [for (final d in revenueByTable.take(8)) [d.label, money(d.value)]])),
+                    [for (final d in tableRevenue.take(8)) [d.label, money(d.value)]])),
             const SizedBox(height: AppSpacing.lg),
           ],
           if (vis('staff')) ...[

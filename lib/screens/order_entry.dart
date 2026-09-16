@@ -16,6 +16,7 @@ import '../ui/widgets/fork_card.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/status_chip.dart';
 import '../widgets/async_view.dart';
+import '../widgets/reprint_needed.dart';
 import '../widgets/table_bill.dart';
 
 /// 6.8 — the most of the order pad's body its header (running-bill strip,
@@ -375,8 +376,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
           // not be held hostage to the seating write.
         }
       }
+      // What the server said about the bill this order joined. A senior role
+      // may add to a printed bill, and is told the paper is now short.
+      ReprintNeeded? reprint;
       if (widget.isDineIn) {
-        await widget.rest.post('/orders', {...base, 'table': _table});
+        final sent = await widget.rest.post('/orders', {...base, 'table': _table});
+        reprint = ReprintNeeded.parse(sent, fallbackTable: _table);
       } else {
         await widget.rest.post('/orders/takeaway', {
           ...base,
@@ -388,7 +393,15 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
           if (widget.isDelivery && _addrCtrl.text.trim().isNotEmpty) 'delivery_address': _addrCtrl.text.trim(),
         });
       }
-      if (mounted) Navigator.pop(context, true);
+      if (!mounted) return;
+      // CLIENT ITEM 6. The order is in and the pad closes as it always does,
+      // but the guest is holding a bill that no longer covers it: the line
+      // says so, with the Reprint that fixes it. Said on the messenger BELOW
+      // this route, so it is still on screen after the pop.
+      if (reprint != null) {
+        showReprintNeeded(ScaffoldMessenger.of(context), widget.rest, reprint);
+      }
+      Navigator.pop(context, true);
     } on OfflineQueued catch (queued) {
       // The order is SAVED, not SENT — and the difference has to survive this
       // screen. Two things follow from that, and both matter:
@@ -420,7 +433,9 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       // server refused to add to it (a waiter cannot reprint, so the paper in
       // the guest's hand would be short). Nothing was written; the cart stays
       // exactly as it is, and the refusal says where a NEW party's order goes.
-      final refusal = e is ApiException && e.status == 409 ? BillPrintedRefusal.parse(e.body) : null;
+      // Read by its CODE, not its status: the server answers 423
+      // ([billPrintedStatus]) so a queued copy parks instead of retrying.
+      final refusal = e is ApiException ? BillPrintedRefusal.parse(e.body) : null;
       setState(() {
         _printedRefusal = refusal;
         _error = refusal == null ? '$e' : null;

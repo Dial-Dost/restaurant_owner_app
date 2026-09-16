@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -16,8 +17,10 @@ import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 import 'package:restaurant_owner_app/widgets/outbox_chip.dart';
+import 'package:restaurant_owner_app/widgets/table_bill.dart';
 
 /// CLIENT ITEM 6 — THE NEXT PARTY AT A PRINTED TABLE.
 ///
@@ -30,8 +33,13 @@ import 'package:restaurant_owner_app/widgets/outbox_chip.dart';
 ///   * AN ORDER FOR THE NEXT GUESTS NEVER LANDS ON THE PRINTED BILL. The tile
 ///     reads "T1", but every write it leads to — the seating, the order, the
 ///     outbox tag — names "T1 #2", the seat's own table row. And when the
-///     server refuses an order on a printed bill (409 `bill_printed`), the pad
-///     writes nothing and offers to take the SAME cart to the next party's seat.
+///     server refuses an order on a printed bill (423 `bill_printed`), the pad
+///     writes nothing and offers to take the SAME cart to the next party's seat;
+///     a queued copy of that order is parked at once, never retried in front of
+///     the device's other work.
+///   * A MANAGER'S ADDITION TO A PRINTED BILL IS TOLD TO REPRINT — after an
+///     order, a merge or an item moved onto it — with a Reprint that prints
+///     that table.
 ///   * C3 STILL HOLDS for the printed party (v3_client_block_test and
 ///     bill_print_authority_test pin that); the number comes back beside it.
 ///   * THE ROOM HAS NO "T1 #2" IN IT: not on the floor plan, not in the
@@ -60,6 +68,9 @@ class _FakeApi extends ApiClient {
 
   /// Decides a write before it is applied: return an exception to refuse it.
   ApiException? Function(String path, Object? body)? refuse;
+
+  /// While true, no write reaches the server at all (a statusless failure).
+  bool offline = false;
 
   /// The server's answer to an applied write, when a screen reads it.
   final Map<String, Object? Function(Object? body)> replies = {};
@@ -91,6 +102,7 @@ class _FakeApi extends ApiClient {
   Future<dynamic> request(String method, String path, String token,
       [Object? body, String? outletId]) async {
     if (method != 'GET') {
+      if (offline) throw ApiException('Connection refused', null);
       attempts.add((method: method, path: path, body: body));
       final refusal = refuse?.call(path, body);
       if (refusal != null) throw refusal;
@@ -201,9 +213,10 @@ _FakeApi _waiter(Map<String, _Route> routes) =>
 
 _FakeApi _owner(Map<String, _Route> routes) => _FakeApi(routes);
 
-/// The 409 the server answers an order on a printed bill with — next_party.ts'
-/// billPrintedRefusal, verbatim.
-ApiException _billPrinted({String? nextParty = 'T1 #2', bool guest = false}) => ApiException.fromBody({
+/// The refusal the server answers an order on a printed bill with —
+/// next_party.ts' billPrintedRefusal, verbatim, at BILL_PRINTED_STATUS.
+ApiException _billPrinted({String? nextParty = 'T1 #2', bool guest = false, int status = billPrintedStatus}) =>
+    ApiException.fromBody({
       'error': guest
           ? "This table's bill has already been printed, so nothing more can be ordered on it here. Please ask a member of staff."
           : nextParty == null
@@ -214,7 +227,7 @@ ApiException _billPrinted({String? nextParty = 'T1 #2', bool guest = false}) => 
       'next_party_table': nextParty,
       'next_party_action': nextParty == null || guest ? null : 'Take it on T1 (next party)',
       'print_count': 1,
-    }, 409);
+    }, status);
 
 // ------------------------------------------------------------------- hosts --
 
@@ -307,6 +320,26 @@ Future<void> _answerCovers(WidgetTester tester, String covers) async {
   await tester.pumpAndSettle();
 }
 
+const String _reprintT1 =
+    "T1's bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.";
+
+/// A senior role's answer to a write that grew a printed bill.
+Map<String, dynamic> _reprintReply(Map<String, dynamic> base, {String table = 'T1'}) => {
+      ...base,
+      'reprint_needed': true,
+      'reprint_message': _reprintT1.replaceAll('T1', table),
+      'reprint_table': table,
+    };
+
+const Map<String, dynamic> _orderBody = {
+  'items': [
+    {'id': 'mi-1', 'name': 'Gulab Jamun', 'price': 120.0, 'quantity': 1},
+  ],
+  'subtotal': 120.0,
+  'total': 120.0,
+  'status': 'Preparing',
+};
+
 /// The backend checkout, when it is next to this one.
 File _backend(String rel) => File('../Restaurant_Backend/$rel');
 
@@ -374,7 +407,43 @@ void main() {
       }
     });
 
-    test('the 409 is read for its action; anything else is not a bill_printed refusal', () {
+    test('a reprint is read off a senior role\'s answer, in the server\'s words, for the table it names', () {
+      final r = ReprintNeeded.parse(_reprintReply({'id': 'o-1'}), fallbackTable: 'T9')!;
+      expect(r.table, 'T1', reason: 'the server named the table; the fallback is only a fallback');
+      expect(r.message, _reprintT1);
+      // A server that flagged it without the sentence or the table.
+      final bare = ReprintNeeded.parse({'reprint_needed': true}, fallbackTable: 'T1 #2')!;
+      expect(bare.table, 'T1 #2');
+      expect(bare.message,
+          "T1 (next party)'s bill was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.");
+      expect(reprintNeededMessage('T1'), _reprintT1);
+      // Not flagged, or nothing to reprint: no line.
+      for (final none in [null, 'x', <String, dynamic>{}, {'reprint_needed': false}, {'reprint_needed': 'true'}]) {
+        expect(ReprintNeeded.parse(none, fallbackTable: 'T1'), isNull, reason: '$none');
+      }
+      expect(ReprintNeeded.parse({'reprint_needed': true}), isNull);
+    });
+
+    test('revenue by table is TABLE-WISE: a next-party seating is added in under its table, as the web does', () {
+      final rows = [
+        {'table_name': 'T1', 'table_label': 'T1', 'total': 1050},
+        {'table_name': 'T1 #2', 'table_label': 'T1', 'total': '630'},
+        {'table_name': 'T2', 'total': 400.0}, // an older backend: no label
+        {'table_name': 'T3', 'table_label': 'T3', 'total': 0},
+        {'table_label': '', 'table_name': '', 'total': 50},
+        'junk',
+      ];
+      expect(tableWiseLabel(rows[1] as Map), 'T1');
+      expect(tableWiseLabel(rows[2] as Map), 'T2');
+      expect(revenueByTable(rows), [
+        (label: 'Table T1', value: 1680.0),
+        (label: 'Table T2', value: 400.0),
+        (label: 'Table —', value: 50.0),
+      ]);
+      expect(revenueByTable(const []), isEmpty);
+    });
+
+    test('the refusal is read for its action; anything else is not a bill_printed refusal', () {
       final r = BillPrintedRefusal.parse(_billPrinted().body)!;
       expect(r.table, 'T1');
       expect(r.nextPartyTable, 'T1 #2');
@@ -461,6 +530,19 @@ void main() {
       expect(src, contains('return `\${String(root ?? "").trim()} (next party)`;'));
       expect(src, contains('return `Take it on \${tableSentenceName(next, parent)}`;'));
       expect(src, contains('return `Seat the next party at \${'));
+      expect(src, contains("was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.`;"));
+      expect(reprintNeededMessage('T1'), endsWith('was already printed, so the paper no longer shows this. Reprint the bill before the guest pays.'));
+    });
+
+    test('the refusal\'s status is the server\'s, and it is one this app\'s outbox parks', () {
+      final src = source();
+      if (src == null) {
+        markTestSkipped('no Restaurant_Backend checkout beside this one');
+        return;
+      }
+      expect(src, contains('export const BILL_PRINTED_STATUS = $billPrintedStatus;'));
+      expect(billPrintedStatus, isNot(409));
+      expect(const [401, 408, 409, 429], isNot(contains(billPrintedStatus)));
     });
 
     test('the /get-tables row carries the three fields this app reads', () {
@@ -661,11 +743,47 @@ void main() {
       expect((api.to('/orders').single.body as Map)['table'], 'T1 #2');
     });
 
+    testWidgets('the late answer for T1\'s bill is not drawn once the pad is on "T1 #2"', (tester) async {
+      // T1's running bill is slow to come back; the refusal and the move to
+      // the seat happen first. When it lands, it is the PRINTED party's bill,
+      // and drawing it would show the next party somebody else's money.
+      final late = Completer<Object?>();
+      final routes = _floor([_root(), _seat()]);
+      routes['/bill-for-table'] = (path) => path.contains('%23')
+          ? throw ApiException('Nothing on this table yet', 404)
+          : late.future;
+      final api = _waiter(routes);
+      api.refuse = (path, body) =>
+          path == '/orders' && (body as Map)['table'] == 'T1' ? _billPrinted() : null;
+      await _pumpPad(tester, api);
+      await _addAndSend(tester);
+      await tester.tap(find.byKey(const ValueKey('order-take-on-next-party')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.text('New order · T1 (next party)'), findsOneWidget);
+      expect(find.byType(TableApcStrip), findsNothing);
+
+      late.complete(_printedBill());
+      await tester.pumpAndSettle();
+      expect(find.byType(TableApcStrip), findsNothing,
+          reason: "T1's bill was drawn as the next party's");
+    });
+
     testWidgets('with no seat to point at: the sentence, and no button', (tester) async {
       final (api, _) = await _pumpPad(tester, refusingT1(nextParty: null));
       await _addAndSend(tester);
       expect(find.textContaining('Ask a manager to add it and reprint the bill.'), findsOneWidget);
       expect(find.byKey(const ValueKey('order-take-on-next-party')), findsNothing);
+      expect(api.writes, isEmpty);
+    });
+
+    testWidgets('read by its CODE: an older server\'s 409 refusal still gets the banner', (tester) async {
+      final api = _waiter(_floor([_root(), _seat()]));
+      api.refuse = (path, body) => path == '/orders' ? _billPrinted(status: 409) : null;
+      await _pumpPad(tester, api);
+      await _addAndSend(tester);
+      expect(find.byKey(const ValueKey('order-take-on-next-party')), findsOneWidget);
       expect(api.writes, isEmpty);
     });
 
@@ -676,6 +794,170 @@ void main() {
       await _addAndSend(tester);
       expect(find.text('Table is unoccupied'), findsWidgets);
       expect(find.byKey(const ValueKey('order-bill-printed')), findsNothing);
+    });
+  });
+
+  // ==========================================================================
+  // THE OUTBOX AND A PRINTED BILL
+  // ==========================================================================
+
+  group('a queued order the server refuses for a printed bill', () {
+    Future<RestClient> queuedOrderForT1(_FakeApi api) async {
+      final rest = await _signIn(api);
+      await Outbox.instance.debugReset();
+      api.offline = true;
+      await expectLater(rest.post('/orders', {..._orderBody, 'table': 'T1'}), throwsA(isA<OfflineQueued>()));
+      expect(Outbox.instance.pendingCount, 1);
+      api.offline = false;
+      return rest;
+    }
+
+    tearDown(() => Outbox.instance.debugReset());
+
+    test('is PARKED on its first answer, with the server\'s sentence — and the next order goes straight out',
+        () async {
+      final api = _waiter(_floor([_root(), _seat()]));
+      final rest = await queuedOrderForT1(api);
+      api.refuse = (path, body) =>
+          path == '/orders' && (body as Map)['table'] == 'T1' ? _billPrinted() : null;
+
+      final drained = await rest.drainOutbox();
+
+      expect(drained.outcome, OutboxDrainOutcome.blocked);
+      final entry = Outbox.instance.entries.single;
+      expect(entry.failed, isTrue);
+      expect(entry.attempts, 0, reason: 'parked, not retried');
+      expect(entry.failureStatus, billPrintedStatus);
+      expect(entry.failureMessage, startsWith("T1's bill has already been printed"));
+      expect(api.attempts.where((a) => a.path == '/orders'), hasLength(1));
+      expect(Outbox.instance.hasPending, isFalse);
+
+      // THE ORDERING RULE IS NOT HOLDING ANYTHING: an order for another table
+      // is sent now, not queued behind the refusal.
+      await rest.post('/orders', {..._orderBody, 'table': 'T2'});
+      expect([for (final w in api.to('/orders')) (w.body as Map)['table']], ['T2']);
+    });
+
+    test('CONTROL — why the server does not answer 409: a 409 is retried, and holds every later write', () async {
+      final api = _waiter(_floor([_root(), _seat()]));
+      final rest = await queuedOrderForT1(api);
+      api.refuse = (path, body) =>
+          path == '/orders' && (body as Map)['table'] == 'T1' ? _billPrinted(status: 409) : null;
+
+      final drained = await rest.drainOutbox();
+
+      expect(drained.outcome, OutboxDrainOutcome.retryLater);
+      final entry = Outbox.instance.entries.single;
+      expect([entry.failed, entry.attempts], [false, 1]);
+      await expectLater(rest.post('/orders', {..._orderBody, 'table': 'T2'}), throwsA(isA<OfflineQueued>()));
+      expect(api.to('/orders'), isEmpty);
+    });
+  });
+
+  // ==========================================================================
+  // A MANAGER'S ADDITION TO A PRINTED BILL
+  // ==========================================================================
+
+  group('a senior role adds to a printed bill: told to reprint, with the Reprint', () {
+    testWidgets('from the pad: it closes as sent, the line stays, and Reprint prints THAT table', (tester) async {
+      final api = _owner(_floor([_root(), _seat()]));
+      api.replies['/orders'] = (_) => _reprintReply({'id': 'o-9'});
+      final (_, closed) = await _pumpPad(tester, api);
+      await _addAndSend(tester);
+
+      expect(closed, [true]);
+      expect(find.byType(OrderEntryScreen), findsNothing);
+      expect(find.text(_reprintT1), findsOneWidget);
+      expect(api.to('/print/bill'), isEmpty, reason: 'nothing prints until it is asked for');
+
+      await tester.tap(find.byKey(const ValueKey('reprint-needed-action')));
+      await tester.pumpAndSettle();
+      expect(api.to('/print/bill').single.body, {'table_name': 'T1'});
+      expect(find.text('Printing bill…'), findsOneWidget);
+    });
+
+    testWidgets('from the pad: an answer with no flag closes exactly as before, no line', (tester) async {
+      final api = _owner(_floor([_root(printed: false)]));
+      api.replies['/orders'] = (_) => {'id': 'o-9'};
+      final (_, closed) = await _pumpPad(tester, api);
+      await _addAndSend(tester);
+      expect(closed, [true]);
+      expect(find.byKey(const ValueKey('reprint-needed')), findsNothing);
+    });
+
+    testWidgets('a MERGE into the printed table: one line says both, and Reprint prints it', (tester) async {
+      final api = _owner(_floor([_root(), _root(name: 'T5', printed: false)]));
+      api.replies['/bills/merge'] = (_) => _reprintReply({'success': true, 'total_amt': 1650, 'moved_orders': 1});
+      await _mountFloor(tester, api);
+      await tester.tap(_rootTile);
+      await tester.pumpAndSettle();
+      await _reveal(tester, find.widgetWithText(ForkButton, 'Merge'));
+      await tester.tap(find.widgetWithText(ForkButton, 'Merge'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Table T5'));
+      await tester.pumpAndSettle();
+
+      expect(api.to('/bills/merge').single.body, {'from_table': 'T5', 'to_table': 'T1'});
+      // Asked ABOVE the sheet — a snackbar would sit under its barrier.
+      expect(find.descendant(of: find.byType(AlertDialog), matching: find.text('Merged Table T5 into T1. $_reprintT1')),
+          findsOneWidget);
+      expect(api.to('/print/bill'), isEmpty);
+      await tester.tap(find.byKey(const ValueKey('reprint-needed-action')));
+      await tester.pumpAndSettle();
+      expect(api.to('/print/bill').single.body, {'table_name': 'T1'});
+      expect(find.byType(AlertDialog), findsNothing);
+    });
+
+    testWidgets('…and "Not now" prints nothing', (tester) async {
+      final api = _owner(_floor([_root(), _root(name: 'T5', printed: false)]));
+      api.replies['/bills/merge'] = (_) => _reprintReply({'success': true, 'total_amt': 1650, 'moved_orders': 1});
+      await _mountFloor(tester, api);
+      await tester.tap(_rootTile);
+      await tester.pumpAndSettle();
+      await _reveal(tester, find.widgetWithText(ForkButton, 'Merge'));
+      await tester.tap(find.widgetWithText(ForkButton, 'Merge'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Table T5'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Not now'));
+      await tester.pumpAndSettle();
+      expect(api.to('/print/bill'), isEmpty);
+    });
+
+    testWidgets('a MERGE with no flag reads exactly as it did', (tester) async {
+      final api = _owner(_floor([_root(printed: false), _root(name: 'T5', printed: false)]));
+      api.replies['/bills/merge'] = (_) => {'success': true, 'total_amt': 1650, 'moved_orders': 1};
+      await _mountFloor(tester, api);
+      await tester.tap(_rootTile);
+      await tester.pumpAndSettle();
+      await _reveal(tester, find.widgetWithText(ForkButton, 'Merge'));
+      await tester.tap(find.widgetWithText(ForkButton, 'Merge'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Table T5'));
+      await tester.pumpAndSettle();
+      expect(find.text('Merged Table T5 into T1.'), findsOneWidget);
+      expect(find.byKey(const ValueKey('reprint-needed')), findsNothing);
+    });
+
+    test('the wiring: every write that can grow a printed bill reads the flag', () {
+      String read(String rel) => File(rel).readAsStringSync().replaceAll(String.fromCharCode(13), '');
+      final pad = read('lib/screens/order_entry.dart');
+      expect(pad, contains("final sent = await widget.rest.post('/orders', {...base, 'table': _table});\n"
+          '        reprint = ReprintNeeded.parse(sent, fallbackTable: _table);'));
+      expect(pad, contains('showReprintNeeded(ScaffoldMessenger.of(context), widget.rest, reprint);'));
+      // The refusal is keyed on its code, never on a status.
+      expect(pad, contains('final refusal = e is ApiException ? BillPrintedRefusal.parse(e.body) : null;'));
+      expect(pad, isNot(contains('e.status == 409')));
+      final mod = read('lib/screens/modules.dart');
+      expect(mod, contains("final res = await widget.rest.post('/bills/move-item',"));
+      expect(mod, contains('final reprint = ReprintNeeded.parse(res, fallbackTable: dest);'));
+      expect(mod, contains("await askToReprint(context, widget.rest, reprint,\n            messenger: messenger, lead: 'Moved \$name to Table \$dest.');"));
+      expect(mod, contains("final res = await widget.rest.post('/bills/merge',"));
+      expect(mod, contains('final reprint = ReprintNeeded.parse(res, fallbackTable: _name);'));
+      expect(mod, contains('printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);'));
+      // …and the table-wise chart folds through the shared helper.
+      expect(mod, contains('final tableRevenue = revenueByTable(orders);'));
+      expect(mod, isNot(contains("'Table \${_s(o as Map, 'table_name', '—')}'")));
     });
   });
 

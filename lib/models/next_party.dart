@@ -31,9 +31,20 @@ library;
 /// The chip on a sibling's tile.
 const String nextPartyChip = 'Next party';
 
-/// The machine-readable code on the server's 409 for an order added to a
-/// printed bill.
+/// The machine-readable code on the server's refusal of an order added to a
+/// printed bill. The refusal is read by this code and never by its status.
 const String billPrintedCode = 'bill_printed';
+
+/// The status that refusal arrives with: 423, and deliberately not 409.
+///
+/// The outbox (services/outbox.dart) reads a 409 on a queued write as "this
+/// key is still in flight" and retries it — eight times, holding every later
+/// write from this device behind it (the ordering rule). A refusal is not in
+/// flight; it is final. Any 4xx other than 401/408/409/429 is parked on its
+/// first answer with the server's sentence on the chip, and the server answers
+/// 423 so that 2.0.0 tills, which cannot be patched, park it too
+/// (next_party.ts' BILL_PRINTED_STATUS).
+const int billPrintedStatus = 423;
 
 /// The sentence POST /add-table answers a reserved name with, verbatim from
 /// the server. Shown before the request is even sent, so the owner learns the
@@ -108,7 +119,7 @@ String tableSentenceNameOf(Map row) =>
   return (root: m.group(1)!, seq: seq);
 }
 
-/// The button beside a 409: "Take it on 12 (next party)".
+/// The button beside that refusal: "Take it on 12 (next party)".
 String takeItOnLabel(String nextPartyTable) => 'Take it on ${tableSentenceName(nextPartyTable)}';
 
 /// The line after a print, when the server named a seat for the next party.
@@ -129,7 +140,7 @@ String? nextPartyAfterPrintMessage(String? nextPartyTable) {
   return (table: table, message: message.isNotEmpty ? message : nextPartyAfterPrintMessage(table));
 }
 
-/// The server's 409 for an order added to a printed bill, read.
+/// The server's refusal of an order added to a printed bill, read.
 class BillPrintedRefusal {
   const BillPrintedRefusal({
     required this.message,
@@ -167,4 +178,68 @@ class BillPrintedRefusal {
       actionLabel: elsewhere ? (label.isNotEmpty ? label : takeItOnLabel(next)) : null,
     );
   }
+}
+
+/// "12's bill was already printed, so the paper no longer shows this. Reprint
+/// the bill before the guest pays." — the server's reprintNeededMessage, word
+/// for word, for a server that flagged the reprint without the sentence.
+String reprintNeededMessage(String table, {String? parentTable}) =>
+    "${tableSentenceName(table, parentTable: parentTable)}'s bill was already printed, "
+    'so the paper no longer shows this. Reprint the bill before the guest pays.';
+
+/// A SENIOR ROLE PUT MORE ON A PRINTED BILL, and the paper in the guest's hand
+/// is now short: the guest would pay the printed total while the settle books
+/// the larger one. The server allows it (a manager, a cashier, a captain may
+/// add after a print) and answers `reprint_needed: true`, the sentence, and
+/// the table whose paper to reprint. Every screen that sends such a write
+/// reads it with [parse] and offers the Reprint (`showReprintNeeded` in
+/// widgets/reprint_needed.dart); the web dashboard does the same with the
+/// same words.
+class ReprintNeeded {
+  const ReprintNeeded({required this.table, required this.message});
+
+  /// The table to reprint — the handle ("12 #2"), never the display name.
+  final String table;
+
+  /// The server's sentence, shown as it stands.
+  final String message;
+
+  /// Null unless [response] flags a reprint. [fallbackTable] is the table the
+  /// write was for, used only when the server did not name one.
+  static ReprintNeeded? parse(Object? response, {String? fallbackTable}) {
+    if (response is! Map || response['reprint_needed'] != true) return null;
+    final named = _str(response, 'reprint_table');
+    final table = named.isNotEmpty ? named : (fallbackTable ?? '').trim();
+    if (table.isEmpty) return null;
+    final said = _str(response, 'reprint_message');
+    return ReprintNeeded(table: table, message: said.isNotEmpty ? said : reprintNeededMessage(table));
+  }
+}
+
+/// What a TABLE-WISE view calls a seating row of /orders/apc: the ROOT's name
+/// for a next-party seating ("12" for "12 #2"), else its own table name. The
+/// web dashboard's table-wise summary reads the same field the same way
+/// (`table_label ?? table_name`). A label only — the row is still its own
+/// seating, with its own money and covers.
+String tableWiseLabel(Map row) {
+  final label = _str(row, 'table_label');
+  return label.isNotEmpty ? label : _str(row, 'table_name');
+}
+
+/// Revenue by table: each seating's `total` added in under its
+/// [tableWiseLabel], largest first — the web's table-wise summary, grouped the
+/// same way. Seatings with nothing to show are left out, as they always were.
+List<({String label, double value})> revenueByTable(List rows) {
+  double amount(Object? v) => v is num ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
+  final byLabel = <String, double>{};
+  for (final r in rows) {
+    if (r is! Map) continue;
+    final label = tableWiseLabel(r);
+    final key = label.isEmpty ? '—' : label;
+    byLabel[key] = (byLabel[key] ?? 0) + amount(r['total']);
+  }
+  return [
+    for (final e in byLabel.entries)
+      if (e.value > 0) (label: 'Table ${e.key}', value: e.value),
+  ]..sort((a, b) => b.value.compareTo(a.value));
 }
