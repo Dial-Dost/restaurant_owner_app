@@ -634,6 +634,8 @@ void main() {
       expect(reports, contains('final settleNc = NcSettle.settlementSummary(totals);'));
       expect(reports, contains('final scopes = NcSettle.byScope(d);'));
       expect(RegExp(r'_misNcBeside\(').allMatches(reports).length, 3, reason: 'two calls and the definition');
+      // The kitchen-ticket drill-down marks a comped line, as the web one does.
+      expect(reports, contains("Text(NcSettle.lineLabel(_s(it, 'name'), it['nc']), style: text.bodyMedium),"));
       final modules = read('lib/screens/modules.dart');
       expect(modules, contains("import '../models/nc_settle.dart';"));
       expect(modules, contains('final ncSettled = NcSettle.settlement(bill);'));

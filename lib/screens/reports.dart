@@ -2543,7 +2543,9 @@ Widget _misKotBody(BuildContext context, Map order) {
               ),
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(_s(it, 'name'), style: text.bodyMedium),
+                  // A comped line is marked as the bill marks it (the web drill-down
+                  // says the same); its figure stays the ticket's — what was cooked.
+                  Text(NcSettle.lineLabel(_s(it, 'name'), it['nc']), style: text.bodyMedium),
                   if (_s(it, 'note', '').isNotEmpty)
                     Text(_s(it, 'note'), style: text.bodySmall),
                 ]),
