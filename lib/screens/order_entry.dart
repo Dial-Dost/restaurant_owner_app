@@ -99,6 +99,14 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // can be held still when the note and Send button appear or go (see [_setQty]).
   final ScrollController _menuScroll = ScrollController();
   final GlobalKey _headerKey = GlobalKey();
+  // ITEM 3 (2.0.1) — the menu search's text. The field used to have no
+  // controller, so its text lived in the TextField's private one and the clear
+  // button could only reset [_query]: the list came back unfiltered, the x went
+  // away, and the word stayed in the box for the next keystroke to add to
+  // ("dal" + "n" = "daln", "No items match"). [_query] is still what the filter
+  // reads; the two are set together, in onChanged and in the clear button, and
+  // anything else that ever changes the search must set both.
+  final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
   bool _sending = false;
   String? _error;
@@ -188,6 +196,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _phoneCtrl.dispose();
     _addrCtrl.dispose();
     _coversCtrl.dispose();
+    _searchCtrl.dispose();
     _menuScroll.dispose();
     _draftRev.dispose();
     super.dispose();
@@ -457,6 +466,8 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                   Padding(
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
                     child: TextField(
+                      key: const ValueKey('order-search'),
+                      controller: _searchCtrl,
                       decoration: InputDecoration(
                         prefixIcon: const Icon(Icons.search),
                         hintText: 'Search menu…',
@@ -464,7 +475,19 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                         border: const OutlineInputBorder(),
                         suffixIcon: _query.isEmpty
                             ? null
-                            : IconButton(icon: const Icon(Icons.clear), onPressed: () => setState(() => _query = '')),
+                            : IconButton(
+                                key: const ValueKey('order-search-clear'),
+                                icon: const Icon(Icons.clear),
+                                tooltip: 'Clear search',
+                                // ITEM 3 (2.0.1) — the TEXT goes, not just the
+                                // filter. clear() does not call onChanged, so
+                                // [_query] is reset here too. Focus stays in the
+                                // box: the waiter is about to type the next dish.
+                                onPressed: () {
+                                  _searchCtrl.clear();
+                                  setState(() => _query = '');
+                                },
+                              ),
                       ),
                       onChanged: (v) => setState(() => _query = v),
                     ),
