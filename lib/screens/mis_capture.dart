@@ -303,103 +303,115 @@ class _CaptureReasonDialogState extends State<_CaptureReasonDialog> {
           borderRadius: AppRadius.cardAll,
           border: Border.all(color: AppColors.borderStrong),
         ),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            Text(widget.title.toUpperCase(), style: text.labelSmall),
-            if (widget.headline != null) ...[
-              const SizedBox(height: 6),
-              Text(widget.headline!,
-                  style: text.displaySmall!.copyWith(
-                      color: widget.danger ? AppColors.danger : AppColors.copperHi)),
-            ],
-            const SizedBox(height: 8),
-            Text(widget.subtitle, style: text.bodySmall),
-            if (widget.extra != null) ...[
-              const SizedBox(height: AppSpacing.lg),
-              widget.extra!,
-            ],
-            if (widget.kinds.isNotEmpty) ...[
-              const SizedBox(height: AppSpacing.lg),
-              Text('WHY', style: text.labelSmall),
-              const SizedBox(height: 8),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                for (final (value, label) in widget.kinds)
-                  _CapturePill(
-                    key: ValueKey('capture-kind-$value'),
-                    label: label,
-                    selected: _kind == value,
-                    onTap: () => setState(() => _kind = value),
-                  ),
-              ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            TextField(
-              key: const ValueKey('capture-reason'),
-              controller: _reason,
-              autofocus: true,
-              minLines: 2,
-              maxLines: 3,
-              maxLength: 400,
-              textCapitalization: TextCapitalization.sentences,
-              onChanged: (_) => setState(() {}),
-              decoration: InputDecoration(
-                labelText: widget.reasonOptional ? misOptionalReasonLabel : 'Reason',
-                alignLabelWithHint: true,
-                helperText: widget.reasonOptional
-                    ? 'Optional. If you add one, it goes on the control report, verbatim.'
-                    : 'In your own words. It goes on the control report, verbatim.',
-              ),
-            ),
-            if (widget.needsAuthoriser) ...[
-              const SizedBox(height: 4),
-              TextField(
-                key: const ValueKey('capture-authoriser'),
-                controller: _authorisedBy,
-                onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
-                  labelText: 'Authorised by (username)',
-                  helperText: 'The staff member who approved it. Yours is filled in — '
-                      'change it if someone else said yes.',
-                  helperMaxLines: 3,
-                ),
-              ),
-              const SizedBox(height: 6),
-              // What this control IS and IS NOT, said plainly on the screen where
-              // the name is typed. It is not proof anyone was standing there;
-              // this system has no step-up credential and pretending otherwise
-              // would be a worse control than an honest one.
-              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'The name is checked against your staff list and against this same '
-                    'permission. Who is acting is taken from your own sign-in and cannot be typed.',
-                    style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+        // The fields scroll; Cancel and Confirm do not. On a 360dp phone this form
+        // is taller than the screen, and with the buttons at the foot of the scroll
+        // a waiver that needs no typing still needed a scroll before its one tap.
+        // Pinned under the fields they stay on screen, above the keyboard too:
+        // Dialog pads itself by the keyboard's height.
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Flexible(
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Text(widget.title.toUpperCase(), style: text.labelSmall),
+                if (widget.headline != null) ...[
+                  const SizedBox(height: 6),
+                  Text(widget.headline!,
+                      style: text.displaySmall!.copyWith(
+                          color: widget.danger ? AppColors.danger : AppColors.copperHi)),
+                ],
+                const SizedBox(height: 8),
+                Text(widget.subtitle, style: text.bodySmall),
+                if (widget.extra != null) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  widget.extra!,
+                ],
+                if (widget.kinds.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  Text('WHY', style: text.labelSmall),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    for (final (value, label) in widget.kinds)
+                      _CapturePill(
+                        key: ValueKey('capture-kind-$value'),
+                        label: label,
+                        selected: _kind == value,
+                        onTap: () => setState(() => _kind = value),
+                      ),
+                  ]),
+                ],
+                const SizedBox(height: AppSpacing.lg),
+                TextField(
+                  key: const ValueKey('capture-reason'),
+                  controller: _reason,
+                  // The keyboard comes up for a reason the act cannot go without. The
+                  // waiver's is optional and its commonest use is the kind as chosen, the
+                  // name as filled, Confirm: on a phone a keyboard would only cover that.
+                  autofocus: !widget.reasonOptional,
+                  minLines: 2,
+                  maxLines: 3,
+                  maxLength: 400,
+                  textCapitalization: TextCapitalization.sentences,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    labelText: widget.reasonOptional ? misOptionalReasonLabel : 'Reason',
+                    alignLabelWithHint: true,
+                    helperText: widget.reasonOptional
+                        ? 'Optional. If you add one, it goes on the control report, verbatim.'
+                        : 'In your own words. It goes on the control report, verbatim.',
                   ),
                 ),
+                if (widget.needsAuthoriser) ...[
+                  const SizedBox(height: 4),
+                  TextField(
+                    key: const ValueKey('capture-authoriser'),
+                    controller: _authorisedBy,
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Authorised by (username)',
+                      helperText: 'The staff member who approved it. Yours is filled in — '
+                          'change it if someone else said yes.',
+                      helperMaxLines: 3,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  // What this control IS and IS NOT, said plainly on the screen where
+                  // the name is typed. It is not proof anyone was standing there;
+                  // this system has no step-up credential and pretending otherwise
+                  // would be a worse control than an honest one.
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'The name is checked against your staff list and against this same '
+                        'permission. Who is acting is taken from your own sign-in and cannot be typed.',
+                        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+                      ),
+                    ),
+                  ]),
+                ],
               ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            Wrap(
-              alignment: WrapAlignment.end,
-              spacing: AppSpacing.sm,
-              runSpacing: AppSpacing.sm,
-              children: [
-                ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
-                ForkButton(
-                  key: const ValueKey('capture-confirm'),
-                  label: widget.confirmLabel,
-                  icon: Icons.check,
-                  dense: true,
-                  // Disabled until it could succeed, rather than posting a body
-                  // the server would refuse with a field name nobody typed.
-                  onPressed: _ready ? _submit : null,
-                ),
-              ],
             ),
-          ]),
-        ),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.sm,
+            children: [
+              ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
+              ForkButton(
+                key: const ValueKey('capture-confirm'),
+                label: widget.confirmLabel,
+                icon: Icons.check,
+                dense: true,
+                // Disabled until it could succeed, rather than posting a body
+                // the server would refuse with a field name nobody typed.
+                onPressed: _ready ? _submit : null,
+              ),
+            ],
+          ),
+        ]),
       ),
     );
   }

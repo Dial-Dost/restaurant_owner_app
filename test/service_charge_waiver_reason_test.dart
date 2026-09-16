@@ -110,6 +110,30 @@ void main() {
       expect(src, contains("labelText: widget.reasonOptional ? misOptionalReasonLabel : 'Reason',"));
     });
 
+    String dialogState() => src.substring(
+          src.indexOf('class _CaptureReasonDialogState'),
+          src.indexOf('class _CapturePill'),
+        );
+
+    test('an optional reason does not take the focus (no keyboard on a phone); a required one still does', () {
+      final dialog = dialogState();
+      expect(RegExp(r'autofocus:').allMatches(dialog).length, 1);
+      expect(dialog, contains('autofocus: !widget.reasonOptional,'));
+    });
+
+    test('Cancel and Confirm sit OUTSIDE the scroll, so a phone can reach them without one', () {
+      final dialog = dialogState();
+      final scroll = dialog.indexOf('child: SingleChildScrollView(');
+      final confirm = dialog.indexOf("key: const ValueKey('capture-confirm'),");
+      expect(dialog, contains('Flexible(\n            child: SingleChildScrollView('));
+      expect(scroll, greaterThan(0));
+      expect(confirm, greaterThan(scroll));
+      // The scroll's own Column closes before the button row begins.
+      final closes = dialog.indexOf('              ]),\n            ),\n          ),\n', scroll);
+      expect(closes, greaterThan(scroll));
+      expect(closes, lessThan(confirm));
+    });
+
     test('putting the charge back still sends its reason and never sets the flag', () {
       final reverse = src.substring(
         src.indexOf('Future<void> _reverseServiceChargeWaiver('),

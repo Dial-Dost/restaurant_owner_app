@@ -328,6 +328,21 @@ VoidCallback? _pressOf(WidgetTester tester, Key key) {
       .onPressed;
 }
 
+/// Whether the shared reason box holds the keyboard focus.
+bool _reasonFocused(WidgetTester tester) => tester
+    .widget<EditableText>(find.descendant(
+        of: find.byKey(const ValueKey('capture-reason')), matching: find.byType(EditableText)))
+    .focusNode
+    .hasFocus;
+
+/// [key] is wholly inside a [width] x [height] window: tappable where it is,
+/// without a scroll.
+void _expectOnScreen(WidgetTester tester, Key key, double width, double height) {
+  final r = tester.getRect(find.byKey(key));
+  expect(r.top >= 0 && r.left >= 0 && r.bottom <= height && r.right <= width, isTrue,
+      reason: '$key is at $r, outside the ${width.toInt()}x${height.toInt()} screen');
+}
+
 /// Fill the shared reason form and confirm it.
 Future<void> _fillReason(
   WidgetTester tester, {
@@ -1728,6 +1743,63 @@ void main() {
       expect(tester.takeException(), isNull, reason: 'the reason form overflowed a phone');
       expect(find.byKey(const ValueKey('capture-reason')), findsOneWidget);
       expect(find.byKey(const ValueKey('capture-authoriser')), findsOneWidget);
+    });
+
+    // The waiver's reason is optional (2.0.1), so its commonest use is one tap:
+    // the kind as chosen, the name as filled, Confirm. On a phone that needs two
+    // things the 1400x1200 harness never shows: no keyboard thrown up over the
+    // form for a field nobody has to fill, and a Confirm that is ON the screen
+    // rather than at the foot of a form taller than it.
+    for (final (w, h) in const [(360.0, 640.0), (360.0, 800.0), (390.0, 844.0)]) {
+      testWidgets('a ${w.toInt()}x${h.toInt()} phone removes the service charge in one tap: '
+          'no keyboard, Confirm on screen', (tester) async {
+        final api = await _mount(tester, m.tablesModule, _tableRoutes(), width: w, height: h);
+        await _openTable(tester);
+        await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+        await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: 'the reason form overflowed a phone');
+
+        expect(_reasonFocused(tester), isFalse,
+            reason: 'an optional reason must not pull the keyboard up');
+        expect(tester.testTextInput.isVisible, isFalse);
+        _expectOnScreen(tester, const ValueKey('capture-confirm'), w, h);
+
+        // No scroll, no typing: the one tap.
+        await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+        await tester.pumpAndSettle();
+        final body = api.writes
+            .singleWhere((x) => x.path == '/bills/service-charge-waiver/print')
+            .body as Map;
+        expect(body['waiver_kind'], 'guest_request');
+        expect(body['authorised_by'], 'manager01');
+        expect(body.containsKey('reason'), isFalse);
+      });
+    }
+
+    testWidgets('UNCHANGED on a phone: a reason the act needs still brings the keyboard up, '
+        'and Confirm stays above the keyboard', (tester) async {
+      final api = await _mount(tester, m.tablesModule,
+          _tableRoutes(bill: _bill(waived: true, printCount: 1)), width: 360, height: 640);
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
+      await tester.tap(find.byKey(const ValueKey('sc-waiver-reverse')));
+      await tester.pumpAndSettle();
+      expect(_reasonFocused(tester), isTrue, reason: 'putting the charge back needs a reason');
+
+      // The keyboard, as Android reports it: the bottom 300 logical pixels.
+      tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+      addTearDown(tester.view.resetViewInsets);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull, reason: 'the reason form overflowed above a keyboard');
+      _expectOnScreen(tester, const ValueKey('capture-confirm'), 360, 640 - 300);
+
+      await tester.enterText(find.byKey(const ValueKey('capture-reason')), 'Manager overruled it');
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+      final body = api.bodyOf('/bills/service-charge-waiver/w-1/reverse') as Map?;
+      expect(body!['reason'], 'Manager overruled it');
     });
   });
 
