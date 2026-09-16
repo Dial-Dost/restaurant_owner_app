@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
+import '../models/next_party.dart';
 import '../models/order_draft.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
+import '../services/api_client.dart';
 import '../services/outbox.dart';
 import '../services/phone_validation.dart';
 import '../services/rest_client.dart';
@@ -102,6 +104,20 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   String _query = '';
   bool _sending = false;
   String? _error;
+
+  /// CLIENT ITEM 6 — the server's 409 for an order added to a bill that has
+  /// already been printed, read ([BillPrintedRefusal]). Drawn above the Send
+  /// button with its "Take it on 12 (next party)" action; null otherwise.
+  BillPrintedRefusal? _printedRefusal;
+
+  /// The next-party seat this order was moved to by that action, or null.
+  /// Once set, it is THE table: the occupy, the order, the running bill and
+  /// the title all follow it. The cart does not move — it is the same order.
+  String? _retarget;
+
+  /// The table this pad sends to: the one it was opened on, or the next-party
+  /// seat the waiter moved the order to.
+  String? get _table => _retarget ?? widget.tableName;
   // What this table is ALREADY running at (its active orders merged, covers,
   // APC vs target). Dine-in only — a takeaway has no table to be per-head about.
   // Null until it loads, and stays null when the table has no open bill yet.
@@ -124,8 +140,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   /// Whether THIS send is the one that occupies the table. Dine-in only: a
   /// takeaway has no table to occupy, and its virtual table is provisioned
   /// server-side.
+  ///
+  /// A next-party seat ([_retarget]) is always one: the server hands out only a
+  /// FREE seat, so this order is what seats the new party there — covers and
+  /// all, exactly as a waiter's first order on any free table.
   bool get _occupyOnSend =>
-      widget.occupyOnSend && widget.isDineIn && (widget.tableName ?? '').trim().isNotEmpty;
+      (widget.occupyOnSend || _retarget != null) && widget.isDineIn && (_table ?? '').trim().isNotEmpty;
 
   /// The covers dialog, deliberately worded as a question about the party rather
   /// than as an instruction to seat them: this is the send button's follow-up,
@@ -174,10 +194,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // legitimate state here (the waiter is about to create the first order).
   Future<void> _loadTableBill() async {
     if (!widget.isDineIn) return;
-    final name = widget.tableName ?? '';
+    final name = _table ?? '';
     if (name.isEmpty) return;
     final bill = await loadTableBill(widget.rest, name);
-    if (!mounted) return;
+    // The pad moved to the next-party seat while this was on its way: the
+    // answer is the printed table's bill and must not be drawn as this one's.
+    if (!mounted || name != (_table ?? '')) return;
     setState(() => _tableBill = bill);
   }
 
@@ -320,6 +342,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     setState(() {
       _sending = true;
       _error = null;
+      _printedRefusal = null;
     });
     final p = widget.rest.auth.profile;
     final total = orderDraftTotal(lines);
@@ -345,7 +368,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         // first and its bill predates the seating it belongs to, so it is
         // attributed to the PREVIOUS party or to none at all.
         try {
-          await widget.rest.post('/occupy-table', {'table_name': widget.tableName, 'num_covers': covers});
+          await widget.rest.post('/occupy-table', {'table_name': _table, 'num_covers': covers});
         } on OfflineQueued catch (_) {
           // Queued, not lost — and queued AHEAD of the order below, which the
           // outbox replays in the order it was written. The kitchen ticket must
@@ -353,7 +376,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         }
       }
       if (widget.isDineIn) {
-        await widget.rest.post('/orders', {...base, 'table': widget.tableName});
+        await widget.rest.post('/orders', {...base, 'table': _table});
       } else {
         await widget.rest.post('/orders/takeaway', {
           ...base,
@@ -393,19 +416,62 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         Navigator.pop(context, true);
       }
     } catch (e) {
+      // CLIENT ITEM 6. The bill for this table has been printed, and the
+      // server refused to add to it (a waiter cannot reprint, so the paper in
+      // the guest's hand would be short). Nothing was written; the cart stays
+      // exactly as it is, and the refusal says where a NEW party's order goes.
+      final refusal = e is ApiException && e.status == 409 ? BillPrintedRefusal.parse(e.body) : null;
       setState(() {
-        _error = '$e';
+        _printedRefusal = refusal;
+        _error = refusal == null ? '$e' : null;
         _sending = false;
       });
     }
   }
+
+  /// "Take it on 12 (next party)": the same cart, sent to the seat the server
+  /// named. One tap and the covers question — the send that follows occupies
+  /// that seat for the new party, as a waiter's first order on a free table
+  /// always has.
+  Future<void> _takeItOnNextParty(String seat) async {
+    setState(() {
+      _retarget = seat;
+      _printedRefusal = null;
+      _tableBill = null;
+    });
+    unawaited(_loadTableBill());
+    await _send();
+  }
+
+  /// The refusal and its action, above the Send button so it is on screen
+  /// whatever the menu is scrolled to.
+  Widget _printedRefusalBanner(BillPrintedRefusal refusal) => Padding(
+        key: const ValueKey('order-bill-printed'),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        child: ForkCard(
+          inset: true,
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
+            Text(refusal.message, style: TextStyle(color: AppColors.warning, fontWeight: FontWeight.w600)),
+            if (refusal.nextPartyTable != null && refusal.actionLabel != null) ...[
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                key: const ValueKey('order-take-on-next-party'),
+                onPressed: _sending ? null : () => _takeItOnNextParty(refusal.nextPartyTable!),
+                icon: const Icon(Icons.event_seat_outlined, size: 18),
+                label: Text(refusal.actionLabel!),
+              ),
+            ],
+          ]),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.isDineIn
-            ? 'New order · ${widget.tableName}'
+            ? 'New order · ${tableSentenceName(_table ?? '')}'
             : widget.isDelivery
                 ? 'New delivery'
                 : 'New takeaway'),
@@ -449,7 +515,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                         onTap: () => showTableBillSheet(
                           context,
                           rest: widget.rest,
-                          tableName: widget.tableName ?? '',
+                          tableName: _table ?? '',
                           profile: _profile,
                         ),
                       ),
@@ -473,6 +539,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 ]),
               ),
             ),
+            if (_printedRefusal != null) _printedRefusalBanner(_printedRefusal!),
             if (_count > 0) _sendBar(),
           ]),
         ),
@@ -691,7 +758,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       builder: (_) => _OrderReviewSheet(
         revision: _draftRev,
         title: widget.isDineIn
-            ? '${widget.tableName}'
+            ? tableSentenceName(_table ?? '')
             : widget.isDelivery
                 ? 'Delivery'
                 : 'Takeaway',
