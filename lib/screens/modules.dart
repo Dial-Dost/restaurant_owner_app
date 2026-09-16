@@ -18,6 +18,8 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../config.dart';
 import '../models/bill_round_off.dart';
 import '../models/gross_net.dart';
+import '../models/kot_copy.dart';
+import '../models/kot_docket_settings.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -12820,7 +12822,8 @@ Future<void> _changeOrderStatus(
 Widget kdsModule(RestClient rest, Profile p) => _KdsHome(rest: rest);
 
 // True when the order item is a HELD course (waiting to be fired).
-bool _itemHeld(Map m) => m['course_hold'] == true && (m['fired_at'] == null || '${m['fired_at']}'.isEmpty);
+// The one held-course predicate, shared with the local KOT copy's totals.
+bool _itemHeld(Map m) => kotLineHeld(m);
 
 // "Barked" step: un-barked orders sit greyed with idle timers until the expo
 // barks them to the kitchen. Missing field (older backend) counts as barked.
@@ -13557,7 +13560,7 @@ class _KdsCardState extends State<_KdsCard> {
           ForkIconButton(
             icon: Icons.print_outlined,
             tooltip: 'Print KOT (local PDF copy)',
-            onPressed: () => _printKot(_s(o, 'table'), items),
+            onPressed: () => _printKot({...o, 'items': items}),
           ),
         ]),
       ]),
@@ -13711,77 +13714,107 @@ Future<void> _reprintKot(
   }
 }
 
-/// ROUND 2 ITEM 2 — the line a HELD dish carries directly under itself, in the
-/// slot a note uses, word for word what the thermal docket prints (escpos.ts).
-const String kotHoldLine = '[Hold] Do not cook until fired';
+// THE HOLD LINE, THE NOTE LINE AND THE ITEM BLOCK now live in
+// models/kot_copy.dart (kotHoldLine, kotNoteLine, kotDocket, kotCopyRows): pure,
+// so the kitchen board, this copy and their tests read one definition.
 
-/// The note line under a dish, tagged the way the client's reference docket
-/// tags it and the thermal docket now prints it: `[Note] <note>`.
-String kotNoteLine(String note) => '[Note] $note';
-
-/// One dish on a KOT: its number, name and quantity, and the indented lines
-/// that hang under it — [kotHoldLine] first when it is held, then its note.
-typedef KotDocketRow = ({String no, String name, int qty, bool held, List<String> under});
-
-/// The whole item block of a KOT, laid out once so the PDF copy and its tests
-/// read the same thing.
-typedef KotDocket = ({List<KotDocketRow> rows, int totalQty, int holdQty, bool showTotal, bool showHold});
-
-/// THE ITEM BLOCK OF A KITCHEN TICKET, as the thermal docket lays it out.
+/// THE LOCAL KOT COPY AS A PDF — [kotCopyRows] drawn in the pdf package's
+/// default font, in a column as wide as an 80mm roll prints (72mm).
 ///
-/// ROUND 2 ITEM 2: "Hold order should come after the name of the dish which is
-/// to be put on hold and not before. It should be in the same position like the
-/// way a note appears on the food order." This copy used to lift held lines out
-/// under a `** HOLD **` banner with their own H1/H2 numbering, so the kitchen
-/// read the banner BEFORE the dish it applied to. Now:
+/// ONE TYPE SIZE FOR EVERY LINE, as on the reference docket, where emphasis is
+/// WEIGHT: "KOT", the service mode, the table and each dish name are bold, and
+/// nothing is set larger or in italics. 10pt is the docket's own standard size
+/// (28 dots per em at the printer's 203 dpi is 9.9pt), so the copy matches the
+/// paper the client approved rather than a document. It does NOT follow the
+/// restaurant's KOT text size — that setting sizes the kitchen docket, and this
+/// is a copy for whoever pressed the button.
 ///
-///   * every dish keeps its number and its place in the list, held or not;
-///   * a held dish's first under-line is [kotHoldLine], and a note follows it;
-///   * Total Qty counts only what may be cooked now, and Hold Qty — the held
-///     quantity — sits directly under it. A wholly held docket prints no Total
-///     Qty (a "0" reads as an empty ticket); a docket with nothing held prints no
-///     Hold Qty, exactly as before the feature.
+/// A character the default font cannot draw (a rupee sign, say) prints as the
+/// pdf package's placeholder box rather than failing the copy.
 ///
-/// `_itemHeld` is the same predicate the on-screen ticket dims by, so the card,
-/// the docket and this copy cannot disagree about which lines wait.
+/// `pageFormat` is whatever the print dialog chose: on A4 the column sits at the
+/// top left; on a roll it fills the paper.
 @visibleForTesting
-KotDocket kotDocket(List items) {
-  final rows = <KotDocketRow>[];
-  var totalQty = 0;
-  var holdQty = 0;
-  var heldLines = 0;
-  for (final it in items) {
-    final m = it as Map;
-    final held = _itemHeld(m);
-    final qty = math.max(1, (num.tryParse('${m['quantity'] ?? 1}') ?? 1).round());
-    if (held) {
-      holdQty += qty;
-      heldLines += 1;
-    } else {
-      totalQty += qty;
-    }
-    final note = '${m['note'] ?? ''}'.trim();
-    rows.add((
-      no: '${rows.length + 1}',
-      name: '${m['name'] ?? ''}',
-      qty: qty,
-      held: held,
-      under: [if (held) kotHoldLine, if (note.isNotEmpty) kotNoteLine(note)],
-    ));
+pw.Document kotCopyPdf(
+  List<KotCopyRow> rows, {
+  PdfPageFormat pageFormat = PdfPageFormat.a4,
+  bool compress = true,
+}) {
+  const size = 10.0;
+  const regular = pw.TextStyle(fontSize: size);
+  final bold = pw.TextStyle(fontSize: size, fontWeight: pw.FontWeight.bold);
+  // THE COLUMNS ARE SIZED TO WHAT THEY HOLD, as the docket's are: the number
+  // column to the widest dish number (so item 100 cannot print over its dish),
+  // the quantity column to the widest quantity or "Qty". A digit in the default
+  // font is 0.56em wide; the gutter after the number is 0.4em, as on the docket.
+  var numChars = 1;
+  var qtyChars = 3;
+  for (final r in rows) {
+    if (r.kind != KotCopyKind.columns) continue;
+    if (r.text.isNotEmpty) numChars = math.max(numChars, r.no.length);
+    qtyChars = math.max(qtyChars, r.qty.length);
   }
-  return (
-    rows: rows,
-    totalQty: totalQty,
-    holdQty: holdQty,
-    showTotal: heldLines < rows.length || heldLines == 0,
-    showHold: heldLines > 0,
+  final numW = numChars * 0.56 * size + 0.4 * size;
+  final qtyW = qtyChars * 0.6 * size;
+  pw.Widget draw(KotCopyRow r) {
+    switch (r.kind) {
+      case KotCopyKind.rule:
+        // 0.8pt is two and a half dots on a 203 dpi roll: a thinner dash can
+        // drop out entirely when the page is scaled onto thermal paper.
+        return pw.Divider(height: 8, thickness: 0.8, borderStyle: pw.BorderStyle.dashed);
+      case KotCopyKind.line:
+        return pw.Container(
+          alignment: r.centred ? pw.Alignment.center : pw.Alignment.centerLeft,
+          padding: const pw.EdgeInsets.symmetric(vertical: 1),
+          child: pw.Text(r.text,
+              style: r.bold ? bold : regular, textAlign: r.centred ? pw.TextAlign.center : pw.TextAlign.left),
+        );
+      case KotCopyKind.under:
+        return pw.Padding(
+          padding: pw.EdgeInsets.only(left: numW, bottom: 1),
+          child: pw.Text(r.text, style: regular),
+        );
+      case KotCopyKind.columns:
+        final qty = pw.SizedBox(width: qtyW, child: pw.Text(r.qty, style: regular, textAlign: pw.TextAlign.right));
+        return pw.Padding(
+          padding: const pw.EdgeInsets.symmetric(vertical: 1),
+          child: r.text.isEmpty
+              // The heading and the totals: the left cell runs into the name
+              // column ("No.Item", "Total Qty"), as it does on the docket.
+              ? pw.Row(children: [pw.Expanded(child: pw.Text(r.no, style: regular)), qty])
+              : pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+                  pw.SizedBox(width: numW, child: pw.Text(r.no, style: regular)),
+                  pw.Expanded(child: pw.Text(r.text, style: r.bold ? bold : regular)),
+                  qty,
+                ]),
+        );
+    }
+  }
+
+  final doc = pw.Document(compress: compress);
+  doc.addPage(
+    pw.Page(
+      pageFormat: pageFormat,
+      build: (ctx) => pw.Align(
+        alignment: pw.Alignment.topLeft,
+        child: pw.SizedBox(
+          width: math.min(72 * PdfPageFormat.mm, pageFormat.availableWidth),
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            mainAxisSize: pw.MainAxisSize.min,
+            children: [for (final r in rows) draw(r)],
+          ),
+        ),
+      ),
+    ),
   );
+  return doc;
 }
 
-// Print a Kitchen Order Ticket (KOT) for a table's items.
-/// A LOCAL PDF copy of one order's kitchen ticket, laid out like the thermal
-/// docket the backend renders (escpos.ts `buildReceiptBase64`, kind "kot") so a
-/// chef reads the same shape whichever came off the printer.
+/// A LOCAL PDF copy of one order's kitchen ticket, laid out like the reference
+/// docket the backend renders (escpos.ts `layoutKot`) so a chef reads the same
+/// shape whichever came off the printer — see models/kot_copy.dart for the line
+/// order and for what it leaves out.
 ///
 /// IT DELIBERATELY CARRIES NO "KOT - n" NUMBER, and says so on the paper.
 /// The day-scoped ticket number is allocated server-side, inside the same
@@ -13792,75 +13825,14 @@ KotDocket kotDocket(List items) {
 /// moment a second till printed. So this copy is honest about being unnumbered
 /// rather than quietly printing a number the kitchen cannot trust.
 ///
-/// This ticket also covers ONE ORDER, whereas a thermal KOT covers the table's
-/// whole running order set — another reason not to stamp it with a series
-/// number that means "the nth ticket this outlet sent to the kitchen today".
-Future<void> _printKot(String table, List items) async {
-  final docket = kotDocket(items);
-  // ROUND 2 ITEM 3 — "Dish names should come in bold on KOT, and the font of
-  // other items on the KOT should also be increased slightly." Every size here
-  // is two points up on what this copy printed, and the dish name is the one
-  // bold run on the row besides its quantity.
-  const body = pw.TextStyle(fontSize: 14);
-  const small = pw.TextStyle(fontSize: 11);
-  // The under-dish lines — hold and note alike — in the italic the reference
-  // docket sets its "[Note]" in, so a hold reads as the same kind of line.
-  final underStyle = pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic);
-  pw.Widget row(KotDocketRow r) {
-    return pw.Padding(
-      padding: const pw.EdgeInsets.symmetric(vertical: 2),
-      child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          pw.SizedBox(width: 28, child: pw.Text(r.no, style: const pw.TextStyle(fontSize: 16))),
-          pw.Expanded(
-              child: pw.Text(r.name, style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold))),
-          pw.SizedBox(
-            width: 34,
-            // "x3", bold — the same treatment the thermal docket gives it, and
-            // for the same reason: a bare digit at the end of a row reads as a
-            // line number as easily as a quantity.
-            child: pw.Text('x${r.qty}',
-                style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold),
-                textAlign: pw.TextAlign.right),
-          ),
-        ]),
-        // UNDER the dish, never above it: "[Hold] …" then "[Note] …".
-        for (final l in r.under)
-          pw.Padding(
-            padding: const pw.EdgeInsets.only(left: 28, top: 1),
-            child: pw.Text(l, style: underStyle),
-          ),
-      ]),
-    );
-  }
-
-  final doc = pw.Document();
-  doc.addPage(
-    pw.Page(
-      build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Text('KOT', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
-        // Printed tickets leave the screen, so they carry the zone explicitly.
-        pw.Text(RestaurantTime.stampNow(), style: small),
-        pw.Text('Local copy - no ticket number', style: const pw.TextStyle(fontSize: 10)),
-        pw.SizedBox(height: 6),
-        pw.Text('Table No: $table', style: body),
-        pw.Divider(),
-        // Numbered lines with the quantity in its own right-hand column, matching
-        // the thermal docket's "No. / Item / Qty".
-        pw.Row(children: [
-          pw.SizedBox(width: 28, child: pw.Text('No.', style: small)),
-          pw.Expanded(child: pw.Text('Item', style: small)),
-          pw.SizedBox(width: 34, child: pw.Text('Qty', style: small, textAlign: pw.TextAlign.right)),
-        ]),
-        pw.Divider(),
-        ...docket.rows.map(row),
-        pw.Divider(),
-        if (docket.showTotal) pw.Text('Total Qty: ${docket.totalQty}', style: body),
-        if (docket.showHold) pw.Text('Hold Qty: ${docket.holdQty}', style: body),
-      ]),
-    ),
-  );
-  await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+/// This ticket also covers ONE ORDER — the lines the board is showing for it,
+/// station filter and all — whereas a thermal KOT covers the table's whole
+/// running order set.
+Future<void> _printKot(Map order) async {
+  // Printed tickets leave the screen, so they carry the zone explicitly.
+  final rows = kotCopyRows(order, stamp: RestaurantTime.stampNow());
+  await Printing.layoutPdf(
+      onLayout: (PdfPageFormat format) => kotCopyPdf(rows, pageFormat: format).save());
 }
 
 /// A quantity as a person writes it: 5 not 5.0, 2.5 stays 2.5.
@@ -31040,6 +31012,12 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           // restaurant that predates migration 040, and an older backend that
           // has never heard of the key must not present the feature as off.
           'kot_auto_print': settings['kot_auto_print'] != false,
+          // Which kitchen docket prints, and how large the reference docket's
+          // type is (migration 050). Read on the forgiving rules: a backend that
+          // has never heard of either key prints the reference docket at the
+          // standard size, so that is what the card shows.
+          kotPrintStyleKey: readKotPrintStyle(settings),
+          kotTextSizeKey: readKotTextSize(settings),
           // Guest page theme. The resolved config is on both endpoints; the font
           // allowlist, the live/legacy field split and the enum option lists only
           // on /settings (older backends omit them and the editor falls back to
@@ -31086,6 +31064,15 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             _RequireTableOtpCard(rest: rest, initial: m['require_table_otp'] == true),
             const SizedBox(height: 14),
             _KotAutoPrintCard(rest: rest, initial: m['kot_auto_print'] != false),
+            const SizedBox(height: 14),
+            // Directly under the auto-print switch: both answer "what reaches
+            // the kitchen printer", and this one is the recovery control somebody
+            // is hunting for while a kitchen printer feeds blank tickets.
+            _KotDocketCard(
+              rest: rest,
+              initialStyle: readKotPrintStyle(m),
+              initialTextSize: readKotTextSize(m),
+            ),
             const SizedBox(height: 14),
             _QueueMenuCard(rest: rest, initial: m['queue_show_menu'] != false),
             const SizedBox(height: AppSpacing.xxl),
@@ -32133,6 +32120,146 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
           height: 24,
           child: FittedBox(fit: BoxFit.contain, child: Switch(value: _on, onChanged: _busy ? null : _set)),
         ),
+      ]),
+    );
+  }
+}
+
+// THE TWO KITCHEN DOCKET SETTINGS (migration 050) — which docket the kitchen
+// printers print, and how large the reference docket's type is. The web
+// dashboard's "KOT print style" card offers the same two choices in the same
+// words; models/kot_docket_settings.dart holds them.
+//
+// THE STYLE IS A RECOVERY CONTROL. The reference docket prints as an image; a
+// kitchen printer that cannot draw one feeds BLANK PAPER, which is an order
+// nobody cooks. This is the switch back to the plain text docket.
+//
+// THE SIZE is the client's "The font sizes must be smaller in the KOT":
+// Small / Standard (their reference ticket exactly) / Large. It sizes the
+// reference docket only — the classic text docket prints in the printer's own
+// font and ignores it. The copy says so, and the card repeats it while classic
+// is the style selected.
+//
+// SAVED ON PICK, one key per save, like the web card and the switches above:
+// whoever changes either is standing at a printer comparing paper. The choice
+// moves first so it answers the tap, and is put back if the save is refused —
+// a control that sat on the old value mid-request gets pressed twice.
+//
+// Admin-only, like the rest of this screen; POST /restaurant/settings checks
+// "Manage Restaurant Settings", and a 403 reverts with the server's sentence.
+class _KotDocketCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialStyle;
+  final String initialTextSize;
+  const _KotDocketCard({required this.rest, required this.initialStyle, required this.initialTextSize});
+
+  @override
+  State<_KotDocketCard> createState() => _KotDocketCardState();
+}
+
+class _KotDocketCardState extends State<_KotDocketCard> {
+  late String _style = widget.initialStyle;
+  late String _size = widget.initialTextSize;
+  bool _busy = false;
+
+  void _put(String key, String value) {
+    if (key == kotPrintStyleKey) {
+      _style = value;
+    } else {
+      _size = value;
+    }
+  }
+
+  Future<void> _save(String key, String value) async {
+    final previous = key == kotPrintStyleKey ? _style : _size;
+    if (_busy || value == previous) return;
+    setState(() {
+      _put(key, value);
+      _busy = true;
+    });
+    try {
+      final reply = await widget.rest.post('/restaurant/settings', {key: value});
+      if (!mounted) return;
+      final saved = kotDocketSaved(reply, key, value);
+      setState(() => _put(key, saved));
+      // The latest pick's sentence, not the one before it: an owner flipping
+      // style then size should not read the first confirmation for four seconds.
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(kotDocketSavedMessage(key, saved, style: _style))));
+    } catch (e) {
+      if (mounted) {
+        setState(() => _put(key, previous)); // revert on failure
+        final msg = (e is ApiException && e.status == 403)
+            ? e.sentenceOr('Only an admin can change how kitchen dockets print.')
+            : '$e';
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // One choice: a radio mark, the owner's words, and a line of detail — the
+  // queue-menu editor's option rows.
+  Widget _option(TextTheme text, String key, KotDocketOption o, String selected) {
+    final on = o.value == selected;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: ForkCard(
+        key: ValueKey('$key-${o.value}'),
+        inset: true,
+        selected: on,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        onTap: _busy ? null : () => _save(key, o.value),
+        child: Row(children: [
+          Icon(
+            on ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+            size: 16,
+            color: on ? AppColors.copperHi : AppColors.textTertiary,
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(o.label, style: text.titleSmall),
+              Text(o.detail, style: text.bodySmall),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Icon(Icons.print_outlined, size: 18, color: AppColors.copperHi),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(child: Text(kotPrintStyleTitle, style: text.titleMedium)),
+        ]),
+        const SizedBox(height: 4),
+        Text(kotPrintStyleDescription, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        for (final o in kotPrintStyleOptions) _option(text, kotPrintStyleKey, o, _style),
+        Text(kotPrintStyleHelp, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text(kotTextSizeTitle, style: text.titleSmall),
+        const SizedBox(height: AppSpacing.sm),
+        for (final o in kotTextSizeOptions) _option(text, kotTextSizeKey, o, _size),
+        Text(kotTextSizeHelp, style: text.bodySmall),
+        if (_style == kotPrintStyleClassic) ...[
+          const SizedBox(height: 4),
+          Text(
+            kotTextSizeClassicNote,
+            key: const ValueKey('kot-text-size-classic-note'),
+            style: text.bodySmall!.copyWith(fontWeight: FontWeight.w600),
+          ),
+        ],
       ]),
     );
   }
