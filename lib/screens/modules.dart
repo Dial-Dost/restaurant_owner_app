@@ -31013,9 +31013,12 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           // has never heard of the key must not present the feature as off.
           'kot_auto_print': settings['kot_auto_print'] != false,
           // Which kitchen docket prints, and how large the reference docket's
-          // type is (migration 050). Read on the forgiving rules: a backend that
-          // has never heard of either key prints the reference docket at the
-          // standard size, so that is what the card shows.
+          // type is (migration 050), and whether this backend has the two
+          // settings at all. One that has never heard of them prints ONLY the
+          // classic docket and ignores a save of them, so the card is not shown
+          // there (see kotDocketSettingsSupported) rather than showing a
+          // reference / standard choice that backend does not print.
+          kotDocketSupportedKey: kotDocketSettingsSupported(settings),
           kotPrintStyleKey: readKotPrintStyle(settings),
           kotTextSizeKey: readKotTextSize(settings),
           // Guest page theme. The resolved config is on both endpoints; the font
@@ -31067,13 +31070,18 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             const SizedBox(height: 14),
             // Directly under the auto-print switch: both answer "what reaches
             // the kitchen printer", and this one is the recovery control somebody
-            // is hunting for while a kitchen printer feeds blank tickets.
-            _KotDocketCard(
-              rest: rest,
-              initialStyle: readKotPrintStyle(m),
-              initialTextSize: readKotTextSize(m),
-            ),
-            const SizedBox(height: 14),
+            // is hunting for while a kitchen printer feeds blank tickets. Only
+            // against a backend that has the two settings (the loader's
+            // kotDocketSupportedKey): an older one prints classic and stores
+            // neither.
+            if (m[kotDocketSupportedKey] == true) ...[
+              _KotDocketCard(
+                rest: rest,
+                initialStyle: readKotPrintStyle(m),
+                initialTextSize: readKotTextSize(m),
+              ),
+              const SizedBox(height: 14),
+            ],
             _QueueMenuCard(rest: rest, initial: m['queue_show_menu'] != false),
             const SizedBox(height: AppSpacing.xxl),
             const SectionHeader(title: 'Payments'),
@@ -32147,6 +32155,9 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
 //
 // Admin-only, like the rest of this screen; POST /restaurant/settings checks
 // "Manage Restaurant Settings", and a 403 reverts with the server's sentence.
+// A 200 whose settings document lacks the key (a backend rolled back since the
+// page loaded, which ignores the key) stored nothing: kotDocketSaved throws,
+// and the card reverts with kotDocketNotSupported rather than confirming.
 class _KotDocketCard extends StatefulWidget {
   final RestClient rest;
   final String initialStyle;
