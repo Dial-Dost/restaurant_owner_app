@@ -777,17 +777,78 @@ void main() {
       expect(api.writes.any((w) => '${w.body}'.contains('no_service_charge')), isFalse);
     });
 
-    testWidgets('"Guest asked" is already chosen — the commonest case is reason and confirm',
+    testWidgets('"Guest asked" is already chosen and the reason is optional — the commonest case is one tap',
+        (tester) async {
+      // Client item (2.0.1): "the reason should not be mandatory". The kind is
+      // preselected and the second name prefilled, so Confirm is live at once.
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      expect(find.text('Reason (optional)'), findsOneWidget);
+      expect(_pressOf(tester, const ValueKey('capture-confirm')), isNotNull);
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+      final body = removals(api).single.body as Map;
+      expect(body['waiver_kind'], 'guest_request');
+      expect(body['authorised_by'], 'manager01');
+      expect(body['table_name'], 'T1');
+      // No reason is NO KEY, not "": a server from before the change refused ""
+      // in its schema, while an absent reason gets its clean refusal.
+      expect(body.containsKey('reason'), isFalse);
+    });
+
+    testWidgets('a reason of only spaces is sent as none', (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: '    ');
+      expect((removals(api).single.body as Map).containsKey('reason'), isFalse);
+    });
+
+    testWidgets('a typed reason is still sent, trimmed', (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await _fillReason(tester, reason: '  Long wait  ');
+      expect((removals(api).single.body as Map)['reason'], 'Long wait');
+    });
+
+    testWidgets('the second name is STILL required: cleared, Confirm goes inert and nothing is sent',
         (tester) async {
       final api = await _mount(tester, m.tablesModule, _tableRoutes());
       await _openTable(tester);
       await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
       await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
       await tester.pumpAndSettle();
-      // A reason is still required: it is the control document.
+      await tester.enterText(find.byKey(const ValueKey('capture-authoriser')), '   ');
+      await tester.pumpAndSettle();
       expect(_pressOf(tester, const ValueKey('capture-confirm')), isNull);
-      await _fillReason(tester, reason: 'Guest asked at the table');
-      expect((removals(api).single.body as Map)['waiver_kind'], 'guest_request');
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+      expect(removals(api), isEmpty);
+    });
+
+    testWidgets('an older server\'s refusal of a missing reason is shown as sent, and the bill is read again',
+        (tester) async {
+      // A 2.0.1 till against a backend or database without migration 051.
+      final api = await _mount(tester, m.tablesModule, _tableRoutes());
+      api.failOn = '/bills/service-charge-waiver/print';
+      api.failMessage = 'Say why the service charge is coming off — waiver_kind and reason are required.';
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.tap(find.byKey(const ValueKey('sc-remove-and-print')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('waiver_kind and reason are required'), findsOneWidget);
+      final posted = api.calls.indexOf('POST /bills/service-charge-waiver/print');
+      expect(api.calls.skip(posted + 1).any((c) => c.startsWith('GET /bill-for-table')), isTrue);
     });
 
     testWidgets('the headline names the charge on a TAX-LINE bill too', (tester) async {
@@ -947,6 +1008,38 @@ void main() {
       await _fillReason(tester, reason: 'Manager overruled it');
       final body = api.bodyOf('/bills/service-charge-waiver/w-1/reverse') as Map?;
       expect(body!['reason'], 'Manager overruled it');
+    });
+
+    testWidgets('a live waiver recorded WITHOUT a reason shows who and who authorised, and no quoted dash',
+        (tester) async {
+      final bill = _bill(waived: true, printCount: 1);
+      (bill['service_charge_waiver'] as Map)['reason'] = null;
+      await _mount(tester, m.tablesModule, _tableRoutes(bill: bill));
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
+      expect(find.text('asha, authorised by manager01'), findsOneWidget);
+      expect(find.textContaining('“'), findsNothing);
+    });
+
+    testWidgets('a live waiver WITH a reason reads exactly as it did', (tester) async {
+      await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 1)));
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
+      expect(find.text('“Long wait for the mains” — asha, authorised by manager01'), findsOneWidget);
+    });
+
+    testWidgets('UNCHANGED: putting the charge back still demands a reason', (tester) async {
+      final api = await _mount(tester, m.tablesModule, _tableRoutes(bill: _bill(waived: true, printCount: 1)));
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('sc-waiver-reverse')));
+      await tester.tap(find.byKey(const ValueKey('sc-waiver-reverse')));
+      await tester.pumpAndSettle();
+      expect(find.text('Reason'), findsOneWidget);
+      expect(find.text('Reason (optional)'), findsNothing);
+      expect(_pressOf(tester, const ValueKey('capture-confirm')), isNull);
+      await tester.tap(find.byKey(const ValueKey('capture-confirm')));
+      await tester.pumpAndSettle();
+      expect(api.writes.where((w) => w.path.contains('/reverse')), isEmpty);
     });
 
     testWidgets('a live waiver reprints through the same route: the table only, no second form',
