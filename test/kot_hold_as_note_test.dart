@@ -153,10 +153,16 @@ void main() {
       expect(body, isNot(contains("'* \$")));
       // What it draws is the shared layout, not a second copy of it.
       expect(body, contains('kotCopyRows(order, stamp: RestaurantTime.stampNow())'));
-      // Dish names bold (item 3) — and nothing in italics any more: the
-      // reference docket sets its [Note] upright.
+      // Dish names bold (item 3). The one slanted line is a dish's [Note] —
+      // client item 5: the reference docket sets it smaller and slanted — never
+      // [Hold] and never a dish name.
       expect(body, contains('pw.Expanded(child: pw.Text(r.text, style: r.bold ? bold : regular))'));
-      expect(body, isNot(contains('FontStyle.italic')));
+      expect('FontStyle.italic'.allMatches(body).length, 1);
+      expect(body, contains('final note = pw.TextStyle(fontSize: kotCopyNotePt, fontStyle: pw.FontStyle.italic);'));
+      expect(body, contains('child: pw.Text(r.text, style: r.note ? note : regular),'));
+      // …and that style is reached from the note line alone.
+      expect('? note :'.allMatches(body).length, 1);
+      expect(body, isNot(contains('style: note')));
       // And the board's print button is wired to it, with the lines the board
       // is showing (its station filter applied), not the order's raw list.
       expect(src, contains("onPressed: () => _printKot({...o, 'items': items}),"));
