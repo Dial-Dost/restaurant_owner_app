@@ -303,12 +303,24 @@ class ReprintNeeded {
 
   /// Null unless [response] flags a reprint. [fallbackTable] is the table the
   /// write was for, used only when the server did not name one.
-  static ReprintNeeded? parse(Object? response, {String? fallbackTable}) {
-    if (response is! Map || response['reprint_needed'] != true) return null;
-    final named = _str(response, 'reprint_table');
+  static ReprintNeeded? parse(Object? response, {String? fallbackTable}) =>
+      _parse(response, 'reprint_', fallbackTable);
+
+  /// CLIENT ITEM 4 — A MOVE CHANGES TWO BILLS. Every reprint a move's answer
+  /// asks for: the first in the ordinary `reprint_*` fields, and — when both the
+  /// destination's and the source's papers were printed — the second in
+  /// `also_reprint_*`, which only a move sends. Empty when neither was printed.
+  static List<ReprintNeeded> parseAll(Object? response, {String? fallbackTable}) => [
+        ?_parse(response, 'reprint_', fallbackTable),
+        ?_parse(response, 'also_reprint_', null),
+      ];
+
+  static ReprintNeeded? _parse(Object? response, String prefix, String? fallbackTable) {
+    if (response is! Map || response['${prefix}needed'] != true) return null;
+    final named = _str(response, '${prefix}table');
     final table = named.isNotEmpty ? named : (fallbackTable ?? '').trim();
     if (table.isEmpty) return null;
-    final said = _str(response, 'reprint_message');
+    final said = _str(response, '${prefix}message');
     return ReprintNeeded(table: table, message: said.isNotEmpty ? said : reprintNeededMessage(table));
   }
 }

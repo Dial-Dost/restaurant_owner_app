@@ -1,6 +1,6 @@
 /// THE ANSWERS THE SERVER SHIPS BESIDE `waiter_only` — "may this identity DO
 /// x", decided once, on the server, for every client. Nine until 2.0.2, which
-/// added the two moves (client items 1 and 2).
+/// added the two moves (client items 1 and 2) and cancel_kot (client item 3).
 ///
 /// WHY AN ENUM OF WIRE KEYS AND NOT NINE BOOLEAN FIELDS SPRAYED ACROSS THE APP.
 /// Each of these is backed by a permission UUID and a route guard, and the whole
@@ -50,7 +50,14 @@ enum Capability {
   /// POST /tables/move-order — "Move an order", one ticket. The server answers
   /// it off "Add Orders", which a waiter holds; the floor keeps it a senior's
   /// ([FloorScope.moveOrder]).
-  moveOrder('move_order');
+  moveOrder('move_order'),
+
+  /// "Cancel KOT" on the table sheet and "Cancelled" on the stage sheet —
+  /// cancelling food the kitchen has been told about (client item 3). FALSE
+  /// for a waiter-only login even when it holds [voidOrder]: the server
+  /// refuses every such cancel with `cancel_needs_senior`. A PENDING order's
+  /// "Decline" does not read this.
+  cancelKot('cancel_kot');
 
   const Capability(this.wireKey);
 

@@ -570,14 +570,17 @@ void main() {
       await tester.tap(find.text('Table T7'));
       await tester.pumpAndSettle();
       expect(find.textContaining('correction docket prints'), findsOneWidget);
+      // Client item 4: with no picker, the confirm is where the dishes are named.
+      expect(find.textContaining('2 × Paneer Tikka.'), findsOneWidget);
       await tester.tap(find.text('Confirm'));
       await tester.pumpAndSettle();
 
       final moves = api.writes.where((w) => w.path == '/tables/move-order').toList();
       expect(moves, hasLength(1));
       expect(moves.first.body, {'order_id': 'o-1', 'to_table': 'T7'});
-      // The KOT number is reported back, so whoever pressed it can tell the pass.
-      expect(find.textContaining('KOT-26'), findsOneWidget);
+      // The KOT number is reported back, so whoever pressed it can tell the pass —
+      // and the dishes, so they can tell the pass WHAT (client item 4).
+      expect(find.text('Moved to T7: 2 × Paneer Tikka. Correction docket KOT-26 is printing — tell the pass.'), findsOneWidget);
     });
 
     testWidgets('several live orders on the real /orders shape open a picker that says what each holds', (tester) async {
@@ -615,9 +618,12 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('No live order on this table to move.'), findsNothing);
       expect(find.text('Which order on T4?'), findsOneWidget);
-      expect(find.textContaining('2 items'), findsOneWidget);
-      expect(find.textContaining('1 item'), findsOneWidget);
-      expect(find.text('Order o-c'), findsNothing);
+      // Client item 4: each row names its dishes — it used to say "2 items" and
+      // "1 item", which is not how anybody tells two tickets apart.
+      expect(find.text('2 × Paneer Tikka, 2 × Masala Chai\nThe kitchen has this one'), findsOneWidget);
+      expect(find.text('2 × Masala Chai\nNot sent to the kitchen yet'), findsOneWidget);
+      expect(find.textContaining('item'), findsNothing);
+      expect(find.textContaining('Order o-c'), findsNothing);
     });
 
     testWidgets('an UNBARKED order says nothing will print', (tester) async {
