@@ -14191,12 +14191,15 @@ Future<void> _reprintKot(
 // so the kitchen board, this copy and their tests read one definition.
 
 /// THE LOCAL KOT COPY AS A PDF — [kotCopyRows] drawn in the pdf package's
-/// default font, in a column as wide as an 80mm roll prints (72mm).
+/// default font (Helvetica), in a column as wide as an 80mm roll prints (72mm).
 ///
-/// ONE TYPE SIZE FOR EVERY LINE, as on the reference docket, where emphasis is
+/// THE KITCHEN DOCKET'S SIZES, as on the reference docket, where emphasis is
 /// WEIGHT: "KOT", the service mode, the table and each dish name are bold, and
-/// nothing is set larger or in italics. 10pt is the docket's own standard size
-/// (28 dots per em at the printer's 203 dpi is 9.9pt), so the copy matches the
+/// nothing is set larger. Every line is [kotCopyBodyPt] — the docket's standard
+/// 27 dots per em at the printer's 203 dpi, 9.6pt — except a dish's "[Note]",
+/// which the docket sets a step smaller and slanted: [kotCopyNotePt] (its 23
+/// dots, 8.2pt) in Helvetica-Oblique, whose 12-degree slant is the docket's
+/// 0.21 shear. "[Hold]" stays upright at the body size. So the copy matches the
 /// paper the client approved rather than a document. It does NOT follow the
 /// restaurant's KOT text size — that setting sizes the kitchen docket, and this
 /// is a copy for whoever pressed the button.
@@ -14212,9 +14215,11 @@ pw.Document kotCopyPdf(
   PdfPageFormat pageFormat = PdfPageFormat.a4,
   bool compress = true,
 }) {
-  const size = 10.0;
+  const size = kotCopyBodyPt;
   const regular = pw.TextStyle(fontSize: size);
   final bold = pw.TextStyle(fontSize: size, fontWeight: pw.FontWeight.bold);
+  // Never bold: the docket's note face is the slanted regular one.
+  final note = pw.TextStyle(fontSize: kotCopyNotePt, fontStyle: pw.FontStyle.italic);
   // THE COLUMNS ARE SIZED TO WHAT THEY HOLD, as the docket's are: the number
   // column to the widest dish number (so item 100 cannot print over its dish),
   // the quantity column to the widest quantity or "Qty". A digit in the default
@@ -14244,7 +14249,7 @@ pw.Document kotCopyPdf(
       case KotCopyKind.under:
         return pw.Padding(
           padding: pw.EdgeInsets.only(left: numW, bottom: 1),
-          child: pw.Text(r.text, style: regular),
+          child: pw.Text(r.text, style: r.note ? note : regular),
         );
       case KotCopyKind.columns:
         final qty = pw.SizedBox(width: qtyW, child: pw.Text(r.qty, style: regular, textAlign: pw.TextAlign.right));
@@ -32650,6 +32655,16 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
 // A 200 whose settings document lacks the key (a backend rolled back since the
 // page loaded, which ignores the key) stored nothing: kotDocketSaved throws,
 // and the card reverts with kotDocketNotSupported rather than confirming.
+//
+// "PRINT A TEST KOT" (client item 5) posts the existing POST /print/test for
+// the kitchen role: one slip in the style and size above, so whoever changed
+// either reads the paper now instead of at the next order. Online only (the
+// outbox refuses every /print write offline, and this says so); disabled while
+// the request is out, so one tap is one slip; a refusal shows the server's
+// sentence. The route checks the Print permission, not the settings one.
+// The button is also off while a pick is saving, and the picks are off while a
+// test is out (kotDocketLocks): the server builds the slip from the settings as
+// they are when the request lands, and a pick has already moved the card.
 class _KotDocketCard extends StatefulWidget {
   final RestClient rest;
   final String initialStyle;
@@ -32664,6 +32679,32 @@ class _KotDocketCardState extends State<_KotDocketCard> {
   late String _style = widget.initialStyle;
   late String _size = widget.initialTextSize;
   bool _busy = false;
+  bool _testing = false;
+
+  KotDocketLocks get _locks => kotDocketLocks(saving: _busy, testing: _testing);
+
+  Future<void> _testPrint() async {
+    if (_locks.testDisabled) return;
+    setState(() => _testing = true);
+    String message;
+    try {
+      final reply = await widget.rest.post(kotTestPrintPath, kotTestPrintBody);
+      message = kotTestPrintSentMessage(reply);
+    } on OfflineUnavailable {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    } on ApiException catch (e) {
+      // A status is the server's answer — show its sentence. No status never
+      // reached anyone.
+      message = kotTestPrintFailedMessage(e.status == null ? kotTestPrintOffline : e.message);
+    } catch (_) {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    }
+    if (!mounted) return;
+    setState(() => _testing = false);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
 
   void _put(String key, String value) {
     if (key == kotPrintStyleKey) {
@@ -32675,7 +32716,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
 
   Future<void> _save(String key, String value) async {
     final previous = key == kotPrintStyleKey ? _style : _size;
-    if (_busy || value == previous) return;
+    if (_locks.choicesDisabled || value == previous) return;
     setState(() {
       _put(key, value);
       _busy = true;
@@ -32716,7 +32757,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
         inset: true,
         selected: on,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        onTap: _busy ? null : () => _save(key, o.value),
+        onTap: _locks.choicesDisabled ? null : () => _save(key, o.value),
         child: Row(children: [
           Icon(
             on ? Icons.radio_button_checked : Icons.radio_button_unchecked,
@@ -32763,6 +32804,18 @@ class _KotDocketCardState extends State<_KotDocketCard> {
             style: text.bodySmall!.copyWith(fontWeight: FontWeight.w600),
           ),
         ],
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(
+            key: const ValueKey('kot-test-print'),
+            label: _testing ? kotTestPrintSending : kotTestPrintLabel,
+            icon: Icons.print_outlined,
+            onPressed: _locks.testDisabled ? null : _testPrint,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(kotTestPrintHelp, style: text.bodySmall),
       ]),
     );
   }
