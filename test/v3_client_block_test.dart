@@ -191,10 +191,20 @@ Map<String, dynamic> _nextPartySeat() => {
     };
 
 /// What a current backend does on a print: answers with the seat it opened,
-/// and lists that seat on the next /get-tables.
+/// and lists that seat on the next /get-tables — beside the printed table,
+/// which now says it is printed.
 _FakeApi _withNextPartyOnPrint(_FakeApi api) {
   api.replies['/print/bill'] = (_) {
-    api.routes['/get-tables'] = [_table(), _nextPartySeat()];
+    api.routes['/get-tables'] = [
+      {
+        ..._table(),
+        'print_count': 1,
+        'bill_printed_at': '2026-09-11T10:45:00Z',
+        'printed_at': '2026-09-11T10:45:00Z',
+        'paper_stale': false,
+      },
+      _nextPartySeat(),
+    ];
     return <String, dynamic>{
       'success': true,
       'next_party_table': 'T1 #2',
@@ -289,7 +299,8 @@ Future<void> _pressEverything(WidgetTester tester) async {
   for (final b in find.byType(ForkButton).evaluate().toList()) {
     final w = b.widget as ForkButton;
     if (w.onPressed == null) continue;
-    if (w.label == 'Add order') continue; // pushes a route, tested elsewhere
+    // Each pushes a route or opens its own dialog; tested elsewhere.
+    if (const {'Add order', 'Add to printed bill', 'Move table'}.contains(w.label)) continue;
     w.onPressed!();
     await tester.pumpAndSettle();
   }
@@ -412,7 +423,14 @@ void main() {
   // C3 — THE ONE PRINT
   // ==========================================================================
 
-  group('C3 · a waiter prints once, and the table leaves their floor', () {
+  // CLIENT ITEMS 1 AND 2 (2.0.2) AMENDED C3, AND THIS GROUP WAS REWRITTEN ON
+  // PURPOSE. It used to pin that the printed table LEFT the waiter's floor.
+  // Gaia settles at night, and "if a bill is not settled, the table completely
+  // vanishes" was the complaint: the table now stays, orange, with a green seat
+  // beside it for the next guests. "Once" still holds for an unchanged bill;
+  // a waiter prints again only when the server says the paper is out of date
+  // (waiter_floor_printed_test pins that half).
+  group('C3 · a waiter prints once per paper, and the table stays on their floor', () {
     Future<_FakeApi> printAsWaiter(WidgetTester tester, _FakeApi api) async {
       await _mountFloor(tester, api);
       await _openTable(tester);
@@ -424,13 +442,7 @@ void main() {
       return api;
     }
 
-    // CHANGED ON PURPOSE FOR CLIENT ITEM 6. This test used to pin that the
-    // table went and nothing came back — which is exactly the complaint: "Table
-    // where bill is printed is disappearing from the waiter app. There should be
-    // a duplicate table showing same number for order taking for the next round
-    // of guests." C3 still holds for the PRINTED PARTY; the number comes back as
-    // the next party's seat the server opened on the print.
-    testWidgets('the print happens, the printed party goes, and the next party gets T1',
+    testWidgets('the print happens, the printed T1 STAYS in orange, and the next party gets a green T1',
         (tester) async {
       final api = await printAsWaiter(tester, _withNextPartyOnPrint(_waiterApi(_floorRoutes())));
 
@@ -438,32 +450,43 @@ void main() {
       expect(api.to('/print/bill'), hasLength(1));
       expect((api.to('/print/bill').single.body as Map)['table_name'], 'T1');
 
-      // The sheet closed itself and the floor came back WITHOUT the printed row…
+      // The sheet closed itself and the floor came back WITH the printed row…
       expect(find.text('Table T1'), findsNothing);
-      expect(find.byKey(const ValueKey('table-title-T1')), findsNothing,
-          reason: 'the printed party is still on their floor');
-      // …and WITH the number, as the next party's seat.
+      expect(find.byKey(const ValueKey('table-title-T1')), findsOneWidget,
+          reason: 'the printed table left the waiter\'s floor');
+      expect(find.byKey(const ValueKey('table-T1-Bill printed')), findsOneWidget);
+      // …and the number again, green, as the next party's seat.
       expect(find.byKey(const ValueKey('table-title-T1 #2')), findsOneWidget);
-      expect(find.text('T1'), findsOneWidget, reason: 'the tile reads the same number');
+      expect(find.byKey(const ValueKey('table-T1 #2-Free')), findsOneWidget);
+      expect(find.text('T1'), findsNWidgets(2), reason: 'both tiles read the same number');
       expect(find.byKey(const ValueKey('next-party-chip-T1 #2')), findsOneWidget);
-      expect(find.text('Next party'), findsOneWidget);
-      // The waiter is told where the next guests go, in the server's words —
-      // in the line that follows "Printing bill…" off the screen.
+      expect(find.text('#2'), findsOneWidget);
+      // The waiter is told the table stays and where the next guests go — in
+      // the line that follows "Printing bill…" off the screen.
       await tester.pump(const Duration(seconds: 4));
       await tester.pumpAndSettle();
-      expect(find.textContaining('It has come off your tables. Seat the next party at T1 (next party).'),
+      expect(
+          find.text("T1's bill is printed. T1 stays on your floor in orange until a manager settles it. "
+              'New guests at T1: use the green T1.'),
           findsOneWidget);
+      expect(find.textContaining('come off your tables'), findsNothing);
       expect(find.textContaining('every table you printed'), findsNothing);
     });
 
-    // THE OLD BACKEND, and the reason the empty-floor sentence stays: no seat is
-    // opened, so the floor is what 2.0.0 showed.
-    testWidgets('against a backend with no next-party seat, the table goes and nothing replaces it',
+    // THE OLD BACKEND: no seat is opened and no print state is sent. The table
+    // still stays — orange on this device's memory of the print — and the line
+    // offers no green seat, because there is none.
+    testWidgets('against a backend with no next-party seat, the table stays and no green seat is named',
         (tester) async {
       await printAsWaiter(tester, _waiterApi(_floorRoutes()));
       expect(find.text('Table T1'), findsNothing);
-      expect(find.text('T1'), findsNothing, reason: 'the printed table is still on their floor');
-      expect(find.textContaining('every table you printed'), findsOneWidget);
+      expect(find.byKey(const ValueKey('table-T1-Bill printed')), findsOneWidget);
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pumpAndSettle();
+      expect(
+          find.text("T1's bill is printed. T1 stays on your floor in orange until a manager settles it."),
+          findsOneWidget);
+      expect(find.textContaining('every table you printed'), findsNothing);
     });
 
     // NOTHING WAS WRITTEN TO THE TABLE, and this is the assertion that separates
@@ -481,17 +504,22 @@ void main() {
       expect(api.writes.map((w) => w.path).toSet(), {'/print/bill'});
     });
 
-    // THE SECOND PRINT IS UNREACHABLE, not merely undrawn: the table is gone, so
-    // there is no sheet to reach, and driving what IS on screen writes nothing.
-    testWidgets('a second print is unreachable on the next look at the floor',
+    // A SECOND PRINT OF AN UNCHANGED BILL IS UNREACHABLE, not merely undrawn:
+    // the orange T1's sheet has no print control, says who reprints, and
+    // driving everything it does offer prints nothing.
+    testWidgets('a second print of the same paper is unreachable on the next look at the floor',
         (tester) async {
       final api = await printAsWaiter(tester, _withNextPartyOnPrint(_waiterApi(_floorRoutes())));
       // Come back to the screen as a back-navigation or a poll would.
       await _mountFloor(tester, api);
-      expect(find.byKey(const ValueKey('table-title-T1')), findsNothing);
-      // The only T1 left is the next party's, which has nothing on it to print.
-      expect(find.byKey(const ValueKey('table-title-T1 #2')), findsOneWidget);
+      expect(find.byKey(const ValueKey('table-title-T1')), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('table-title-T1')));
+      await tester.pumpAndSettle();
+      await _reveal(tester, find.byKey(const ValueKey('table-print-spent')));
       expect(find.byKey(const ValueKey('table-print-bill')), findsNothing);
+      expect(find.byKey(const ValueKey('table-print-spent')), findsOneWidget);
+      // The first control on the orange sheet is the confirmed addition.
+      expect(find.byKey(const ValueKey('table-add-to-printed')), findsOneWidget);
       await _pressEverything(tester);
       final printed = [for (final w in api.to('/print/bill')) (w.body as Map)['table_name']];
       expect(printed, ['T1'], reason: 'a second bill was printed for the printed party');
@@ -529,7 +557,7 @@ void main() {
     });
 
     // THE POLICY ITSELF, stated where it can be argued with.
-    test('BillPrintScope narrows nobody but a waiter, and only after a print', () {
+    test('BillPrintScope: a waiter prints again only onto stale paper, and nobody loses a table', () {
       Profile who(String role, {List<String> actions = const ['a1']}) =>
           Profile.fromJson(<String, dynamic>{
             'role': role,
@@ -539,17 +567,33 @@ void main() {
           });
 
       final fresh = BillPrintScope.of(who('waiter'), printed: false);
-      expect([fresh.print, !fresh.reprintNeedsSenior, !fresh.retiresTable],
+      expect([fresh.print, !fresh.reprintNeedsSenior, !fresh.retiresTable, !fresh.updated],
           everyElement(isTrue));
-      final spent = BillPrintScope.of(who('waiter'), printed: true);
-      expect([spent.print, !spent.reprintNeedsSenior, !spent.retiresTable],
-          everyElement(isFalse));
+      expect(fresh.printLabel, 'Print bill');
+      // An unchanged bill, or one nobody can vouch for, is still a senior's.
+      for (final stale in <bool?>[false, null]) {
+        final spent = BillPrintScope.of(who('waiter'), printed: true, paperStale: stale);
+        expect(spent.print, isFalse, reason: 'paper_stale=$stale');
+        expect(spent.reprintNeedsSenior, isTrue, reason: 'paper_stale=$stale');
+        expect(spent.retiresTable, isFalse, reason: 'the printed table left the floor');
+        expect(spent.updated, isFalse);
+      }
+      // Out-of-date paper: the one reprint a waiter makes, and it says so.
+      final updated = BillPrintScope.of(who('waiter'), printed: true, paperStale: true);
+      expect([updated.print, updated.updated, !updated.reprintNeedsSenior, !updated.retiresTable],
+          everyElement(isTrue));
+      expect(updated.printLabel, 'Print updated bill');
+      // "Stale" before any print is not a reprint at all.
+      expect(BillPrintScope.of(who('waiter'), printed: false, paperStale: true).updated, isFalse);
 
       for (final role in ['admin', 'manager', 'cashier', 'captain']) {
         for (final printed in [false, true]) {
-          final s = BillPrintScope.of(who(role), printed: printed);
-          expect(s.print, isTrue, reason: '$role lost the reprint');
-          expect(s.retiresTable, isFalse, reason: '$role lost a table off their floor');
+          for (final stale in <bool?>[false, true, null]) {
+            final s = BillPrintScope.of(who(role), printed: printed, paperStale: stale);
+            expect(s.print, isTrue, reason: '$role lost the reprint');
+            expect(s.retiresTable, isFalse, reason: '$role lost a table off their floor');
+            expect(s.printLabel, printed && stale == true ? 'Print updated bill' : 'Print bill');
+          }
         }
       }
     });

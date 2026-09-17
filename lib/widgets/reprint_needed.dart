@@ -1,9 +1,15 @@
 import 'package:flutter/material.dart';
 
+import '../models/floor_state.dart';
 import '../models/next_party.dart';
 import '../services/rest_client.dart';
 
 /// CLIENT ITEM 6 — "THIS BILL WAS ALREADY PRINTED — REPRINT IT".
+///
+/// 2.0.2 (client items 1 and 2): the action says "Print updated bill". That is
+/// what the print now is — the server stamps it UPDATED BILL, because the paper
+/// no longer matches — and it is the one reprint a waiter who added to the
+/// bill may make.
 ///
 /// A senior role's write that put more on a printed bill (an order, a merge,
 /// an item moved onto it) is answered with [ReprintNeeded]. The server has
@@ -29,7 +35,7 @@ void showReprintNeeded(ScaffoldMessengerState messenger, RestClient rest, Reprin
     content: Text(notice.message),
     action: SnackBarAction(
       key: const ValueKey('reprint-needed-action'),
-      label: 'Reprint',
+      label: printUpdatedBillLabel,
       onPressed: () async {
         try {
           await rest.post('/print/bill', {'table_name': notice.table});
@@ -62,14 +68,14 @@ Future<bool> askToReprint(
     context: context,
     builder: (ctx) => AlertDialog(
       key: const ValueKey('reprint-needed'),
-      title: const Text('Reprint the bill?'),
+      title: const Text('Print the updated bill?'),
       content: Text(text.isEmpty ? notice.message : '$text ${notice.message}'),
       actions: [
         TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Not now')),
         FilledButton(
           key: const ValueKey('reprint-needed-action'),
           onPressed: () => Navigator.pop(ctx, true),
-          child: const Text('Reprint'),
+          child: const Text(printUpdatedBillLabel),
         ),
       ],
     ),

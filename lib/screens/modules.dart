@@ -17,6 +17,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/floor_state.dart';
 import '../models/gross_net.dart';
 import '../models/kot_copy.dart';
 import '../models/kot_docket_settings.dart';
@@ -56,6 +57,7 @@ import '../models/menu_badge.dart';
 import '../models/payment_modes.dart';
 import '../models/nc_settle.dart';
 import '../widgets/async_view.dart';
+import '../widgets/floor_chips.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
@@ -6950,77 +6952,51 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
       builder: (context, data, reload) {
         final scope = FloorScope.of(p, surface: surface);
         final allRows = (data['tables'] as List?) ?? const [];
-        // REQUIREMENT C3 — "the table should clear/reset from their view".
+        // CLIENT ITEMS 1 AND 2 — A PRINTED TABLE STAYS ON EVERY FLOOR.
         //
-        // THEIR VIEW, and nothing else. The row leaves this one grid on this one
-        // device; the table is still occupied, still owes the money, still on
-        // every manager's screen and still on the Floor plan. Nothing is written
-        // — see [BillPrintScope] for why "clear the table" could not be what was
-        // meant, given C2 says the same waiter may not settle.
-        //
-        // Only on the SERVICE surface. The floor plan is a picture of the room,
-        // and a room with a table missing out of it is not a floor plan.
+        // C3 used to filter a printed table off a waiter's grid ("clear from
+        // their view"). Gaia settles its bills at night, so that emptied the
+        // waiter's floor of every pending bill for hours: "if a bill is not
+        // settled, the table completely vanishes". The printed table now stays,
+        // orange ([FloorState.printed]), and nothing is filtered on the service
+        // surface — see [BillPrintScope.retiresTable].
         //
         // CLIENT ITEM 6 — AND THE ROOM HAS NO "12 #2" IN IT. A next-party seat
         // ([isNextPartyRow]) is a second name for a table the plan already
         // draws, opened by the server when 12's bill was printed and retired
         // once it is idle; it is not furniture, so the layout editor never
-        // shows it. On the service surface it is an ordinary row and passes
-        // the C3 filter below on ITS OWN print state: the printed party at 12
-        // leaves the waiter's grid, and the tile for the next party at 12 is
-        // exactly what they are left with.
+        // shows it. On the service surface it is an ordinary row: the green
+        // "12" beside the orange one.
         final List rows = surface != FloorSurface.service
             ? [for (final r in allRows) if (!isNextPartyRow(r as Map)) r]
-            : [
-                for (final r in allRows)
-                  if (!BillPrintScope.of(p,
-                          // THE SERVER DECIDES, AND THE `??` IS THE WHOLE POINT.
-                          // When the row carries print state at all, that state
-                          // is the answer — including when it says "not printed"
-                          // and this tablet remembers otherwise. The per-device
-                          // memory is reached ONLY on the null, which means the
-                          // backend shipped no print state on this payload; see
-                          // [serverBillPrintState] for the exact keys and
-                          // [PrintedBills] for what that fallback is worth (it
-                          // survives a restart, not a reinstall and not a second
-                          // tablet).
-                          printed: serverBillPrintState(r as Map) ??
-                              PrintedBills.instance
-                                  .printed(p.resId, p.outletId, _s(r, 'table_name')))
-                      .retiresTable)
-                    r,
-              ];
+            : allRows;
         final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
         final zoneError = _s(data, 'zone_error', '');
         final zoneOrder = (data['order'] as Map?)?.cast<String, int>() ?? const <String, int>{};
         final zoneBorn = (data['born'] as Map?)?.cast<String, DateTime>() ?? const <String, DateTime>{};
-        // Counted off the SAME three-state rule the cards paint with, so the
-        // legend can never disagree with what is on screen.
-        final occ = rows.where((r) => _tableState(r as Map).label == 'Occupied').length;
-        final waiting = rows.where((r) => _tableState(r as Map).label == 'Seated').length;
-        // A PARTY at "12 #2" is counted like any other (it is somebody to
-        // serve), but an idle next-party seat is not a free TABLE — 12 is
-        // already counted — and it carries 12's booking, so it would count a
+        // Counted off the SAME rule the tiles paint with ([_floorState]), so the
+        // legend can never disagree with what is on screen. A PARTY at "12 #2"
+        // is counted like any other (somebody to serve, or a bill to settle),
+        // but an idle next-party seat is not a free TABLE — 12 is already
+        // counted — and it carries 12's booking, so it would count a
         // reservation twice. Free and Reserved are the room's.
-        final res = rows
-            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Reserved')
-            .length;
-        final free = rows
-            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Free')
-            .length;
+        final floorStates = <FloorState>[
+          for (final r in rows)
+            if (_floorState(r as Map, p) case final s
+                when !(isNextPartyRow(r) && (s == FloorState.free || s == FloorState.reserved)))
+              s,
+        ];
         // A caller (an order notification's "Open T4") asked us to focus a table.
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
         final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
+        // CLIENT ITEMS 1 AND 2: "3 Running · 8 Bill printed · 2 Seated · 23 Free",
+        // in the tiles' own inks. A state with no table is left out, as "0
+        // Seated" always was. "N Bill printed" is the night-settle backlog, and
+        // a tap narrows the floor to it ([PrintedBacklogFilter]).
         final serviceLegend = <Widget>[
-          StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
-          // Only when there IS one. A restaurant where every seated table has
-          // ordered should not carry a permanent "0 Seated" chip explaining a
-          // distinction it never sees.
-          if (waiting > 0)
-            StatusChip(label: '$waiting Seated', color: AppColors.warning, dense: true),
-          StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
-          StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
+          for (final row in floorLegend(floorStates, withCounts: true))
+            FloorLegendChip(key: ValueKey('floor-legend-${row.state.name}'), state: row.state, label: row.label),
         ];
         // 2.1 — ON THE FLOOR PLAN THE HEADER READS THE ROOM, NOT THE SERVICE.
         // "4 Occupied · 23 Free" is the Tables screen's read-out (2.2), and the
@@ -7061,7 +7037,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                   context, rest, [for (final r in allRows) if (!isNextPartyRow(r as Map)) r], reload),
             ),
         ];
-        return Scaffold(
+        return PrintedBacklogFilter(states: floorStates, child: Scaffold(
           backgroundColor: Colors.transparent,
           // See [FloorScope.addTable]: the floor's layout controls travel
           // together, and a waiter has none of them.
@@ -7103,13 +7079,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
           ),
           // A restaurant with zones but no tables yet is a real state now that a
           // zone can exist on its own — don't hide the roster behind "no tables".
-          body: rows.isEmpty && allRows.isNotEmpty
-              // C3: every table this waiter had is printed and off their list.
-              // Said in words, because a blank grid on the screen they land on
-              // reads as an outage rather than as a finished section.
-              ? _empty('Nothing open for you right now — every table you printed '
-                  'has gone to a manager to settle.')
-              : rows.isEmpty && zones.isEmpty
+          body: rows.isEmpty && zones.isEmpty
               ? _empty(scope.addTable
                   ? 'No tables yet — add one with the button below.'
                   : 'No tables on the floor yet.')
@@ -7177,6 +7147,11 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                         padding: const EdgeInsets.only(bottom: 10),
                         child: Wrap(spacing: 6, runSpacing: 6, children: headerActions),
                       ),
+                    // CLIENT ITEMS 1 AND 2 — the waiter's colour key: what green,
+                    // orange and the rest mean, with no counts (a count of the
+                    // restaurant's tables is the summary they do not get).
+                    if (!scope.floorSummary && surface == FloorSurface.service)
+                      const Padding(padding: EdgeInsets.only(bottom: 10), child: FloorColourKey()),
                     // Floor SECTIONS — create / rename / un-label, and drag a
                     // table from one zone to another. See [_FloorSections].
                     _FloorSections(
@@ -7193,7 +7168,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                     ),
                   ]),
                 ),
-        );
+        ));
       },
     );
 
@@ -7981,7 +7956,14 @@ class _FloorSectionsState extends State<_FloorSections> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
-    final all = widget.rows.map((r) => r as Map).toList();
+    // CLIENT ITEMS 1 AND 2: the owner's "N Bill printed" chip narrows the floor
+    // to the night-settle backlog ([PrintedBacklogFilter]). Service only.
+    // Only while a printed table is there to show (PrintedBacklogFilter.activeOf).
+    final onlyPrinted = widget.surface == FloorSurface.service && PrintedBacklogFilter.activeOf(context);
+    final all = [
+      for (final r in widget.rows)
+        if (!onlyPrinted || _floorState(r as Map, widget.profile) == FloorState.printed) r as Map,
+    ];
     // Grouped on the lower-cased name so a table labelled "Patio" lands in the
     // roster's "patio" instead of splitting the floor into two look-alike zones.
     final groups = <String, List<Map>>{};
@@ -7995,10 +7977,13 @@ class _FloorSectionsState extends State<_FloorSections> {
     // Every zone on the roster gets a group even when nothing is in it. This is
     // the whole point of reading the roster: an empty zone has no table to be
     // inferred from, so before this it simply did not exist on this screen.
-    _zonesNow().forEach((key, name) {
-      groups.putIfAbsent(key, () => <Map>[]);
-      labels.putIfAbsent(key, () => name);
-    });
+    // (Not while the printed-only filter is on: an empty zone has no backlog.)
+    if (!onlyPrinted) {
+      _zonesNow().forEach((key, name) {
+        groups.putIfAbsent(key, () => <Map>[]);
+        labels.putIfAbsent(key, () => name);
+      });
+    }
     // The owner's arrangement, falling through to alphabetical for anything
     // they have not placed. "Unassigned" is never IN this list — it always
     // renders last, so no table can hide behind a section it hasn't been given.
@@ -8422,12 +8407,14 @@ class _ReorderSectionsDialogState extends State<_ReorderSectionsDialog> {
 //   Seated    a party is seated — counted, timed, waiter assigned, OTP minted —
 //             and has not ordered yet. This is the state that used to be
 //             painted as Occupied and was the actual complaint.
-//   Occupied  seated AND food is on the bill.
+//   Running   seated AND food is on the bill (1.8.7 to 2.0.1 said "Occupied").
+//   Bill printed  the same, once the bill has been printed — client items 1
+//             and 2 (models/floor_state.dart).
 //
 // Everything money-adjacent on this card still keys on SEATED, never on the
 // display state: the covers chip, the OTP, the bill line, and every action in
-// the sheet. The only things the new state changes are the chip, the tint and
-// the legend.
+// the sheet. The only things the states change are the chip, the tint and the
+// legend.
 
 /// Is a party physically at this table? The seating fact — `is_occupied` —
 /// under whichever name this backend sends it.
@@ -8442,32 +8429,37 @@ bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
 /// claim about the floor.
 bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
 
-/// How strongly a table tile is washed with its state colour.
+/// The five-state floor status ([floorStateOf]). `reserved` covers both an
+/// active booking window and an upcoming one, and never outranks a party who is
+/// actually sitting there. How strongly each state washes its tile is
+/// [floorWash]; its ink is [floorInk] — fixed per scheme, never the accent.
 ///
-/// One place to tune the floor's readability, because these three numbers are
-/// the whole difference between "I can see which tables are busy" and "I have to
-/// read every card". They are alphas composited over `AppColors.card`
-/// (0xFF1B1716), so they behave the same way under every shell scheme rather
-/// than being hand-picked hexes that only work against one background.
-///
-/// Ordered by how much the state wants attention, and deliberately NOT equal:
-/// Occupied is the state the floor is scanned for, so it is the loudest.
-const double _kOccupiedWash = 0.20;
-const double _kSeatedWash = 0.16;
-const double _kReservedWash = 0.13;
+/// PRINTED is the SERVER'S print state for this seating. This device's memory
+/// ([PrintedBills]) answers only when the row carries no print state at all —
+/// a backend older than those fields; see [serverBillPrintState].
+FloorState _floorState(Map t, Profile p) => floorStateOf(
+      seated: _tableSeated(t),
+      hasOrder: t.containsKey('has_order') ? t['has_order'] == true : null,
+      printed: serverBillPrintState(t) ??
+          PrintedBills.instance.printed(p.resId, p.outletId, _s(t, 'table_name')),
+      reserved: t['reserved'] == true || t['booked'] == true,
+    );
 
-/// The three-state floor status. `reserved` covers both an active booking
-/// window and an upcoming one, and never outranks a party who is actually
-/// sitting there.
-({String label, Color color}) _tableState(Map t) {
-  final seated = _tableSeated(t);
-  if (seated && _tableHasOrder(t)) return (label: 'Occupied', color: AppColors.copper);
-  // Amber, not copper: a party sitting with nothing ordered is the one state on
-  // this floor plan that is asking somebody to go over. It is deliberately NOT
-  // the reserved blue either — a reserved table is a promise, this is a guest.
-  if (seated) return (label: 'Seated', color: AppColors.warning);
-  if (t['reserved'] == true || t['booked'] == true) return (label: 'Reserved', color: AppColors.info);
-  return (label: 'Free', color: AppColors.neutral);
+/// [_floorState] as the words and ink a chip draws.
+({String label, Color color}) _tableState(Map t, Profile p) {
+  final s = _floorState(t, p);
+  return (label: s.word, color: floorInk(s));
+}
+
+/// When the bill in hand was last printed, as the restaurant's clock reads it
+/// ("13:32", or "16/09 13:32") — '' when the payload names no print. The LAST
+/// print, because that is the paper the guest is holding.
+String _printedClock(Map? row) {
+  for (final k in const ['printed_at', 'last_printed_at', 'bill_printed_at']) {
+    final v = '${row?[k] ?? ''}'.trim();
+    if (v.isNotEmpty) return printedClockOf(RestaurantTime.wallOf(v), RestaurantTime.nowWall());
+  }
+  return '';
 }
 
 /// A one-line description of an order, for a picker that has to let somebody
@@ -8543,12 +8535,14 @@ class _TableBox extends StatelessWidget {
     final shownName = tableDisplayName(table);
     // `occupied` here is the SEATING — a party is physically at this table —
     // and it is what every money-adjacent line below keys on. What the card
-    // SAYS is a separate decision with three answers; see _tableState.
+    // SAYS is a separate decision with five answers; see _floorState.
     final occupied = _tableSeated(table);
-    final reserved = table['reserved'] == true || table['booked'] == true;
-    final state = _tableState(table);
-    final status = state.label;
-    final stateColor = state.color;
+    final floor = _floorState(table, profile);
+    final status = floor.word;
+    final stateColor = floorInk(floor);
+    // CLIENT ITEMS 1 AND 2: the orange tile says when its paper was printed,
+    // whether the bill has grown since, and under which name it was printed.
+    final printed = floor == FloorState.printed;
     // A seated party who has not ordered is tinted like the state they are in,
     // so the floor reads at a glance without anyone parsing a chip.
     final awaitingOrder = occupied && !_tableHasOrder(table);
@@ -8605,7 +8599,6 @@ class _TableBox extends StatelessWidget {
         constraints: const BoxConstraints(minHeight: 128),
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          gradient: occupied || reserved ? null : AppColors.cardGradient,
           // OCCUPIED AND FREE MUST BE TELLABLE APART ACROSS THE ROOM.
           //
           // These washes used to be 0.07 / 0.07 / 0.06 over AppColors.card,
@@ -8618,40 +8611,35 @@ class _TableBox extends StatelessWidget {
           // READ the card to know whether there is a party at it.
           //
           // The fills below are strong enough to carry the state on their own,
-          // and the status pill now confirms what the colour already said rather
-          // than being the only thing that says it. Each state keeps its own hue
-          // — copper earns, amber wants attention, blue is a promise — so this is
-          // more contrast, not a new vocabulary.
-          color: awaitingOrder
-              ? Color.alphaBlend(AppColors.warning.withValues(alpha: _kSeatedWash), AppColors.card)
-              : occupied
-                  ? Color.alphaBlend(AppColors.copper.withValues(alpha: _kOccupiedWash), AppColors.card)
-                  : reserved
-                      ? Color.alphaBlend(AppColors.info.withValues(alpha: _kReservedWash), AppColors.card)
-                      : null,
+          // and the status pill confirms what the colour already said rather
+          // than being the only thing that says it. CLIENT ITEMS 1 AND 2: every
+          // state has its own FIXED ink (green free, amber seated, red running,
+          // orange printed, blue reserved — [floorInk]), and a free table is
+          // washed green too, faintly ([floorWash]).
+          color: Color.alphaBlend(stateColor.withValues(alpha: floorWash(floor)), AppColors.card),
           borderRadius: AppRadius.cardAll,
           border: Border.all(
             color: focused
                 ? AppColors.copperHi
-                : awaitingOrder
-                    ? AppColors.warning.withValues(alpha: 0.60)
-                    : occupied
-                        ? AppColors.copper.withValues(alpha: 0.85)
-                        : reserved
-                            ? AppColors.info.withValues(alpha: 0.50)
-                            : AppColors.border,
+                : stateColor.withValues(
+                    alpha: switch (floor) {
+                      FloorState.running || FloorState.printed => 0.85,
+                      FloorState.seated => 0.60,
+                      FloorState.reserved => 0.50,
+                      FloorState.free => 0.45,
+                    }),
             // A busy table is outlined, not hairlined. At 1px against a 7%-white
             // border the occupied edge was the same weight as every free card's;
             // 2px is what makes the distinction survive being glanced at.
-            width: focused ? 2 : (occupied || awaitingOrder ? 2 : 1),
+            width: focused || occupied ? 2 : 1,
           ),
-          // The copper glow is the "this table is earning" signal, so it belongs
-          // to Occupied alone. A seated table with no order gets the tint and
-          // the border but not the glow.
+          // The glow is the "this table owes money" signal: running and printed
+          // alone. A seated table with no order gets the tint and the border
+          // but not the glow.
           boxShadow: focused
               ? [BoxShadow(color: AppColors.copperHi.withValues(alpha: 0.22), blurRadius: 26, spreadRadius: 1)]
-              : occupied && !awaitingOrder
-                  ? [BoxShadow(color: AppColors.copper.withValues(alpha: 0.10), blurRadius: 24)]
+              : floor == FloorState.running || floor == FloorState.printed
+                  ? [BoxShadow(color: stateColor.withValues(alpha: 0.10), blurRadius: 24)]
                   : null,
         ),
         child: Column(
@@ -8689,21 +8677,41 @@ class _TableBox extends StatelessWidget {
                   duration: AppDurations.base,
                   switchInCurve: Curves.easeOut,
                   switchOutCurve: Curves.easeIn,
-                  child: StatusChip(
-                      key: ValueKey('table-$name-$status'),
-                      label: status,
-                      color: stateColor,
-                      dense: true),
+                  child: FloorStateChip(key: ValueKey('table-$name-$status'), state: floor),
                 ),
+                // "#2", neutral and small: the tile reads "12" like its root,
+                // and this says which party. "Next party" is its tooltip and
+                // its spoken label (and the words, on a server with no
+                // party_no).
                 if (nextParty)
-                  StatusChip(
+                  FloorChip(
                       key: ValueKey('next-party-chip-$name'),
-                      label: nextPartyChip,
-                      color: AppColors.info,
-                      dense: true),
+                      label: nextPartyBadge(table['party_no']) ?? nextPartyChip,
+                      color: AppColors.floorNextParty,
+                      tooltip: nextPartyChip),
                 ?apcTick,
               ],
             ),
+            if (printed) ...[
+              const SizedBox(height: 6),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                for (final chip in printedTileChips(
+                  printedClock: _printedClock(table),
+                  paperStale: paperStaleOf(table),
+                  printedAs: printedAsOf(table),
+                ))
+                  chip == paperStaleChip
+                      ? FloorChip(
+                          key: ValueKey('table-paper-stale-$name'),
+                          label: chip,
+                          color: AppColors.floorPrinted,
+                          maxLines: 2)
+                      : InfoChip(
+                          key: ValueKey('table-printed-$name-$chip'),
+                          icon: chip.startsWith('Printed as') ? Icons.swap_horiz : Icons.receipt_long_outlined,
+                          label: chip),
+              ]),
+            ],
             if (occupied && otp.isNotEmpty) ...[
               const SizedBox(height: 8),
               // Copper-accented, kept prominent — staff read this aloud to guests.
@@ -8989,7 +8997,7 @@ class _TableSheetState extends State<_TableSheet> {
   /// sheet that describes rather than decides. Every ACTION below reads
   /// [_occupied], the seating, because a party who has not ordered yet still
   /// needs Add order, Settle, Release and Edit seating.
-  ({String label, Color color}) get _state => _tableState(widget.table);
+  ({String label, Color color}) get _state => _tableState(widget.table, widget.profile);
   String get _orderUrl {
     final root = '${AppConfig.orderBaseUrl}/order/${widget.profile.restaurantUsername}';
     // Opaque token hides + locks the table in the URL (preferred).
@@ -9320,14 +9328,117 @@ class _TableSheetState extends State<_TableSheet> {
   /// [billPrintStateKeys]. It is NOT a second opinion: a server that says "not
   /// printed" is not overruled by this tablet's memory, because the server is
   /// describing the bill the guest is actually sitting in front of.
+  ///
+  /// The floor row this sheet was opened from answers too, before the bill has
+  /// loaded: /get-tables carries the same print state, and a printed table must
+  /// open ORANGE (client items 1 and 2), not as an unprinted one for a moment.
   bool get _billPrinted =>
       serverBillPrintState(_bill) ??
+      serverBillPrintState(widget.table) ??
       PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name);
 
-  /// Whether this reader may print this bill, and what happens to the table on
-  /// their screen once they have. One object asked at every affordance, for the
-  /// same reason [FloorScope] is.
-  BillPrintScope get _printScope => BillPrintScope.of(widget.profile, printed: _billPrinted);
+  /// CLIENT ITEMS 1 AND 2 — DOES THE PAPER STILL MATCH THE BILL? The bill's
+  /// own answer once it has loaded (the whole paper: lines, discount, charges),
+  /// the floor row's until then (the lines). Null is "not known".
+  bool? get _paperStale => _bill != null ? paperStaleOf(_bill) : paperStaleOf(widget.table);
+
+  /// Whether this reader may print this bill, and what the control says. One
+  /// object asked at every affordance, for the same reason [FloorScope] is.
+  BillPrintScope get _printScope =>
+      BillPrintScope.of(widget.profile, printed: _billPrinted, paperStale: _paperStale);
+
+  /// CLIENT ITEMS 1 AND 2 — the orange line at the top of a printed table's
+  /// sheet: when it was printed, whether it has grown since, and the name the
+  /// paper carries after a move. Said to everyone; none of it is money.
+  Widget _printedBanner(TextTheme text) {
+    final source = _bill ?? widget.table;
+    final chips = printedTileChips(
+      printedClock: _printedClock(source),
+      paperStale: _paperStale,
+      printedAs: printedAsOf(source),
+    );
+    return ForkCard(
+      key: const ValueKey('table-printed-banner'),
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(children: [
+        Icon(Icons.receipt_long, size: 18, color: AppColors.floorPrinted),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(chips.join(' · '),
+              style: text.titleSmall!.copyWith(color: AppColors.floorPrinted)),
+        ),
+      ]),
+    );
+  }
+
+  /// CLIENT ITEMS 1 AND 2 — "ADD TO PRINTED BILL", ASKED FIRST.
+  ///
+  /// The orange table's first control. It does not open the pad straight away:
+  /// the new food goes on paper the guest already holds, and the green seat
+  /// beside this table is where a NEW party's order belongs. So the confirm says
+  /// both — "12's bill was printed at 13:32. These items go on that bill and it
+  /// must be printed again. New guests? Use the green 12." — and only [Add to
+  /// printed bill] opens the pad that sends `add_to_printed_bill` (the server
+  /// refuses a waiter's addition without it). [Use green 12] opens the pad on
+  /// the green seat instead, whose first order seats the new party.
+  Future<void> _addToPrinted() async {
+    // The green seat, off the floor as it is now. A floor that cannot be read
+    // offers no green seat rather than a stale one.
+    Map? green;
+    try {
+      final rows = await widget.rest.getList('/get-tables');
+      green = greenSeatFor(widget.table, rows,
+          (r) => !_tableSeated(r) && r['has_order'] != true && r['reserved'] != true && r['booked'] != true);
+    } catch (_) {/* no green seat to offer */}
+    if (!mounted) return;
+    final parent = parentTableOf(widget.table);
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        key: const ValueKey('add-to-printed-confirm'),
+        backgroundColor: AppColors.surface,
+        title: Text(addToPrintedBillLabel(_name, parentTable: parent)),
+        content: Text(addToPrintedBillConfirm(
+          table: _name,
+          parentTable: parent,
+          printedClock: _printedClock(_bill ?? widget.table),
+          hasGreen: green != null,
+        )),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          if (green != null)
+            OutlinedButton(
+              key: const ValueKey('add-to-printed-use-green'),
+              onPressed: () => Navigator.pop(ctx, 'green'),
+              child: Text(useGreenTableLabel(tableDisplayName(widget.table))),
+            ),
+          FilledButton(
+            key: const ValueKey('add-to-printed-go'),
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.floorPrinted,
+              foregroundColor: AppColors.isLight ? Colors.white : AppColors.bg,
+            ),
+            onPressed: () => Navigator.pop(ctx, 'printed'),
+            child: const Text(addToPrintedBillAction),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || !mounted) return;
+    final greenName = green == null ? '' : _s(green, 'table_name');
+    Navigator.of(context).pop();
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => choice == 'green' && greenName.isNotEmpty
+            // The green seat is free: its first order seats the new party,
+            // covers and all, whoever is taking it.
+            ? OrderEntryScreen(rest: widget.rest, tableName: greenName, occupyOnSend: true)
+            : OrderEntryScreen(rest: widget.rest, tableName: _name, addToPrintedBill: true),
+      ),
+    );
+    widget.reload();
+  }
 
   /// THE SERVER'S SERVICE CLOCK FOR THIS SEATING — requirement D2, measured
   /// once, on the machine that has the whole picture.
@@ -9428,6 +9539,12 @@ class _TableSheetState extends State<_TableSheet> {
     // the server renders, so a settings/profile hiccup must degrade to the old
     // name-only header rather than block the print.
     final paper = await _billPaper();
+    // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
+    // another till may have printed it since this sheet opened. The same
+    // tri-state C3 uses, so an older backend falls back to this device's
+    // memory and nothing else.
+    final printedBefore = serverBillPrintState(bill) ??
+        PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name);
     // 5.1 — and the LOGO, which this preview never drew. The logo the roll
     // prints (GET /restaurant/logo/bill: the SVG bill logo or the branding PNG,
     // fitted and thresholded exactly as the printer gets it), falling back to
@@ -9459,12 +9576,12 @@ class _TableSheetState extends State<_TableSheet> {
         // the caller's employee record — which is the person signed in here.
         cashier: widget.profile.firstName.trim(),
         printedAt: RestaurantTime.nowWall(),
-        // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
-        // another till may have printed it since this sheet opened. The same
-        // tri-state C3 uses, so an older backend falls back to this device's
-        // memory and nothing else.
-        reprint: serverBillPrintState(bill) ??
-            PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name),
+        reprint: printedBefore,
+        // CLIENT ITEMS 1 AND 2: a print that replaces paper the bill has
+        // outgrown says UPDATED BILL, and which print it replaces — the roll's
+        // own banner (escpos.ts), previewed.
+        updated: printedBefore && paperStaleOf(bill) == true,
+        replacesLine: replacesBillLine(_printedClock(bill)),
       ),
     );
     if (confirmed == true) {
@@ -9504,12 +9621,19 @@ class _TableSheetState extends State<_TableSheet> {
       return;
     }
     if (!mounted) return;
+    // An UPDATED bill when the paper the guest holds no longer matches — the
+    // one reprint a waiter may make (client items 1 and 2).
+    final updated = BillPrintScope.of(widget.profile,
+            printed: serverBillPrintState(bill) ?? _billPrinted, paperStale: paperStaleOf(bill))
+        .updated;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.surface,
-        title: Text('Print the bill for $_name?'),
-        content: Text('${lines.length} item(s) on this table. The printed bill goes to the guest.'),
+        title: Text(updated ? 'Print the updated bill for $_name?' : 'Print the bill for $_name?'),
+        content: Text(updated
+            ? '${lines.length} item(s) on this table. The updated bill goes to the guest and replaces the one they have.'
+            : '${lines.length} item(s) on this table. The printed bill goes to the guest.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Print')),
@@ -9517,31 +9641,27 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (ok != true) return;
-    final retires = BillPrintScope.of(widget.profile, printed: true).retiresTable;
-    if (!await _thermalPrint(messenger, announceNextParty: !retires)) return;
-    // ---- REQUIREMENT C3: the one print, and what it costs the waiter --------
+    final waiterOnly = RoleScope.isWaiterOnly(widget.profile);
+    if (!await _thermalPrint(messenger, announceNextParty: !waiterOnly)) return;
+    if (!waiterOnly) return;
+    // ---- REQUIREMENT C3, AS CLIENT ITEMS 1 AND 2 LEFT IT ---------------------
     //
-    // Asked as the state the print PUTS this reader in — "printed: true" — so
-    // the one rule in [BillPrintScope] answers here too rather than a second
-    // role test being written at the call site. It comes back false for every
-    // identity that is not waiter-only, so a manager's print marks nothing,
-    // retires nothing, and reads exactly as it did.
-    if (!BillPrintScope.of(widget.profile, printed: true).retiresTable) return;
+    // The print is remembered on this device for a backend that sends no print
+    // state (the fallback [_billPrinted] reads), and NOTHING IS WRITTEN to the
+    // table: it is still occupied and still owes the money. It no longer
+    // leaves the waiter's floor — it stays, orange, until a manager settles it
+    // at night — and the line says so, with the green seat the server opened
+    // for the next guests.
     await PrintedBills.instance.mark(widget.profile.resId, widget.profile.outletId, _name);
     if (!mounted) return;
-    // CLIENT ITEM 6: the table's NUMBER is not gone with it. The line names
-    // the seat the server opened for the next guests ("Seat the next party at
-    // 12 (next party).") — the tile the waiter will find on the floor below.
-    final seat = _nextPartySeat.message;
     messenger.showSnackBar(SnackBar(
-        duration: Duration(seconds: seat == null ? 4 : 7),
-        content: Text('${tableSentenceNameOf(widget.table)} is printed and with a manager to settle. '
-            'It has come off your tables.${seat == null ? '' : ' $seat'}')));
-    // The sheet closes and the floor reloads WITHOUT this table — that is the
-    // whole of "clear/reset from their view". NOTHING IS WRITTEN to the table:
-    // it is still occupied, still owes the money, and is still on every
-    // manager's screen. See [BillPrintScope] for why it cannot mean more than
-    // that without becoming the settle C2 forbids.
+        key: const ValueKey('table-printed-stays'),
+        duration: const Duration(seconds: 7),
+        content: Text(printedStaysMessage(
+          tableSentence: tableSentenceNameOf(widget.table),
+          root: tableDisplayName(widget.table),
+          hasGreen: _nextPartySeat.table != null,
+        ))));
     _popAndReload();
   }
 
@@ -9950,12 +10070,21 @@ class _TableSheetState extends State<_TableSheet> {
   /// Merge is for — putting two parties on one bill — and the server refuses it
   /// by name, but offering it here and then explaining the refusal would be a
   /// worse way to teach the same thing than not offering it.
+  ///
+  /// CLIENT ITEM 2 — A WAITER'S TOO ([FloorScope.moveTable]), on any seated
+  /// table, the orange ones included: a printed party moves with its bill and
+  /// its print record, and the server opens the green seat at the destination.
+  /// The party's own table FAMILY is never offered ("12" and "12 #2" are one
+  /// table: the server refuses the move); another table's free next-party seat
+  /// is, by its sentence name ("15 (next party)"). NOT QUEUED: offline, the
+  /// move is refused here and nothing is saved to send later.
   Future<void> _moveTable(ScaffoldMessengerState messenger) async {
     List rows = const [];
     try {
       rows = await widget.rest.getList('/get-tables');
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('Could not read the floor plan — $e')));
+      messenger.showSnackBar(SnackBar(
+          content: Text(isUnreachableError(e) ? moveTableNeedsConnection : 'Could not read the floor plan — $e')));
       return;
     }
     final covers = _int(widget.table['covers']) ?? 1;
@@ -9963,6 +10092,7 @@ class _TableSheetState extends State<_TableSheet> {
       final m = t as Map;
       final n = _s(m, 'table_name');
       if (n.isEmpty || n == _name) return false;
+      if (sameTableFamily(widget.table, m)) return false;
       if (_tableSeated(m)) return false;
       // The server enforces this too (assertCoversFitTable, the same rule
       // seating uses). Filtering here means the list only ever offers tables the
@@ -9983,11 +10113,13 @@ class _TableSheetState extends State<_TableSheet> {
         children: [
           for (final t in free)
             SimpleDialogOption(
-              onPressed: () => Navigator.pop(ctx, _s(t as Map, 'table_name')),
+              key: ValueKey('move-to-${_s(t as Map, 'table_name')}'),
+              onPressed: () => Navigator.pop(ctx, _s(t, 'table_name')),
               child: ListTile(
                 dense: true,
-                leading: const Icon(Icons.table_restaurant),
-                title: Text('Table ${_s(t, 'table_name')}'),
+                // Green: every table on this list is free.
+                leading: Icon(Icons.table_restaurant, color: AppColors.floorFree),
+                title: Text('Table ${tableSentenceNameOf(t)}'),
                 subtitle: Text(_seatsLabel(t)),
               ),
             ),
@@ -9995,24 +10127,35 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (dest == null || dest.isEmpty || !mounted) return;
-    // Named consequences, because this moves money as well as people.
+    final from = tableSentenceNameOf(widget.table);
+    final to = tableSentenceName(dest);
+    // Named consequences, because this moves money as well as people — and,
+    // for a printed party, paper that still names the table they left.
     final ok = await _confirm(
       context,
-      'Move everything from $_name to $dest?',
+      'Move everything from $from to $to?',
       'The guests, their $covers cover${covers == 1 ? '' : 's'}, every order and the '
-      'running bill move together. $_name becomes free.',
+      'running bill move together. $from becomes free.'
+      '${_billPrinted ? ' ${printedPartyMoveNote(from, to)}' : ''}',
     );
     if (!ok) return;
     try {
       final res = await widget.rest.post('/tables/move', {'from_table': _name, 'to_table': dest});
       final moved = res is Map ? (_int(res['moved_orders']) ?? 0) : 0;
+      // A printed party's destination gets its own green seat; the server
+      // names it (next_party_message) and the line passes it on.
+      final seat = res is Map ? _s(res, 'next_party_message', '') : '';
       messenger.showSnackBar(SnackBar(
-          content: Text('Moved $_name to $dest — $moved order${moved == 1 ? '' : 's'} came with them.')));
+          duration: Duration(seconds: seat.isEmpty ? 4 : 7),
+          content: Text('Moved $_name to $dest — $moved order${moved == 1 ? '' : 's'} came with them.'
+              '${seat.isEmpty ? '' : ' $seat'}')));
       _popAndReload();
     } catch (e) {
       // The server refuses rather than half-applying, so the floor is exactly as
-      // it was and the message is the whole story.
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      // it was and the message is the whole story. Offline, OutboxPolicy
+      // refuses the write before it is sent: nothing was queued.
+      messenger.showSnackBar(SnackBar(
+          content: Text(e is OfflineUnavailable || isUnreachableError(e) ? moveTableNeedsConnection : '$e')));
     }
   }
 
@@ -10195,8 +10338,20 @@ class _TableSheetState extends State<_TableSheet> {
     final orderIds = (_bill?['order_ids'] as List?) ?? [];
     if (orderIds.isEmpty) return;
     final oid = '${orderIds.first}';
+    // CLIENT ITEMS 1 AND 2 — this settles the bill too, so it asks the payment
+    // sheet's question, off a fresh read (the sheet may have been open a while).
+    // A read that fails asks off the bill in hand; it never blocks.
+    Map? paper = _bill;
     try {
-      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) paper = r;
+    } catch (_) {/* the bill in hand */}
+    if (!mounted) return;
+    final stale = _stalePaperWarningOf(paper);
+    if (stale != null && !await _confirmStalePaperSettle(context, stale)) return;
+    try {
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment',
+          stale != null ? const {'settled_with_stale_paper': true} : null);
       await widget.rest.post('/bills/order/$oid/close');
       messenger.showSnackBar(const SnackBar(content: Text('Payment approved — table freed.')));
       _popAndReload();
@@ -10310,7 +10465,7 @@ class _TableSheetState extends State<_TableSheet> {
               // "Table 12 (next party)" for a next-party seat (client item 6) -
               // the number the waiter tapped, in the words the web uses too.
               Expanded(child: Text('Table ${tableSentenceNameOf(widget.table)}', style: text.headlineMedium)),
-              StatusChip(label: _state.label, color: _state.color),
+              FloorChip(label: _state.label, color: _state.color, dense: false),
             ]),
             const SizedBox(height: 10),
             Wrap(spacing: 6, runSpacing: 6, children: [
@@ -10385,6 +10540,11 @@ class _TableSheetState extends State<_TableSheet> {
                   ),
               ],
             ]),
+            // CLIENT ITEMS 1 AND 2 — "Printed 13:32 · Updated — print again".
+            if (_occupied && _billPrinted) ...[
+              const SizedBox(height: 12),
+              _printedBanner(text),
+            ],
             // ROUND 2 ITEM 1 — the name and GSTIN on this table's bill, at the top.
             if (_billCustomerHeader(messenger, text) case final header?) ...[
               const SizedBox(height: 12),
@@ -10698,24 +10858,27 @@ class _TableSheetState extends State<_TableSheet> {
               // guests and everything of theirs; Move an order takes one ticket
               // and leaves the guests where they are.
               //
-              // Gated with Merge and the rest of billOps, and for Merge's exact
-              // reason: both of these carry a running bill from one table to
-              // another, which is a change to what a guest owes and where it is
-              // owed. A waiter who mis-keys a ticket asks the same person they
-              // would ask to split or discount one.
-              if (_scope.billOps) ...[
+              // Each on its own flag ([FloorScope.moveTable], [FloorScope.moveOrder]).
+              // Move an order stays a senior's: it carries food from one bill to
+              // another, and a waiter who mis-keys a ticket asks the same person
+              // they would ask to split or discount one. Move table is a
+              // waiter's too since 2.0.2 (client item 2) — theirs sits at the
+              // top of the sheet ([_orderAndPrintActions]).
+              if (_scope.moveTable || _scope.moveOrder) ...[
                 const SizedBox(height: 10),
                 Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
-                  ForkButton.ghost(
-                    label: 'Move table',
-                    icon: Icons.swap_horiz,
-                    onPressed: () => _moveTable(messenger),
-                  ),
-                  ForkButton.ghost(
-                    label: 'Move an order',
-                    icon: Icons.move_down,
-                    onPressed: () => _moveKot(messenger),
-                  ),
+                  if (_scope.moveTable)
+                    ForkButton.ghost(
+                      label: 'Move table',
+                      icon: Icons.swap_horiz,
+                      onPressed: () => _moveTable(messenger),
+                    ),
+                  if (_scope.moveOrder)
+                    ForkButton.ghost(
+                      label: 'Move an order',
+                      icon: Icons.move_down,
+                      onPressed: () => _moveKot(messenger),
+                    ),
                 ]),
               ],
               // ITEM 20. Freeing an occupied table without taking the money is a
@@ -10866,30 +11029,43 @@ class _TableSheetState extends State<_TableSheet> {
       // A waiter has no "seat guests" button any more, so placing the
       // order is how a table starts. POST /orders provisions the seating
       // server-side; nothing here has to be pressed first.
+      //
+      // CLIENT ITEMS 1 AND 2: ON A PRINTED TABLE THE FIRST CONTROL IS "ADD TO
+      // PRINTED BILL", and it asks before it opens the pad ([_addToPrinted]).
       if (!_scope.seat) ...[
-        full(ForkButton(
-          key: const ValueKey('table-add-order'),
-          label: 'Add order',
-          icon: Icons.add,
-          large: true,
-          onPressed: _addOrder,
-        )),
+        if (_occupied && _billPrinted)
+          full(ForkButton(
+            key: const ValueKey('table-add-to-printed'),
+            label: addToPrintedBillAction,
+            icon: Icons.add,
+            large: true,
+            onPressed: _addToPrinted,
+          ))
+        else
+          full(ForkButton(
+            key: const ValueKey('table-add-order'),
+            label: 'Add order',
+            icon: Icons.add,
+            large: true,
+            onPressed: _addOrder,
+          )),
         // Nothing to print until something has been ordered — an empty
         // table has no bill, and a button that answers "No open bill to
         // print for this table" is a button that wasted a walk.
         //
-        // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME. Once this
-        // waiter has printed, the control is gone and a sentence stands
-        // where it was. The sentence is not decoration — a waiter handed a
-        // blank space where a button was will go and press it on the next
-        // tablet, and a guest asking for their bill again needs to hear
-        // what happens next rather than watch somebody prod a dead screen.
+        // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME — unless the
+        // paper is out of date (client items 1 and 2), when the control comes
+        // back as "Print updated bill". Otherwise a sentence stands where it
+        // was. The sentence is not decoration — a waiter handed a blank space
+        // where a button was will go and press it on the next tablet, and a
+        // guest asking for their bill again needs to hear what happens next
+        // rather than watch somebody prod a dead screen.
         if (_occupied) ...[
           const SizedBox(height: 10),
           if (_printScope.print)
             full(ForkButton.ghost(
               key: const ValueKey('table-print-bill'),
-              label: 'Print bill',
+              label: _printScope.printLabel,
               icon: Icons.receipt_long,
               large: true,
               onPressed: () => _printBillWithoutPreview(messenger),
@@ -10905,12 +11081,23 @@ class _TableSheetState extends State<_TableSheet> {
                 Expanded(
                   child: Text(
                     'Bill printed. A manager reprints it and settles the table '
-                    'from here — ask one if the guest needs another copy.',
+                    'from here — ask one if the guest needs another copy. '
+                    'Anything you add to it can be printed again as an updated bill.',
                     style: text.bodySmall,
                   ),
                 ),
               ]),
             ),
+          // CLIENT ITEM 2 — "Move table", on any seated table, orange included.
+          if (_scope.moveTable) ...[
+            const SizedBox(height: 10),
+            full(ForkButton.ghost(
+              key: const ValueKey('table-move-party'),
+              label: 'Move table',
+              icon: Icons.swap_horiz,
+              onPressed: () => _moveTable(messenger),
+            )),
+          ],
         ],
         const SizedBox(height: 16),
       ],
@@ -10921,18 +11108,21 @@ class _TableSheetState extends State<_TableSheet> {
       // wrap and still previews the receipt first, then prints via the server
       // (unified ESC/POS format → thermal printer agent), matching the web bill.
       if (_scope.seat && _occupied) ...[
+        // The same question on a printed table as a waiter is asked: the web
+        // dashboard asks everyone, and a manager's dessert lands on the same
+        // paper.
         full(ForkButton(
           key: const ValueKey('table-manager-add-order'),
-          label: 'Add order',
+          label: _billPrinted ? addToPrintedBillAction : 'Add order',
           icon: Icons.add,
           large: true,
-          onPressed: _addOrder,
+          onPressed: _billPrinted ? _addToPrinted : _addOrder,
         )),
         if (_bill != null && _scope.billOps) ...[
           const SizedBox(height: 10),
           full(ForkButton.ghost(
             key: const ValueKey('table-manager-print-bill'),
-            label: 'Print bill',
+            label: _printScope.printLabel,
             icon: Icons.receipt_long,
             large: true,
             onPressed: () => _previewBill(messenger),
@@ -10957,6 +11147,7 @@ class _TableSheetState extends State<_TableSheet> {
         orderId: '${orderIds.first}',
         tableName: _name,
         fallbackTotal: _money(_bill?['grand_total'] ?? _bill?['total_amt']),
+        paperBill: _bill,
       ),
     );
     if (done == true) _popAndReload();
@@ -11146,6 +11337,12 @@ class _BillPreviewDialog extends StatelessWidget {
   /// banner on paper or here.
   final bool reprint;
 
+  /// CLIENT ITEMS 1 AND 2 — the print replaces paper the bill has outgrown, so
+  /// the roll stamps "** UPDATED BILL **" and [replacesLine] ("Replaces the
+  /// bill printed 13:32") where it would stamp REPRINT, and so does this.
+  final bool updated;
+  final String replacesLine;
+
   /// True when the tenant prints on the 58mm roll (`bill_paper_width`): 32
   /// columns, no margins, the narrow item table. False is the 80mm roll, which
   /// is also what an unreadable setting means on the server.
@@ -11176,6 +11373,8 @@ class _BillPreviewDialog extends StatelessWidget {
     this.logo,
     required this.tableName,
     this.reprint = false,
+    this.updated = false,
+    this.replacesLine = '',
     this.narrow = false,
     this.qrNote = '',
     this.showQr = true,
@@ -11399,7 +11598,24 @@ class _BillPreviewDialog extends StatelessWidget {
                       // logo, because that is where the roll prints it. Large, bold
                       // and boxed so it cannot be read past on a copy turned toward
                       // a guest.
-                      if (reprint) ...[
+                      if (updated) ...[
+                        Container(
+                          key: const ValueKey('bill-preview-updated'),
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          decoration: BoxDecoration(border: Border.all(color: Colors.black87, width: 2)),
+                          child: const Text('UPDATED BILL',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  fontSize: 22, fontWeight: FontWeight.w900, letterSpacing: 3, color: Colors.black)),
+                        ),
+                        if (replacesLine.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text(replacesLine,
+                                key: const ValueKey('bill-preview-replaces'), textAlign: TextAlign.center),
+                          ),
+                        const SizedBox(height: 8),
+                      ] else if (reprint) ...[
                         Container(
                           key: const ValueKey('bill-preview-reprint'),
                           padding: const EdgeInsets.symmetric(vertical: 4),

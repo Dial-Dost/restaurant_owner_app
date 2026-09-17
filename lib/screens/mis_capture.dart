@@ -1633,6 +1633,7 @@ class _PaymentSheet extends StatefulWidget {
     required this.orderId,
     required this.tableName,
     required this.fallbackTotal,
+    this.paperBill,
   });
 
   final RestClient rest;
@@ -1644,9 +1645,51 @@ class _PaymentSheet extends StatefulWidget {
   /// ledger answers, and as the whole truth if it never does.
   final String fallbackTotal;
 
+  /// The table sheet's GET /bill-for-table, read here for whether the PAPER
+  /// still matches the bill (client items 1 and 2). A fresher copy read by
+  /// [_PaymentSheetState._load] wins.
+  final Map? paperBill;
+
   @override
   State<_PaymentSheet> createState() => _PaymentSheetState();
 }
+
+/// CLIENT ITEMS 1 AND 2 — THE ONE STALE-PAPER QUESTION, asked by every door
+/// that settles a bill: the payment sheet's "Settle & close" and the table
+/// sheet's "Approve payment & close". [warning] is stalePaperSettleWarning's
+/// sentence. True means "Settle anyway": the caller settles the same amount it
+/// always would and sends `settled_with_stale_paper`, which the server audits.
+/// It never blocks.
+Future<bool> _confirmStalePaperSettle(BuildContext context, String warning) async {
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      key: const ValueKey('settle-stale-paper-confirm'),
+      backgroundColor: AppColors.surface,
+      title: const Text('The printed bill is out of date'),
+      content: Text(warning),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(
+          key: const ValueKey('settle-anyway'),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text(settleAnywayLabel),
+        ),
+      ],
+    ),
+  );
+  return go == true;
+}
+
+/// The stale-paper warning for a /bill-for-table payload, or null when its
+/// paper is not KNOWN to be out of date. One reading for every settle door.
+String? _stalePaperWarningOf(Map? bill) => stalePaperSettleWarning(
+      paperStale: paperStaleOf(bill),
+      printedClock: _printedClock(bill),
+      printedTotal: printedTotalOf(bill),
+      grandTotal: bill == null ? null : _numOf(bill['grand_total'] ?? bill['total_amt']),
+      money: (v) => _money(v),
+    );
 
 class _PaymentSheetState extends State<_PaymentSheet> {
   // ---- the modes -------------------------------------------------------------
@@ -1712,6 +1755,19 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   // The open bill it quotes from is read fresh in [_load].
   Map? _ncBill;
   bool _ncMode = false;
+
+  // ---- the paper (client items 1 and 2) -----------------------------------
+  //
+  // A bill that grew after its print leaves the guest holding a smaller total
+  // than the till is about to take. The server says so (`paper_stale`, with
+  // the printed and the current totals for a senior) and this sheet WARNS —
+  // it never blocks: the settle books the current grand total either way, and
+  // a settle past the warning is recorded (`settled_with_stale_paper`).
+  Map? _paperBill;
+  bool _printingUpdated = false;
+
+  /// The warning, or null when the paper is not KNOWN to be out of date.
+  String? get _staleWarning => _ncMode ? null : _stalePaperWarningOf(_paperBill);
 
   /// This server has no settle-nc route ([NcSettle.routeMissing]). Learned from
   /// the first attempt, for the life of this sheet. The pill and the ₹0 bill's
@@ -1812,6 +1868,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       _allModes = modes;
       _modes = PaymentModes.till(modes);
       _ncBill = ncBill;
+      _paperBill = ncBill ?? widget.paperBill;
       // A ₹0 bill whose dishes were all comped IS an NC bill: it opens as one
       // and is never offered as a ₹0 UPI settle (what installed 2.0.0 tills
       // sent). A refusal re-read keeps the form open if NC is still possible.
@@ -2107,6 +2164,58 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     }
   }
 
+  /// "Print updated bill" from the warning: the same POST /print/bill the
+  /// table's own control sends, then the bill read again so the warning goes
+  /// once the paper matches.
+  Future<void> _printUpdatedBill() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() {
+      _printingUpdated = true;
+      _error = null;
+    });
+    try {
+      await widget.rest.post('/print/bill', {'table_name': widget.tableName});
+      messenger.showSnackBar(const SnackBar(content: Text('Printing the updated bill…')));
+      final r = await widget.rest
+          .get('/bill-for-table?table_name=${Uri.encodeQueryComponent(widget.tableName)}');
+      if (mounted && r is Map) setState(() => _paperBill = r);
+    } catch (e) {
+      if (mounted) setState(() => _error = _captureError(e));
+    } finally {
+      if (mounted) setState(() => _printingUpdated = false);
+    }
+  }
+
+  Widget _stalePaperCard(TextTheme text, String warning) => Container(
+        key: const ValueKey('settle-stale-paper'),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: AppColors.card,
+          borderRadius: AppRadius.controlAll,
+          border: Border.all(color: AppColors.floorPrinted),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(Icons.receipt_long, size: 18, color: AppColors.floorPrinted),
+            const SizedBox(width: 8),
+            Expanded(child: Text(warning, style: text.bodyMedium!.copyWith(color: AppColors.floorPrinted))),
+          ]),
+          if (widget.tableName.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: ForkButton.ghost(
+                key: const ValueKey('settle-print-updated'),
+                label: printUpdatedBillLabel,
+                icon: Icons.receipt_long,
+                dense: true,
+                onPressed: _busy || _printingUpdated ? null : _printUpdatedBill,
+              ),
+            ),
+          ],
+        ]),
+      );
+
   /// Settle, approve and close — the same three calls the old dialog made, with
   /// the body chosen by [_isSimpleSettle].
   Future<void> _settleAndClose() async {
@@ -2115,6 +2224,12 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     if (refusal != null) {
       setState(() => _error = refusal);
       return;
+    }
+    // CLIENT ITEMS 1 AND 2 — the paper is out of date: asked, never refused.
+    final stale = _staleWarning;
+    if (stale != null) {
+      final go = await _confirmStalePaperSettle(context, stale);
+      if (!go || !mounted) return;
     }
     setState(() {
       _busy = true;
@@ -2126,6 +2241,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       final body = <String, dynamic>{
         if (_misCounterId.isNotEmpty) 'counter_id': _misCounterId,
         if (_needsProofNow && _hasProof) 'payment_proof_screenshot_url': _proofUrl,
+        // Recorded in the audit line; the amount settled is unchanged.
+        if (stale != null) 'settled_with_stale_paper': true,
       };
       if (_isSimpleSettle) {
         // UNCHANGED PATH. No `tenders` key, so every value the settle computes is
@@ -2143,7 +2260,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
         body['tenders'] = [for (final t in tenders) t.toJson()];
       }
       await widget.rest.post('/bills/order/$oid/waiter-confirm-payment', body);
-      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment',
+          stale != null ? const {'settled_with_stale_paper': true} : null);
       await widget.rest.post('/bills/order/$oid/close');
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
@@ -2339,6 +2457,10 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 Flexible(
                   child: SingleChildScrollView(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                      if (_staleWarning case final warning?) ...[
+                        _stalePaperCard(text, warning),
+                        const SizedBox(height: AppSpacing.lg),
+                      ],
                       if (_ncMode) ...[
                         _ncExplanation(text),
                         const SizedBox(height: AppSpacing.lg),

@@ -40,8 +40,9 @@ import 'package:restaurant_owner_app/widgets/table_bill.dart';
 ///   * A MANAGER'S ADDITION TO A PRINTED BILL IS TOLD TO REPRINT — after an
 ///     order, a merge or an item moved onto it — with a Reprint that prints
 ///     that table.
-///   * C3 STILL HOLDS for the printed party (v3_client_block_test and
-///     bill_print_authority_test pin that); the number comes back beside it.
+///   * THE PRINTED PARTY STAYS, ORANGE, AND THE SEAT BESIDE IT IS GREEN (client
+///     items 1 and 2 retired C3's "off their floor"; v3_client_block_test and
+///     waiter_floor_printed_test pin the rest). Both tiles read "T1".
 ///   * THE ROOM HAS NO "T1 #2" IN IT: not on the floor plan, not in the
 ///     delete list, not in the Free count, and not makeable by hand.
 ///   * ONE VOCABULARY with the server and the web: "Next party", "T1 (next
@@ -574,18 +575,26 @@ void main() {
   // ==========================================================================
 
   group('a waiter\'s floor after a print', () {
-    testWidgets('one "T1": the next party\'s seat, with its chip; the printed party is off', (tester) async {
+    // CHANGED ON PURPOSE FOR CLIENT ITEMS 1 AND 2. This used to pin that the
+    // printed T1 was OFF the waiter's floor and only its seat was left. "If a
+    // bill is not settled, the table completely vanishes" was the complaint:
+    // the printed T1 now stays, orange, and the seat beside it is green.
+    testWidgets('two "T1"s: the printed one orange, the next party\'s green with its "#2"', (tester) async {
       await _mountFloor(tester, _waiter(_floor([_root(), _seat()])));
-      expect(_rootTile, findsNothing);
+      expect(_rootTile, findsOneWidget, reason: 'the printed party left the waiter\'s floor');
       expect(_seatTile, findsOneWidget);
-      expect(find.text('T1'), findsOneWidget);
+      expect(find.text('T1'), findsNWidgets(2));
+      expect(find.byKey(const ValueKey('table-T1-Bill printed')), findsOneWidget);
+      expect(find.byKey(const ValueKey('table-T1 #2-Free')), findsOneWidget);
       expect(find.byKey(const ValueKey('next-party-chip-T1 #2')), findsOneWidget);
+      expect(find.text('#2'), findsOneWidget);
+      expect(find.byTooltip(nextPartyChip), findsOneWidget, reason: 'the chip still says what it is');
       expect(find.text('T1 #2'), findsNothing, reason: 'the handle is not what the tile says');
       // The per-table outbox badge is keyed by the HANDLE, which is what an
-      // order queued for the seat is tagged with.
+      // order queued for the seat is tagged with — and the printed T1 keeps its
+      // own.
       final badges = tester.widgetList<OutboxTagBadge>(find.byType(OutboxTagBadge)).map((b) => b.tag);
-      expect(badges, contains('table:T1 #2'));
-      expect(badges, isNot(contains('table:T1')));
+      expect(badges, containsAll(['table:T1 #2', 'table:T1']));
       expect(OutboxPolicy.tagFor('/orders', {'table': 'T1 #2'}), 'table:T1 #2');
     });
 
@@ -627,15 +636,18 @@ void main() {
       expect(seatAt.dx, greaterThan(rootAt.dx));
       expect(tester.getTopLeft(find.byKey(const ValueKey('table-title-T2'))).dx, greaterThan(seatAt.dx),
           reason: 'the seat is listed straight after its table');
-      // Free is T2 alone.
+      // Free is T2 alone; the printed T1 is the night-settle backlog.
       expect(find.text('1 Free'), findsOneWidget);
-      expect(find.text('1 Occupied'), findsOneWidget);
+      expect(find.text('1 Bill printed'), findsOneWidget);
     });
 
     testWidgets('a seated next party is a party like any other on the legend', (tester) async {
       await _mountFloor(tester, _owner(_floor([_root(), {..._seat(occupied: true), 'has_order': true}])));
-      expect(find.text('2 Occupied'), findsOneWidget);
-      expect(find.text('0 Free'), findsOneWidget);
+      expect(find.text('1 Bill printed'), findsOneWidget);
+      expect(find.text('1 Running'), findsOneWidget);
+      // A state with no table is left out, as "0 Seated" always was.
+      expect(find.byKey(const ValueKey('floor-legend-free')), findsNothing);
+      expect(find.text('0 Free'), findsNothing);
     });
   });
 
@@ -1022,7 +1034,13 @@ void main() {
     test('the wiring: every write that can grow a printed bill reads the flag', () {
       String read(String rel) => File(rel).readAsStringSync().replaceAll(String.fromCharCode(13), '');
       final pad = read('lib/screens/order_entry.dart');
-      expect(pad, contains("final sent = await widget.rest.post('/orders', {...base, 'table': _table});\n"
+      // 2.0.2 (client items 1 and 2): the same post, carrying the confirmed
+      // "add to printed bill" flag when — and only when — it was chosen.
+      expect(pad, contains("final sent = await widget.rest.post('/orders', {\n"
+          '          ...base,\n'
+          "          'table': _table,\n"
+          '          if (_addsToPrinted) addToPrintedBillKey: true,\n'
+          '        });\n'
           '        reprint = ReprintNeeded.parse(sent, fallbackTable: _table);'));
       expect(pad, contains('showReprintNeeded(ScaffoldMessenger.of(context), widget.rest, reprint);'));
       // The refusal is keyed on its code, never on a status.

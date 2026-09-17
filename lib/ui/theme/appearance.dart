@@ -210,8 +210,9 @@ enum LightTone {
 ///   --destructive        -> danger
 ///
 /// What the web does not name (the tertiary ink, and the success / warning /
-/// info / neutral inks the app's floor and reports use) is filled in on the
-/// same temperature. light_theme_test.dart holds body inks, status inks, the
+/// info / neutral inks the app's reports use) is filled in on the same
+/// temperature. The floor's five inks are the web's own light FLOOR_INKS
+/// (src/lib/floor-state.ts), one set for all three palettes. light_theme_test.dart holds body inks, status inks, the
 /// derived accent and the table-state washes to WCAG AA 4.5:1 on these
 /// grounds, so a retune that makes anything unreadable fails CI.
 abstract final class AppLightPalettes {
@@ -235,6 +236,9 @@ abstract final class AppLightPalettes {
     success: Color(0xFF2B6326), warning: Color(0xFF8A5A00),
     danger: Color(0xFFC32222), info: Color(0xFF36648A),
     neutral: Color(0xFF5F6670),
+    floorFree: Color(0xFF2B6326), floorSeated: Color(0xFF7A5B00),
+    floorRunning: Color(0xFFB0283C), floorPrinted: Color(0xFFA84A06),
+    floorReserved: Color(0xFF2F5F8F), floorNextParty: Color(0xFF5F6670),
   );
 
   // Beige — warm cream.
@@ -252,6 +256,9 @@ abstract final class AppLightPalettes {
     success: Color(0xFF2B6326), warning: Color(0xFF805300),
     danger: Color(0xFFC32222), info: Color(0xFF36648A),
     neutral: Color(0xFF625649),
+    floorFree: Color(0xFF2B6326), floorSeated: Color(0xFF7A5B00),
+    floorRunning: Color(0xFFB0283C), floorPrinted: Color(0xFFA84A06),
+    floorReserved: Color(0xFF2F5F8F), floorNextParty: Color(0xFF5F6670),
   );
 
   // Soft grey — a neutral with less glare than white.
@@ -269,6 +276,9 @@ abstract final class AppLightPalettes {
     success: Color(0xFF2B6326), warning: Color(0xFF805300),
     danger: Color(0xFFC32222), info: Color(0xFF36648A),
     neutral: Color(0xFF575D66),
+    floorFree: Color(0xFF2B6326), floorSeated: Color(0xFF7A5B00),
+    floorRunning: Color(0xFFB0283C), floorPrinted: Color(0xFFA84A06),
+    floorReserved: Color(0xFF2F5F8F), floorNextParty: Color(0xFF5F6670),
   );
 
   /// The palette a [LightTone] paints.

@@ -55,12 +55,24 @@ class OrderEntryScreen extends StatefulWidget {
   /// count.
   final bool occupyOnSend;
 
+  /// CLIENT ITEMS 1 AND 2 — THIS ORDER GOES ON A BILL THAT HAS BEEN PRINTED,
+  /// AND THE READER SAID SO.
+  ///
+  /// Set only by the table sheet's "Add to printed bill", after its confirm.
+  /// The pad then shows the orange strip and every send to [tableName] carries
+  /// `add_to_printed_bill: true` — the server's condition for a waiter's
+  /// addition to printed paper. False everywhere else, so an order taken the
+  /// ordinary way never reaches printed paper by accident: the server refuses
+  /// it and the pad asks ([BillPrintedRefusal.addToPrintedLabel]).
+  final bool addToPrintedBill;
+
   const OrderEntryScreen({
     super.key,
     required this.rest,
     this.tableName,
     this.orderType = 'dine_in',
     this.occupyOnSend = false,
+    this.addToPrintedBill = false,
   });
 
   bool get isDineIn => orderType == 'dine_in';
@@ -132,6 +144,16 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   /// The table this pad sends to: the one it was opened on, or the next-party
   /// seat the waiter moved the order to.
   String? get _table => _retarget ?? widget.tableName;
+
+  /// CLIENT ITEMS 1 AND 2 — the reader chose to add to the printed bill: on the
+  /// table sheet ([OrderEntryScreen.addToPrintedBill]) or beside the server's
+  /// refusal ([_addToPrintedAfterRefusal]).
+  late bool _confirmedPrinted = widget.addToPrintedBill;
+
+  /// Whether THIS send carries `add_to_printed_bill`: a dine-in order, still
+  /// aimed at the printed table the choice was made for. Moving the order to
+  /// the next party's seat ([_retarget]) is the other choice, and drops it.
+  bool get _addsToPrinted => _confirmedPrinted && _retarget == null && widget.isDineIn;
   // What this table is ALREADY running at (its active orders merged, covers,
   // APC vs target). Dine-in only — a takeaway has no table to be per-head about.
   // Null until it loads, and stays null when the table has no open bill yet.
@@ -403,7 +425,13 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       // may add to a printed bill, and is told the paper is now short.
       ReprintNeeded? reprint;
       if (widget.isDineIn) {
-        final sent = await widget.rest.post('/orders', {...base, 'table': _table});
+        // The flag rides in the body, so a copy the outbox saves and replays is
+        // judged exactly as this one would have been.
+        final sent = await widget.rest.post('/orders', {
+          ...base,
+          'table': _table,
+          if (_addsToPrinted) addToPrintedBillKey: true,
+        });
         reprint = ReprintNeeded.parse(sent, fallbackTable: _table);
       } else {
         await widget.rest.post('/orders/takeaway', {
@@ -491,6 +519,43 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     await _send();
   }
 
+  /// "Add to T1's printed bill", beside the server's refusal: the same cart,
+  /// sent again to the same table, now saying it belongs on the printed bill.
+  /// The refusal's sentence above it is the question; this is the answer.
+  Future<void> _addToPrintedAfterRefusal() async {
+    setState(() {
+      _confirmedPrinted = true;
+      _printedRefusal = null;
+    });
+    await _send();
+  }
+
+  /// The orange strip across the top of the pad while it adds to printed
+  /// paper, so nobody takes a new party's order here by mistake.
+  Widget _addingToPrintedStrip() => Padding(
+        key: const ValueKey('order-adding-to-printed'),
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: AppColors.card,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppColors.floorPrinted, width: 1.5),
+          ),
+          child: Row(children: [
+            Icon(Icons.receipt_long, size: 16, color: AppColors.floorPrinted),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(addingToPrintedBillStrip(_table ?? ''),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontWeight: FontWeight.w700, color: AppColors.floorPrinted)),
+            ),
+          ]),
+        ),
+      );
+
   /// The refusal's sentence, at the foot of the header's SCROLL, directly above
   /// its action.
   ///
@@ -516,18 +581,50 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   /// "Take it on 12 (next party)", pinned beside [_sendBar] and outside the
   /// header's scroll, for the reason "Send order" is: while the refusal stands
   /// it is the one control the waiter needs, and it must never scroll away.
-  Widget _takeItOnButton(BillPrintedRefusal refusal) => Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        child: SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            key: const ValueKey('order-take-on-next-party'),
-            onPressed: _sending ? null : () => _takeItOnNextParty(refusal.nextPartyTable!),
-            icon: const Icon(Icons.event_seat_outlined, size: 18),
-            label: Text(refusal.actionLabel!),
+  ///
+  /// CLIENT ITEMS 1 AND 2: a 2.0.2 server offers the other answer too — "Add to
+  /// 12's printed bill" — and the two share ONE row, so the pinned block is no
+  /// taller than it was (a 360dp phone with the keyboard up has no line to
+  /// spare). Either label is scaled down rather than cut.
+  Widget _refusalActions(BillPrintedRefusal refusal) {
+    final take = refusal.nextPartyTable != null && refusal.actionLabel != null && _retarget == null;
+    final add = refusal.addToPrintedLabel != null && !_confirmedPrinted && _retarget == null;
+    Widget label(String s) => FittedBox(fit: BoxFit.scaleDown, child: Text(s, maxLines: 1));
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Row(children: [
+        if (take)
+          Expanded(
+            child: FilledButton.icon(
+              key: const ValueKey('order-take-on-next-party'),
+              onPressed: _sending ? null : () => _takeItOnNextParty(refusal.nextPartyTable!),
+              icon: const Icon(Icons.event_seat_outlined, size: 18),
+              label: label(refusal.actionLabel!),
+            ),
           ),
-        ),
-      );
+        if (take && add) const SizedBox(width: 8),
+        if (add)
+          Expanded(
+            child: OutlinedButton.icon(
+              key: const ValueKey('order-add-to-printed'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppColors.floorPrinted,
+                side: BorderSide(color: AppColors.floorPrinted),
+              ),
+              onPressed: _sending ? null : _addToPrintedAfterRefusal,
+              icon: const Icon(Icons.receipt_long, size: 18),
+              label: label(refusal.addToPrintedLabel!),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  bool _hasRefusalActions(BillPrintedRefusal? refusal) =>
+      refusal != null &&
+      _retarget == null &&
+      ((refusal.nextPartyTable != null && refusal.actionLabel != null) ||
+          (refusal.addToPrintedLabel != null && !_confirmedPrinted));
 
   @override
   Widget build(BuildContext context) {
@@ -565,6 +662,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
             Flexible(
               child: SingleChildScrollView(
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  if (_addsToPrinted) _addingToPrintedStrip(),
                   // What the table is already running at — visible while the order is
                   // being built, so the waiter can see the per-head gap in time to close
                   // it. Tapping opens the full item-by-item bill.
@@ -617,8 +715,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                 ]),
               ),
             ),
-            if (_printedRefusal?.nextPartyTable != null && _printedRefusal?.actionLabel != null)
-              _takeItOnButton(_printedRefusal!),
+            if (_hasRefusalActions(_printedRefusal)) _refusalActions(_printedRefusal!),
             if (_count > 0) _sendBar(),
           ]),
         ),

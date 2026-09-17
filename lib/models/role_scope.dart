@@ -1,3 +1,4 @@
+import 'floor_state.dart';
 import 'profile.dart';
 
 /// Role-shaped scoping: what a signed-in user's JOB says they are here to do,
@@ -391,6 +392,8 @@ class FloorScope {
     required this.money,
     required this.floorSummary,
     required this.managerOnlyAsks,
+    this.moveTable = false,
+    this.moveOrder = false,
   });
 
   /// "Seat guests & take order" — POST /occupy-table.
@@ -505,6 +508,23 @@ class FloorScope {
   /// ENABLED comp button, which the requirement forbids regardless of grant.
   final bool managerOnlyAsks;
 
+  /// "Move table" — POST /tables/move, the whole party and its bill to a free
+  /// table. CLIENT ITEM 2: "On the waiter dashboard, Move table option needs to
+  /// be implemented."
+  ///
+  /// THE SERVER'S ANSWER (`move_table`, which it grants a waiter), falling back
+  /// to what this control was before 2.0.2 — a senior's — for a backend that
+  /// predates the flag. That older backend would move the party but not its
+  /// printed bill's record or the green seat, so the fallback keeps it off a
+  /// waiter's sheet until the server says otherwise.
+  final bool moveTable;
+
+  /// "Move an order" — POST /tables/move-order, one ticket to another table.
+  /// STAYS A SENIOR'S: the route answers off "Add Orders", which every waiter
+  /// holds, so the role gate is ANDed with the server's flag here rather than
+  /// replaced by it — the client asked for Move table, not for this.
+  final bool moveOrder;
+
   /// [surface] says WHICH floor screen is asking — see [FloorSurface].
   ///
   /// IT DEFAULTS TO [FloorSurface.service], THE RESTRICTIVE ONE, and that
@@ -566,12 +586,15 @@ class FloorScope {
       // non-chargeable uuid must still not get an enabled comp button, so the role
       // gate cannot be replaced by the capability — only added to.
       managerOnlyAsks: !waiterOnly,
+      moveTable: RoleScope.may(p, Capability.moveTable, fallback: !waiterOnly),
+      moveOrder: !waiterOnly && RoleScope.may(p, Capability.moveOrder, fallback: true),
     );
   }
 }
 
 /// PRINTING A TABLE'S BILL — requirement C3, which is the one item in this block
-/// that had to be interpreted rather than merely implemented.
+/// that had to be interpreted rather than merely implemented, and which client
+/// items 1 and 2 (2.0.2) then amended. See the last section below.
 ///
 /// WHAT WAS ASKED, VERBATIM: "Waiters can only execute Print Bill ONCE. After
 /// clicking, the button must disappear and the table should clear/reset from
@@ -615,15 +638,35 @@ class FloorScope {
 /// all, i.e. a backend older than those fields. It is a courtesy, not a control:
 /// it survives a back-navigation and an app restart, and it does not survive a
 /// reinstall or a second tablet.
+///
+/// CLIENT ITEMS 1 AND 2 — THE TABLE STAYS, AND "ONCE" MEANS "ONCE PER PAPER".
+/// "If a bill is not settled, the table completely vanishes; bills are settled
+/// only at night." The printed table now stays on the waiter's floor, in orange
+/// ([retiresTable] is false for everyone). A waiter may add to it on purpose,
+/// and then the paper in the guest's hand is short — so a waiter may print
+/// AGAIN exactly when the server says the paper no longer matches the bill
+/// (`paper_stale`, migration 055), and that print says "UPDATED BILL". An
+/// unchanged bill is still a senior's to reprint, and an unknown answer (an
+/// older backend, a print made before 055) fails closed the same way.
 class BillPrintScope {
   const BillPrintScope({
     required this.print,
     required this.reprintNeedsSenior,
     required this.retiresTable,
+    this.updated = false,
+    this.printLabel = printBillLabel,
   });
 
   /// Whether the Print bill control may be drawn and pressed at all right now.
   final bool print;
+
+  /// True when the bill has been printed and the paper is known to be out of
+  /// date: the next print is an UPDATED bill, and the control says so.
+  final bool updated;
+
+  /// The control's words: "Print updated bill" when [updated], else "Print
+  /// bill".
+  final String printLabel;
 
   /// True when this reader has used up their one print and a second one is
   /// somebody else's to make. Drives the sentence the sheet shows in the
@@ -631,28 +674,33 @@ class BillPrintScope {
   /// was will press it again on the next device they find.
   final bool reprintNeedsSenior;
 
-  /// Whether this table now leaves THIS reader's floor grid.
-  ///
-  /// Never a release, never a settle, never a write of any kind — the row is
-  /// filtered out of one list on one device. The table is still occupied, still
-  /// owes money, and is still on every manager's screen, which is the whole
-  /// difference between "clear from their view" and "clear the table".
+  /// Whether this table leaves THIS reader's floor grid. ALWAYS FALSE since
+  /// 2.0.2 (client items 1 and 2): a printed table is a pending bill until the
+  /// night settle, and a waiter needs it in front of them — orange, beside the
+  /// green seat for the next party. Kept as a field so the one place that used
+  /// to filter on it is visibly asking a question whose answer is "no".
   final bool retiresTable;
 
-  /// [printed] is "this table's current bill has already been printed by this
-  /// reader", resolved by the caller from the server's answer where there is one
-  /// and from the device memory otherwise.
-  factory BillPrintScope.of(Profile p, {required bool printed}) {
+  /// [printed] is "this table's current bill has already been printed",
+  /// resolved by the caller from the server's answer where there is one and
+  /// from the device memory otherwise. [paperStale] is the server's
+  /// `paper_stale`: true, false, or null for "not known".
+  factory BillPrintScope.of(Profile p, {required bool printed, bool? paperStale}) {
     final waiterOnly = RoleScope.isWaiterOnly(p);
+    final updated = printed && paperStale == true;
+    final label = updated ? printUpdatedBillLabel : printBillLabel;
     // Everyone else is untouched — same control, same number of presses, same
-    // receipt preview in front of it.
+    // receipt preview in front of it. Only the words say when it is an update.
     if (!waiterOnly) {
-      return const BillPrintScope(print: true, reprintNeedsSenior: false, retiresTable: false);
+      return BillPrintScope(
+          print: true, reprintNeedsSenior: false, retiresTable: false, updated: updated, printLabel: label);
     }
     return BillPrintScope(
-      print: !printed,
-      reprintNeedsSenior: printed,
-      retiresTable: printed,
+      print: !printed || updated,
+      reprintNeedsSenior: printed && !updated,
+      retiresTable: false,
+      updated: updated,
+      printLabel: label,
     );
   }
 }

@@ -4,11 +4,12 @@
 /// should be a duplicate table showing same number for order taking for the
 /// next round of guests."
 ///
-/// The disappearing is C3 and it stays ([BillPrintScope]): once a waiter prints
-/// a table's bill, that PARTY is off their floor. What they were missing is the
-/// NUMBER. The server now opens a second seat for it — a real table row called
-/// "12 #2" whose `parent_table` is "12" — when a bill is printed, and retires it
-/// once it is idle. On /get-tables it arrives as:
+/// The disappearing was C3. 2.0.1 kept it and gave back the NUMBER: the server
+/// opens a second seat — a real table row called "12 #2" whose `parent_table`
+/// is "12" — when a bill is printed, and retires it once it is idle. 2.0.2
+/// (client items 1 and 2) keeps the printed table on the floor too, in orange,
+/// with that seat green beside it (models/floor_state.dart). On /get-tables the
+/// seat arrives as:
 ///
 ///   table_name    "12 #2"   the handle every route addresses it by
 ///   parent_table  "12"      null on every other table
@@ -147,9 +148,13 @@ class BillPrintedRefusal {
     required this.table,
     required this.nextPartyTable,
     required this.actionLabel,
+    this.addToPrintedLabel,
   });
 
-  /// The server's sentence, shown as it stands.
+  /// The server's sentence, shown as it stands — its 2.0.2 one
+  /// (`add_to_printed_message`) when it also offers [addToPrintedLabel],
+  /// because the 2.0.1 sentence sends the waiter to a manager for the very
+  /// thing that button does.
   final String message;
 
   /// The printed table.
@@ -161,6 +166,12 @@ class BillPrintedRefusal {
   /// The button's label, or null when there is no button to draw.
   final String? actionLabel;
 
+  /// 2.0.2 (client items 1 and 2): the server's label for "add these to the
+  /// printed bill anyway" — "Add to 12's printed bill" — or null when it did
+  /// not offer one (a guest, a merge, a move, or a server older than 2.0.2).
+  /// Pressing it sends the same order again with [addToPrintedBillKey].
+  final String? addToPrintedLabel;
+
   /// Null unless [body] is a `bill_printed` refusal.
   static BillPrintedRefusal? parse(Object? body, {String? fallbackMessage}) {
     if (body is! Map || _str(body, 'code') != billPrintedCode) return null;
@@ -168,7 +179,9 @@ class BillPrintedRefusal {
     final next = _str(body, 'next_party_table');
     final elsewhere = next.isNotEmpty && next.toLowerCase() != table.toLowerCase();
     final label = _str(body, 'next_party_action');
-    final message = _str(body, 'error');
+    final addLabel = _str(body, 'add_to_printed_action');
+    final addMessage = addLabel.isNotEmpty ? _str(body, 'add_to_printed_message') : '';
+    final message = addMessage.isNotEmpty ? addMessage : _str(body, 'error');
     return BillPrintedRefusal(
       message: message.isNotEmpty
           ? message
@@ -176,8 +189,92 @@ class BillPrintedRefusal {
       table: table,
       nextPartyTable: elsewhere ? next : null,
       actionLabel: elsewhere ? (label.isNotEmpty ? label : takeItOnLabel(next)) : null,
+      addToPrintedLabel: addLabel.isNotEmpty ? addLabel : null,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT ITEMS 1 AND 2 — ADDING TO A PRINTED BILL, ON PURPOSE
+// ---------------------------------------------------------------------------
+//
+// "If a bill is printed on a table (not settled), there should still be an
+// option to add more items onto the existing bill." The server lets a waiter do
+// it only when the write says `add_to_printed_bill: true`, and this app sends
+// that only after the waiter has seen what it means and chosen it over the
+// green seat beside the table. The words are the web dashboard's too
+// (src/lib/next-party.ts).
+
+/// The body key the server reads (Restaurant_Backend next_party.ts
+/// ADD_TO_PRINTED_BILL_KEY). Only a literal `true` counts there.
+const String addToPrintedBillKey = 'add_to_printed_bill';
+
+/// "Add to 12's printed bill" — the server's addToPrintedBillLabel.
+String addToPrintedBillLabel(String table, {String? parentTable}) =>
+    "Add to ${tableSentenceName(table, parentTable: parentTable)}'s printed bill";
+
+/// The orange tile's first control, and the confirm's primary action.
+const String addToPrintedBillAction = 'Add to printed bill';
+
+/// "Use green 12" — the confirm's other action: the next party's seat.
+String useGreenTableLabel(String root) => 'Use green ${root.trim()}';
+
+/// THE CONFIRM, in one sentence: "12's bill was printed at 13:32. These items
+/// go on that bill and it must be printed again. New guests? Use the green 12."
+/// [printedClock] is '' when the print time is unknown; [hasGreen] is whether
+/// there is a green seat to send new guests to.
+String addToPrintedBillConfirm({
+  required String table,
+  String? parentTable,
+  String? printedClock,
+  required bool hasGreen,
+}) {
+  final named = tableSentenceName(table, parentTable: parentTable);
+  final parent = (parentTable ?? '').trim();
+  final root = parent.isNotEmpty ? parent : (parseNextPartyName(table)?.root ?? table.trim());
+  final when = (printedClock ?? '').trim();
+  final printed = when.isNotEmpty ? "$named's bill was printed at $when." : "$named's bill has been printed.";
+  final green = hasGreen ? ' New guests? Use the green $root.' : '';
+  return '$printed These items go on that bill and it must be printed again.$green';
+}
+
+/// The strip across the order pad while it is adding to printed paper.
+String addingToPrintedBillStrip(String table, {String? parentTable}) =>
+    "Adding to ${tableSentenceName(table, parentTable: parentTable)}'s printed bill";
+
+/// The FAMILY a /get-tables row belongs to: the root's name for a next-party
+/// seat, its own otherwise, folded for comparison. "12" and "12 #2" are one
+/// table.
+String tableFamilyKey(Map row) => (parentTableOf(row) ?? _str(row, 'table_name')).toLowerCase();
+
+/// Are these two rows the SAME PHYSICAL TABLE? The server refuses a party move
+/// between them (Restaurant_Backend next_party.ts sameTableFamily), so the move
+/// picker never offers one.
+bool sameTableFamily(Map a, Map b) {
+  final key = tableFamilyKey(a);
+  return key.isNotEmpty && key == tableFamilyKey(b);
+}
+
+/// THE GREEN SEAT BESIDE A PRINTED TABLE: the family's free member other than
+/// [printedRow] — the root when it is free, else the lowest-numbered free
+/// next-party seat, the choice the server makes (freeFamilySeat). Null when the
+/// whole family is busy. [isFree] is the floor's own answer.
+Map? greenSeatFor(Map printedRow, List rows, bool Function(Map row) isFree) {
+  final self = _str(printedRow, 'table_name').toLowerCase();
+  final free = [
+    for (final r in rows)
+      if (r is Map &&
+          sameTableFamily(printedRow, r) &&
+          _str(r, 'table_name').toLowerCase() != self &&
+          isFree(r))
+        r,
+  ];
+  for (final r in free) {
+    if (!isNextPartyRow(r)) return r;
+  }
+  int seq(Map r) => (r['party_no'] is num) ? (r['party_no'] as num).toInt() : 1 << 30;
+  free.sort((a, z) => seq(a).compareTo(seq(z)));
+  return free.isEmpty ? null : free.first;
 }
 
 /// "12's bill was already printed, so the paper no longer shows this. Reprint

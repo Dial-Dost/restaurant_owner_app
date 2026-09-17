@@ -196,6 +196,14 @@ abstract final class GaiaColors {
     textPrimary: text,
     textSecondary: text2,
     textTertiary: text3,
+    // The floor's inks in the wood (client items 1 and 2): sage for free, coral
+    // for running, the next-party chip in text2. See AppShellScheme.floorFree.
+    floorFree: Color(0xFF9BC4A0),
+    floorSeated: Color(0xFFE2C458),
+    floorRunning: Color(0xFFD9705F),
+    floorPrinted: Color(0xFFF0934A),
+    floorReserved: Color(0xFF8FB0D0),
+    floorNextParty: text2,
   );
 
   /// Champagne, expressed as a Rustic accent ramp.
