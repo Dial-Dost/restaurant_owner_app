@@ -56,11 +56,15 @@ class TableKotGroup {
   /// "KOT 5 · 14:57" — the header staff match against the docket on the pass.
   /// The time is the restaurant's wall clock (see [RestaurantTime]); a block
   /// whose order carries no readable timestamp shows the number alone.
+  ///
+  /// CLIENT ITEM 4: a ticket moved here from another table says so — "KOT 65 ·
+  /// 16:27 · from 12" — which is what the pass's correction docket says too.
   String get header {
     final at = placedAt.isEmpty || RestaurantTime.wallOf(placedAt) == null
         ? ''
         : RestaurantTime.clock(placedAt);
-    return at.isEmpty ? label : '$label · $at';
+    final from = order == null ? null : movedFromLabel(order!);
+    return [label, if (at.isNotEmpty) at, ?from].join(' · ');
   }
 }
 
@@ -137,14 +141,25 @@ List<Map<String, dynamic>> _kotOrderLines(Map o) {
   ];
 }
 
-/// 1.3 — MAY THIS PERSON CANCEL A KOT FROM THE TABLE PREVIEW.
+/// 1.3 — MAY THIS PERSON CANCEL A KOT FROM THE TABLE PREVIEW (or pick
+/// "Cancelled" for a ticketed order on the stage sheet).
 ///
-/// Yes when they can take either of the two routes [_cancelOrder] chooses
-/// between: the strict void (its own capability) or the plain cancel, which the
-/// server gates on "Add Orders". Hidden otherwise, rather than drawn as a button
-/// that 403s.
-bool _mayCancelKot(Profile p) =>
-    _mayDo(p, Capability.voidOrder, _permVoidOrder) || _holdsAction(p, _permAddOrders);
+/// CLIENT ITEM 3 (2026-09-17): "On the waiter dashboard, Cancel KOT option
+/// should be removed." The server's `cancel_kot` answers it — false for a
+/// waiter-only login, whatever it was granted, because every route that can
+/// cancel a ticketed order now refuses one (`cancel_needs_senior`). Against a
+/// backend older than the flag the answer is worked out the way it always was
+/// (either of the two routes [_cancelOrder] chooses between: the strict void or
+/// the plain cancel on "Add Orders"), less a waiter-only login.
+///
+/// A PENDING order's "Decline" does not ask this: it was never ticketed, and a
+/// waiter keeps it.
+bool _mayCancelKot(Profile p) => RoleScope.may(
+      p,
+      Capability.cancelKot,
+      fallback: !RoleScope.isWaiterOnly(p) &&
+          (_mayDo(p, Capability.voidOrder, _permVoidOrder) || _holdsAction(p, _permAddOrders)),
+    );
 
 /// One separated KOT block: the header (number, time, Cancel KOT) and its lines.
 class _TableKotBlock extends StatelessWidget {

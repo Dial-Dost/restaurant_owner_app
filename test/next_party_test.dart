@@ -1030,8 +1030,12 @@ void main() {
       expect(pad, isNot(contains('e.status == 409')));
       final mod = read('lib/screens/modules.dart');
       expect(mod, contains("final res = await widget.rest.post('/bills/move-item',"));
-      expect(mod, contains('final reprint = ReprintNeeded.parse(res, fallbackTable: dest);'));
-      expect(mod, contains("await askToReprint(context, widget.rest, reprint,\n            messenger: messenger, lead: 'Moved \$name to Table \$dest.');"));
+      // Client item 4: both moves read EVERY reprint their answer asks for (a
+      // move changes two bills) through one helper, which offers each in turn.
+      expect(mod, contains('await _afterMoveReprints(messenger, res, fallbackTable: dest, lead: said);'));
+      expect(mod, contains('final reprints = ReprintNeeded.parseAll(res, fallbackTable: fallbackTable);'));
+      expect(mod, contains("final res = await widget.rest.post(\n        '/tables/move-order',"));
+      expect(mod, contains('await askToReprint(context, widget.rest, reprint,\n          messenger: messenger,\n          lead: first ? lead : null,'));
       expect(mod, contains("final res = await widget.rest.post('/bills/merge',"));
       expect(mod, contains('final reprint = ReprintNeeded.parse(res, fallbackTable: _name);'));
       expect(mod, contains('printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);'));

@@ -17,10 +17,12 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/cancel_kot.dart';
 import '../models/gross_net.dart';
 import '../models/kot_copy.dart';
 import '../models/kot_docket_settings.dart';
 import '../models/next_party.dart';
+import '../models/order_moves.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -3556,8 +3558,19 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
 
             final title = Text('Table ${_s(o, 'table')}',
                 style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis);
-            final desc = Text('${_s(o, 'customer', 'Guest')} · ${items.length} item(s)',
-                style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis);
+            // CLIENT ITEM 4: a ticket a dish move emptied says what left it and
+            // where ("Moved to 31: 1 × NOT YOUR PUCHKA"), not "0 item(s)"; a
+            // ticket that arrived by a move says where from.
+            final movedAway = movedAwayLine(o);
+            final movedFrom = _s(o, 'moved_from', '');
+            final desc = Text(
+                movedAway != null && items.isEmpty
+                    ? movedAway
+                    : '${_s(o, 'customer', 'Guest')} · ${items.length} item(s)',
+                key: ValueKey('order-desc-${o['id']}'),
+                style: text.bodySmall,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis);
             final emoji = orderType == 'delivery'
                 ? '🛵'
                 : orderType == 'takeaway'
@@ -3580,6 +3593,8 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   // no `kot_nos` must not grow a "KOT —" line implying the
                   // ticket was never sent to the kitchen.
                   if (kotLabel.isNotEmpty) _kv('KOT', kotLabel),
+                  if (movedFrom.isNotEmpty) _kv('Moved from', 'Table $movedFrom'),
+                  if (movedAway != null) _kv('Moved', movedAway),
                   _kv('Placed', placedLabel.isEmpty ? '\u2014' : placedLabel),
                   _kv('Taken by', _s(o, 'taken_by_employee_name', '\u2014')),
                   // D2's span as a line rather than a chip. Not live here — a
@@ -3726,9 +3741,15 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                     Text(_money(o['total']), style: text.titleSmall),
                   ],
                 ]),
-                if (stale || focused || orderType != 'dine_in') ...[
+                if (stale || focused || orderType != 'dine_in' || movedFrom.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (movedFrom.isNotEmpty)
+                      InfoChip(
+                        key: ValueKey('order-moved-from-${o['id']}'),
+                        icon: Icons.move_down,
+                        label: 'Moved from $movedFrom',
+                      ),
                     if (stale)
                       StatusChip(
                         label: 'Over 24h · unsettled',
@@ -3776,7 +3797,9 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                               rest: rest,
                               profile: p,
                               orderId: '${o['id']}',
-                              value: voidValue(o['total']))) {
+                              value: voidValue(o['total']),
+                              // Never ticketed: a waiter keeps this (item 3).
+                              pending: true)) {
                             reload();
                           }
                         },
@@ -8470,22 +8493,6 @@ const double _kReservedWash = 0.13;
   return (label: 'Free', color: AppColors.neutral);
 }
 
-/// A one-line description of an order, for a picker that has to let somebody
-/// tell two tickets on the same table apart: how many lines and what it is
-/// worth. Falls back to the id only when the payload carries neither, so a row
-/// is never blank.
-String _kotSummary(Map order) {
-  // `/orders` carries `items` and `total` on the row itself; the nested `food`
-  // map is an older shape, still honoured so nothing that sends it goes blank.
-  final food = order['food'] is Map ? order['food'] as Map : order;
-  final items = (food['items'] as List?) ?? const [];
-  final total = food['total'] ?? food['subtotal'];
-  final n = items.length;
-  final money = total == null ? '' : ' \u00b7 ${_money(total)}';
-  if (n == 0 && money.isEmpty) return 'Order ${_s(order, 'id')}';
-  return '$n item${n == 1 ? '' : 's'}$money';
-}
-
 /// Card width for one floor-plan tile inside a zone [available] px wide.
 ///
 /// 168 is the design width and every desktop column keeps it. A portrait phone
@@ -9591,19 +9598,43 @@ class _TableSheetState extends State<_TableSheet> {
     if (dest == null || dest.isEmpty) return;
     try {
       final res = await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
-      // CLIENT ITEM 6: moved onto a table whose bill is already printed — its
-      // paper is now short, and the line offers the reprint of THAT table.
-      final reprint = ReprintNeeded.parse(res, fallbackTable: dest);
-      if (reprint == null) {
-        messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
-      } else if (mounted) {
-        await askToReprint(context, widget.rest, reprint,
-            messenger: messenger, lead: 'Moved $name to Table $dest.');
-      }
+      // CLIENT ITEM 4: the answer names the dish and whether its docket is
+      // printing on the new table, under the KOT number the pass knows it by.
+      final said = movedItemSentence(toTable: dest, dishes: movedDishesOf(res), fallbackName: name, response: res);
+      await _afterMoveReprints(messenger, res, fallbackTable: dest, lead: said);
       await _loadBill();
       widget.reload();
     } catch (e) {
+      // A comped dish is refused in the server's words ("Reverse the comp
+      // first, then move it."), as is a printed bill.
       messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  /// What a move tells the person who pressed it: [lead] as a snackbar, or —
+  /// when the move changed a bill whose paper is already in a guest's hand —
+  /// one "Reprint the bill?" for each such table (CLIENT ITEMS 4 and 6). A move
+  /// changes two bills, so there can be two; this sheet's own table is reprinted
+  /// with its own Print.
+  Future<void> _afterMoveReprints(
+    ScaffoldMessengerState messenger,
+    Object? res, {
+    required String fallbackTable,
+    required String lead,
+  }) async {
+    final reprints = ReprintNeeded.parseAll(res, fallbackTable: fallbackTable);
+    if (reprints.isEmpty) {
+      messenger.showSnackBar(SnackBar(key: const ValueKey('move-result'), content: Text(lead)));
+      return;
+    }
+    var first = true;
+    for (final reprint in reprints) {
+      if (!mounted) return;
+      await askToReprint(context, widget.rest, reprint,
+          messenger: messenger,
+          lead: first ? lead : null,
+          printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);
+      first = false;
     }
   }
 
@@ -10055,6 +10086,11 @@ class _TableSheetState extends State<_TableSheet> {
     // One ticket needs no picker; several do, and each row has to say enough to
     // tell them apart — what is on it, what it is worth, and whether the kitchen
     // has already been told.
+    //
+    // CLIENT ITEM 4: each row is the ticket as the pass knows it ("KOT 65") and
+    // the dishes on it — the picker used to say "3 items · ₹1427.00", which is
+    // not how anybody tells two tickets apart. The money stays only for a login
+    // that is shown money.
     var order = mine.length == 1 ? mine.first as Map : null;
     order ??= await showDialog<Map>(
         context: context,
@@ -10062,17 +10098,33 @@ class _TableSheetState extends State<_TableSheet> {
           title: Text('Which order on $_name?'),
           children: [
             for (final o in mine)
-              SimpleDialogOption(
-                onPressed: () => Navigator.pop(ctx, o as Map),
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(_orderBarked(o) ? Icons.receipt_long : Icons.hourglass_empty),
-                  title: Text(_kotSummary(o)),
-                  subtitle: Text(_orderBarked(o)
-                      ? 'The kitchen has this one'
-                      : 'Not sent to the kitchen yet'),
-                ),
-              ),
+              Builder(builder: (_) {
+                final row = moveOrderPickerRow(o as Map);
+                final id = _s(o, 'id');
+                return SimpleDialogOption(
+                  key: ValueKey('move-order-pick-$id'),
+                  onPressed: () => Navigator.pop(ctx, o),
+                  child: ListTile(
+                    dense: true,
+                    isThreeLine: row.dishes.isNotEmpty,
+                    leading: Icon(_orderBarked(o) ? Icons.receipt_long : Icons.hourglass_empty),
+                    title: Text(
+                      _scope.money ? '${row.title} · ${_money(o['total'] ?? o['subtotal'])}' : row.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      [
+                        if (row.dishes.isNotEmpty) row.dishes,
+                        _orderBarked(o) ? 'The kitchen has this one' : 'Not sent to the kitchen yet',
+                      ].join('\n'),
+                      key: ValueKey('move-order-dishes-$id'),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                );
+              }),
           ],
         ),
       );
@@ -10118,15 +10170,12 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (dest == null || dest.isEmpty || !mounted) return;
     final barked = _orderBarked(order);
+    // The confirm names WHAT is moving — every dish, even when there was only
+    // one ticket and so no picker — before what the kitchen will see.
     final ok = await _confirm(
       context,
       'Move this order to $dest?',
-      barked
-          ? 'The kitchen already has a docket for $_name, so a correction docket '
-            'prints for $dest with the same KOT number. $_name keeps its guests '
-            'and its other orders.'
-          : 'The kitchen has not been sent this order yet, so nothing prints now — '
-            'it will print for $dest when it is sent.',
+      moveOrderConfirmBody(order: order, fromTable: _name, toTable: dest, barked: barked),
     );
     if (!ok) return;
     try {
@@ -10135,13 +10184,16 @@ class _TableSheetState extends State<_TableSheet> {
         {'order_id': _s(order, 'id'), 'to_table': dest},
       );
       final print = res is Map ? res['print'] : null;
-      final kotNo = print is Map ? print['kot_no'] : null;
-      final printed = print is Map && print['printed'] == true;
-      messenger.showSnackBar(SnackBar(
-        content: Text(printed
-            ? 'Moved to $dest. Correction docket KOT-$kotNo is printing — tell the pass.'
-            : 'Moved to $dest. Nothing was on the pass for it, so no docket printed.'),
-      ));
+      final served = movedDishesOf(res);
+      final said = movedOrderSentence(
+        toTable: dest,
+        printed: print is Map && print['printed'] == true,
+        kotNo: print is Map ? print['kot_no'] : null,
+        dishes: served.isNotEmpty ? served : orderDishLines(order),
+      );
+      // A senior moving between printed bills is offered both reprints (the
+      // server refuses a waiter-only login outright, in its own words).
+      await _afterMoveReprints(messenger, res, fallbackTable: dest, lead: said);
       _popAndReload();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -11622,6 +11674,9 @@ Future<bool> _confirm(BuildContext context, String title, String message) async 
   final ok = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
+      // A move's confirm names every dish it carries (client item 4); on a
+      // 360dp phone that list must scroll rather than overflow.
+      scrollable: true,
       title: Text(title),
       content: Text(message),
       actions: [
@@ -12812,12 +12867,16 @@ Future<void> _changeOrderStatus(
   // Un-barked orders must pass the Barked step before they can be cooked/served —
   // BUT a Pending order isn't approved to the kitchen yet, so it can't be barked
   // until it's accepted (Preparing). Don't offer 'Barked' while Pending.
-  final isPending = current.toLowerCase() == 'pending';
+  final isPending = orderIsPending(current);
+  // CLIENT ITEM 3 — "Cancelled" on a ticketed order is Cancel KOT by another
+  // name, so it is offered exactly where Cancel KOT is. A Pending order's
+  // "Cancelled" is a decline, and a waiter keeps it.
+  final mayCancel = isPending || profile == null || _mayCancelKot(profile);
   final stages = <String>[
     if (!barked && !isPending) 'Barked',
     'Preparing',
     if (barked) 'Served',
-    'Cancelled',
+    if (mayCancel) 'Cancelled',
   ];
   final messenger = ScaffoldMessenger.of(context);
   // A settled bill is view-once: its order status is locked and cannot change.
@@ -12976,7 +13035,7 @@ Future<void> _changeOrderStatus(
     // The stage sheet above was awaited, so the screen may be gone; a reason
     // form opened against a dead context is a form nobody can dismiss.
     if (!context.mounted) return;
-    if (await _cancelOrder(context, rest: rest, profile: profile, orderId: orderId, value: value)) {
+    if (await _cancelOrder(context, rest: rest, profile: profile, orderId: orderId, value: value, pending: isPending)) {
       reload();
     }
     return;
@@ -13781,6 +13840,12 @@ class _KdsCardState extends State<_KdsCard> {
 ///
 /// Returns true when the order was cancelled, false when the user backed out or
 /// the write failed — so the caller reloads only when something changed.
+///
+/// CLIENT ITEM 3 — [pending] says the order has never been ticketed (a Decline).
+/// Anything else is a KOT the kitchen holds, and a login that may not cancel one
+/// ([_mayCancelKot]) is told so here, in the server's words, and nothing is
+/// sent: the buttons are already hidden, and this is what stops a call site
+/// added later from quietly re-opening the path.
 Future<bool> _cancelOrder(
   BuildContext context, {
   required RestClient rest,
@@ -13788,12 +13853,23 @@ Future<bool> _cancelOrder(
   required String orderId,
   String what = 'this order',
   String value = '',
+  bool pending = false,
 }) async {
   final messenger = ScaffoldMessenger.of(context);
+  if (!pending && profile != null && !_mayCancelKot(profile)) {
+    messenger.showSnackBar(SnackBar(
+      key: const ValueKey('cancel-needs-senior'),
+      content: Text(cancelNeedsSeniorSentence(const [])),
+    ));
+    return false;
+  }
   // WHOEVER CAN GIVE THE FULLER ANSWER IS ASKED FOR IT. The void form records a
   // kind, a reason AND an authoriser against the order in one transaction, which
-  // is what the Void KOT report is built to read.
-  if (profile != null && _mayDo(profile, Capability.voidOrder, _permVoidOrder)) {
+  // is what the Void KOT report is built to read. Not a waiter-only login's
+  // decline, though: the server refuses that login the void route for anything
+  // but a Pending order, and a manager's name is not what declining a QR order
+  // should cost.
+  if (profile != null && _mayCancelKot(profile) && _mayDo(profile, Capability.voidOrder, _permVoidOrder)) {
     return misVoidOrder(context, rest: rest, profile: profile, orderId: orderId,
         what: what, value: value);
   }

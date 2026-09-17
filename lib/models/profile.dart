@@ -40,7 +40,14 @@ enum Capability {
   viewRoles('view_roles'),
 
   /// POST /roles — who may create and edit a custom role.
-  manageRoles('manage_roles');
+  manageRoles('manage_roles'),
+
+  /// "Cancel KOT" on the table sheet and "Cancelled" on the stage sheet —
+  /// cancelling food the kitchen has been told about (client item 3). FALSE
+  /// for a waiter-only login even when it holds [voidOrder]: the server
+  /// refuses every such cancel with `cancel_needs_senior`. A PENDING order's
+  /// "Decline" does not read this.
+  cancelKot('cancel_kot');
 
   const Capability(this.wireKey);
 
