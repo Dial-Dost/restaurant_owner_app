@@ -28,7 +28,12 @@ class ApiException implements Exception {
   /// half never has to reach for the human-readable one.
   final String? serverError;
 
-  ApiException(this.message, [this.status, this.details, this.serverError]);
+  /// The decoded refusal body, whole, for the few refusals a screen ACTS on
+  /// rather than only shows — client item 6's `{code: "bill_printed",
+  /// next_party_table}` is the first. Null when the body was not JSON.
+  final Map? body;
+
+  ApiException(this.message, [this.status, this.details, this.serverError, this.body]);
 
   /// THE ONE PLACE A NON-2xx BODY BECOMES WORDS.
   ///
@@ -71,6 +76,7 @@ class ApiException implements Exception {
       status,
       details,
       serverError,
+      decoded is Map ? decoded : null,
     );
   }
 

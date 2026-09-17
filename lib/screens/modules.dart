@@ -18,6 +18,9 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../config.dart';
 import '../models/bill_round_off.dart';
 import '../models/gross_net.dart';
+import '../models/kot_copy.dart';
+import '../models/kot_docket_settings.dart';
+import '../models/next_party.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -51,10 +54,12 @@ import '../ui/widgets/time_slot_picker.dart';
 import '../widgets/appearance_card.dart';
 import '../models/menu_badge.dart';
 import '../models/payment_modes.dart';
+import '../models/nc_settle.dart';
 import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
+import '../widgets/reprint_needed.dart';
 import '../widgets/outbox_chip.dart';
 import '../widgets/table_bill.dart';
 import 'order_entry.dart';
@@ -216,10 +221,17 @@ String _fmtDay(String iso) => iso.isEmpty ? '' : RestaurantTime.day(iso);
 String _fmtClock(String iso) => iso.isEmpty ? '' : RestaurantTime.clock(iso);
 
 // Pick a table from a dropdown of all tables (shows occupancy). Returns the name.
+//
+// A booking's table, so the ROOM's tables only: a next-party seat ("12 #2",
+// client item 6) exists while 12's bill is unpaid and is gone minutes later,
+// and the server refuses a booking on one.
 Future<String?> _pickTable(BuildContext context, RestClient rest) async {
   List tables;
   try {
-    tables = await rest.getList('/get-tables');
+    tables = [
+      for (final t in await rest.getList('/get-tables'))
+        if (!isNextPartyRow(t as Map)) t,
+    ];
   } catch (e) {
     if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     return null;
@@ -1322,6 +1334,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
   final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone · $offset');
   final byMethod = _headlineByMethod(context, h, columns: columns);
+  final ncToday = _headlineNc(context, h);
 
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
@@ -1376,6 +1389,11 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
         if (byMethod != null) ...[
           const SizedBox(height: AppSpacing.lg),
           byMethod,
+        ],
+        // BESIDE the by-method block, never inside it (client item 5).
+        if (ncToday != null) ...[
+          const SizedBox(height: AppSpacing.lg),
+          ncToday,
         ],
       ]),
     ),
@@ -1528,6 +1546,36 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       ),
     ],
   ]);
+}
+
+/// NON-CHARGEABLE TODAY, under the by-method block (client item 5). A bill
+/// settled as NC took 0.00, so it has no row among the modes (the server drops
+/// ₹0 rows there), and folding its value into them would put money in the
+/// drawer that never came in. So it is its own labelled line — `today_nc`,
+/// server-authored — shown even on a day when no mode took anything. The web
+/// `headline-stats.tsx` draws the same line. Null when there is nothing today,
+/// or the payload is from a backend without it.
+Widget? _headlineNc(BuildContext context, Map h) {
+  final nc = NcSettle.headlineNc(h);
+  if (nc == null) return null;
+  final text = Theme.of(context).textTheme;
+  return Column(
+    key: const ValueKey('headline-nc'),
+    crossAxisAlignment: CrossAxisAlignment.start,
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+      const SizedBox(height: 4),
+      Text(NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v)), style: text.titleSmall),
+      if (nc.hint.isNotEmpty) ...[
+        const SizedBox(height: 3),
+        Text(nc.hint,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+      ],
+    ],
+  );
 }
 
 /// The Accounting window the by-method drill-down jumps to: the day the sheet
@@ -1993,8 +2041,13 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
         int countWhere(List l, bool Function(Map) f) => l.where((e) => f(e as Map)).length;
 
         final tablesBelow = countWhere(tables, (t) => t['apc_status'] == 'red' || t['apc_status'] == 'yellow');
-        final occupied = countWhere(tables, (t) => t['occupied'] == true);
-        final totalTables = tables.length;
+        // "N of M tables occupied" counts the ROOM (client item 6): the next
+        // party's seat at a printed 12 is a second name for a table already in
+        // M, and 12 is occupied while either has a party. Every party still
+        // counts in the covers below.
+        final roomUse = countRoomsInUse(tables, (t) => t['occupied'] == true);
+        final occupied = roomUse.inUse;
+        final totalTables = roomUse.rooms;
 
         final text = Theme.of(context).textTheme;
         final width = MediaQuery.sizeOf(context).width;
@@ -6907,8 +6960,17 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         //
         // Only on the SERVICE surface. The floor plan is a picture of the room,
         // and a room with a table missing out of it is not a floor plan.
-        final rows = surface != FloorSurface.service
-            ? allRows
+        //
+        // CLIENT ITEM 6 — AND THE ROOM HAS NO "12 #2" IN IT. A next-party seat
+        // ([isNextPartyRow]) is a second name for a table the plan already
+        // draws, opened by the server when 12's bill was printed and retired
+        // once it is idle; it is not furniture, so the layout editor never
+        // shows it. On the service surface it is an ordinary row and passes
+        // the C3 filter below on ITS OWN print state: the printed party at 12
+        // leaves the waiter's grid, and the tile for the next party at 12 is
+        // exactly what they are left with.
+        final List rows = surface != FloorSurface.service
+            ? [for (final r in allRows) if (!isNextPartyRow(r as Map)) r]
             : [
                 for (final r in allRows)
                   if (!BillPrintScope.of(p,
@@ -6936,8 +6998,16 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         // legend can never disagree with what is on screen.
         final occ = rows.where((r) => _tableState(r as Map).label == 'Occupied').length;
         final waiting = rows.where((r) => _tableState(r as Map).label == 'Seated').length;
-        final res = rows.where((r) => _tableState(r as Map).label == 'Reserved').length;
-        final free = rows.length - occ - waiting - res;
+        // A PARTY at "12 #2" is counted like any other (it is somebody to
+        // serve), but an idle next-party seat is not a free TABLE — 12 is
+        // already counted — and it carries 12's booking, so it would count a
+        // reservation twice. Free and Reserved are the room's.
+        final res = rows
+            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Reserved')
+            .length;
+        final free = rows
+            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Free')
+            .length;
         // A caller (an order notification's "Open T4") asked us to focus a table.
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
@@ -6985,7 +7055,10 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
               label: 'Delete a table',
               icon: Icons.delete_outline,
               dense: true,
-              onPressed: () => _deleteTableFromHeader(context, rest, allRows, reload),
+              // Room tables only: the server refuses a next-party seat, which
+              // closes by itself once it is idle (client item 6).
+              onPressed: () => _deleteTableFromHeader(
+                  context, rest, [for (final r in allRows) if (!isNextPartyRow(r as Map)) r], reload),
             ),
         ];
         return Scaffold(
@@ -7021,7 +7094,8 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
               // already taken instead of collecting "Table exists" from the
               // server halfway through.
               existing: [
-                for (final r in rows) _s(r as Map, 'table_name', ''),
+                for (final r in rows)
+                  if (!isNextPartyRow(r as Map)) _s(r, 'table_name', ''),
               ],
             ),
             icon: const Icon(Icons.add),
@@ -8459,7 +8533,14 @@ class _TableBox extends StatelessWidget {
   Widget build(BuildContext context) {
     if (surface == FloorSurface.plan) return _planTile(context);
     final text = Theme.of(context).textTheme;
+    // The HANDLE — what every request, the outbox tag and the paper use.
     final name = _s(table, 'table_name');
+    // CLIENT ITEM 6. "Same number for order taking for the next round of
+    // guests": a next-party seat's tile reads the ROOT's number, big, with a
+    // "Next party" chip beside the state. Its bill and KOT still say "12 #2",
+    // so two open bills for 12 stay apart at the till.
+    final nextParty = isNextPartyRow(table);
+    final shownName = tableDisplayName(table);
     // `occupied` here is the SEATING — a party is physically at this table —
     // and it is what every money-adjacent line below keys on. What the card
     // SAYS is a separate decision with three answers; see _tableState.
@@ -8579,7 +8660,11 @@ class _TableBox extends StatelessWidget {
           children: [
             Row(children: [
               Expanded(
-                child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
+                child: Text(shownName,
+                    key: ValueKey('table-title-$name'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.titleMedium),
               ),
               if (paymentPending) StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
               // Per-table honesty. An order taken during an outage is saved on
@@ -8610,6 +8695,12 @@ class _TableBox extends StatelessWidget {
                       color: stateColor,
                       dense: true),
                 ),
+                if (nextParty)
+                  StatusChip(
+                      key: ValueKey('next-party-chip-$name'),
+                      label: nextPartyChip,
+                      color: AppColors.info,
+                      dense: true),
                 ?apcTick,
               ],
             ),
@@ -9188,16 +9279,32 @@ class _TableSheetState extends State<_TableSheet> {
   // [misServiceChargeBlock] — and a bill that already carries a waiver prints
   // without the charge from here too, because the server applies the waiver to
   // every print.
-  Future<bool> _thermalPrint(ScaffoldMessengerState messenger) async {
+  ///
+  /// CLIENT ITEM 6: every successful print answers `next_party_table` — the
+  /// seat the server opened (or found) for the next guests at this number -
+  /// and the sentence that names it. It is kept in [_nextPartySeat] for the
+  /// caller and said here unless [announceNextParty] is off (the waiter's path
+  /// says it in its own, longer line). The floor behind this sheet is re-read
+  /// so a manager sees the new tile without leaving the bill.
+  Future<bool> _thermalPrint(ScaffoldMessengerState messenger, {bool announceNextParty = true}) async {
     try {
-      await widget.rest.post('/print/bill', {'table_name': _name});
-      messenger.showSnackBar(const SnackBar(content: Text('Printing bill…'), duration: Duration(seconds: 3)));
+      final res = await widget.rest.post('/print/bill', {'table_name': _name});
+      _nextPartySeat = nextPartyAfterPrint(res);
+      final seat = _nextPartySeat.message;
+      final say = announceNextParty && seat != null;
+      messenger.showSnackBar(SnackBar(
+          content: Text(say ? 'Printing bill… $seat' : 'Printing bill…'),
+          duration: Duration(seconds: say ? 6 : 3)));
+      if (_nextPartySeat.table != null) widget.reload();
       return true;
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
       return false;
     }
   }
+
+  /// What the last print said about the next party's seat; see [_thermalPrint].
+  ({String? table, String? message}) _nextPartySeat = (table: null, message: null);
 
   /// C3 — HAS THIS TABLE'S BILL ALREADY BEEN PRINTED?
   ///
@@ -9410,7 +9517,8 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (ok != true) return;
-    if (!await _thermalPrint(messenger)) return;
+    final retires = BillPrintScope.of(widget.profile, printed: true).retiresTable;
+    if (!await _thermalPrint(messenger, announceNextParty: !retires)) return;
     // ---- REQUIREMENT C3: the one print, and what it costs the waiter --------
     //
     // Asked as the state the print PUTS this reader in — "printed: true" — so
@@ -9421,9 +9529,14 @@ class _TableSheetState extends State<_TableSheet> {
     if (!BillPrintScope.of(widget.profile, printed: true).retiresTable) return;
     await PrintedBills.instance.mark(widget.profile.resId, widget.profile.outletId, _name);
     if (!mounted) return;
+    // CLIENT ITEM 6: the table's NUMBER is not gone with it. The line names
+    // the seat the server opened for the next guests ("Seat the next party at
+    // 12 (next party).") — the tile the waiter will find on the floor below.
+    final seat = _nextPartySeat.message;
     messenger.showSnackBar(SnackBar(
-        content: Text('$_name is printed and with a manager to settle. '
-            'It has come off your tables.')));
+        duration: Duration(seconds: seat == null ? 4 : 7),
+        content: Text('${tableSentenceNameOf(widget.table)} is printed and with a manager to settle. '
+            'It has come off your tables.${seat == null ? '' : ' $seat'}')));
     // The sheet closes and the floor reloads WITHOUT this table — that is the
     // whole of "clear/reset from their view". NOTHING IS WRITTEN to the table:
     // it is still occupied, still owes the money, and is still on every
@@ -9477,8 +9590,16 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (dest == null || dest.isEmpty) return;
     try {
-      await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
-      messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      final res = await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
+      // CLIENT ITEM 6: moved onto a table whose bill is already printed — its
+      // paper is now short, and the line offers the reprint of THAT table.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: dest);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      } else if (mounted) {
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger, lead: 'Moved $name to Table $dest.');
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -9794,8 +9915,21 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (src == null || src.isEmpty) return;
     try {
-      await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
-      messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      final res = await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
+      // CLIENT ITEM 6: merged into this table after its bill was printed (the
+      // "same guests, one more round" case) — the paper is short until it is
+      // reprinted, and the line offers exactly that.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: _name);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      } else if (mounted) {
+        // This sheet IS that table: the reprint is its own Print, next-party
+        // line and all.
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger,
+            lead: 'Merged Table $src into $_name.',
+            printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -10173,11 +10307,20 @@ class _TableSheetState extends State<_TableSheet> {
         child: SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Row(children: [
-              Expanded(child: Text('Table $_name', style: text.headlineMedium)),
+              // "Table 12 (next party)" for a next-party seat (client item 6) -
+              // the number the waiter tapped, in the words the web uses too.
+              Expanded(child: Text('Table ${tableSentenceNameOf(widget.table)}', style: text.headlineMedium)),
               StatusChip(label: _state.label, color: _state.color),
             ]),
             const SizedBox(height: 10),
             Wrap(spacing: 6, runSpacing: 6, children: [
+              // ...and the name its KOT and bill will print, so the paper the
+              // cashier holds can be matched to this tile.
+              if (isNextPartyRow(widget.table))
+                InfoChip(
+                    key: const ValueKey('next-party-bill-name'),
+                    icon: Icons.receipt_long_outlined,
+                    label: 'Bill reads $_name'),
               if (_seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: _seats),
               if (_clubbedWith.isNotEmpty)
                 InfoChip(icon: Icons.link, label: 'Clubbed with ${_clubbedWith.join(' + ')}'),
@@ -11041,7 +11184,6 @@ class _BillPreviewDialog extends StatelessWidget {
   });
 
   static double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
-  static double _round2(double v) => (v * 100).roundToDouble() / 100;
 
   /// A percentage as the renderer's template literal prints it: "10", "2.5".
   static String _pct(double p) => p % 1 == 0 ? '${p.toInt()}' : '$p';
@@ -11219,6 +11361,9 @@ class _BillPreviewDialog extends StatelessWidget {
     final date = '${two(stamp.day)}/${two(stamp.month)}/${stamp.year} ${two(stamp.hour)}:${two(stamp.minute)}';
     final chargesService = billPrintsServiceChargeNote(bill);
     final note = qrNote.trim().isEmpty ? _billQrNoteFallback : qrNote.trim();
+    // What the comped lines were worth, disclosed under the total exactly as
+    // escpos.ts discloses it — never a rung of the ladder. Null with no comp.
+    final ncValue = NcSettle.paperNcValue(items);
 
     return Dialog(
       backgroundColor: Colors.transparent,
@@ -11367,12 +11512,15 @@ class _BillPreviewDialog extends StatelessWidget {
                         // `itemLabel` prints it: "Paneer Tikka (Half)".
                         final variation = '${m['variation'] ?? ''}'.trim();
                         final name = _s(m, 'name');
+                        // A COMPED LINE (migration 034) reads "<dish> (NC)" at
+                        // 0.00, as the paper prints it, so the Amount column
+                        // adds up to the Sub Total under it.
                         return _itemRow(
                           col,
-                          variation.isEmpty ? name : '$name ($variation)',
+                          NcSettle.lineLabel(variation.isEmpty ? name : '$name ($variation)', m['nc']),
                           '${qty % 1 == 0 ? qty.toInt() : qty}',
                           price.toStringAsFixed(2),
-                          _round2(price * qty).toStringAsFixed(2),
+                          NcSettle.lineAmount(price, qty, m['nc']).toStringAsFixed(2),
                         );
                       }),
                       _rule(thick: true),
@@ -11405,6 +11553,14 @@ class _BillPreviewDialog extends StatelessWidget {
                       _ladder(col, ['Grand Total'], _money(grandTotal),
                           style: const TextStyle(fontSize: 17, height: 1.25, fontWeight: FontWeight.w800, color: Colors.black)),
                       _rule(),
+                      // Beside the ladder, never in it — escpos.ts's order.
+                      if (ncValue != null) ...[
+                        KeyedSubtree(
+                          key: const ValueKey('bill-preview-nc-value'),
+                          child: _ladder(col, ['NC value (not charged)'], ncValue.toStringAsFixed(2)),
+                        ),
+                        _rule(),
+                      ],
                       // THE FOOTER. The disclaimer first, bold, straight under the
                       // total it is about — a guest reads it before deciding what
                       // to pay — and only when the guest is being charged for
@@ -11652,7 +11808,10 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
         Text('Add inventory items first to build a recipe.', style: text.bodySmall)
       else
         for (int i = 0; i < _recipe.length; i++)
-          Row(children: [
+          // Keyed on the row itself (see [_groupCard]): the quantity box is an
+          // initialValue field, so without it removing a row left its quantity
+          // on screen beside the next ingredient.
+          Row(key: ObjectKey(_recipe[i]), children: [
             Expanded(
               flex: 3,
               child: DropdownButtonFormField<String>(
@@ -11676,7 +11835,11 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
                 onChanged: (v) => _recipe[i]['qty'] = double.tryParse(v) ?? 0,
               ),
             ),
-            IconButton(icon: const Icon(Icons.close, size: 16), onPressed: () => setState(() => _recipe.removeAt(i))),
+            IconButton(
+              icon: const Icon(Icons.close, size: 16),
+              tooltip: 'Remove ingredient',
+              onPressed: () => setState(() => _recipe.removeAt(i)),
+            ),
           ]),
     ]);
   }
@@ -11724,7 +11887,15 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
   Widget _groupCard(int gi) {
     final g = _modifiers[gi];
     final options = g['options'] as List;
+    // THE ROWS ARE KEYED ON THEIR OWN MAPS — found by the item 3 (2.0.1) sweep.
+    // These boxes are `TextFormField(initialValue:)`, which reads the value once,
+    // when the field is first built. Unkeyed, removing a group or an option that
+    // was not the last one shifted the list under fields that kept their text:
+    // the removed "Medium +40" stayed on screen, "Large +80" vanished, and a
+    // price typed into the box reading +40 was saved as Large's. Each map is its
+    // own object (never a const literal), so ObjectKey follows the row itself.
     return Padding(
+      key: ObjectKey(g),
       padding: const EdgeInsets.only(bottom: 8),
       child: ForkCard(
         inset: true,
@@ -11766,7 +11937,7 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
             ),
           ]),
           for (int oi = 0; oi < options.length; oi++)
-            Row(children: [
+            Row(key: ObjectKey(options[oi]), children: [
               Expanded(
                 flex: 3,
                 child: TextFormField(
@@ -11787,6 +11958,7 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
               ),
               IconButton(
                 icon: const Icon(Icons.close, size: 16),
+                tooltip: 'Remove option',
                 onPressed: () => setState(() => options.removeAt(oi)),
               ),
             ]),
@@ -12441,6 +12613,14 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
       setState(() => _error = 'Give the table a name (e.g. T7).');
       return;
     }
+    // "12 #2" is the server's to make (client item 6): its own sentence,
+    // before the request rather than after it — for every name a run makes.
+    if (_adding &&
+        (isReservedPartyName(name) ||
+            allocateTableNames(name, _runCount, widget.existingNames).names.any(isReservedPartyName))) {
+      setState(() => _error = reservedTableNameError);
+      return;
+    }
     final cap = int.tryParse(_capacity.text.trim());
     final max = int.tryParse(_max.text.trim());
     if (cap == null || cap < 1 || max == null || max < 1) {
@@ -12820,7 +13000,8 @@ Future<void> _changeOrderStatus(
 Widget kdsModule(RestClient rest, Profile p) => _KdsHome(rest: rest);
 
 // True when the order item is a HELD course (waiting to be fired).
-bool _itemHeld(Map m) => m['course_hold'] == true && (m['fired_at'] == null || '${m['fired_at']}'.isEmpty);
+// The one held-course predicate, shared with the local KOT copy's totals.
+bool _itemHeld(Map m) => kotLineHeld(m);
 
 // "Barked" step: un-barked orders sit greyed with idle timers until the expo
 // barks them to the kitchen. Missing field (older backend) counts as barked.
@@ -13557,7 +13738,7 @@ class _KdsCardState extends State<_KdsCard> {
           ForkIconButton(
             icon: Icons.print_outlined,
             tooltip: 'Print KOT (local PDF copy)',
-            onPressed: () => _printKot(_s(o, 'table'), items),
+            onPressed: () => _printKot({...o, 'items': items}),
           ),
         ]),
       ]),
@@ -13711,77 +13892,107 @@ Future<void> _reprintKot(
   }
 }
 
-/// ROUND 2 ITEM 2 — the line a HELD dish carries directly under itself, in the
-/// slot a note uses, word for word what the thermal docket prints (escpos.ts).
-const String kotHoldLine = '[Hold] Do not cook until fired';
+// THE HOLD LINE, THE NOTE LINE AND THE ITEM BLOCK now live in
+// models/kot_copy.dart (kotHoldLine, kotNoteLine, kotDocket, kotCopyRows): pure,
+// so the kitchen board, this copy and their tests read one definition.
 
-/// The note line under a dish, tagged the way the client's reference docket
-/// tags it and the thermal docket now prints it: `[Note] <note>`.
-String kotNoteLine(String note) => '[Note] $note';
-
-/// One dish on a KOT: its number, name and quantity, and the indented lines
-/// that hang under it — [kotHoldLine] first when it is held, then its note.
-typedef KotDocketRow = ({String no, String name, int qty, bool held, List<String> under});
-
-/// The whole item block of a KOT, laid out once so the PDF copy and its tests
-/// read the same thing.
-typedef KotDocket = ({List<KotDocketRow> rows, int totalQty, int holdQty, bool showTotal, bool showHold});
-
-/// THE ITEM BLOCK OF A KITCHEN TICKET, as the thermal docket lays it out.
+/// THE LOCAL KOT COPY AS A PDF — [kotCopyRows] drawn in the pdf package's
+/// default font, in a column as wide as an 80mm roll prints (72mm).
 ///
-/// ROUND 2 ITEM 2: "Hold order should come after the name of the dish which is
-/// to be put on hold and not before. It should be in the same position like the
-/// way a note appears on the food order." This copy used to lift held lines out
-/// under a `** HOLD **` banner with their own H1/H2 numbering, so the kitchen
-/// read the banner BEFORE the dish it applied to. Now:
+/// ONE TYPE SIZE FOR EVERY LINE, as on the reference docket, where emphasis is
+/// WEIGHT: "KOT", the service mode, the table and each dish name are bold, and
+/// nothing is set larger or in italics. 10pt is the docket's own standard size
+/// (28 dots per em at the printer's 203 dpi is 9.9pt), so the copy matches the
+/// paper the client approved rather than a document. It does NOT follow the
+/// restaurant's KOT text size — that setting sizes the kitchen docket, and this
+/// is a copy for whoever pressed the button.
 ///
-///   * every dish keeps its number and its place in the list, held or not;
-///   * a held dish's first under-line is [kotHoldLine], and a note follows it;
-///   * Total Qty counts only what may be cooked now, and Hold Qty — the held
-///     quantity — sits directly under it. A wholly held docket prints no Total
-///     Qty (a "0" reads as an empty ticket); a docket with nothing held prints no
-///     Hold Qty, exactly as before the feature.
+/// A character the default font cannot draw (a rupee sign, say) prints as the
+/// pdf package's placeholder box rather than failing the copy.
 ///
-/// `_itemHeld` is the same predicate the on-screen ticket dims by, so the card,
-/// the docket and this copy cannot disagree about which lines wait.
+/// `pageFormat` is whatever the print dialog chose: on A4 the column sits at the
+/// top left; on a roll it fills the paper.
 @visibleForTesting
-KotDocket kotDocket(List items) {
-  final rows = <KotDocketRow>[];
-  var totalQty = 0;
-  var holdQty = 0;
-  var heldLines = 0;
-  for (final it in items) {
-    final m = it as Map;
-    final held = _itemHeld(m);
-    final qty = math.max(1, (num.tryParse('${m['quantity'] ?? 1}') ?? 1).round());
-    if (held) {
-      holdQty += qty;
-      heldLines += 1;
-    } else {
-      totalQty += qty;
-    }
-    final note = '${m['note'] ?? ''}'.trim();
-    rows.add((
-      no: '${rows.length + 1}',
-      name: '${m['name'] ?? ''}',
-      qty: qty,
-      held: held,
-      under: [if (held) kotHoldLine, if (note.isNotEmpty) kotNoteLine(note)],
-    ));
+pw.Document kotCopyPdf(
+  List<KotCopyRow> rows, {
+  PdfPageFormat pageFormat = PdfPageFormat.a4,
+  bool compress = true,
+}) {
+  const size = 10.0;
+  const regular = pw.TextStyle(fontSize: size);
+  final bold = pw.TextStyle(fontSize: size, fontWeight: pw.FontWeight.bold);
+  // THE COLUMNS ARE SIZED TO WHAT THEY HOLD, as the docket's are: the number
+  // column to the widest dish number (so item 100 cannot print over its dish),
+  // the quantity column to the widest quantity or "Qty". A digit in the default
+  // font is 0.56em wide; the gutter after the number is 0.4em, as on the docket.
+  var numChars = 1;
+  var qtyChars = 3;
+  for (final r in rows) {
+    if (r.kind != KotCopyKind.columns) continue;
+    if (r.text.isNotEmpty) numChars = math.max(numChars, r.no.length);
+    qtyChars = math.max(qtyChars, r.qty.length);
   }
-  return (
-    rows: rows,
-    totalQty: totalQty,
-    holdQty: holdQty,
-    showTotal: heldLines < rows.length || heldLines == 0,
-    showHold: heldLines > 0,
+  final numW = numChars * 0.56 * size + 0.4 * size;
+  final qtyW = qtyChars * 0.6 * size;
+  pw.Widget draw(KotCopyRow r) {
+    switch (r.kind) {
+      case KotCopyKind.rule:
+        // 0.8pt is two and a half dots on a 203 dpi roll: a thinner dash can
+        // drop out entirely when the page is scaled onto thermal paper.
+        return pw.Divider(height: 8, thickness: 0.8, borderStyle: pw.BorderStyle.dashed);
+      case KotCopyKind.line:
+        return pw.Container(
+          alignment: r.centred ? pw.Alignment.center : pw.Alignment.centerLeft,
+          padding: const pw.EdgeInsets.symmetric(vertical: 1),
+          child: pw.Text(r.text,
+              style: r.bold ? bold : regular, textAlign: r.centred ? pw.TextAlign.center : pw.TextAlign.left),
+        );
+      case KotCopyKind.under:
+        return pw.Padding(
+          padding: pw.EdgeInsets.only(left: numW, bottom: 1),
+          child: pw.Text(r.text, style: regular),
+        );
+      case KotCopyKind.columns:
+        final qty = pw.SizedBox(width: qtyW, child: pw.Text(r.qty, style: regular, textAlign: pw.TextAlign.right));
+        return pw.Padding(
+          padding: const pw.EdgeInsets.symmetric(vertical: 1),
+          child: r.text.isEmpty
+              // The heading and the totals: the left cell runs into the name
+              // column ("No.Item", "Total Qty"), as it does on the docket.
+              ? pw.Row(children: [pw.Expanded(child: pw.Text(r.no, style: regular)), qty])
+              : pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+                  pw.SizedBox(width: numW, child: pw.Text(r.no, style: regular)),
+                  pw.Expanded(child: pw.Text(r.text, style: r.bold ? bold : regular)),
+                  qty,
+                ]),
+        );
+    }
+  }
+
+  final doc = pw.Document(compress: compress);
+  doc.addPage(
+    pw.Page(
+      pageFormat: pageFormat,
+      build: (ctx) => pw.Align(
+        alignment: pw.Alignment.topLeft,
+        child: pw.SizedBox(
+          width: math.min(72 * PdfPageFormat.mm, pageFormat.availableWidth),
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            mainAxisSize: pw.MainAxisSize.min,
+            children: [for (final r in rows) draw(r)],
+          ),
+        ),
+      ),
+    ),
   );
+  return doc;
 }
 
-// Print a Kitchen Order Ticket (KOT) for a table's items.
-/// A LOCAL PDF copy of one order's kitchen ticket, laid out like the thermal
-/// docket the backend renders (escpos.ts `buildReceiptBase64`, kind "kot") so a
-/// chef reads the same shape whichever came off the printer.
+/// A LOCAL PDF copy of one order's kitchen ticket, laid out like the reference
+/// docket the backend renders (escpos.ts `layoutKot`) so a chef reads the same
+/// shape whichever came off the printer — see models/kot_copy.dart for the line
+/// order and for what it leaves out.
 ///
 /// IT DELIBERATELY CARRIES NO "KOT - n" NUMBER, and says so on the paper.
 /// The day-scoped ticket number is allocated server-side, inside the same
@@ -13792,75 +14003,14 @@ KotDocket kotDocket(List items) {
 /// moment a second till printed. So this copy is honest about being unnumbered
 /// rather than quietly printing a number the kitchen cannot trust.
 ///
-/// This ticket also covers ONE ORDER, whereas a thermal KOT covers the table's
-/// whole running order set — another reason not to stamp it with a series
-/// number that means "the nth ticket this outlet sent to the kitchen today".
-Future<void> _printKot(String table, List items) async {
-  final docket = kotDocket(items);
-  // ROUND 2 ITEM 3 — "Dish names should come in bold on KOT, and the font of
-  // other items on the KOT should also be increased slightly." Every size here
-  // is two points up on what this copy printed, and the dish name is the one
-  // bold run on the row besides its quantity.
-  const body = pw.TextStyle(fontSize: 14);
-  const small = pw.TextStyle(fontSize: 11);
-  // The under-dish lines — hold and note alike — in the italic the reference
-  // docket sets its "[Note]" in, so a hold reads as the same kind of line.
-  final underStyle = pw.TextStyle(fontSize: 13, fontStyle: pw.FontStyle.italic);
-  pw.Widget row(KotDocketRow r) {
-    return pw.Padding(
-      padding: const pw.EdgeInsets.symmetric(vertical: 2),
-      child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-          pw.SizedBox(width: 28, child: pw.Text(r.no, style: const pw.TextStyle(fontSize: 16))),
-          pw.Expanded(
-              child: pw.Text(r.name, style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold))),
-          pw.SizedBox(
-            width: 34,
-            // "x3", bold — the same treatment the thermal docket gives it, and
-            // for the same reason: a bare digit at the end of a row reads as a
-            // line number as easily as a quantity.
-            child: pw.Text('x${r.qty}',
-                style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold),
-                textAlign: pw.TextAlign.right),
-          ),
-        ]),
-        // UNDER the dish, never above it: "[Hold] …" then "[Note] …".
-        for (final l in r.under)
-          pw.Padding(
-            padding: const pw.EdgeInsets.only(left: 28, top: 1),
-            child: pw.Text(l, style: underStyle),
-          ),
-      ]),
-    );
-  }
-
-  final doc = pw.Document();
-  doc.addPage(
-    pw.Page(
-      build: (ctx) => pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Text('KOT', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
-        // Printed tickets leave the screen, so they carry the zone explicitly.
-        pw.Text(RestaurantTime.stampNow(), style: small),
-        pw.Text('Local copy - no ticket number', style: const pw.TextStyle(fontSize: 10)),
-        pw.SizedBox(height: 6),
-        pw.Text('Table No: $table', style: body),
-        pw.Divider(),
-        // Numbered lines with the quantity in its own right-hand column, matching
-        // the thermal docket's "No. / Item / Qty".
-        pw.Row(children: [
-          pw.SizedBox(width: 28, child: pw.Text('No.', style: small)),
-          pw.Expanded(child: pw.Text('Item', style: small)),
-          pw.SizedBox(width: 34, child: pw.Text('Qty', style: small, textAlign: pw.TextAlign.right)),
-        ]),
-        pw.Divider(),
-        ...docket.rows.map(row),
-        pw.Divider(),
-        if (docket.showTotal) pw.Text('Total Qty: ${docket.totalQty}', style: body),
-        if (docket.showHold) pw.Text('Hold Qty: ${docket.holdQty}', style: body),
-      ]),
-    ),
-  );
-  await Printing.layoutPdf(onLayout: (PdfPageFormat format) => doc.save());
+/// This ticket also covers ONE ORDER — the lines the board is showing for it,
+/// station filter and all — whereas a thermal KOT covers the table's whole
+/// running order set.
+Future<void> _printKot(Map order) async {
+  // Printed tickets leave the screen, so they carry the zone explicitly.
+  final rows = kotCopyRows(order, stamp: RestaurantTime.stampNow());
+  await Printing.layoutPdf(
+      onLayout: (PdfPageFormat format) => kotCopyPdf(rows, pageFormat: format).save());
 }
 
 /// A quantity as a person writes it: 5 not 5.0, 2.5 stays 2.5.
@@ -19441,11 +19591,10 @@ Widget _analyticsBody(
         double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
         String money(double v) => '₹${v.toStringAsFixed(0)}';
 
-        final revenueByTable = orders
-            .map((o) => (label: 'Table ${_s(o as Map, 'table_name', '—')}', value: num0(o['total'])))
-            .where((d) => d.value > 0)
-            .toList()
-          ..sort((a, b) => b.value.compareTo(a.value));
+        // TABLE-WISE (client item 6): a next-party seating at 12 is reported as
+        // 12, and each seating's money is added in under that label — the web
+        // dashboard's table-wise summary, grouped the same way.
+        final tableRevenue = revenueByTable(orders);
         final staffApc = incentives
             .map((e) => (label: _s(e as Map, 'employee_name', 'Staff'), value: num0(e['mean_apc'])))
             .where((d) => d.value > 0)
@@ -20605,16 +20754,16 @@ Widget _analyticsBody(
                 Gaia.of(context)
                     ? _strataShare(
                         context,
-                        revenueByTable.take(8).toList(),
+                        tableRevenue.take(8).toList(),
                         money,
-                        total: revenueByTable.fold<double>(0, (a, d) => a + d.value),
+                        total: tableRevenue.fold<double>(0, (a, d) => a + d.value),
                         remainderLabel: 'Other tables',
                         caption: 'Thickness is each table’s share of the'
                             ' period’s table revenue.',
                       )
-                    : _barChart(context, revenueByTable.take(8).toList(), money),
+                    : _barChart(context, tableRevenue.take(8).toList(), money),
                 onDownload: () => dl('revenue-by-table', const ['Table', 'Revenue'],
-                    [for (final d in revenueByTable.take(8)) [d.label, money(d.value)]])),
+                    [for (final d in tableRevenue.take(8)) [d.label, money(d.value)]])),
             const SizedBox(height: AppSpacing.lg),
           ],
           if (vis('staff')) ...[
@@ -22909,7 +23058,8 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
             Wrap(spacing: 6, runSpacing: 4, children: [
               if (when.isNotEmpty) InfoChip(icon: Icons.schedule, label: _fmtTime(when)),
               if (covers != null && covers > 0) InfoChip(icon: Icons.people_outline, label: '$covers covers'),
-              if (method.isNotEmpty && method != '—') InfoChip(icon: Icons.payments_outlined, label: method),
+              if (method.isNotEmpty && method != '—')
+                InfoChip(icon: Icons.payments_outlined, label: NcSettle.isMethod(method) ? kNcSettleLabel : method),
               if (refunded) const InfoChip(icon: Icons.undo, label: 'Refunded'),
               // ROUND 2 ITEM 1 — who the bill was for, so a correction is visible
               // on the row it was made from.
@@ -23283,6 +23433,9 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
   final servicePct = _numOf(bill['service_charge_percent']);
   final coupon = _s(bill, 'coupon_code', '');
   final method = _s(bill, 'payment_method', '');
+  // The NC marker is not a mode and has one name everywhere (migration 052).
+  final methodShown = NcSettle.isMethod(method) ? kNcSettleLabel : method;
+  final ncSettled = NcSettle.settlement(bill);
   final covers = _int(bill['covers']);
   // What rounded the settled total to the rupee (backend migration 048), as
   // recorded at settle. Null on a bill that needed none or was settled before
@@ -23361,7 +23514,7 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       if (refunded)
         StatusChip(label: 'Refunded ${_money(bill['refund_amount'])}', color: AppColors.danger)
       else
-        StatusChip(label: method.isEmpty ? 'Closed' : method, color: AppColors.success),
+        StatusChip(label: method.isEmpty ? 'Closed' : methodShown, color: AppColors.success),
     ]),
     // ROUND 2 ITEM 1 — `Name:` and `Customer GSTIN:` directly under the header
     // and above the date, the slot the printed bill carries them in, worded as
@@ -23385,7 +23538,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
         for (var i = 0; i < items.length; i++) ...[
           if (i > 0) rule(),
           money(
-            _s(items[i], 'name', 'Item'),
+            // A comped line is its own line at 0.00 — the paper's words.
+            NcSettle.lineLabel(_s(items[i], 'name', 'Item'), items[i]['nc']),
             _money(items[i]['line_total'] ?? (_numOf(items[i]['price']) * (_int(items[i]['quantity']) ?? 1))),
             sub: '${_int(items[i]['quantity']) ?? 1} × ${_money(items[i]['price'])}'
                 '${_s(items[i], 'note', '').isEmpty ? '' : ' · ${_s(items[i], 'note')}'}',
@@ -23415,6 +23569,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       if (roundOff != null) money('Round off', billRoundOffMoney(roundOff)),
       rule(),
       money(reportWords ? kGross : 'Grand total', _money(grand), strong: true, tint: AppColors.copperHi),
+      // Beside the ladder, never in it: what the comped lines were worth.
+      if (_numOf(bill['nc_total']) > 0) money('NC value (not charged)', _money(bill['nc_total'])),
       const SizedBox(height: 6),
       Row(children: [
         Icon(balances ? Icons.check_circle_outline : Icons.error_outline,
@@ -23430,7 +23586,21 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
       ]),
     ]),
     card('Payment', [
-      money(method.isEmpty ? 'Method not recorded' : method, _money(grand)),
+      money(method.isEmpty ? 'Method not recorded' : methodShown, _money(grand)),
+      // A BILL SETTLED AS NC says why it took nothing, and on whose say-so.
+      if (ncSettled != null) ...[
+        rule(),
+        money(
+          'Settled as non-chargeable',
+          _money(ncSettled.value),
+          sub: '${ncSettled.kind.isEmpty ? '' : '${ncSettled.kind} · '}authorised by ${ncSettled.authorisedBy}'
+              '${ncSettled.reason.isEmpty ? '' : ' · ${ncSettled.reason}'} · given away, before tax',
+          tint: AppColors.warning,
+        ),
+        if ((ncSettled.wouldHaveCharged ?? 0) > 0)
+          money('Would have been (incl. tax)', _money(ncSettled.wouldHaveCharged),
+              sub: 'Information only — in no report'),
+      ],
       // Split payments: each part is its own tender, so they are named
       // individually rather than collapsed into the headline method.
       for (final sp in splits) ...[
@@ -31040,6 +31210,15 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
           // restaurant that predates migration 040, and an older backend that
           // has never heard of the key must not present the feature as off.
           'kot_auto_print': settings['kot_auto_print'] != false,
+          // Which kitchen docket prints, and how large the reference docket's
+          // type is (migration 050), and whether this backend has the two
+          // settings at all. One that has never heard of them prints ONLY the
+          // classic docket and ignores a save of them, so the card is not shown
+          // there (see kotDocketSettingsSupported) rather than showing a
+          // reference / standard choice that backend does not print.
+          kotDocketSupportedKey: kotDocketSettingsSupported(settings),
+          kotPrintStyleKey: readKotPrintStyle(settings),
+          kotTextSizeKey: readKotTextSize(settings),
           // Guest page theme. The resolved config is on both endpoints; the font
           // allowlist, the live/legacy field split and the enum option lists only
           // on /settings (older backends omit them and the editor falls back to
@@ -31087,6 +31266,20 @@ Widget settingsModule(RestClient rest, Profile p) => AsyncView<Map<String, dynam
             const SizedBox(height: 14),
             _KotAutoPrintCard(rest: rest, initial: m['kot_auto_print'] != false),
             const SizedBox(height: 14),
+            // Directly under the auto-print switch: both answer "what reaches
+            // the kitchen printer", and this one is the recovery control somebody
+            // is hunting for while a kitchen printer feeds blank tickets. Only
+            // against a backend that has the two settings (the loader's
+            // kotDocketSupportedKey): an older one prints classic and stores
+            // neither.
+            if (m[kotDocketSupportedKey] == true) ...[
+              _KotDocketCard(
+                rest: rest,
+                initialStyle: readKotPrintStyle(m),
+                initialTextSize: readKotTextSize(m),
+              ),
+              const SizedBox(height: 14),
+            ],
             _QueueMenuCard(rest: rest, initial: m['queue_show_menu'] != false),
             const SizedBox(height: AppSpacing.xxl),
             const SectionHeader(title: 'Payments'),
@@ -32133,6 +32326,149 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
           height: 24,
           child: FittedBox(fit: BoxFit.contain, child: Switch(value: _on, onChanged: _busy ? null : _set)),
         ),
+      ]),
+    );
+  }
+}
+
+// THE TWO KITCHEN DOCKET SETTINGS (migration 050) — which docket the kitchen
+// printers print, and how large the reference docket's type is. The web
+// dashboard's "KOT print style" card offers the same two choices in the same
+// words; models/kot_docket_settings.dart holds them.
+//
+// THE STYLE IS A RECOVERY CONTROL. The reference docket prints as an image; a
+// kitchen printer that cannot draw one feeds BLANK PAPER, which is an order
+// nobody cooks. This is the switch back to the plain text docket.
+//
+// THE SIZE is the client's "The font sizes must be smaller in the KOT":
+// Small / Standard (their reference ticket exactly) / Large. It sizes the
+// reference docket only — the classic text docket prints in the printer's own
+// font and ignores it. The copy says so, and the card repeats it while classic
+// is the style selected.
+//
+// SAVED ON PICK, one key per save, like the web card and the switches above:
+// whoever changes either is standing at a printer comparing paper. The choice
+// moves first so it answers the tap, and is put back if the save is refused —
+// a control that sat on the old value mid-request gets pressed twice.
+//
+// Admin-only, like the rest of this screen; POST /restaurant/settings checks
+// "Manage Restaurant Settings", and a 403 reverts with the server's sentence.
+// A 200 whose settings document lacks the key (a backend rolled back since the
+// page loaded, which ignores the key) stored nothing: kotDocketSaved throws,
+// and the card reverts with kotDocketNotSupported rather than confirming.
+class _KotDocketCard extends StatefulWidget {
+  final RestClient rest;
+  final String initialStyle;
+  final String initialTextSize;
+  const _KotDocketCard({required this.rest, required this.initialStyle, required this.initialTextSize});
+
+  @override
+  State<_KotDocketCard> createState() => _KotDocketCardState();
+}
+
+class _KotDocketCardState extends State<_KotDocketCard> {
+  late String _style = widget.initialStyle;
+  late String _size = widget.initialTextSize;
+  bool _busy = false;
+
+  void _put(String key, String value) {
+    if (key == kotPrintStyleKey) {
+      _style = value;
+    } else {
+      _size = value;
+    }
+  }
+
+  Future<void> _save(String key, String value) async {
+    final previous = key == kotPrintStyleKey ? _style : _size;
+    if (_busy || value == previous) return;
+    setState(() {
+      _put(key, value);
+      _busy = true;
+    });
+    try {
+      final reply = await widget.rest.post('/restaurant/settings', {key: value});
+      if (!mounted) return;
+      final saved = kotDocketSaved(reply, key, value);
+      setState(() => _put(key, saved));
+      // The latest pick's sentence, not the one before it: an owner flipping
+      // style then size should not read the first confirmation for four seconds.
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(kotDocketSavedMessage(key, saved, style: _style))));
+    } catch (e) {
+      if (mounted) {
+        setState(() => _put(key, previous)); // revert on failure
+        final msg = (e is ApiException && e.status == 403)
+            ? e.sentenceOr('Only an admin can change how kitchen dockets print.')
+            : '$e';
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // One choice: a radio mark, the owner's words, and a line of detail — the
+  // queue-menu editor's option rows.
+  Widget _option(TextTheme text, String key, KotDocketOption o, String selected) {
+    final on = o.value == selected;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: ForkCard(
+        key: ValueKey('$key-${o.value}'),
+        inset: true,
+        selected: on,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        onTap: _busy ? null : () => _save(key, o.value),
+        child: Row(children: [
+          Icon(
+            on ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+            size: 16,
+            color: on ? AppColors.copperHi : AppColors.textTertiary,
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(o.label, style: text.titleSmall),
+              Text(o.detail, style: text.bodySmall),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return ForkCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Icon(Icons.print_outlined, size: 18, color: AppColors.copperHi),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(child: Text(kotPrintStyleTitle, style: text.titleMedium)),
+        ]),
+        const SizedBox(height: 4),
+        Text(kotPrintStyleDescription, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        for (final o in kotPrintStyleOptions) _option(text, kotPrintStyleKey, o, _style),
+        Text(kotPrintStyleHelp, style: text.bodySmall),
+        const SizedBox(height: AppSpacing.lg),
+        Text(kotTextSizeTitle, style: text.titleSmall),
+        const SizedBox(height: AppSpacing.sm),
+        for (final o in kotTextSizeOptions) _option(text, kotTextSizeKey, o, _size),
+        Text(kotTextSizeHelp, style: text.bodySmall),
+        if (_style == kotPrintStyleClassic) ...[
+          const SizedBox(height: 4),
+          Text(
+            kotTextSizeClassicNote,
+            key: const ValueKey('kot-text-size-classic-note'),
+            style: text.bodySmall!.copyWith(fontWeight: FontWeight.w600),
+          ),
+        ],
       ]),
     );
   }
@@ -33279,6 +33615,13 @@ class _TaxSettingsCardState extends State<_TaxSettingsCard> {
           ),
         for (int i = 0; i < _taxes.length; i++)
           Padding(
+            // KEYED ON THE TAX ITSELF — found by the item 3 (2.0.1) sweep. The name
+            // and rate are `TextFormField(initialValue:)`, read once when the box
+            // is built. Unkeyed, removing CGST from CGST / SGST / VAT left the boxes
+            // reading CGST 2.5 and SGST 2.5 while Save sent SGST 2.5 and VAT 5 (the
+            // boxes and the rate summary above them disagreed), and a rate typed
+            // into the box reading SGST changed VAT's — on every bill after Save.
+            key: ObjectKey(_taxes[i]),
             padding: const EdgeInsets.only(bottom: 8),
             child: Row(children: [
               Expanded(
@@ -33833,6 +34176,10 @@ class _PostersCardState extends State<_PostersCard> {
     final ratio = (w > 0 && h > 0) ? w / h : 16 / 9;
 
     return Padding(
+      // Keyed on the poster (found by the item 3 (2.0.1) sweep): the caption is an
+      // initialValue field, so after a delete an unkeyed tile kept the deleted
+      // poster's caption, and Enter saved that text onto the poster now beside it.
+      key: ValueKey('poster-${p['id']}'),
       padding: const EdgeInsets.only(bottom: 12),
       child: Container(
         padding: const EdgeInsets.all(12),

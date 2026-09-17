@@ -73,6 +73,10 @@ class _FakeApi extends ApiClient {
   /// Paths that must fail, so a refusal can be exercised as well as a success.
   final Set<String> failWrites = <String>{};
 
+  /// Path fragment -> the server's answer to a write there, for the writes
+  /// whose ANSWER a screen reads (a print names the next party's seat).
+  final Map<String, Object? Function(Object? body)> replies = {};
+
   @override
   Future<LoginResult> login(String restaurantName, String user, String password,
           {String? outletId}) async =>
@@ -101,6 +105,9 @@ class _FakeApi extends ApiClient {
     if (method != 'GET') {
       writes.add((method: method, path: path, body: body));
       if (failWrites.any(path.contains)) throw ApiException('nope', 500);
+      for (final r in replies.entries) {
+        if (path == r.key) return r.value(body);
+      }
       return <String, dynamic>{'success': true};
     }
     if (routes.containsKey(path)) return routes[path];
@@ -165,6 +172,37 @@ Map<String, dynamic> _bill({
       'admin_approved_at': ?settledAt,
       'payment_status': paymentStatus,
     };
+
+/// CLIENT ITEM 6 — the seat the server opens beside a printed T1: its own
+/// row, free, unprinted, and named for its root.
+Map<String, dynamic> _nextPartySeat() => {
+      'table_name': 'T1 #2',
+      'parent_table': 'T1',
+      'party_no': 2,
+      'display_name': 'T1',
+      'capacity': 4,
+      'max_capacity': 4,
+      'section': 'Main',
+      'occupied': false,
+      'reserved': false,
+      'print_count': 0,
+      'bill_printed_at': null,
+      'printed_at': null,
+    };
+
+/// What a current backend does on a print: answers with the seat it opened,
+/// and lists that seat on the next /get-tables.
+_FakeApi _withNextPartyOnPrint(_FakeApi api) {
+  api.replies['/print/bill'] = (_) {
+    api.routes['/get-tables'] = [_table(), _nextPartySeat()];
+    return <String, dynamic>{
+      'success': true,
+      'next_party_table': 'T1 #2',
+      'next_party_message': 'Seat the next party at T1 (next party).',
+    };
+  };
+  return api;
+}
 
 Map<String, dynamic> _floorRoutes({bool occupied = true, Map<String, dynamic>? bill}) => {
       '/get-tables': [_table(occupied: occupied)],
@@ -386,18 +424,45 @@ void main() {
       return api;
     }
 
-    testWidgets('the print happens, the button goes, and the table goes with it',
+    // CHANGED ON PURPOSE FOR CLIENT ITEM 6. This test used to pin that the
+    // table went and nothing came back — which is exactly the complaint: "Table
+    // where bill is printed is disappearing from the waiter app. There should be
+    // a duplicate table showing same number for order taking for the next round
+    // of guests." C3 still holds for the PRINTED PARTY; the number comes back as
+    // the next party's seat the server opened on the print.
+    testWidgets('the print happens, the printed party goes, and the next party gets T1',
         (tester) async {
-      final api = await printAsWaiter(tester, _waiterApi(_floorRoutes()));
+      final api = await printAsWaiter(tester, _withNextPartyOnPrint(_waiterApi(_floorRoutes())));
 
       // The action itself is untouched — the guest still gets a real bill.
       expect(api.to('/print/bill'), hasLength(1));
       expect((api.to('/print/bill').single.body as Map)['table_name'], 'T1');
 
-      // The sheet closed itself and the floor came back WITHOUT the table.
+      // The sheet closed itself and the floor came back WITHOUT the printed row…
+      expect(find.text('Table T1'), findsNothing);
+      expect(find.byKey(const ValueKey('table-title-T1')), findsNothing,
+          reason: 'the printed party is still on their floor');
+      // …and WITH the number, as the next party's seat.
+      expect(find.byKey(const ValueKey('table-title-T1 #2')), findsOneWidget);
+      expect(find.text('T1'), findsOneWidget, reason: 'the tile reads the same number');
+      expect(find.byKey(const ValueKey('next-party-chip-T1 #2')), findsOneWidget);
+      expect(find.text('Next party'), findsOneWidget);
+      // The waiter is told where the next guests go, in the server's words —
+      // in the line that follows "Printing bill…" off the screen.
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('It has come off your tables. Seat the next party at T1 (next party).'),
+          findsOneWidget);
+      expect(find.textContaining('every table you printed'), findsNothing);
+    });
+
+    // THE OLD BACKEND, and the reason the empty-floor sentence stays: no seat is
+    // opened, so the floor is what 2.0.0 showed.
+    testWidgets('against a backend with no next-party seat, the table goes and nothing replaces it',
+        (tester) async {
+      await printAsWaiter(tester, _waiterApi(_floorRoutes()));
       expect(find.text('Table T1'), findsNothing);
       expect(find.text('T1'), findsNothing, reason: 'the printed table is still on their floor');
-      // Said in words rather than left as a blank grid.
       expect(find.textContaining('every table you printed'), findsOneWidget);
     });
 
@@ -420,13 +485,16 @@ void main() {
     // there is no sheet to reach, and driving what IS on screen writes nothing.
     testWidgets('a second print is unreachable on the next look at the floor',
         (tester) async {
-      final api = await printAsWaiter(tester, _waiterApi(_floorRoutes()));
+      final api = await printAsWaiter(tester, _withNextPartyOnPrint(_waiterApi(_floorRoutes())));
       // Come back to the screen as a back-navigation or a poll would.
       await _mountFloor(tester, api);
-      expect(find.text('T1'), findsNothing);
+      expect(find.byKey(const ValueKey('table-title-T1')), findsNothing);
+      // The only T1 left is the next party's, which has nothing on it to print.
+      expect(find.byKey(const ValueKey('table-title-T1 #2')), findsOneWidget);
       expect(find.byKey(const ValueKey('table-print-bill')), findsNothing);
       await _pressEverything(tester);
-      expect(api.to('/print/bill'), hasLength(1), reason: 'a second bill was printed');
+      final printed = [for (final w in api.to('/print/bill')) (w.body as Map)['table_name']];
+      expect(printed, ['T1'], reason: 'a second bill was printed for the printed party');
     });
 
     // A PRINT THAT FAILED IS A PRINT THEY STILL HAVE TO MAKE. Burning the one

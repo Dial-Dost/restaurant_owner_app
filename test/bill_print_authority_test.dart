@@ -92,8 +92,28 @@ Map<String, dynamic> _table({Map<String, dynamic> printState = const {}}) => {
       ...printState,
     };
 
-Map<String, dynamic> _routes({Map<String, dynamic> printState = const {}}) => {
-      '/get-tables': [_table(printState: printState)],
+/// CLIENT ITEM 6 — the next party's seat a current backend lists beside a
+/// printed T1. Its own row, with its own (unprinted) print state.
+const Map<String, dynamic> _nextPartySeat = {
+  'table_name': 'T1 #2',
+  'parent_table': 'T1',
+  'party_no': 2,
+  'display_name': 'T1',
+  'capacity': 4,
+  'max_capacity': 4,
+  'section': 'Main',
+  'occupied': false,
+  'reserved': false,
+  'print_count': 0,
+  'bill_printed_at': null,
+  'printed_at': null,
+};
+
+final Finder _printedRow = find.byKey(const ValueKey('table-title-T1'));
+final Finder _nextPartyRow = find.byKey(const ValueKey('table-title-T1 #2'));
+
+Map<String, dynamic> _routes({Map<String, dynamic> printState = const {}, bool nextParty = false}) => {
+      '/get-tables': [_table(printState: printState), if (nextParty) _nextPartySeat],
       '/table-assignments': <dynamic>[],
       '/get-bookings': <dynamic>[],
       '/table-sections': {
@@ -215,6 +235,21 @@ void main() {
       expect(find.text('T1'), findsNothing);
     });
 
+    // CHANGED ON PURPOSE FOR CLIENT ITEM 6: the PRINTED PARTY leaves, and the
+    // number stays as the next party's seat, decided on that row's own print
+    // state — which the server says is not printed.
+    testWidgets('…and keeps its NUMBER through the next party\'s seat', (tester) async {
+      await _mountFloor(
+        tester,
+        _FakeApi(_routes(printState: const {'bill_printed_at': '2026-09-11T10:42:00Z'}, nextParty: true),
+            role: 'waiter', actions: const ['a1'], waiterOnly: true),
+      );
+      expect(_printedRow, findsNothing);
+      expect(_nextPartyRow, findsOneWidget);
+      expect(find.text('T1'), findsOneWidget);
+      expect(find.text('Next party'), findsOneWidget);
+    });
+
     testWidgets('and keeps it when the server has said nothing', (tester) async {
       await _mountFloor(
         tester,
@@ -234,6 +269,14 @@ void main() {
             actions: const ['*']),
       );
       expect(find.text('T1'), findsOneWidget);
+      // …and sees the next party's seat BESIDE it, not instead of it.
+      await _mountFloor(
+        tester,
+        _FakeApi(_routes(printState: const {'bill_printed_at': '2026-09-11T10:42:00Z'}, nextParty: true),
+            actions: const ['*']),
+      );
+      expect(_printedRow, findsOneWidget);
+      expect(_nextPartyRow, findsOneWidget);
     });
   });
 
@@ -302,10 +345,13 @@ void main() {
       // the print happened on the till at the pass, not here.
       await _mountFloor(
         tester,
-        _FakeApi(_routes(printState: const {'print_count': 2}),
+        _FakeApi(_routes(printState: const {'print_count': 2}, nextParty: true),
             role: 'waiter', actions: const ['a1'], waiterOnly: true),
       );
-      expect(find.text('T1'), findsNothing);
+      // CHANGED ON PURPOSE FOR CLIENT ITEM 6: the printed PARTY is gone and the
+      // next party's seat is what reads "T1".
+      expect(_printedRow, findsNothing);
+      expect(_nextPartyRow, findsOneWidget);
     });
 
     testWidgets('no print state at all — the device memory still answers',

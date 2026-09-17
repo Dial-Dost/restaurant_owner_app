@@ -221,6 +221,7 @@ class _CaptureReasonDialog extends StatefulWidget {
     this.headline,
     this.danger = false,
     this.extra,
+    this.reasonOptional = false,
   });
 
   final String title;
@@ -246,6 +247,12 @@ class _CaptureReasonDialog extends StatefulWidget {
   /// quantity stepper). Rendered above the reason field.
   final Widget? extra;
 
+  /// True ONLY for the service-charge waiver (client item, 2.0.1: "the reason
+  /// should not be mandatory"). Its kind and its second name stay required; the
+  /// comp, the void, the cancel, the tender void and every reversal keep a
+  /// mandatory reason, which is why this is opt-in and defaults to false.
+  final bool reasonOptional;
+
   @override
   State<_CaptureReasonDialog> createState() => _CaptureReasonDialogState();
 }
@@ -265,7 +272,7 @@ class _CaptureReasonDialogState extends State<_CaptureReasonDialog> {
 
   bool get _ready {
     if (widget.kinds.isNotEmpty && _kind.isEmpty) return false;
-    if (_reason.text.trim().isEmpty) return false;
+    if (!widget.reasonOptional && _reason.text.trim().isEmpty) return false;
     if (widget.needsAuthoriser && _authorisedBy.text.trim().isEmpty) return false;
     return true;
   }
@@ -296,101 +303,115 @@ class _CaptureReasonDialogState extends State<_CaptureReasonDialog> {
           borderRadius: AppRadius.cardAll,
           border: Border.all(color: AppColors.borderStrong),
         ),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            Text(widget.title.toUpperCase(), style: text.labelSmall),
-            if (widget.headline != null) ...[
-              const SizedBox(height: 6),
-              Text(widget.headline!,
-                  style: text.displaySmall!.copyWith(
-                      color: widget.danger ? AppColors.danger : AppColors.copperHi)),
-            ],
-            const SizedBox(height: 8),
-            Text(widget.subtitle, style: text.bodySmall),
-            if (widget.extra != null) ...[
-              const SizedBox(height: AppSpacing.lg),
-              widget.extra!,
-            ],
-            if (widget.kinds.isNotEmpty) ...[
-              const SizedBox(height: AppSpacing.lg),
-              Text('WHY', style: text.labelSmall),
-              const SizedBox(height: 8),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                for (final (value, label) in widget.kinds)
-                  _CapturePill(
-                    key: ValueKey('capture-kind-$value'),
-                    label: label,
-                    selected: _kind == value,
-                    onTap: () => setState(() => _kind = value),
-                  ),
-              ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            TextField(
-              key: const ValueKey('capture-reason'),
-              controller: _reason,
-              autofocus: true,
-              minLines: 2,
-              maxLines: 3,
-              maxLength: 400,
-              textCapitalization: TextCapitalization.sentences,
-              onChanged: (_) => setState(() {}),
-              decoration: const InputDecoration(
-                labelText: 'Reason',
-                alignLabelWithHint: true,
-                helperText: 'In your own words. It goes on the control report, verbatim.',
-              ),
-            ),
-            if (widget.needsAuthoriser) ...[
-              const SizedBox(height: 4),
-              TextField(
-                key: const ValueKey('capture-authoriser'),
-                controller: _authorisedBy,
-                onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
-                  labelText: 'Authorised by (username)',
-                  helperText: 'The staff member who approved it. Yours is filled in — '
-                      'change it if someone else said yes.',
-                  helperMaxLines: 3,
-                ),
-              ),
-              const SizedBox(height: 6),
-              // What this control IS and IS NOT, said plainly on the screen where
-              // the name is typed. It is not proof anyone was standing there;
-              // this system has no step-up credential and pretending otherwise
-              // would be a worse control than an honest one.
-              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'The name is checked against your staff list and against this same '
-                    'permission. Who is acting is taken from your own sign-in and cannot be typed.',
-                    style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+        // The fields scroll; Cancel and Confirm do not. On a 360dp phone this form
+        // is taller than the screen, and with the buttons at the foot of the scroll
+        // a waiver that needs no typing still needed a scroll before its one tap.
+        // Pinned under the fields they stay on screen, above the keyboard too:
+        // Dialog pads itself by the keyboard's height.
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Flexible(
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Text(widget.title.toUpperCase(), style: text.labelSmall),
+                if (widget.headline != null) ...[
+                  const SizedBox(height: 6),
+                  Text(widget.headline!,
+                      style: text.displaySmall!.copyWith(
+                          color: widget.danger ? AppColors.danger : AppColors.copperHi)),
+                ],
+                const SizedBox(height: 8),
+                Text(widget.subtitle, style: text.bodySmall),
+                if (widget.extra != null) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  widget.extra!,
+                ],
+                if (widget.kinds.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  Text('WHY', style: text.labelSmall),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    for (final (value, label) in widget.kinds)
+                      _CapturePill(
+                        key: ValueKey('capture-kind-$value'),
+                        label: label,
+                        selected: _kind == value,
+                        onTap: () => setState(() => _kind = value),
+                      ),
+                  ]),
+                ],
+                const SizedBox(height: AppSpacing.lg),
+                TextField(
+                  key: const ValueKey('capture-reason'),
+                  controller: _reason,
+                  // The keyboard comes up for a reason the act cannot go without. The
+                  // waiver's is optional and its commonest use is the kind as chosen, the
+                  // name as filled, Confirm: on a phone a keyboard would only cover that.
+                  autofocus: !widget.reasonOptional,
+                  minLines: 2,
+                  maxLines: 3,
+                  maxLength: 400,
+                  textCapitalization: TextCapitalization.sentences,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    labelText: widget.reasonOptional ? misOptionalReasonLabel : 'Reason',
+                    alignLabelWithHint: true,
+                    helperText: widget.reasonOptional
+                        ? 'Optional. If you add one, it goes on the control report, verbatim.'
+                        : 'In your own words. It goes on the control report, verbatim.',
                   ),
                 ),
+                if (widget.needsAuthoriser) ...[
+                  const SizedBox(height: 4),
+                  TextField(
+                    key: const ValueKey('capture-authoriser'),
+                    controller: _authorisedBy,
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Authorised by (username)',
+                      helperText: 'The staff member who approved it. Yours is filled in — '
+                          'change it if someone else said yes.',
+                      helperMaxLines: 3,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  // What this control IS and IS NOT, said plainly on the screen where
+                  // the name is typed. It is not proof anyone was standing there;
+                  // this system has no step-up credential and pretending otherwise
+                  // would be a worse control than an honest one.
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'The name is checked against your staff list and against this same '
+                        'permission. Who is acting is taken from your own sign-in and cannot be typed.',
+                        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+                      ),
+                    ),
+                  ]),
+                ],
               ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            Wrap(
-              alignment: WrapAlignment.end,
-              spacing: AppSpacing.sm,
-              runSpacing: AppSpacing.sm,
-              children: [
-                ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
-                ForkButton(
-                  key: const ValueKey('capture-confirm'),
-                  label: widget.confirmLabel,
-                  icon: Icons.check,
-                  dense: true,
-                  // Disabled until it could succeed, rather than posting a body
-                  // the server would refuse with a field name nobody typed.
-                  onPressed: _ready ? _submit : null,
-                ),
-              ],
             ),
-          ]),
-        ),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.sm,
+            children: [
+              ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
+              ForkButton(
+                key: const ValueKey('capture-confirm'),
+                label: widget.confirmLabel,
+                icon: Icons.check,
+                dense: true,
+                // Disabled until it could succeed, rather than posting a body
+                // the server would refuse with a field name nobody typed.
+                onPressed: _ready ? _submit : null,
+              ),
+            ],
+          ),
+        ]),
       ),
     );
   }
@@ -1100,7 +1121,20 @@ final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive:
 ///     the commit and the print) — that, and never "removed".
 ///
 /// The web dashboard's `serviceChargeRemovalSentence` says the same words.
+///
+/// CLIENT ITEM 6: a bill that PRINTED also opened (or found) the seat for the
+/// next party at this number, and the line says where it is — the server's
+/// own sentence, after everything above and only when there was paper.
 ({String message, Duration shown}) serviceChargeRemovalOutcome(Object? response) {
+  final base = _serviceChargeRemovalBase(response);
+  final r = response is Map ? response : const {};
+  final seat = r['printed'] == true ? nextPartyAfterPrint(r).message : null;
+  if (seat == null) return base;
+  final longer = base.shown < const Duration(seconds: 6) ? const Duration(seconds: 6) : base.shown;
+  return (message: '${base.message} $seat', shown: longer);
+}
+
+({String message, Duration shown}) _serviceChargeRemovalBase(Object? response) {
   final r = response is Map ? response : const {};
   final created = r['waiver_created'] == true;
   final printed = r['printed'] == true;
@@ -1179,6 +1213,49 @@ final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive:
   );
 }
 
+// ------------------------------------ the waiver's reason is optional (2.0.1) --
+//
+// "When waiving a service charge, the reason should not be mandatory and should
+// be left as optional." The waiver's reason only: the kind (chosen already) and
+// the authoriser stay required, and every other act on this file keeps its
+// mandatory reason. The server stores a missing reason as NULL where migration
+// 051 allows it, and refuses exactly as before where it does not.
+
+/// The reason box's label on the waiver form. The web dashboard says the same.
+const String misOptionalReasonLabel = 'Reason (optional)';
+
+/// The body of POST /bills/service-charge-waiver/print for a new waiver.
+///
+/// A blank reason is left OUT, not sent as "": a server from before the change
+/// refused "" in its schema with a sentence nobody could act on, while an
+/// absent reason gets its own clean refusal.
+Map<String, dynamic> serviceChargeRemovalBody({
+  required String tableName,
+  required String kind,
+  required String reason,
+  required String authorisedBy,
+}) {
+  final why = reason.trim();
+  return <String, dynamic>{
+    // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
+    // bill and mints one when the table has none, which is the case a guest
+    // asks about before the bill has been raised.
+    'table_name': tableName,
+    'waiver_kind': kind,
+    if (why.isNotEmpty) 'reason': why,
+    'authorised_by': authorisedBy,
+  };
+}
+
+/// Who took the charge off, and why when they said: `“Long wait” — asha,
+/// authorised by manager01`, or `asha, authorised by manager01` for a waiver
+/// recorded without a reason — never a quoted dash standing in for one.
+String serviceChargeWaiverAttribution(Map waiver) {
+  final why = '${waiver['reason'] ?? ''}'.trim();
+  final who = '${_s(waiver, 'waived_by_username')}, authorised by ${_s(waiver, 'authorised_by_username')}';
+  return why.isEmpty ? who : '“$why” — $who';
+}
+
 /// The waiver block on the table sheet: either the one control that takes the
 /// charge off and prints, or the live waiver with its reprint and the control
 /// to put the charge back.
@@ -1245,8 +1322,7 @@ Widget misServiceChargeBlock(
             ),
           ],
           const SizedBox(height: 4),
-          Text('“${_s(w, 'reason')}” — ${_s(w, 'waived_by_username')}, '
-              'authorised by ${_s(w, 'authorised_by_username')}',
+          Text(serviceChargeWaiverAttribution(w),
               style: text.bodySmall!.copyWith(fontStyle: FontStyle.italic)),
           const SizedBox(height: 10),
           Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
@@ -1383,19 +1459,20 @@ Future<void> _removeServiceChargeAndPrint(
       kinds: _scWaiverKinds,
       needsAuthoriser: true,
       suggestedAuthoriser: profile.employeeUsername,
+      reasonOptional: true,
     ),
   );
   if (answer == null) return;
   try {
-    final res = await rest.post('/bills/service-charge-waiver/print', {
-      // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
-      // bill and mints one when the table has none, which is the case a guest
-      // asks about before the bill has been raised.
-      'table_name': tableName,
-      'waiver_kind': answer.kind,
-      'reason': answer.reason,
-      'authorised_by': answer.authorisedBy,
-    });
+    final res = await rest.post(
+      '/bills/service-charge-waiver/print',
+      serviceChargeRemovalBody(
+        tableName: tableName,
+        kind: answer.kind,
+        reason: answer.reason,
+        authorisedBy: answer.authorisedBy,
+      ),
+    );
     final outcome = serviceChargeRemovalOutcome(res);
     messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
   } catch (e) {
@@ -1626,6 +1703,25 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   bool _busy = false;
   String? _error;
 
+  // ---- settle as NC (client item 5, lib/models/nc_settle.dart) -------------
+  //
+  // NOT A MODE. The pill sits among the modes because that is where the client
+  // looks for it; what it does is a different act — one POST that comps every
+  // dish and closes the bill at 0.00, with no approve or close after it.
+  // Offered only to a session holding BOTH the comp permission and Close Bill.
+  // The open bill it quotes from is read fresh in [_load].
+  Map? _ncBill;
+  bool _ncMode = false;
+
+  /// This server has no settle-nc route ([NcSettle.routeMissing]). Learned from
+  /// the first attempt, for the life of this sheet. The pill and the ₹0 bill's
+  /// auto-open both step aside, so "Settle & close" is there to use.
+  bool _ncUnsupported = false;
+  String _ncKind = '';
+  final TextEditingController _ncReason = TextEditingController();
+  late final TextEditingController _ncAuthorisedBy =
+      TextEditingController(text: widget.profile.employeeUsername);
+
   @override
   void initState() {
     super.initState();
@@ -1638,6 +1734,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     _txnRef.dispose();
     _tip.dispose();
     _tipTo.dispose();
+    _ncReason.dispose();
+    _ncAuthorisedBy.dispose();
     super.dispose();
   }
 
@@ -1696,6 +1794,16 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       final s = await widget.rest.getMap('/restaurant/settings');
       modes = PaymentModes.parse(s['payment_methods']);
     } catch (_) {/* an older backend or no line: the built-in list, see above */}
+    // The open bill the NC quote comes from — read only for a session that may
+    // settle as NC. Its `subtotal` is what the settle sends as expected_value.
+    Map? ncBill;
+    if (_mayNc && widget.tableName.isNotEmpty) {
+      try {
+        final r = await widget.rest
+            .get('/bill-for-table?table_name=${Uri.encodeQueryComponent(widget.tableName)}');
+        if (r is Map) ncBill = r;
+      } catch (_) {/* the NC pill then says the bill could not be read */}
+    }
     if (!mounted) return;
     setState(() {
       _state = state;
@@ -1703,6 +1811,11 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       _counters = counters;
       _allModes = modes;
       _modes = PaymentModes.till(modes);
+      _ncBill = ncBill;
+      // A ₹0 bill whose dishes were all comped IS an NC bill: it opens as one
+      // and is never offered as a ₹0 UPI settle (what installed 2.0.0 tills
+      // sent). A refusal re-read keeps the form open if NC is still possible.
+      _ncMode = _ncOffered && _ncBlocker == null && (_ncMode || NcSettle.opensAsNc(ncBill));
       // Keep the cashier's pick if it is still on offer; otherwise UPI, as the
       // sheet always opened on, or the first mode this restaurant takes.
       if (!_modes.any((m) => m.id == _method) && _modes.isNotEmpty) {
@@ -1805,6 +1918,34 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       _composerTip <= 0 &&
       (!_ledgerOk || (_remaining > 0 && (_composerAmount - _remaining).abs() < 0.005));
 
+  /// May this session settle as NC? The comp permission AND Close Bill — the
+  /// two gates the route checks. A waiter holds neither (C1).
+  bool get _mayNc => NcSettle.mayOffer(
+        compItem: _mayDo(widget.profile, Capability.compItem, _permNonChargeable),
+        settleBill: FloorScope.of(widget.profile).settle,
+      );
+
+  /// Is the NC pill on offer: may this session settle as NC, and does this
+  /// server know how?
+  bool get _ncOffered => _mayNc && !_ncUnsupported;
+
+  /// Why the NC pill is unavailable, or null. Money already taken, parts being
+  /// composed or a discount on the bill each stop it — see [NcSettle.blocker].
+  String? get _ncBlocker =>
+      NcSettle.blocker(bill: _ncBill, tendered: _tendered, drafts: _drafts.length, money: (v) => _money(v));
+
+  /// Why "Settle as NC" cannot be pressed yet, or null.
+  String? get _ncRefusal {
+    final blocked = _ncBlocker;
+    if (blocked != null) return blocked;
+    return NcSettle.formReady(kind: _ncKind, reason: _ncReason.text, authorisedBy: _ncAuthorisedBy.text)
+        ? null
+        : 'Choose why it is going free, give the reason, and name who authorised it.';
+  }
+
+  /// The refusal standing next to whichever button this sheet is showing.
+  String? get _refusalNow => _ncMode ? _ncRefusal : _settleRefusal;
+
   // ---- proof ---------------------------------------------------------------
 
   /// Content type sniffed from the actual bytes rather than the file extension:
@@ -1879,6 +2020,12 @@ class _PaymentSheetState extends State<_PaymentSheet> {
 
   // ---- acts ----------------------------------------------------------------
 
+  /// A press that writes puts the keyboard away first. With the keyboard up,
+  /// the refusal and error lines ride at the foot of the scroll (see [build]),
+  /// where a line that explains a failed settle could sit below the fold. With
+  /// the keyboard down, they stand beside the button again.
+  void _putKeyboardAway() => FocusManager.instance.primaryFocus?.unfocus();
+
   void _addPart() {
     final c = _composed;
     if (c == null || _tenderCount >= _maxTenders) return;
@@ -1899,6 +2046,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// the table stays open. It is the whole reason POST /bills/tenders exists
   /// separately from the settle.
   Future<void> _recordPartPayment() async {
+    _putKeyboardAway();
     final tenders = _allDrafts;
     if (tenders.isEmpty) return;
     final messenger = ScaffoldMessenger.of(context);
@@ -1962,6 +2110,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// Settle, approve and close — the same three calls the old dialog made, with
   /// the body chosen by [_isSimpleSettle].
   Future<void> _settleAndClose() async {
+    _putKeyboardAway();
     final refusal = _settleRefusal;
     if (refusal != null) {
       setState(() => _error = refusal);
@@ -2028,6 +2177,70 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     }
   }
 
+  /// SETTLE AS NC — ONE call, and nothing after it: the server comps every
+  /// remaining dish and closes the bill at 0.00 in its own transaction, so
+  /// there is no approve and no close to send. Refused offline like every
+  /// `/bills` write (OutboxPolicy), and never queued.
+  Future<void> _settleAsNc() async {
+    _putKeyboardAway();
+    final refusal = _ncRefusal;
+    if (refusal != null) {
+      setState(() => _error = refusal);
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final oid = widget.orderId;
+    try {
+      final res = await widget.rest.post(
+        '/bills/order/$oid/settle-nc',
+        NcSettle.body(
+          kind: _ncKind,
+          reason: _ncReason.text,
+          authorisedBy: _ncAuthorisedBy.text,
+          // The quote this sheet showed. A bill that changed meanwhile is
+          // refused by the server rather than given away at a size nobody saw.
+          expectedValue: NcSettle.value(_ncBill),
+          counterId: _misCounterId,
+        ),
+      );
+      messenger.showSnackBar(
+          SnackBar(content: Text(NcSettle.doneSentence(res is Map ? res : const {}, (v) => _money(v)))));
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      // AN OLDER SERVER, with no settle-nc route. Its 404 page says only
+      // "Request failed (404).", and a fully comped ₹0 bill opens in NC mode,
+      // where "Settle as NC" is the only action. Without this the manager is
+      // left on a form that cannot work. Nothing was written, and re-reading
+      // the bill would only reopen that form, so there is no re-read.
+      if (e is ApiException && NcSettle.routeMissing(status: e.status, body: e.body)) {
+        setState(() {
+          _busy = false;
+          _ncUnsupported = true;
+          _ncMode = false;
+          _error = kNcSettleUnsupported;
+        });
+        return;
+      }
+      setState(() {
+        _busy = false;
+        _error = _captureError(e);
+      });
+      // A refusal the SERVER answered (the quote moved, a payment landed): read
+      // the bill again so the sheet shows what the refusal was about. An outage
+      // wrote nothing, and re-reading through it would only lose the quote.
+      if (e is ApiException && e.status != null) {
+        final said = _error;
+        await _load();
+        if (mounted) setState(() => _error = said);
+      }
+    }
+  }
+
   /// Why the bill cannot be settled yet, or null. Under-tender at settle is
   /// refused by the server (the tenders must reconstruct the grand total to the
   /// paisa); saying so here means the cashier is not told after the card machine.
@@ -2065,9 +2278,48 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final width = MediaQuery.sizeOf(context).width;
+    // THE KEYBOARD HALVES THIS DIALOG ON A PHONE, and only the middle of it
+    // scrolls. At 360x640 with the keyboard up there is about 300px for the
+    // headline, the form and the buttons. A four-line refusal pinned beside
+    // the button pushed the button under the keyboard. So did the NC
+    // headline's paragraph, which is why that paragraph is always in the
+    // scroll now. While the keyboard is up, the error, refusal and approval
+    // lines ride at the foot of the scroll, still directly above the buttons.
+    // A press that writes puts the keyboard away first ([_putKeyboardAway]),
+    // so a failed settle's reason is pinned beside the button again.
+    //
+    // Read here, above the Dialog, which strips the insets from its child.
+    // The Dialog follows the keyboard with no animation of its own (below).
+    // With its default 100ms lag, the lines were pinned again while the dialog
+    // was still keyboard-short, and it overflowed for those frames.
+    final keyboardUp = MediaQuery.viewInsetsOf(context).bottom > 0;
+    final notes = <Widget>[
+      if (_error != null) ...[
+        const SizedBox(height: 10),
+        Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+      ],
+      // WHY "Settle & close" IS GREY, standing next to it. A disabled
+      // primary button on a money screen with no reason beside it is
+      // the dead-looking control this app has been bitten by before —
+      // and here the reason is always something the cashier can act
+      // on: take the rest, or record what has been paid.
+      if (_error == null && _refusalNow != null) ...[
+        const SizedBox(height: 10),
+        Text(_refusalNow!,
+            key: const ValueKey('pay-refusal'),
+            style: text.bodySmall!.copyWith(color: AppColors.warning)),
+      ],
+      // No approval follows an NC settle — nothing was taken.
+      if (!_ncMode) ...[
+        const SizedBox(height: AppSpacing.md),
+        Text('Approval is required before the bill closes and the table frees.', style: text.bodySmall),
+      ],
+    ];
     return Dialog(
       backgroundColor: Colors.transparent,
       insetPadding: const EdgeInsets.all(AppSpacing.lg),
+      // The keyboard's insets already move frame by frame on a phone.
+      insetAnimationDuration: Duration.zero,
       child: Container(
         width: math.min(480, width - 32),
         constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.9),
@@ -2082,11 +2334,15 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 padding: EdgeInsets.all(40),
                 child: Center(child: CircularProgressIndicator()))
             : Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                _headline(text),
+                _ncMode ? _ncHeadline(text) : _headline(text),
                 const SizedBox(height: AppSpacing.lg),
                 Flexible(
                   child: SingleChildScrollView(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                      if (_ncMode) ...[
+                        _ncExplanation(text),
+                        const SizedBox(height: AppSpacing.lg),
+                      ],
                       if (_counters.isNotEmpty) ...[
                         _tillRow(text),
                         const SizedBox(height: AppSpacing.lg),
@@ -2102,28 +2358,19 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                       // Nothing left to take: no method pills, no amount field.
                       // A composer offering to take money on a bill that owes
                       // none is the shortest route to an over-tender.
-                      if (!_ledgerOk || _remaining > 0) _composerBlock(text),
+                      if (_ncMode)
+                        _ncBlock(text)
+                      else if (!_ledgerOk || _remaining > 0)
+                        _composerBlock(text)
+                      // Nothing to take, but the bill can still be given away:
+                      // the pills alone, so NC can be chosen.
+                      else if (_mayNc)
+                        _methodPills(text, _busy || _uploading),
+                      if (keyboardUp) ...notes,
                     ]),
                   ),
                 ),
-                if (_error != null) ...[
-                  const SizedBox(height: 10),
-                  Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
-                ],
-                // WHY "Settle & close" IS GREY, standing next to it. A disabled
-                // primary button on a money screen with no reason beside it is
-                // the dead-looking control this app has been bitten by before —
-                // and here the reason is always something the cashier can act
-                // on: take the rest, or record what has been paid.
-                if (_error == null && _settleRefusal != null) ...[
-                  const SizedBox(height: 10),
-                  Text(_settleRefusal!,
-                      key: const ValueKey('pay-refusal'),
-                      style: text.bodySmall!.copyWith(color: AppColors.warning)),
-                ],
-                const SizedBox(height: AppSpacing.md),
-                Text('Approval is required before the bill closes and the table frees.',
-                    style: text.bodySmall),
+                if (!keyboardUp) ...notes,
                 const SizedBox(height: AppSpacing.md),
                 _actions(text),
               ]),
@@ -2180,6 +2427,38 @@ class _PaymentSheetState extends State<_PaymentSheet> {
         ]),
       ],
     ]);
+  }
+
+  /// THE NC HEADLINE: nothing to pay, and what is being given away — the
+  /// server's own figures off the open bill. What the guest would have paid is
+  /// said once, as information, and is in no report ([_ncExplanation]).
+  Widget _ncHeadline(TextTheme text) {
+    final given = NcSettle.givenAway(_ncBill);
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(
+        widget.tableName.isEmpty ? 'SETTLE AS NC' : 'SETTLE AS NC · TABLE ${widget.tableName.toUpperCase()}',
+        style: text.labelSmall,
+      ),
+      const SizedBox(height: 8),
+      Text(NcSettle.headline(given, (v) => _money(v)),
+          key: const ValueKey('pay-nc-headline'),
+          style: text.titleLarge!.copyWith(color: AppColors.copperHi)),
+    ]);
+  }
+
+  /// What the NC headline's figure is made of, and what the guest would have
+  /// paid. The first thing in the SCROLL, not pinned under the headline: it runs
+  /// to four lines on a phone (see [build]).
+  Widget _ncExplanation(TextTheme text) {
+    final would = NcSettle.wouldHaveCharged(_ncBill);
+    final comped = NcSettle.alreadyComped(_ncBill);
+    return Text(
+      'Before tax, at the prices on the bill'
+      '${comped > 0 ? ', including ${_money(comped)} already comped dish by dish' : ''}.'
+      '${would > 0 ? ' The guest would have paid ${_money(would)} with service charge and tax — information only; it is in no report.' : ''}',
+      key: const ValueKey('pay-nc-explanation'),
+      style: text.bodySmall,
+    );
   }
 
   Widget _tillRow(TextTheme text) {
@@ -2310,18 +2589,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     final canCapture = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
     final locked = _busy || _uploading;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text(_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART', style: text.labelSmall),
-      const SizedBox(height: 8),
-      Wrap(spacing: 8, runSpacing: 8, children: [
-        // Keyed by the id (what is sent), labelled by the owner's name for it.
-        for (final m in _modes)
-          _CapturePill(
-            key: ValueKey('pay-method-${m.id}'),
-            label: m.label,
-            selected: _method == m.id,
-            onTap: locked ? null : () => setState(() => _method = m.id),
-          ),
-      ]),
+      _methodPills(text, locked),
       if (_ledgerOk) ...[
         const SizedBox(height: AppSpacing.md),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2459,6 +2727,106 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     ]);
   }
 
+  /// The payment-mode pills — and, for a session that may, the NC pill beside
+  /// them, which is NOT a mode (see [NcSettle]). Shared by the composer and the
+  /// NC form, so either can switch to the other.
+  Widget _methodPills(TextTheme text, bool locked) {
+    final ncBlocked = _ncOffered ? _ncBlocker : null;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(_ncMode ? 'SETTLE AS' : (_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART'), style: text.labelSmall),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        // Keyed by the id (what is sent), labelled by the owner's name for it.
+        for (final m in _modes)
+          _CapturePill(
+            key: ValueKey('pay-method-${m.id}'),
+            label: m.label,
+            selected: !_ncMode && _method == m.id,
+            onTap: locked
+                ? null
+                : () => setState(() {
+                      _method = m.id;
+                      _ncMode = false;
+                      _error = null;
+                    }),
+          ),
+        if (_ncOffered)
+          // Greyed, with the reason under it, when the server would refuse it.
+          Opacity(
+            opacity: ncBlocked == null ? 1 : 0.45,
+            child: _CapturePill(
+              key: const ValueKey('pay-method-NC'),
+              label: kNcSettlePill,
+              selected: _ncMode,
+              onTap: (locked || ncBlocked != null)
+                  ? null
+                  : () => setState(() {
+                        _ncMode = true;
+                        _error = null;
+                      }),
+            ),
+          ),
+      ]),
+      if (ncBlocked != null && !_ncMode) ...[
+        const SizedBox(height: 6),
+        Text('NC is not available here: $ncBlocked',
+            key: const ValueKey('pay-nc-blocked'),
+            style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+      ],
+    ]);
+  }
+
+  /// THE NC FORM: why, in whose words, on whose say-so — the comp sheet's three
+  /// questions, in place of the amount, reference, tip, split and proof, none
+  /// of which a bill that takes nothing has. The reason stays required.
+  Widget _ncBlock(TextTheme text) {
+    final locked = _busy;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _methodPills(text, locked),
+      const SizedBox(height: AppSpacing.md),
+      Text(kNcWholeBillOnly, key: const ValueKey('pay-nc-whole-bill'), style: text.bodySmall),
+      const SizedBox(height: AppSpacing.lg),
+      Text('WHY IS IT GOING FREE', style: text.labelSmall),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        for (final (value, label) in _ncKinds)
+          _CapturePill(
+            key: ValueKey('pay-nc-kind-$value'),
+            label: label,
+            selected: _ncKind == value,
+            onTap: locked ? null : () => setState(() => _ncKind = value),
+          ),
+      ]),
+      const SizedBox(height: AppSpacing.md),
+      TextField(
+        key: const ValueKey('pay-nc-reason'),
+        controller: _ncReason,
+        minLines: 2,
+        maxLines: 3,
+        maxLength: 400,
+        textCapitalization: TextCapitalization.sentences,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Reason',
+          alignLabelWithHint: true,
+          helperText: 'Required. It goes on the NC Summary, verbatim.',
+        ),
+      ),
+      const SizedBox(height: 4),
+      TextField(
+        key: const ValueKey('pay-nc-authoriser'),
+        controller: _ncAuthorisedBy,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Authorised by (username)',
+          helperText: 'The staff member who approved giving this bill away. Yours is filled in — '
+              'change it if someone else said yes.',
+          helperMaxLines: 3,
+        ),
+      ),
+    ]);
+  }
+
   Widget _tipBlock(TextTheme text, bool locked) {
     return ForkCard(
       inset: true,
@@ -2532,7 +2900,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
 
   Widget _actions(TextTheme text) {
     final locked = _busy || _uploading;
-    final canPart = _ledgerOk && _allDrafts.isNotEmpty && _remaining > 0;
+    final canPart = !_ncMode && _ledgerOk && _allDrafts.isNotEmpty && _remaining > 0;
     final canSettle = _settleRefusal == null;
     return Wrap(
       alignment: WrapAlignment.end,
@@ -2552,12 +2920,20 @@ class _PaymentSheetState extends State<_PaymentSheet> {
             dense: true,
             onPressed: locked ? null : _recordPartPayment,
           ),
-        ForkButton(
-          key: const ValueKey('pay-settle'),
-          label: _busy ? 'Processing…' : 'Settle & close',
-          icon: Icons.check,
-          onPressed: (locked || !canSettle) ? null : _settleAndClose,
-        ),
+        if (_ncMode)
+          ForkButton(
+            key: const ValueKey('pay-settle-nc'),
+            label: _busy ? 'Processing…' : kNcSettleButton,
+            icon: Icons.card_giftcard,
+            onPressed: (locked || _ncRefusal != null) ? null : _settleAsNc,
+          )
+        else
+          ForkButton(
+            key: const ValueKey('pay-settle'),
+            label: _busy ? 'Processing…' : 'Settle & close',
+            icon: Icons.check,
+            onPressed: (locked || !canSettle) ? null : _settleAndClose,
+          ),
       ],
     );
   }

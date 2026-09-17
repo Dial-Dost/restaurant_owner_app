@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/bill_round_off.dart';
+import '../models/nc_settle.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../services/rest_client.dart';
@@ -280,6 +281,17 @@ class _TableBillSheetState extends State<_TableBillSheet> {
     );
   }
 
+  /// A line's name. A COMPED DISH READS AS THE PAPER PRINTS IT, `<dish> (NC)`,
+  /// at 0.00 ([_items]). The server keeps its menu price on the line and leaves
+  /// it out of `subtotal`, so printing that price here made a column that did
+  /// not add up to the Subtotal under it. A waiter sees neither figure
+  /// (ITEM 19), and not the marker either: the comp is a manager's act on the
+  /// bill.
+  String _lineName(Map it) {
+    final name = '${it['name'] ?? '—'}';
+    return _showsMoney ? NcSettle.lineLabel(name, it['nc']) : name;
+  }
+
   // Every line already sent to the kitchen for this table (its active orders,
   // merged by the backend).
   Widget _items(Map<String, dynamic> bill) {
@@ -298,7 +310,7 @@ class _TableBillSheetState extends State<_TableBillSheet> {
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('${it['name'] ?? '—'}  ×${it['quantity'] ?? 1}', style: text.bodyLarge),
+                  Text('${_lineName(it)}  ×${it['quantity'] ?? 1}', style: text.bodyLarge),
                   if ('${it['note'] ?? ''}'.trim().isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 2),
@@ -311,7 +323,8 @@ class _TableBillSheetState extends State<_TableBillSheet> {
               // quantity and its kitchen note all stay — that is the ticket.
               if (_showsMoney) ...[
                 const SizedBox(width: 10),
-                Text(_money(_num(it['price']) * _num(it['quantity'] ?? 1)), style: text.titleSmall),
+                Text(_money(NcSettle.lineAmount(_num(it['price']), _num(it['quantity'] ?? 1), it['nc'])),
+                    style: text.titleSmall),
               ],
             ]),
           ),
@@ -344,6 +357,17 @@ class _TableBillSheetState extends State<_TableBillSheet> {
           Expanded(child: Text('TOTAL PAYABLE', style: text.labelSmall)),
           Text(_money(bill['grand_total'] ?? bill['total_amt']), style: text.displaySmall),
         ]),
+        // Beside the total, never in it: what the comped dishes were worth.
+        // The server's own `nc_total`, as the bill preview and the closed bill
+        // show it.
+        if (_num(bill['nc_total']) > 0)
+          KeyedSubtree(
+            key: const ValueKey('table-bill-nc-value'),
+            child: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: row('NC value (not charged)', _money(bill['nc_total'])),
+            ),
+          ),
       ]),
     );
   }
