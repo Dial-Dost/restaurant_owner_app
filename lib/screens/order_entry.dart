@@ -114,10 +114,15 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   bool _sending = false;
   String? _error;
 
-  /// CLIENT ITEM 6 — the server's 409 for an order added to a bill that has
-  /// already been printed, read ([BillPrintedRefusal]). Drawn above the Send
-  /// button with its "Take it on 12 (next party)" action; null otherwise.
+  /// CLIENT ITEM 6 — the server's refusal of an order added to a bill that has
+  /// already been printed, read ([BillPrintedRefusal]). Its sentence is drawn
+  /// at the foot of the header's scroll, and its "Take it on 12 (next party)"
+  /// action is pinned above the Send button. Null otherwise.
   BillPrintedRefusal? _printedRefusal;
+
+  /// The refusal's sentence, which rides in the header's scroll: scrolled into
+  /// view when the refusal arrives (see [_printedRefusalSentence]).
+  final GlobalKey _printedRefusalKey = GlobalKey();
 
   /// The next-party seat this order was moved to by that action, or null.
   /// Once set, it is THE table: the occupy, the order, the running bill and
@@ -320,6 +325,15 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
 
   Future<void> _send() async {
     if (_cart.isEmpty) return;
+    // THE KEYBOARD GOES DOWN ON SEND. A send that lands closes the pad anyway;
+    // one the server refuses needs the screen. The usual flow is type in the
+    // search, Add, Send, so the keyboard was still up when the "bill already
+    // printed" refusal arrived, and on a phone the header it is drawn in (capped
+    // at [_kHeaderMaxShare] of a body already halved by the keyboard) could not
+    // hold "Take it on 12 (next party)" at all. Unfocusing here also clears the
+    // route's focus memory, so the covers dialog below does not hand the focus,
+    // and the keyboard, back to the search box when it closes.
+    FocusManager.instance.primaryFocus?.unfocus();
     // ITEM 5 — THE LINES ARE BUILT HERE, FIRST, before a dialog is asked or the
     // sending flag is raised. They used to be built after `_sending = true` with
     // `_itemsById[id]!`, outside the try: a menu refresh that dropped a carted
@@ -450,6 +464,16 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         _error = refusal == null ? '$e' : null;
         _sending = false;
       });
+      // The sentence sits at the foot of the header's scroll, under the search
+      // and the kitchen note; on a short screen that is below the fold. Bring
+      // it up, top first, so the waiter reads why before the button beneath it.
+      if (refusal != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final sentence = _printedRefusalKey.currentContext;
+          if (!mounted || sentence == null) return;
+          unawaited(Scrollable.ensureVisible(sentence));
+        });
+      }
     }
   }
 
@@ -467,26 +491,41 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     await _send();
   }
 
-  /// The refusal and its action, above the Send button so it is on screen
-  /// whatever the menu is scrolled to.
-  Widget _printedRefusalBanner(BillPrintedRefusal refusal) => Padding(
+  /// The refusal's sentence, at the foot of the header's SCROLL, directly above
+  /// its action.
+  ///
+  /// IT USED TO BE ONE FIXED BLOCK WITH THE BUTTON, outside the scroll, and on
+  /// a phone that block did not fit. The server's sentence runs to seven lines
+  /// at 360dp, so the block alone was about 260px tall. The header is capped at
+  /// [_kHeaderMaxShare] of the body, and only its scroll can shrink. Without the
+  /// keyboard, that squeezed the search and the kitchen note to nothing. With
+  /// the keyboard up, the block overflowed the cap, and "Take it on 12 (next
+  /// party)" and "Send order" were clipped out of reach. Now only the button is
+  /// pinned ([_takeItOnButton]), and the words scroll with the fields above them.
+  Widget _printedRefusalSentence(BillPrintedRefusal refusal) => Padding(
         key: const ValueKey('order-bill-printed'),
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
         child: ForkCard(
+          key: _printedRefusalKey,
           inset: true,
           padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
-            Text(refusal.message, style: TextStyle(color: AppColors.warning, fontWeight: FontWeight.w600)),
-            if (refusal.nextPartyTable != null && refusal.actionLabel != null) ...[
-              const SizedBox(height: 8),
-              FilledButton.icon(
-                key: const ValueKey('order-take-on-next-party'),
-                onPressed: _sending ? null : () => _takeItOnNextParty(refusal.nextPartyTable!),
-                icon: const Icon(Icons.event_seat_outlined, size: 18),
-                label: Text(refusal.actionLabel!),
-              ),
-            ],
-          ]),
+          child: Text(refusal.message, style: TextStyle(color: AppColors.warning, fontWeight: FontWeight.w600)),
+        ),
+      );
+
+  /// "Take it on 12 (next party)", pinned beside [_sendBar] and outside the
+  /// header's scroll, for the reason "Send order" is: while the refusal stands
+  /// it is the one control the waiter needs, and it must never scroll away.
+  Widget _takeItOnButton(BillPrintedRefusal refusal) => Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        child: SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            key: const ValueKey('order-take-on-next-party'),
+            onPressed: _sending ? null : () => _takeItOnNextParty(refusal.nextPartyTable!),
+            icon: const Icon(Icons.event_seat_outlined, size: 18),
+            label: Text(refusal.actionLabel!),
+          ),
         ),
       );
 
@@ -574,10 +613,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                     ),
                   ),
                   if (_count > 0) _orderFields(),
+                  if (_printedRefusal != null) _printedRefusalSentence(_printedRefusal!),
                 ]),
               ),
             ),
-            if (_printedRefusal != null) _printedRefusalBanner(_printedRefusal!),
+            if (_printedRefusal?.nextPartyTable != null && _printedRefusal?.actionLabel != null)
+              _takeItOnButton(_printedRefusal!),
             if (_count > 0) _sendBar(),
           ]),
         ),

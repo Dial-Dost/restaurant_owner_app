@@ -274,9 +274,9 @@ final Finder _seatTile = find.byKey(const ValueKey('table-title-T1 #2'));
 
 /// The pad, pushed from a host route so a test can see it close.
 Future<(_FakeApi, List<bool?>)> _pumpPad(WidgetTester tester, _FakeApi api,
-    {String table = 'T1', bool occupyOnSend = false}) async {
+    {String table = 'T1', bool occupyOnSend = false, Size size = const Size(420, 900)}) async {
   await tester.pumpWidget(const SizedBox());
-  tester.view.physicalSize = const Size(420, 900);
+  tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
   final rest = await _signIn(api);
@@ -311,6 +311,14 @@ Future<void> _addAndSend(WidgetTester tester) async {
   await tester.pumpAndSettle();
   await tester.tap(find.byKey(const ValueKey('order-send')));
   await tester.pumpAndSettle();
+}
+
+/// Would a finger on [finder]'s centre land on it? False when it is clipped out
+/// of its box or drawn under something else — a control on screen in the tree
+/// and out of reach on the glass.
+bool _reachable(WidgetTester tester, Finder finder) {
+  final target = tester.renderObject(finder);
+  return tester.hitTestOnBinding(tester.getCenter(finder)).path.any((e) => identical(e.target, target));
 }
 
 Future<void> _answerCovers(WidgetTester tester, String covers) async {
@@ -768,6 +776,78 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byType(TableApcStrip), findsNothing,
           reason: "T1's bill was drawn as the next party's");
+    });
+
+    // A PHONE. The tests above pump the pad at 420x900 with no keyboard, and
+    // the refusal fitted there. At 360dp the server's sentence runs to seven
+    // lines, and the usual flow (type in the search, Add, Send) left the
+    // keyboard up when the refusal arrived: the header, capped at 55% of a
+    // body the keyboard had halved, overflowed by 143px, and "Take it on" and
+    // "Send order" were clipped out of reach.
+    const phone = Size(360, 640);
+    const keyboard = FakeViewPadding(bottom: 260);
+
+    Future<void> searchAddSend(WidgetTester tester) async {
+      await tester.showKeyboard(find.byKey(const ValueKey('order-search')));
+      await tester.enterText(find.byKey(const ValueKey('order-search')), 'gul');
+      await tester.pumpAndSettle();
+      await _addAndSend(tester);
+    }
+
+    testWidgets('a 360dp phone with the keyboard up: nothing overflows, and both buttons are within reach',
+        (tester) async {
+      final (api, closed) = await _pumpPad(tester, refusingT1(), size: phone);
+      tester.view.viewInsets = keyboard;
+      await tester.pumpAndSettle();
+      await searchAddSend(tester);
+
+      expect(tester.takeException(), isNull, reason: 'the header overflowed');
+      expect(find.byKey(const ValueKey('order-bill-printed')), findsOneWidget);
+      expect(_reachable(tester, find.byKey(const ValueKey('order-take-on-next-party'))), isTrue,
+          reason: '"Take it on T1 (next party)" is clipped out of reach');
+      expect(_reachable(tester, find.byKey(const ValueKey('order-send'))), isTrue,
+          reason: '"Send order" is clipped out of reach');
+
+      // And it works from there.
+      await tester.tap(find.byKey(const ValueKey('order-take-on-next-party')));
+      await tester.pumpAndSettle();
+      await _answerCovers(tester, '2');
+      expect(api.writes.map((w) => w.path).toList(), ['/occupy-table', '/orders']);
+      expect((api.to('/orders').single.body as Map)['table'], 'T1 #2');
+      expect(closed, [true]);
+    });
+
+    testWidgets('Send puts the keyboard away, and the covers question does not bring it back', (tester) async {
+      await _pumpPad(tester, refusingT1());
+      await searchAddSend(tester);
+      expect(find.byKey(const ValueKey('order-bill-printed')), findsOneWidget);
+      expect(tester.testTextInput.isVisible, isFalse, reason: 'the refusal arrived under the keyboard');
+
+      // "Take it on", then Cancel: the dialog's own field had the keyboard, and
+      // closing it must not hand the focus back to the search box.
+      await tester.tap(find.byKey(const ValueKey('order-take-on-next-party')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      expect(tester.testTextInput.isVisible, isFalse, reason: 'the search box took the keyboard back');
+    });
+
+    testWidgets('the sentence is scrolled into view, and the search is still there above it', (tester) async {
+      await _pumpPad(tester, refusingT1(), size: phone);
+      await searchAddSend(tester);
+      expect(tester.takeException(), isNull);
+      final sentence = find.byKey(const ValueKey('order-bill-printed'));
+      final top = tester.getTopLeft(sentence) + const Offset(24, 16);
+      final hit = tester.hitTestOnBinding(top).path.map((e) => e.target).toSet();
+      expect(hit.contains(tester.renderObject(sentence)), isTrue,
+          reason: 'the start of the sentence is below the fold of the header');
+
+      // The fields above it scroll back: the search is squeezed, not gone.
+      final search = find.byKey(const ValueKey('order-search'));
+      await tester.drag(sentence, const Offset(0, 400));
+      await tester.pumpAndSettle();
+      expect(_reachable(tester, search), isTrue, reason: 'the search box cannot be reached while the refusal stands');
+      expect(_reachable(tester, find.byKey(const ValueKey('order-take-on-next-party'))), isTrue);
     });
 
     testWidgets('with no seat to point at: the sentence, and no button', (tester) async {
