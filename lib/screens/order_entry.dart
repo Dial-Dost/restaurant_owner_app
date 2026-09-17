@@ -109,6 +109,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // "No items match"). The box is now the shared [AppSearchField], and this is
   // only ever written by its onQuery: whatever empties the box empties this.
   String _query = '';
+  // The box's text, held here and never written here (only the box writes
+  // it). It is the pad's so that the words outlive the box: if the box is
+  // ever built afresh, it shows what the list is filtered on, x and all.
+  final TextEditingController _searchBox = TextEditingController();
   bool _sending = false;
   String? _error;
 
@@ -222,6 +226,7 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _phoneCtrl.dispose();
     _addrCtrl.dispose();
     _coversCtrl.dispose();
+    _searchBox.dispose();
     _menuScroll.dispose();
     _draftRev.dispose();
     super.dispose();
@@ -580,13 +585,21 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                         ),
                       ),
                     ),
+                  // KEYED, because the running-bill strip above comes and goes
+                  // while the waiter types: the bill lands after the menu (it is
+                  // never read from the cache), and "Take it on 12 (next party)"
+                  // drops it. Unkeyed, Flutter matched this Padding to the
+                  // strip's and built a new, empty box, while the list stayed
+                  // filtered on the old word with no x to clear it.
                   Padding(
+                    key: const ValueKey('order-search-row'),
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
                     // The x empties the BOX and the filter together, and focus
                     // stays in it: the waiter is about to type the next dish.
                     child: AppSearchField(
                       testId: 'order-search',
                       hint: 'Search menu…',
+                      controller: _searchBox,
                       onQuery: (q) => setState(() => _query = q),
                     ),
                   ),

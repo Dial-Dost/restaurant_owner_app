@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -20,6 +21,7 @@ import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_tabs.dart';
 import 'package:restaurant_owner_app/widgets/menu_badges.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+import 'package:restaurant_owner_app/widgets/table_bill.dart';
 
 import 'fixtures/planted_searches.dart';
 import 'search_contract.dart';
@@ -82,6 +84,21 @@ class _Api extends ApiClient {
   bool lastSearched(String prefix) =>
       gets.lastWhere((p) => p.startsWith(prefix), orElse: () => '').contains('search=');
 }
+
+/// T1's running bill, as /bill-for-table answers it.
+const _runningBill = <String, dynamic>{
+  'bill_id': 'bill-1',
+  'total_amt': 520.0,
+  'subtotal': 520.0,
+  'covers': 2,
+  'apc': 260.0,
+  'target_apc': 300.0,
+  'apc_status': 'red',
+  'order_ids': ['order-1'],
+  'items': [
+    {'name': 'Veg Thali', 'price': 260.0, 'quantity': 2},
+  ],
+};
 
 String _searchOf(String path) => Uri.parse('http://x$path').queryParameters['search'] ?? '';
 
@@ -279,16 +296,25 @@ void main() {
   // ---------------------------------------------------------- the rows ----
 
   // Tables → a table → the order pad (and Orders → takeaway / delivery). The
-  // box the client's complaint was about, as a waiter sees it.
+  // box the client's complaint was about, as a waiter sees it. The table has a
+  // running bill that is slow to come back, and it lands in the rebuild: its
+  // strip goes in above the box while a word is in it.
   searchContractRows('order-search', (tester, ds) async {
     useSearchView(tester);
-    await _signIn(_Api({'/menu': _dishes}, role: 'waiter'));
+    final bill = Completer<Object?>();
+    await _signIn(_Api({'/menu': _dishes, '/bill-for-table': (String _) => bill.future}, role: 'waiter'));
     await tester.pumpWidget(searchThemed(ds, OrderEntryScreen(rest: RestClient(_auth), tableName: 'T1')));
     await tester.pumpAndSettle();
+    expect(find.byType(TableApcStrip), findsNothing);
     return SearchSurface(
       field: find.byKey(const ValueKey('order-search')),
       typed: 'dal',
       filtered: () => find.text('Paneer Tikka').evaluate().isEmpty,
+      rebuild: () async {
+        bill.complete(_runningBill);
+        await tester.pumpAndSettle();
+        expect(find.byType(TableApcStrip), findsOneWidget);
+      },
     );
   });
 

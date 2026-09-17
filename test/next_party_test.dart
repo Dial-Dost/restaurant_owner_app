@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -777,6 +779,57 @@ void main() {
       expect(find.byType(TableApcStrip), findsNothing,
           reason: "T1's bill was drawn as the next party's");
     });
+
+    testWidgets('the search keeps its word and x while the running-bill strip goes and comes back', (tester) async {
+      // "Take it on" drops T1's bill from the pad before the seat's is read,
+      // so the strip above the search goes, and comes back when the seat's
+      // (empty) bill lands. The unkeyed search row used to be rebuilt empty
+      // each time, over a list still filtered on "gul".
+      final seatBill = Completer<Object?>();
+      final routes = _floor([_root(), _seat()]);
+      routes['/bill-for-table'] = (path) => path.contains('%23') ? seatBill.future : _printedBill();
+      routes['/menu'] = (_) => const [
+            {'id': 'mi-1', 'name': 'Gulab Jamun', 'price': 120.0, 'category': 'Desserts'},
+            {'id': 'mi-2', 'name': 'Masala Chai', 'price': 60.0, 'category': 'Drinks'},
+          ];
+      final api = _waiter(routes);
+      api.refuse = (path, body) => path == '/orders' && (body as Map)['table'] == 'T1' ? _billPrinted() : null;
+      await _pumpPad(tester, api);
+      final search = find.byKey(const ValueKey('order-search'));
+      final x = find.byKey(const ValueKey('order-search-clear'));
+      String box() =>
+          tester.widget<EditableText>(find.descendant(of: search, matching: find.byType(EditableText))).controller.text;
+      expect(find.byType(TableApcStrip), findsOneWidget);
+
+      await tester.enterText(search, 'gul');
+      await tester.pumpAndSettle();
+      expect(find.text('Masala Chai'), findsNothing);
+      await _addAndSend(tester);
+      await tester.tap(find.byKey(const ValueKey('order-take-on-next-party')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.text('New order · T1 (next party)'), findsOneWidget);
+      expect(find.byType(TableApcStrip), findsNothing, reason: "the seat's bill is still on its way");
+      expect(box(), 'gul', reason: 'the strip going wiped the box');
+      expect(x, findsOneWidget);
+      expect(find.text('Masala Chai'), findsNothing);
+
+      seatBill.complete(<String, dynamic>{'items': const []});
+      await tester.pumpAndSettle();
+      expect(find.byType(TableApcStrip), findsOneWidget);
+      expect(box(), 'gul', reason: 'the strip coming back wiped the box');
+      expect(x, findsOneWidget);
+      expect(find.text('Masala Chai'), findsNothing);
+
+      // And the x there clears the word and the filter together.
+      await tester.tapAt(tester.getCenter(x),
+          kind: defaultTargetPlatform == TargetPlatform.windows ? PointerDeviceKind.mouse : PointerDeviceKind.touch);
+      await tester.pumpAndSettle();
+      expect(box(), isEmpty);
+      expect(find.text('Masala Chai'), findsOneWidget);
+      expect(api.writes, isEmpty);
+    }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.android, TargetPlatform.windows}));
 
     // A PHONE. The tests above pump the pad at 420x900 with no keyboard, and
     // the refusal fitted there. At 360dp the server's sentence runs to seven
