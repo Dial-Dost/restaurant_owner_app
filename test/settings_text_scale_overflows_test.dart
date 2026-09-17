@@ -6,7 +6,7 @@
 //   * Payments: each till mode's "Require payment screenshot" / "Show on guest
 //     QR page" sat in a min-size Row whose words could not wrap;
 //   * Messaging: the provider dropdown was as wide as its widest choice
-//     ("Twilio (SMS / WhatsApp)"), 200px wider than the card;
+//     ("Twilio (SMS / WhatsApp)"), over 200px wider than the card;
 //   * Branding: the logo box and the "Upload logo" button sat in one Row;
 //   * Appearance: at 2x, the design-system picker's miniatures (82px tall)
 //     could not hold their sample figure.
@@ -169,8 +169,11 @@ Finder _card(String title) =>
 
 /// Drags the Settings list until [title] is built, then walks its card through
 /// the screen top to bottom, a frame at each step, so every row is painted.
+/// The budget is raised from the default 50 drags: Settings on a phone at
+/// large text grows whenever a row learns to wrap, and a test further down the
+/// page ran out at 50 once the Payments options wrapped.
 Future<void> _paintThrough(WidgetTester tester, String title) async {
-  await tester.scrollUntilVisible(find.text(title), 300, scrollable: _list);
+  await tester.scrollUntilVisible(find.text(title), 300, scrollable: _list, maxScrolls: 200);
   final card = _card(title);
   await tester.ensureVisible(card);
   await tester.pumpAndSettle();
