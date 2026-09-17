@@ -1,0 +1,681 @@
+// SETTLE AS NC — client item 5, from the till's side.
+//
+// "NC has to come up as an option for payment mode when settling a bill, this
+// has to be coded in as analytics for NC is required."
+//
+// What these pin:
+//   * the pure rules (lib/models/nc_settle.dart) — gates, refusals, the body,
+//     the words, the report and overview readers, the paper's NC line;
+//   * THE SETTLE SHEET: the NC pill is offered beside the modes only to a
+//     session holding BOTH the comp permission and Close Bill; it posts ONCE to
+//     settle-nc with the sheet's quote and never approves or closes; it is
+//     greyed WITH the reason when money is already on the bill or a discount is;
+//     a ₹0 bill whose dishes were all comped opens as NC and never sends UPI;
+//     offline it refuses with the billing sentence and queues nothing;
+//   * THE PAPER PREVIEW: a comped line reads "<dish> (NC)" at 0.00 and the value
+//     given away is disclosed under the total;
+//   * THE OVERVIEW: today's NC beside the by-method block, never inside it;
+//   * the wiring the widgets above do not reach (the report panels, the closed
+//     bill), and the same words as the web dashboard and the backend.
+
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:restaurant_owner_app/models/nc_settle.dart';
+import 'package:restaurant_owner_app/models/profile.dart';
+import 'package:restaurant_owner_app/screens/modules.dart' as m;
+import 'package:restaurant_owner_app/services/api_client.dart';
+import 'package:restaurant_owner_app/services/auth_controller.dart';
+import 'package:restaurant_owner_app/services/outbox.dart';
+import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
+import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+
+/// PERM_NON_CHARGEABLE and the record-payment action, as the server names them.
+const String _permNc = 'b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472';
+const String _permRecordPayment = '2393edd7-cdd9-439c-9ff3-d563d5216967';
+
+String _rupees(double v) => '₹${v.toStringAsFixed(2)}';
+
+// ------------------------------------------------------------------ the fake
+
+class _FakeApi extends ApiClient {
+  _FakeApi(this.routes, {this.actions = const ['*'], this.role = 'admin'});
+
+  final Map<String, dynamic> routes;
+  final List<String> actions;
+  final String role;
+  static const String username = 'manager01';
+
+  final List<String> calls = <String>[];
+  final List<({String method, String path, Object? body})> writes = [];
+  bool offline = false;
+  String failOn = '';
+  String failMessage = 'refused';
+  final Map<String, Object?> replies = <String, Object?>{};
+
+  @override
+  Future<LoginResult> login(String restaurantName, String user, String password, {String? outletId}) async =>
+      LoginResult(
+        'test-token',
+        Profile.fromJson(<String, dynamic>{
+          'employeeId': 'e1',
+          'restaurantName': 'CSR Organics',
+          'restaurantUsername': 'csrorganics',
+          'res_id': 'res-1',
+          'outlet_id': 'out-1',
+          'employeeUsername': username,
+          'role': role,
+          'actions_set': actions,
+          'action_names': const <String>[],
+        }),
+      );
+
+  @override
+  Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
+    if (offline) throw ApiException('Connection failed');
+    calls.add('$method $path');
+    if (failOn.isNotEmpty && path.contains(failOn)) throw ApiException(failMessage, 400);
+    if (method != 'GET') {
+      writes.add((method: method, path: path, body: body));
+      return replies.containsKey(path) ? replies[path] : <String, dynamic>{'success': true};
+    }
+    if (routes.containsKey(path)) return routes[path];
+    final prefixes = routes.keys.where(path.startsWith).toList()..sort((a, z) => z.length.compareTo(a.length));
+    if (prefixes.isNotEmpty) return routes[prefixes.first];
+    throw ApiException('No fake route for $path', 404);
+  }
+
+  Object? bodyOf(String fragment) {
+    for (final w in writes) {
+      if (w.path.contains(fragment)) return w.body;
+    }
+    return null;
+  }
+
+  bool wrote(String fragment) => writes.any((w) => w.path.contains(fragment));
+}
+
+Future<_FakeApi> _mount(
+  WidgetTester tester,
+  Widget Function(RestClient, Profile) module,
+  Map<String, dynamic> routes, {
+  List<String> actions = const ['*'],
+  String role = 'admin',
+  List<String> labels = const ['Tables', 'Orders', 'Menu', 'Settings'],
+}) async {
+  await tester.pumpWidget(const SizedBox());
+  tester.view.physicalSize = const Size(1400, 1400);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+  SharedPreferences.setMockInitialValues(<String, Object>{});
+  final api = _FakeApi(routes, actions: actions, role: role);
+  final auth = AuthController(api: api);
+  await auth.login('CSR Organics', 'admin', 'admin123');
+  final rest = RestClient(auth);
+  await tester.pumpWidget(MaterialApp(
+    theme: AppTheme.dark(),
+    home: ModuleNavigator(
+      openModule: (_, {Map<String, dynamic>? target}) {},
+      visibleLabels: labels,
+      clearFocus: () {},
+      child: Scaffold(backgroundColor: Colors.transparent, body: module(rest, rest.auth.profile!)),
+    ),
+  ));
+  await tester.pumpAndSettle();
+  return api;
+}
+
+// ------------------------------------------------------------------ fixtures
+
+Map<String, dynamic> _bill({
+  double subtotal = 1200,
+  double grand = 1386,
+  double ncTotal = 0,
+  double discount = 0,
+  List<Map<String, dynamic>>? items,
+}) =>
+    {
+      'bill_id': 'bill-1',
+      'table_id': 'tbl-1',
+      'total_amt': subtotal,
+      'subtotal': subtotal,
+      'discount': discount,
+      'discount_type': discount > 0 ? 'flat' : null,
+      'discount_value': discount,
+      'service_charge': grand > 0 ? 120.0 : 0.0,
+      'service_charge_percent': 10.0,
+      'service_charge_waived': false,
+      'taxes': grand > 0
+          ? const [
+              {'name': 'CGST', 'percentage': 2.5, 'amount': 33.0},
+              {'name': 'SGST', 'percentage': 2.5, 'amount': 33.0},
+            ]
+          : const <dynamic>[],
+      'tax_total': grand > 0 ? 66.0 : 0.0,
+      'round_off': 0.0,
+      'grand_total': grand,
+      'nc_total': ncTotal,
+      'covers': 3,
+      'apc': 400.0,
+      'order_ids': const ['order-1'],
+      'items': items ??
+          const [
+            {'name': 'Paneer Tikka', 'price': 350.0, 'quantity': 2},
+            {'name': 'Dal Makhani', 'price': 500.0, 'quantity': 1},
+          ],
+      'target_apc': 0,
+      'apc_status': 'neutral',
+      'apc_suggestions': const [],
+      'payment_method': null,
+      'payment_status': null,
+      'bill_no': '101',
+    };
+
+Map<String, dynamic> _tenders({double grand = 1386, double tendered = 0}) => {
+      'bill_id': 'bill-1',
+      'grand_total': grand,
+      'tenders': tendered > 0
+          ? [
+              {'id': 't-1', 'method': 'Cash', 'amount': tendered, 'voided_at': null},
+            ]
+          : <dynamic>[],
+      'tendered': tendered,
+      'outstanding': grand - tendered,
+      'exact': grand == tendered,
+      'partial': tendered > 0 && tendered < grand,
+      'over': false,
+      'tips_total': 0.0,
+      'payment_method': null,
+      'payment_splits': <dynamic>[],
+    };
+
+Map<String, dynamic> _routes({Map<String, dynamic>? bill, Map<String, dynamic>? tenders}) => {
+      '/get-tables': [
+        {
+          'table_name': 'T1',
+          'capacity': 4,
+          'max_capacity': 4,
+          'section': 'Main',
+          'occupied': true,
+          'reserved': false,
+          'num_covers': 3,
+        },
+      ],
+      '/table-assignments': <dynamic>[],
+      '/get-bookings': <dynamic>[],
+      '/table-sections': {
+        'sections': [
+          {'section': 'Main'},
+        ],
+      },
+      '/bill-for-table': bill ?? _bill(),
+      '/orders/scope': {'outlets': <dynamic>[], 'is_all_outlets': false},
+      '/orders': [
+        {
+          'id': 'order-1',
+          'table': 'T1',
+          'status': 'Served',
+          'order_type': 'dine_in',
+          'customer': 'Guest',
+          'total': 1200.0,
+          'created_at': '2026-09-16T12:00:00.000Z',
+          'barked_at': '2026-09-16T12:01:00.000Z',
+          'taken_by_employee_name': 'Asha',
+          'items': [
+            {'id': 'item-1', 'name': 'Paneer Tikka', 'price': 350.0, 'quantity': 2},
+            {'id': 'item-2', 'name': 'Dal Makhani', 'price': 500.0, 'quantity': 1},
+          ],
+        },
+      ],
+      '/bills/tenders': tenders ?? _tenders(),
+      '/billing-counters': {'counters': <dynamic>[]},
+    };
+
+Future<void> _openTable(WidgetTester tester) async {
+  await tester.tap(find.text('T1').first);
+  await tester.pumpAndSettle();
+}
+
+Future<void> _reveal(WidgetTester tester, Finder finder) async {
+  await tester.scrollUntilVisible(finder, 120, scrollable: find.byType(Scrollable).last);
+  await tester.pumpAndSettle();
+}
+
+Future<_FakeApi> _openSettle(
+  WidgetTester tester, {
+  Map<String, dynamic>? bill,
+  Map<String, dynamic>? tenders,
+  List<String> actions = const ['*'],
+  String role = 'admin',
+}) async {
+  final api = await _mount(tester, m.tablesModule, _routes(bill: bill, tenders: tenders), actions: actions, role: role);
+  await _openTable(tester);
+  await _reveal(tester, find.text('Settle bill'));
+  await tester.tap(find.text('Settle bill'));
+  await tester.pumpAndSettle();
+  return api;
+}
+
+VoidCallback? _pressOf(WidgetTester tester, Key key) => tester.widget<ForkButton>(find.byKey(key)).onPressed;
+
+Future<void> _tapVisible(WidgetTester tester, Key key) async {
+  await tester.ensureVisible(find.byKey(key));
+  await tester.pumpAndSettle();
+  await tester.tap(find.byKey(key));
+  await tester.pumpAndSettle();
+}
+
+/// Choose NC and fill its form.
+Future<void> _fillNc(WidgetTester tester, {String kind = 'staff_meal', String reason = 'Team dinner', bool tapPill = true}) async {
+  if (tapPill) await _tapVisible(tester, const ValueKey('pay-method-NC'));
+  await _tapVisible(tester, ValueKey('pay-nc-kind-$kind'));
+  await tester.ensureVisible(find.byKey(const ValueKey('pay-nc-reason')));
+  await tester.enterText(find.byKey(const ValueKey('pay-nc-reason')), reason);
+  await tester.pumpAndSettle();
+}
+
+// --------------------------------------------------------------------- tests
+
+void main() {
+  setUp(m.misResetCaptureMemory);
+
+  group('the rules, by value', () {
+    test('offered only with the comp permission AND Close Bill', () {
+      expect(NcSettle.mayOffer(compItem: true, settleBill: true), isTrue);
+      expect(NcSettle.mayOffer(compItem: false, settleBill: true), isFalse, reason: 'a cashier');
+      expect(NcSettle.mayOffer(compItem: true, settleBill: false), isFalse);
+      expect(NcSettle.mayOffer(compItem: false, settleBill: false), isFalse, reason: 'a waiter');
+    });
+
+    test('the quote is the server\'s own subtotal; a fully comped ₹0 bill opens as NC', () {
+      final b = _bill();
+      expect(NcSettle.value(b), 1200);
+      expect(NcSettle.wouldHaveCharged(b), 1386);
+      expect(NcSettle.givenAway(_bill(subtotal: 1000, ncTotal: 200)), 1200);
+      expect(NcSettle.opensAsNc(b), isFalse);
+      expect(NcSettle.opensAsNc(_bill(subtotal: 0, grand: 0, ncTotal: 760)), isTrue);
+      expect(NcSettle.opensAsNc(_bill(subtotal: 0, grand: 0)), isFalse, reason: 'nothing was given away');
+      expect(NcSettle.opensAsNc(null), isFalse);
+    });
+
+    test('each refusal, in the server\'s order and words', () {
+      String? blocked({Map? bill, double tendered = 0, int drafts = 0}) =>
+          NcSettle.blocker(bill: bill, tendered: tendered, drafts: drafts, money: _rupees);
+      expect(blocked(bill: _bill()), isNull);
+      expect(blocked(), contains('could not be read'));
+      expect(blocked(bill: {..._bill(), 'payment_status': 'pending_approval'}, tendered: 5),
+          startsWith('A payment for this bill is already waiting for approval.'));
+      expect(blocked(bill: _bill(discount: 50), tendered: 400),
+          '₹400.00 is already recorded as paid on this bill. Void that payment first, or comp dishes individually and take the rest.');
+      expect(blocked(bill: _bill(discount: 50), drafts: 1), kNcWholeBillOnly);
+      expect(blocked(bill: _bill(discount: 50)),
+          'This bill carries a discount or a coupon. Remove it first — a comped bill has nothing to discount.');
+      expect(blocked(bill: {..._bill(), 'coupon_code': 'WELCOME'}), contains('discount or a coupon'));
+      expect(blocked(bill: _bill(subtotal: 0, grand: 0)), 'There is nothing on this table to settle.');
+      expect(blocked(bill: _bill(subtotal: 0, grand: 0, ncTotal: 760)), isNull,
+          reason: 'a fully comped table still settles as NC, at 0.00');
+    });
+
+    test('the form needs all three answers, and the body never carries an amount', () {
+      expect(NcSettle.formReady(kind: 'promo', reason: 'Launch night', authorisedBy: 'asha'), isTrue);
+      expect(NcSettle.formReady(kind: '', reason: 'x', authorisedBy: 'asha'), isFalse);
+      expect(NcSettle.formReady(kind: 'promo', reason: '  ', authorisedBy: 'asha'), isFalse,
+          reason: 'the reason stays required for a whole-bill NC');
+      expect(NcSettle.formReady(kind: 'promo', reason: 'x', authorisedBy: ''), isFalse);
+      final body = NcSettle.body(
+          kind: ' staff_meal ', reason: ' Team dinner ', authorisedBy: ' asha ', expectedValue: 1200.004, counterId: 'c-1');
+      expect(body, {
+        'nc_kind': 'staff_meal',
+        'reason': 'Team dinner',
+        'authorised_by': 'asha',
+        'expected_value': 1200.0,
+        'print': true,
+        'counter_id': 'c-1',
+      });
+      for (final k in const ['amount', 'tenders', 'splits', 'payment_method']) {
+        expect(body.containsKey(k), isFalse);
+      }
+      expect(NcSettle.body(kind: 'a', reason: 'b', authorisedBy: 'c', expectedValue: 0).containsKey('counter_id'), isFalse);
+    });
+
+    test('the words on the sheet and in the snackbar', () {
+      expect(NcSettle.headline(1200, _rupees), 'NOTHING TO PAY · ₹1200.00 given away');
+      expect(NcSettle.doneSentence({'bill_no': '101', 'nc_value': 1200, 'printed': true}, _rupees),
+          'Bill 101 was settled as non-chargeable — ₹1200.00 given away, nothing collected. The NC bill is printing.');
+      expect(NcSettle.doneSentence({'nc_value': 5, 'printed': false, 'print_error': 'No printer online'}, _rupees),
+          'The bill was settled as non-chargeable — ₹5.00 given away, nothing collected. The NC bill did not print: No printer online');
+      expect(NcSettle.doneSentence({'bill_no': '7', 'already': true}, _rupees), 'Bill 7 was already settled as non-chargeable.');
+    });
+
+    test('the figures read back: overview, reports, the closed bill', () {
+      final nc = NcSettle.headlineNc({
+        'today_nc': {'label': 'Non-chargeable (NC) — not collected', 'hint': 'h', 'bills': 2, 'value': 1450.5},
+      });
+      expect(nc, (label: 'Non-chargeable (NC) — not collected', hint: 'h', bills: 2, value: 1450.5));
+      expect(NcSettle.besideLine(2, 1450.5, _rupees), '2 NC bills · ₹1450.50 given away');
+      expect(NcSettle.besideLine(1, 0, _rupees), '1 NC bill · ₹0.00 given away');
+      expect(NcSettle.headlineNc({'today_nc': {'label': 'x', 'bills': 0, 'value': 0}}), isNull);
+      expect(NcSettle.headlineNc({'today_nc': {'label': ' ', 'bills': 1, 'value': 1}}), isNull);
+      expect(NcSettle.headlineNc({}), isNull);
+
+      expect(NcSettle.salesSummary({'nc_bills': 1, 'nc_value': 1200}), (bills: 1, value: 1200.0));
+      expect(NcSettle.salesSummary({'nc_bills': 0, 'nc_value': 0}), isNull);
+      expect(NcSettle.settlementSummary({'nc': {'bills': 1, 'value': 1200}}), (bills: 1, value: 1200.0));
+      expect(NcSettle.settlementSummary({}), isNull);
+      expect(
+        NcSettle.byScope({
+          'by_scope': [
+            {'scope': 'item', 'label': 'Item comped', 'entries': 0, 'loss': 0},
+            {'scope': 'bill', 'label': 'Bill settled as NC', 'entries': 3, 'loss': 1200},
+          ],
+        }),
+        [(scope: 'bill', label: 'Bill settled as NC', entries: 3, loss: 1200.0)],
+      );
+
+      final closed = {
+        'payment_method': 'NC',
+        'nc_settlement': {'kind_label': 'Staff meal', 'authorised_by': 'asha', 'reason': 'Team dinner', 'value': 1200, 'would_have_charged': 1386},
+      };
+      expect(NcSettle.settlement(closed),
+          (kind: 'Staff meal', authorisedBy: 'asha', reason: 'Team dinner', value: 1200.0, wouldHaveCharged: 1386.0));
+      expect(NcSettle.settlement({...closed, 'payment_method': 'Cash'}), isNull);
+      expect(NcSettle.isMethod(' nc '), isTrue);
+      expect(NcSettle.isMethod('Upi'), isFalse);
+    });
+
+    test('the paper: a comped line reads "(NC)" at 0.00, and its value is disclosed', () {
+      expect(NcSettle.lineLabel('Gulab Jamun', true), 'Gulab Jamun (NC)');
+      expect(NcSettle.lineLabel('Gulab Jamun', null), 'Gulab Jamun');
+      expect(NcSettle.lineAmount(120, 2, true), 0);
+      expect(NcSettle.lineAmount(120, 2, false), 240);
+      expect(NcSettle.paperNcValue([
+        {'name': 'A', 'price': 350, 'quantity': 1},
+        {'name': 'B', 'price': 120, 'quantity': 2, 'nc': true},
+        {'name': 'C', 'price': 99.5, 'quantity': 0, 'nc': true},
+      ]), 339.5);
+      expect(NcSettle.paperNcValue([{'name': 'A', 'price': 350, 'quantity': 1}]), isNull);
+    });
+
+    test('an NC settle is refused offline with the billing sentence, and never queued', () {
+      final d = OutboxPolicy.decide('POST', '/bills/order/order-1/settle-nc');
+      expect(d.queueable, isFalse);
+      expect(d.refusal, contains('Billing needs a connection'));
+    });
+  });
+
+  group('the settle sheet', () {
+    testWidgets('a manager sees the NC pill beside the modes; choosing it swaps the form, and back', (tester) async {
+      await _openSettle(tester);
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsOneWidget);
+      expect(find.text(kNcSettlePill), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-settle')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsNothing);
+
+      await _tapVisible(tester, const ValueKey('pay-method-NC'));
+      expect(find.byKey(const ValueKey('pay-nc-headline')), findsOneWidget);
+      expect(find.text('NOTHING TO PAY · ₹1200.00 given away'), findsOneWidget);
+      expect(find.textContaining('The guest would have paid ₹1386.00'), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-nc-whole-bill')), findsOneWidget);
+      // Nothing a bill that takes nothing would need.
+      expect(find.byKey(const ValueKey('pay-amount')), findsNothing);
+      expect(find.byKey(const ValueKey('pay-ref')), findsNothing);
+      expect(find.byKey(const ValueKey('pay-add-tip')), findsNothing);
+      expect(find.byKey(const ValueKey('pay-split')), findsNothing);
+      expect(find.text('Approval is required before the bill closes and the table frees.'), findsNothing);
+      // Not pressable until kind and reason are given (the authoriser is filled in).
+      expect(_pressOf(tester, const ValueKey('pay-settle-nc')), isNull);
+      expect(find.byKey(const ValueKey('pay-refusal')), findsOneWidget);
+      final authoriser = tester.widget<TextField>(find.byKey(const ValueKey('pay-nc-authoriser')));
+      expect(authoriser.controller!.text, _FakeApi.username);
+
+      await _tapVisible(tester, const ValueKey('pay-method-Cash'));
+      expect(find.byKey(const ValueKey('pay-settle')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-nc-headline')), findsNothing);
+      expect(find.byKey(const ValueKey('pay-amount')), findsOneWidget);
+    });
+
+    testWidgets('Settle as NC posts ONCE, with the quote — and never approves or closes', (tester) async {
+      final api = await _openSettle(tester);
+      api.replies['/bills/order/order-1/settle-nc'] = {
+        'success': true, 'bill_id': 'bill-1', 'bill_no': '101', 'payment_method': 'NC',
+        'total_amt': 0, 'nc_value': 1200.0, 'nc_lines': 2, 'printed': true,
+      };
+      await _fillNc(tester);
+      expect(_pressOf(tester, const ValueKey('pay-settle-nc')), isNotNull);
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+
+      final body = api.bodyOf('/settle-nc') as Map?;
+      expect(body, {
+        'nc_kind': 'staff_meal',
+        'reason': 'Team dinner',
+        'authorised_by': _FakeApi.username,
+        'expected_value': 1200.0,
+        'print': true,
+      });
+      expect(api.writes.where((w) => w.path.contains('settle-nc')), hasLength(1));
+      expect(api.wrote('waiter-confirm-payment'), isFalse);
+      expect(api.wrote('admin-approve-payment'), isFalse);
+      expect(api.wrote('/close'), isFalse);
+      expect(find.text('Bill 101 was settled as non-chargeable — ₹1200.00 given away, nothing collected. The NC bill is printing.'),
+          findsOneWidget);
+      // The sheet closed over a settled bill.
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsNothing);
+    });
+
+    testWidgets('a fully comped ₹0 bill opens as NC and is never sent as a ₹0 UPI settle', (tester) async {
+      final api = await _openSettle(
+        tester,
+        bill: _bill(subtotal: 0, grand: 0, ncTotal: 760),
+        tenders: _tenders(grand: 0),
+      );
+      expect(find.text('PAID IN FULL'), findsNothing);
+      expect(find.text('NOTHING TO PAY · ₹760.00 given away'), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-settle')), findsNothing);
+      await _fillNc(tester, kind: 'complimentary', reason: 'Owner guests', tapPill: false);
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+      expect((api.bodyOf('/settle-nc') as Map?)?['expected_value'], 0.0);
+      expect(api.wrote('waiter-confirm-payment'), isFalse, reason: 'the UPI a 2.0.0 till sent');
+    });
+
+    testWidgets('money already taken greys the pill and says why', (tester) async {
+      final api = await _openSettle(tester, tenders: _tenders(tendered: 400));
+      final pill = tester.widget<GestureDetector>(
+          find.descendant(of: find.byKey(const ValueKey('pay-method-NC')), matching: find.byType(GestureDetector)));
+      expect(pill.onTap, isNull);
+      expect(find.textContaining('₹400.00 is already recorded as paid on this bill'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('pay-method-NC')), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsNothing);
+      expect(api.wrote('settle-nc'), isFalse);
+    });
+
+    testWidgets('a discount on the bill greys it too', (tester) async {
+      await _openSettle(tester, bill: _bill(discount: 50, grand: 1330));
+      expect(find.byKey(const ValueKey('pay-nc-blocked')), findsOneWidget);
+      expect(find.textContaining('This bill carries a discount or a coupon.'), findsOneWidget);
+    });
+
+    testWidgets('a cashier (Close Bill, no comp permission) is not offered NC', (tester) async {
+      await _openSettle(tester, actions: const [_permRecordPayment], role: 'cashier');
+      expect(find.byKey(const ValueKey('pay-settle')), findsOneWidget, reason: 'the ordinary settle is still there');
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsNothing);
+      expect(find.text(kNcSettlePill), findsNothing);
+    });
+
+    testWidgets('a custom role holding the comp permission and Close Bill is offered it', (tester) async {
+      await _openSettle(tester, actions: const [_permNc, _permRecordPayment], role: 'superadmin');
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsOneWidget);
+    });
+
+    testWidgets('a waiter never reaches a settle control at all (C1)', (tester) async {
+      await _mount(tester, m.tablesModule, _routes(), actions: const ['x'], role: 'waiter');
+      await _openTable(tester);
+      expect(find.text('Settle bill'), findsNothing);
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsNothing);
+    });
+
+    testWidgets('the server\'s refusal is shown verbatim and the bill is read again', (tester) async {
+      final api = await _openSettle(tester);
+      api.failOn = 'settle-nc';
+      api.failMessage =
+          'The bill changed while you were deciding: its food now comes to ₹1300.00, not ₹1200.00. Check it and settle again.';
+      await _fillNc(tester);
+      final readsBefore = api.calls.where((c) => c.contains('/bill-for-table')).length;
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+      expect(find.text(api.failMessage), findsOneWidget);
+      expect(api.calls.where((c) => c.contains('/bill-for-table')).length, greaterThan(readsBefore));
+      // Still open, still in NC mode, the form kept.
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsOneWidget);
+    });
+
+    testWidgets('offline it refuses with the billing sentence and nothing is written or queued', (tester) async {
+      final api = await _openSettle(tester);
+      await _fillNc(tester);
+      api.offline = true;
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+      expect(find.textContaining('Billing needs a connection'), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsOneWidget);
+      expect(api.writes, isEmpty);
+    });
+  });
+
+  group('the bill preview', () {
+    testWidgets('a comped line reads "<dish> (NC)" at 0.00, and its value sits under the total', (tester) async {
+      await _mount(
+        tester,
+        m.tablesModule,
+        _routes(
+          bill: _bill(subtotal: 700, grand: 808.5, ncTotal: 500, items: const [
+            {'name': 'Paneer Tikka', 'price': 350.0, 'quantity': 2},
+            {'name': 'Dal Makhani', 'price': 500.0, 'quantity': 1, 'nc': true},
+          ]),
+        ),
+      );
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('table-manager-print-bill')));
+      await tester.tap(find.byKey(const ValueKey('table-manager-print-bill')));
+      await tester.pumpAndSettle();
+      expect(find.text('Dal Makhani (NC)'), findsOneWidget);
+      expect(find.text('Paneer Tikka'), findsWidgets);
+      expect(find.text('700.00'), findsWidgets, reason: 'the paid line and the Sub Total');
+      expect(find.text('0.00'), findsWidgets, reason: 'the comped line');
+      expect(find.byKey(const ValueKey('bill-preview-nc-value')), findsOneWidget);
+      expect(find.text('NC value (not charged)'), findsOneWidget);
+      expect(find.text('500.00'), findsWidgets);
+    });
+
+    testWidgets('a bill with nothing comped has no NC line', (tester) async {
+      await _mount(tester, m.tablesModule, _routes());
+      await _openTable(tester);
+      await _reveal(tester, find.byKey(const ValueKey('table-manager-print-bill')));
+      await tester.tap(find.byKey(const ValueKey('table-manager-print-bill')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('bill-preview-nc-value')), findsNothing);
+      expect(find.textContaining('(NC)'), findsNothing);
+    });
+  });
+
+  group('the overview', () {
+    Map<String, dynamic> headline({Map<String, dynamic>? nc}) => {
+          'today': '2026-09-16', 'month_from': '2026-09-01', 'timezone': 'Asia/Kolkata',
+          'today_net': {'value': 1000, 'label': "Today's net sale", 'hint': 'x'},
+          'today_gross': {'value': 1100, 'label': "Today's gross sale", 'hint': 'x'},
+          'cash_collection': {'value': 1100, 'label': 'Cash collection', 'hint': 'x'},
+          'today_bills': 2, 'month_bills': 2,
+          'today_by_method': [
+            {'method': 'Cash', 'label': 'Cash', 'bills': 1, 'amount': 1100, 'share_pct': 100, 'refund': 0, 'net_amount': 1100},
+          ],
+          'today_split_bills': 0, 'today_unallocated': 0,
+          'by_method': {'label': 'Collected by payment method', 'hint': 'x'},
+          'today_nc': ?nc,
+        };
+
+    testWidgets('today\'s NC is its own labelled line under the by-method block', (tester) async {
+      await _mount(
+        tester,
+        m.overviewModule,
+        {
+          '/analytics/headline': headline(nc: {
+            'label': 'Non-chargeable (NC) — not collected',
+            'hint': 'Given away today at menu value before tax.',
+            'bills': 1,
+            'value': 1200,
+          }),
+        },
+        labels: const ['Overview', 'Accounting'],
+      );
+      expect(find.byKey(const ValueKey('headline-nc')), findsOneWidget);
+      expect(find.text('NON-CHARGEABLE (NC) — NOT COLLECTED'), findsOneWidget);
+      expect(find.text('1 NC bill · ₹1200.00 given away'), findsOneWidget);
+      // Beside the modes, never one of them.
+      final byMethod = tester.getTopLeft(find.text('COLLECTED BY PAYMENT METHOD'));
+      final nc = tester.getTopLeft(find.byKey(const ValueKey('headline-nc')));
+      expect(nc.dy, greaterThan(byMethod.dy));
+      expect(find.text(kNcSettleLabel), findsNothing, reason: 'no by-method bar is called NC');
+    });
+
+    testWidgets('an older backend, or a day with no NC, draws nothing', (tester) async {
+      await _mount(tester, m.overviewModule, {'/analytics/headline': headline()}, labels: const ['Overview', 'Accounting']);
+      expect(find.byKey(const ValueKey('headline-nc')), findsNothing);
+    });
+  });
+
+  group('the wiring the widgets above do not reach', () {
+    String read(String rel) => File(rel).readAsStringSync().replaceAll('\r\n', '\n');
+
+    test('the report panels and the closed bill read the NC figures', () {
+      final reports = read('lib/screens/reports.dart');
+      expect(reports, contains('final salesNc = NcSettle.salesSummary(totals);'));
+      expect(reports, contains('final settleNc = NcSettle.settlementSummary(totals);'));
+      expect(reports, contains('final scopes = NcSettle.byScope(d);'));
+      expect(RegExp(r'_misNcBeside\(').allMatches(reports).length, 3, reason: 'two calls and the definition');
+      // The kitchen-ticket drill-down marks a comped line, as the web one does.
+      expect(reports, contains("Text(NcSettle.lineLabel(_s(it, 'name'), it['nc']), style: text.bodyMedium),"));
+      final modules = read('lib/screens/modules.dart');
+      expect(modules, contains("import '../models/nc_settle.dart';"));
+      expect(modules, contains('final ncSettled = NcSettle.settlement(bill);'));
+      expect(modules, contains("NcSettle.lineLabel(_s(items[i], 'name', 'Item'), items[i]['nc'])"));
+      expect(modules, contains("money(method.isEmpty ? 'Method not recorded' : methodShown, _money(grand)),"));
+      expect(modules, contains('final ncToday = _headlineNc(context, h);'));
+      expect(modules, contains('label: NcSettle.isMethod(method) ? kNcSettleLabel : method),'),
+          reason: 'the settled-bill row names an NC bill as the paper does');
+    });
+
+    test('the sheet posts to the route the server registers, and only there', () {
+      final sheet = read('lib/screens/mis_capture.dart');
+      expect(sheet, contains("'/bills/order/\$oid/settle-nc'"));
+      final start = sheet.indexOf('Future<void> _settleAsNc() async {');
+      final end = sheet.indexOf('String? get _settleRefusal', start);
+      expect(start, greaterThan(-1));
+      final act = sheet.substring(start, end);
+      expect(act, isNot(contains('admin-approve-payment')));
+      expect(act, isNot(contains('/close')));
+      expect(act, isNot(contains('waiter-confirm-payment')));
+      expect(act, contains('expectedValue: NcSettle.value(_ncBill)'));
+    });
+
+    test('the same words as the web dashboard and the backend (when their checkouts are beside this one)', () {
+      final web = File('../Restaurant_Dashboard_UI/src/lib/nc-settle.ts');
+      if (web.existsSync()) {
+        final src = web.readAsStringSync();
+        expect(src, contains("export const NC_SETTLE_LABEL = '$kNcSettleLabel';"));
+        expect(src, contains("export const NC_SETTLE_BUTTON = '$kNcSettleButton';"));
+        expect(src, contains("'$kNcWholeBillOnly'"));
+        expect(src, contains('NOTHING TO PAY · '));
+      }
+      final backend = File('../Restaurant_Backend/nc_settle.ts');
+      if (backend.existsSync()) {
+        expect(backend.readAsStringSync(), contains('"$kNcWholeBillOnly"'));
+      }
+      final methods = File('../Restaurant_Backend/payment_methods.ts');
+      if (methods.existsSync()) {
+        expect(methods.readAsStringSync(), contains('export const NC_SETTLE_LABEL = "$kNcSettleLabel";'));
+      }
+    });
+  });
+}

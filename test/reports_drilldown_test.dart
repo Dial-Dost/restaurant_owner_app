@@ -456,6 +456,26 @@ void main() {
     expect(tester.takeException(), isNull, reason: 'the drill note overflowed a 360dp phone');
   });
 
+  testWidgets('the kitchen ticket marks a comped line "(NC)", as the bill and the web drill-down do',
+      (tester) async {
+    const path = '/reports/mis/kot/order-9';
+    final original = _routes[path];
+    _routes[path] = {
+      'id': 'order-9', 'status': 'Served', 'table_name': 'T1', 'value': 590.0, 'trail': <dynamic>[],
+      'items': [
+        {'name': 'Paneer Tikka', 'quantity': 1, 'price': 350.0, 'line_total': 350.0},
+        {'name': 'Gulab Jamun', 'quantity': 2, 'price': 120.0, 'line_total': 240.0, 'nc': true},
+      ],
+    };
+    addTearDown(() => _routes[path] = original);
+    await _mount(tester);
+    await _openTab(tester, 'Void KOT');
+    await _tapRow(tester, 'order-9');
+    expect(find.text('Gulab Jamun (NC)'), findsOneWidget);
+    expect(find.text('Paneer Tikka'), findsOneWidget);
+    expect(find.text('Paneer Tikka (NC)'), findsNothing);
+  });
+
   testWidgets('a report that the SERVER refused shows the server own words',
       (tester) async {
     // A 404 is an answer. Dressing it as an outage would send someone to check

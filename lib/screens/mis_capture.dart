@@ -1690,6 +1690,20 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   bool _busy = false;
   String? _error;
 
+  // ---- settle as NC (client item 5, lib/models/nc_settle.dart) -------------
+  //
+  // NOT A MODE. The pill sits among the modes because that is where the client
+  // looks for it; what it does is a different act — one POST that comps every
+  // dish and closes the bill at 0.00, with no approve or close after it.
+  // Offered only to a session holding BOTH the comp permission and Close Bill.
+  // The open bill it quotes from is read fresh in [_load].
+  Map? _ncBill;
+  bool _ncMode = false;
+  String _ncKind = '';
+  final TextEditingController _ncReason = TextEditingController();
+  late final TextEditingController _ncAuthorisedBy =
+      TextEditingController(text: widget.profile.employeeUsername);
+
   @override
   void initState() {
     super.initState();
@@ -1702,6 +1716,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     _txnRef.dispose();
     _tip.dispose();
     _tipTo.dispose();
+    _ncReason.dispose();
+    _ncAuthorisedBy.dispose();
     super.dispose();
   }
 
@@ -1760,6 +1776,16 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       final s = await widget.rest.getMap('/restaurant/settings');
       modes = PaymentModes.parse(s['payment_methods']);
     } catch (_) {/* an older backend or no line: the built-in list, see above */}
+    // The open bill the NC quote comes from — read only for a session that may
+    // settle as NC. Its `subtotal` is what the settle sends as expected_value.
+    Map? ncBill;
+    if (_mayNc && widget.tableName.isNotEmpty) {
+      try {
+        final r = await widget.rest
+            .get('/bill-for-table?table_name=${Uri.encodeQueryComponent(widget.tableName)}');
+        if (r is Map) ncBill = r;
+      } catch (_) {/* the NC pill then says the bill could not be read */}
+    }
     if (!mounted) return;
     setState(() {
       _state = state;
@@ -1767,6 +1793,11 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       _counters = counters;
       _allModes = modes;
       _modes = PaymentModes.till(modes);
+      _ncBill = ncBill;
+      // A ₹0 bill whose dishes were all comped IS an NC bill: it opens as one
+      // and is never offered as a ₹0 UPI settle (what installed 2.0.0 tills
+      // sent). A refusal re-read keeps the form open if NC is still possible.
+      _ncMode = _mayNc && _ncBlocker == null && (_ncMode || NcSettle.opensAsNc(ncBill));
       // Keep the cashier's pick if it is still on offer; otherwise UPI, as the
       // sheet always opened on, or the first mode this restaurant takes.
       if (!_modes.any((m) => m.id == _method) && _modes.isNotEmpty) {
@@ -1868,6 +1899,30 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       _drafts.isEmpty &&
       _composerTip <= 0 &&
       (!_ledgerOk || (_remaining > 0 && (_composerAmount - _remaining).abs() < 0.005));
+
+  /// May this session settle as NC? The comp permission AND Close Bill — the
+  /// two gates the route checks. A waiter holds neither (C1).
+  bool get _mayNc => NcSettle.mayOffer(
+        compItem: _mayDo(widget.profile, Capability.compItem, _permNonChargeable),
+        settleBill: FloorScope.of(widget.profile).settle,
+      );
+
+  /// Why the NC pill is unavailable, or null. Money already taken, parts being
+  /// composed or a discount on the bill each stop it — see [NcSettle.blocker].
+  String? get _ncBlocker =>
+      NcSettle.blocker(bill: _ncBill, tendered: _tendered, drafts: _drafts.length, money: (v) => _money(v));
+
+  /// Why "Settle as NC" cannot be pressed yet, or null.
+  String? get _ncRefusal {
+    final blocked = _ncBlocker;
+    if (blocked != null) return blocked;
+    return NcSettle.formReady(kind: _ncKind, reason: _ncReason.text, authorisedBy: _ncAuthorisedBy.text)
+        ? null
+        : 'Choose why it is going free, give the reason, and name who authorised it.';
+  }
+
+  /// The refusal standing next to whichever button this sheet is showing.
+  String? get _refusalNow => _ncMode ? _ncRefusal : _settleRefusal;
 
   // ---- proof ---------------------------------------------------------------
 
@@ -2092,6 +2147,55 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     }
   }
 
+  /// SETTLE AS NC — ONE call, and nothing after it: the server comps every
+  /// remaining dish and closes the bill at 0.00 in its own transaction, so
+  /// there is no approve and no close to send. Refused offline like every
+  /// `/bills` write (OutboxPolicy), and never queued.
+  Future<void> _settleAsNc() async {
+    final refusal = _ncRefusal;
+    if (refusal != null) {
+      setState(() => _error = refusal);
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final oid = widget.orderId;
+    try {
+      final res = await widget.rest.post(
+        '/bills/order/$oid/settle-nc',
+        NcSettle.body(
+          kind: _ncKind,
+          reason: _ncReason.text,
+          authorisedBy: _ncAuthorisedBy.text,
+          // The quote this sheet showed. A bill that changed meanwhile is
+          // refused by the server rather than given away at a size nobody saw.
+          expectedValue: NcSettle.value(_ncBill),
+          counterId: _misCounterId,
+        ),
+      );
+      messenger.showSnackBar(
+          SnackBar(content: Text(NcSettle.doneSentence(res is Map ? res : const {}, (v) => _money(v)))));
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = _captureError(e);
+      });
+      // A refusal the SERVER answered (the quote moved, a payment landed): read
+      // the bill again so the sheet shows what the refusal was about. An outage
+      // wrote nothing, and re-reading through it would only lose the quote.
+      if (e is ApiException && e.status != null) {
+        final said = _error;
+        await _load();
+        if (mounted) setState(() => _error = said);
+      }
+    }
+  }
+
   /// Why the bill cannot be settled yet, or null. Under-tender at settle is
   /// refused by the server (the tenders must reconstruct the grand total to the
   /// paisa); saying so here means the cashier is not told after the card machine.
@@ -2146,7 +2250,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 padding: EdgeInsets.all(40),
                 child: Center(child: CircularProgressIndicator()))
             : Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                _headline(text),
+                _ncMode ? _ncHeadline(text) : _headline(text),
                 const SizedBox(height: AppSpacing.lg),
                 Flexible(
                   child: SingleChildScrollView(
@@ -2166,7 +2270,14 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                       // Nothing left to take: no method pills, no amount field.
                       // A composer offering to take money on a bill that owes
                       // none is the shortest route to an over-tender.
-                      if (!_ledgerOk || _remaining > 0) _composerBlock(text),
+                      if (_ncMode)
+                        _ncBlock(text)
+                      else if (!_ledgerOk || _remaining > 0)
+                        _composerBlock(text)
+                      // Nothing to take, but the bill can still be given away:
+                      // the pills alone, so NC can be chosen.
+                      else if (_mayNc)
+                        _methodPills(text, _busy || _uploading),
                     ]),
                   ),
                 ),
@@ -2179,16 +2290,19 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 // the dead-looking control this app has been bitten by before —
                 // and here the reason is always something the cashier can act
                 // on: take the rest, or record what has been paid.
-                if (_error == null && _settleRefusal != null) ...[
+                if (_error == null && _refusalNow != null) ...[
                   const SizedBox(height: 10),
-                  Text(_settleRefusal!,
+                  Text(_refusalNow!,
                       key: const ValueKey('pay-refusal'),
                       style: text.bodySmall!.copyWith(color: AppColors.warning)),
                 ],
                 const SizedBox(height: AppSpacing.md),
-                Text('Approval is required before the bill closes and the table frees.',
-                    style: text.bodySmall),
-                const SizedBox(height: AppSpacing.md),
+                // No approval follows an NC settle — nothing was taken.
+                if (!_ncMode) ...[
+                  Text('Approval is required before the bill closes and the table frees.',
+                      style: text.bodySmall),
+                  const SizedBox(height: AppSpacing.md),
+                ],
                 _actions(text),
               ]),
       ),
@@ -2243,6 +2357,32 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 style: text.bodySmall!.copyWith(color: AppColors.copperHi)),
         ]),
       ],
+    ]);
+  }
+
+  /// THE NC HEADLINE: nothing to pay, and what is being given away — the
+  /// server's own figures off the open bill. What the guest would have paid is
+  /// said once, as information, and is in no report.
+  Widget _ncHeadline(TextTheme text) {
+    final given = NcSettle.givenAway(_ncBill);
+    final would = NcSettle.wouldHaveCharged(_ncBill);
+    final comped = NcSettle.alreadyComped(_ncBill);
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(
+        widget.tableName.isEmpty ? 'SETTLE AS NC' : 'SETTLE AS NC · TABLE ${widget.tableName.toUpperCase()}',
+        style: text.labelSmall,
+      ),
+      const SizedBox(height: 8),
+      Text(NcSettle.headline(given, (v) => _money(v)),
+          key: const ValueKey('pay-nc-headline'),
+          style: text.titleLarge!.copyWith(color: AppColors.copperHi)),
+      const SizedBox(height: 6),
+      Text(
+        'Before tax, at the prices on the bill'
+        '${comped > 0 ? ', including ${_money(comped)} already comped dish by dish' : ''}.'
+        '${would > 0 ? ' The guest would have paid ${_money(would)} with service charge and tax — information only; it is in no report.' : ''}',
+        style: text.bodySmall,
+      ),
     ]);
   }
 
@@ -2374,18 +2514,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     final canCapture = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
     final locked = _busy || _uploading;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text(_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART', style: text.labelSmall),
-      const SizedBox(height: 8),
-      Wrap(spacing: 8, runSpacing: 8, children: [
-        // Keyed by the id (what is sent), labelled by the owner's name for it.
-        for (final m in _modes)
-          _CapturePill(
-            key: ValueKey('pay-method-${m.id}'),
-            label: m.label,
-            selected: _method == m.id,
-            onTap: locked ? null : () => setState(() => _method = m.id),
-          ),
-      ]),
+      _methodPills(text, locked),
       if (_ledgerOk) ...[
         const SizedBox(height: AppSpacing.md),
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2523,6 +2652,106 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     ]);
   }
 
+  /// The payment-mode pills — and, for a session that may, the NC pill beside
+  /// them, which is NOT a mode (see [NcSettle]). Shared by the composer and the
+  /// NC form, so either can switch to the other.
+  Widget _methodPills(TextTheme text, bool locked) {
+    final ncBlocked = _mayNc ? _ncBlocker : null;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(_ncMode ? 'SETTLE AS' : (_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART'), style: text.labelSmall),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        // Keyed by the id (what is sent), labelled by the owner's name for it.
+        for (final m in _modes)
+          _CapturePill(
+            key: ValueKey('pay-method-${m.id}'),
+            label: m.label,
+            selected: !_ncMode && _method == m.id,
+            onTap: locked
+                ? null
+                : () => setState(() {
+                      _method = m.id;
+                      _ncMode = false;
+                      _error = null;
+                    }),
+          ),
+        if (_mayNc)
+          // Greyed, with the reason under it, when the server would refuse it.
+          Opacity(
+            opacity: ncBlocked == null ? 1 : 0.45,
+            child: _CapturePill(
+              key: const ValueKey('pay-method-NC'),
+              label: kNcSettlePill,
+              selected: _ncMode,
+              onTap: (locked || ncBlocked != null)
+                  ? null
+                  : () => setState(() {
+                        _ncMode = true;
+                        _error = null;
+                      }),
+            ),
+          ),
+      ]),
+      if (ncBlocked != null && !_ncMode) ...[
+        const SizedBox(height: 6),
+        Text('NC is not available here: $ncBlocked',
+            key: const ValueKey('pay-nc-blocked'),
+            style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary)),
+      ],
+    ]);
+  }
+
+  /// THE NC FORM: why, in whose words, on whose say-so — the comp sheet's three
+  /// questions, in place of the amount, reference, tip, split and proof, none
+  /// of which a bill that takes nothing has. The reason stays required.
+  Widget _ncBlock(TextTheme text) {
+    final locked = _busy;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _methodPills(text, locked),
+      const SizedBox(height: AppSpacing.md),
+      Text(kNcWholeBillOnly, key: const ValueKey('pay-nc-whole-bill'), style: text.bodySmall),
+      const SizedBox(height: AppSpacing.lg),
+      Text('WHY IS IT GOING FREE', style: text.labelSmall),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        for (final (value, label) in _ncKinds)
+          _CapturePill(
+            key: ValueKey('pay-nc-kind-$value'),
+            label: label,
+            selected: _ncKind == value,
+            onTap: locked ? null : () => setState(() => _ncKind = value),
+          ),
+      ]),
+      const SizedBox(height: AppSpacing.md),
+      TextField(
+        key: const ValueKey('pay-nc-reason'),
+        controller: _ncReason,
+        minLines: 2,
+        maxLines: 3,
+        maxLength: 400,
+        textCapitalization: TextCapitalization.sentences,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Reason',
+          alignLabelWithHint: true,
+          helperText: 'Required. It goes on the NC Summary, verbatim.',
+        ),
+      ),
+      const SizedBox(height: 4),
+      TextField(
+        key: const ValueKey('pay-nc-authoriser'),
+        controller: _ncAuthorisedBy,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+          labelText: 'Authorised by (username)',
+          helperText: 'The staff member who approved giving this bill away. Yours is filled in — '
+              'change it if someone else said yes.',
+          helperMaxLines: 3,
+        ),
+      ),
+    ]);
+  }
+
   Widget _tipBlock(TextTheme text, bool locked) {
     return ForkCard(
       inset: true,
@@ -2596,7 +2825,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
 
   Widget _actions(TextTheme text) {
     final locked = _busy || _uploading;
-    final canPart = _ledgerOk && _allDrafts.isNotEmpty && _remaining > 0;
+    final canPart = !_ncMode && _ledgerOk && _allDrafts.isNotEmpty && _remaining > 0;
     final canSettle = _settleRefusal == null;
     return Wrap(
       alignment: WrapAlignment.end,
@@ -2616,12 +2845,20 @@ class _PaymentSheetState extends State<_PaymentSheet> {
             dense: true,
             onPressed: locked ? null : _recordPartPayment,
           ),
-        ForkButton(
-          key: const ValueKey('pay-settle'),
-          label: _busy ? 'Processing…' : 'Settle & close',
-          icon: Icons.check,
-          onPressed: (locked || !canSettle) ? null : _settleAndClose,
-        ),
+        if (_ncMode)
+          ForkButton(
+            key: const ValueKey('pay-settle-nc'),
+            label: _busy ? 'Processing…' : kNcSettleButton,
+            icon: Icons.card_giftcard,
+            onPressed: (locked || _ncRefusal != null) ? null : _settleAsNc,
+          )
+        else
+          ForkButton(
+            key: const ValueKey('pay-settle'),
+            label: _busy ? 'Processing…' : 'Settle & close',
+            icon: Icons.check,
+            onPressed: (locked || !canSettle) ? null : _settleAndClose,
+          ),
       ],
     );
   }
