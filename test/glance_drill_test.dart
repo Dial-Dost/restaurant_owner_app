@@ -160,6 +160,28 @@ void main() {
       expect([for (final m in RegExp(r'"([a-z_]+)"').allMatches(figures)) m.group(1)!], kGlanceFigureKeys);
     });
 
+    test("the modules that take a window are glanceParamsFor's", () {
+      // Every module, given a windowed route: which ones keep the day.
+      const route = GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day);
+      final windowed = {
+        for (final m in kGlanceAppModules)
+          if (glanceTargetFor(m, route, today: today, monthFrom: monthFrom).hasWindow) m,
+      };
+      expect(windowed, {'Reports', 'Accounting', 'History', 'Analytics'});
+      final f = _backend('glance_drill.ts');
+      if (!f.existsSync()) {
+        markTestSkipped('no Restaurant_Backend checkout beside this one');
+        return;
+      }
+      // The backend's switch: every case returns the window; default returns {}.
+      final src = f.readAsStringSync().replaceAll('\r\n', '\n');
+      final fn = src.indexOf('export function glanceParamsFor');
+      final body = src.substring(src.indexOf('switch (module) {', fn), src.indexOf('\n}', fn));
+      final cases = {for (final m in RegExp(r'case "([^"]+)":').allMatches(body)) m.group(1)!};
+      expect(cases, windowed);
+      expect(body, contains('default:\n      return {};'));
+    });
+
     test('every module the table names is one the shell registers', () {
       final labels = [for (final m in RegExp(r"_Module\('([^']+)'").allMatches(_shell().readAsStringSync())) m.group(1)!];
       for (final m in kGlanceAppModules) {
@@ -184,7 +206,7 @@ void main() {
       'fallbacks': [
         _serverTarget('Accounting', {'from': today, 'to': today, 'method': 'Cash'},
             '/dashboard/accounting?from=$today&to=$today&method=Cash#settled-bills', bills: true),
-        _serverTarget('Analytics', {}, '/dashboard/analytics'),
+        _serverTarget('Analytics', {'from': today, 'to': today}, '/dashboard/analytics?from=$today&to=$today'),
       ],
       'secondary': _serverTarget('Cash register', {}, '/dashboard/cash'),
     };
@@ -192,7 +214,7 @@ void main() {
       ..._serverTarget('Reports', {'report': 'settlement_summary', 'from': today, 'to': today, 'slot': 'all'}, ''),
       'fallbacks': [
         _serverTarget('Accounting', {'from': today, 'to': today, 'method': 'Split'}, '', bills: true),
-        _serverTarget('Analytics', {}, ''),
+        _serverTarget('Analytics', {'from': today, 'to': today}, ''),
       ],
       'secondary': _serverTarget('Accounting', {'from': today, 'to': today, 'method': 'Split'}, '', bills: true),
     };
@@ -201,7 +223,7 @@ void main() {
       'fallbacks': [
         _serverTarget('Accounting', {'from': monthFrom, 'to': today}, ''),
         _serverTarget('History', {'from': monthFrom, 'to': today}, ''),
-        _serverTarget('Analytics', {}, ''),
+        _serverTarget('Analytics', {'from': monthFrom, 'to': today}, ''),
       ],
     };
 
@@ -235,12 +257,29 @@ void main() {
             case 'Accounting':
             case 'History':
               expect(t.to, today, reason: key);
+            case 'Analytics':
+              // A fallback lands on the tapped day too, and carries nothing else.
+              expect((t.to, t.method, t.report, t.slotAll), (today, null, null, false), reason: key);
             default:
               expect((t.from, t.to, t.method, t.report, t.slotAll), (null, null, null, null, false), reason: '$key -> ${t.module}');
           }
           if (t.bills) expect(t.module, 'Accounting', reason: key);
         }
       }
+    });
+
+    test('online trade has no fallback: no other screen cuts it by order type', () {
+      for (final key in const ['online_net', 'online_gross']) {
+        final d = glanceFallbackDrill(key, today: today, monthFrom: monthFrom)!;
+        expect(d.primary,
+            const GlanceTarget(module: 'Reports', report: 'sales_summary', from: today, to: today, slotAll: true),
+            reason: key);
+        expect(d.fallbacks, isEmpty, reason: key);
+        expect(d.resolve((m) => m != 'Reports'), isNull, reason: key);
+      }
+      // The other day figures still fall back, on the day.
+      expect(glanceFallbackDrill('today_net', today: today, monthFrom: monthFrom)!.fallbacks,
+          const [GlanceTarget(module: 'Accounting', from: today, to: today), GlanceTarget(module: 'Analytics', from: today, to: today)]);
     });
 
     test('an unknown key has no destination', () {

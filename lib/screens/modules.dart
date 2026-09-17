@@ -1566,6 +1566,9 @@ VoidCallback? _glanceGo(ModuleNavigator? nav, GlanceTarget? t) {
 ///  * Accounting — the window, and a one-shot bill-list filter that also
 ///    scrolls to the settled bills when the jump is about them.
 ///  * History — the window.
+///  * Analytics — the window. It is where a figure falls back to for a user
+///    whose plan or role hides Reports, and its one date control would
+///    otherwise open on whatever it last showed (the last 30 days, first time).
 void _primeGlanceJump(GlanceTarget t) {
   final window = glanceWindowOf(t);
   switch (t.module) {
@@ -1578,6 +1581,8 @@ void _primeGlanceJump(GlanceTarget t) {
       AccountingBillFilter.remember(t.method, reveal: t.bills);
     case 'History':
       if (window != null) DateRangeMemory.remember('history', window);
+    case 'Analytics':
+      if (window != null) DateRangeMemory.remember('analytics', window);
   }
 }
 

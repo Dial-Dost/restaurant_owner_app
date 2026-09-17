@@ -155,6 +155,39 @@ Map<String, dynamic> _headline({Map<String, dynamic> over = const {}, bool drill
   };
 }
 
+/// GET /reports/mis/sales-summary for today, as the backend cuts it: Online
+/// (gross) ₹1250.50 is its delivery row.
+Map<String, dynamic> _salesSummary({bool split = true}) => {
+      'meta': {
+        'report': 'sales_summary',
+        'title': 'Sales Summary',
+        'window': {'from': _today, 'to': _today, 'days': 1, 'source': 'range', 'clamped': false},
+        'timezone': 'Asia/Kolkata',
+        'outlet_scope': 'outlet',
+        'outlet_name': 'GGV',
+        'generated_at': '${_today}T10:00:00.000Z',
+        'notes': <String>[],
+      },
+      'columns': [
+        {'key': 'bucket', 'label': 'Period', 'type': 'text'},
+        {'key': 'bills', 'label': 'Bills', 'type': 'int', 'total': true},
+        {'key': 'grand_total', 'label': 'Gross', 'type': 'money', 'total': true},
+      ],
+      'totals': {
+        'item_total': 24000, 'discount': 0, 'net': 21000, 'service_charge': 1000, 'tax': 1930.5,
+        'round_off': 0.9, 'grand_total': 23931.4, 'refund': 0, 'bills': 15, 'covers': 40, 'apc': 525, 'abv': 1595.43,
+      },
+      'bucket': 'day',
+      'series': [
+        {'bucket': _today, 'bills': 15, 'grand_total': 23931.4},
+      ],
+      if (split)
+        'by_order_type': [
+          {'order_type': 'dine_in', 'bills': 14, 'grand_total': 22680.9, 'share_pct': 94.77},
+          {'order_type': 'delivery', 'bills': 1, 'grand_total': 1250.5, 'share_pct': 5.23},
+        ],
+    };
+
 final _platforms = TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android});
 
 void _window(WidgetTester tester, {double width = 1400, double height = 3000}) {
@@ -223,6 +256,7 @@ void _dirtyMemory() {
   DateRangeMemory.remember('reports', DateRange.fromPreset(RangePreset.last30));
   DateRangeMemory.remember('accounting', DateRange.fromPreset(RangePreset.last7));
   DateRangeMemory.remember('history', DateRange.fromPreset(RangePreset.lastMonth));
+  DateRangeMemory.remember('analytics', DateRange.fromPreset(RangePreset.last30));
   TimeSlotMemory.remember('reports', TimeSlotSelection.preset('lunch'));
 }
 
@@ -276,6 +310,37 @@ void main() {
           _expectReports(e.value.$1, e.value.$2);
           expect(api.writes, isEmpty);
         }
+      }, variant: _platforms);
+
+      testWidgets('Online sale lands on a Sales Summary that shows the order-type split behind it', (tester) async {
+        _window(tester);
+        final opened = <String>[];
+        _dirtyMemory();
+        final h = _headline(over: {
+          'online_gross': {'value': 1250.5, 'label': 'Online sale (gross)', 'hint': 'x', 'drill': _drill('online_gross')},
+          'today_online_bills': 1,
+        });
+        await _mount(tester, system: system, headline: h, opened: opened);
+        await _tap(tester, _key('glance-online_gross'));
+        await _tap(tester, _jump);
+        expect(opened, ['Reports']);
+        _expectReports('sales_summary', _day);
+
+        // The shell now mounts Reports, which reads what the jump left.
+        final api = await _mount(tester, system: system, module: m.reportsModule, extra: {
+          '/reports/mis/sales-summary': _salesSummary(),
+        });
+        final asked = api.calls.where((c) => c.startsWith('GET /reports/mis/sales-summary?')).toList();
+        expect(asked, isNotEmpty);
+        expect(asked.first, startsWith('GET /reports/mis/sales-summary?${_day.reportQuery}'));
+        final split = _key('mis-order-types');
+        await tester.ensureVisible(split);
+        await tester.pumpAndSettle();
+        expect(find.descendant(of: split, matching: find.text(m.kMisOrderTypeLabel)), findsOneWidget);
+        // The tile's ₹1250.50 is the delivery row.
+        expect(find.descendant(of: split, matching: find.text('delivery · ₹1250.50 (5.2%)')), findsOneWidget);
+        expect(find.descendant(of: split, matching: find.text('dine_in · ₹22680.90 (94.8%)')), findsOneWidget);
+        expect(tester.takeException(), isNull);
       }, variant: _platforms);
 
       testWidgets('Cash collection is the Cash row: Settlement Summary first, the drawer second', (tester) async {
@@ -582,9 +647,26 @@ void main() {
       expect(_label(tester, _jump), 'View in Analytics');
       await _tap(tester, _jump);
       expect(opened, ['Analytics']);
+      // ...on the tapped day, not on the window Analytics last showed.
+      expect(DateRangeMemory.of('analytics'), _day);
       // Nothing about Reports was touched on the way to a different module.
       expect(m.misOpenReportKey, 'item_wise');
       expect(TimeSlotMemory.of('reports').isAllDay, isFalse);
+
+      // Month to date lands on the month.
+      _dirtyMemory();
+      opened.clear();
+      await _mount(tester, profile: profile, visible: visible, opened: opened);
+      await _tap(tester, _key('glance-month_to_date'));
+      await _tap(tester, _jump);
+      expect(opened, ['Analytics']);
+      expect(DateRangeMemory.of('analytics'), _month);
+
+      // Online trade is on the Sales Summary alone: the sheet explains, with no jump.
+      await _mount(tester, profile: profile, visible: visible);
+      await _tap(tester, _key('glance-online_gross'));
+      expect(find.text(kGlanceOnlineRule), findsOneWidget);
+      expect(_jump, findsNothing);
 
       // The split note's only destinations are Accounting and Reports: a sheet, no jump.
       await _mount(tester, profile: profile, visible: visible);
@@ -701,6 +783,16 @@ void main() {
       final again = await _mount(tester, module: m.accountingModule, extra: accountingRoutes());
       expect(again.calls.where((c) => c.startsWith('GET /bills/closed?')).first, isNot(contains('payment_method')));
     }, variant: _platforms);
+
+    testWidgets('Analytics opens on the window the jump left, and asks for that window', (tester) async {
+      _window(tester);
+      DateRangeMemory.remember('analytics', _day);
+      final api = await _mount(tester, module: m.analyticsModule);
+      final windowed = api.calls.where((c) => c.startsWith('GET /analytics/advanced?')).toList();
+      expect(windowed, isNotEmpty);
+      expect(windowed.first, 'GET /analytics/advanced?${_day.query}');
+      expect(api.writes, isEmpty);
+    });
 
     testWidgets('Reports opens on the remembered report, the server day and the whole day', (tester) async {
       _window(tester);

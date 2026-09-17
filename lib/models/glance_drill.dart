@@ -190,8 +190,9 @@ const Map<String, GlanceRoute> kGlanceRoutes = {
   'month': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.month, fallbacks: ['Accounting', 'History', 'Analytics']),
   'today_net': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day, fallbacks: ['Accounting', 'Analytics']),
   'today_gross': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day, fallbacks: ['Accounting', 'Analytics']),
-  'online_net': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day, fallbacks: ['Accounting', 'Analytics']),
-  'online_gross': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day, fallbacks: ['Accounting', 'Analytics']),
+  // No fallback: only the Sales Summary's order-type split shows online trade.
+  'online_net': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day),
+  'online_gross': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.day),
   'cash_collection': GlanceRoute('Reports', report: 'settlement_summary', window: GlanceWindow.day, method: 'Cash', bills: true,
       fallbacks: ['Accounting', 'Analytics'], secondary: GlanceRoute('Cash register', window: GlanceWindow.none)),
   'month_to_date': GlanceRoute('Reports', report: 'sales_summary', window: GlanceWindow.month, fallbacks: ['Accounting', 'History', 'Analytics']),
@@ -214,8 +215,9 @@ const List<String> kGlanceFigureKeys = [
 String glanceRowMethod(String method) => method.trim() == 'Unallocated' ? 'Split' : method.trim();
 
 /// glance_drill.ts `glanceParamsFor`, as a target: which of the window, report
-/// and method each module takes. Anything but Reports, Accounting and History
-/// takes nothing.
+/// and method each module takes. Reports, Accounting, History and Analytics
+/// take the window (Analytics so that a fallback lands on the tapped day, not on
+/// whatever it last showed); anything else takes nothing.
 GlanceTarget glanceTargetFor(String module, GlanceRoute route,
     {required String today, required String monthFrom, String? rowMethod}) {
   final windowed = route.window != GlanceWindow.none;
@@ -241,6 +243,7 @@ GlanceTarget glanceTargetFor(String module, GlanceRoute route,
         bills: route.bills,
       );
     case 'History':
+    case 'Analytics':
       return GlanceTarget(module: module, from: windowed ? from : null, to: windowed ? today : null);
     default:
       return GlanceTarget(module: module);
