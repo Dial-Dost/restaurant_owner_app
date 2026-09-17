@@ -9742,28 +9742,38 @@ class _TableSheetState extends State<_TableSheet> {
   /// sent only when the person CHANGED it: the route reads an omitted field as
   /// "unchanged", so a name-only correction is exactly the request it always
   /// was, and keeps working on a server whose GSTIN column is not migrated yet.
+  ///
+  /// CLIENT ITEM 7 — and the guest's address, by the same rule: sent only when
+  /// it changed. A bill read from a server before item 7 carries no
+  /// `customer_address` key at all; then the address goes out only if somebody
+  /// typed in its box (and the answer is checked for it).
   Future<void> _editBillCustomerName(ScaffoldMessengerState messenger) async {
     final currentGstin = '${_bill?['customer_gstin'] ?? ''}'.trim();
+    final addressKnown = _bill?.containsKey('customer_address') ?? false;
+    final currentAddress = billCustomerAddressSeed(_bill?['customer_address']);
     final details = await _askBillCustomerDetails(
       context,
-      title: 'Name / GSTIN on bill · Table $_name',
+      title: 'Name / GSTIN / address on bill · Table $_name',
       // Said plainly because the behaviour is not obvious: the name is stored
       // on every running order, so it changes the whole table's bill, and a
       // settled bill is refused by this route (Accounting has its own).
-      explanation: 'This is the name printed at the top of the bill. It applies to the whole '
-          'table, and can be changed until the bill is settled. Leave it empty to '
-          'print no name.',
+      explanation: 'This is the name, GSTIN and address printed at the top of the bill. They apply '
+          'to the whole table, and can be changed until the bill is settled. Leave a box empty '
+          'to print nothing for it.',
       currentName: _bill?['customer'],
       currentGstin: currentGstin,
+      currentAddress: currentAddress,
     );
     if (details == null) return;
     final name = details.customer;
     final gstinChanged = details.gstin != normaliseBillCustomerGstin(currentGstin);
+    final addressChanged = addressKnown ? details.address != currentAddress : details.addressTouched;
     try {
       final res = await widget.rest.post('/bills/customer-name', {
         'table_name': _name,
         'customer': name,
         if (gstinChanged) 'customer_gstin': details.gstin.isEmpty ? null : details.gstin,
+        if (addressChanged) 'customer_address': details.address.isEmpty ? null : details.address,
       });
       // The server's answer when it gave one: it normalises again, and `null`
       // is how it says the name was cleared.
@@ -9774,6 +9784,10 @@ class _TableSheetState extends State<_TableSheet> {
       // the paper.
       final gstinIgnored = gstinChanged && res is Map && !res.containsKey('customer_gstin');
       final savedGstin = res is Map && res.containsKey('customer_gstin') ? '${res['customer_gstin'] ?? ''}' : details.gstin;
+      // The same check for the address (a server before client item 7).
+      final addressIgnored = addressChanged && res is Map && !res.containsKey('customer_address');
+      final savedAddress =
+          res is Map && res.containsKey('customer_address') ? '${res['customer_address'] ?? ''}' : details.address;
       messenger.showSnackBar(SnackBar(
           content: Text([
         saved.isEmpty
@@ -9783,6 +9797,10 @@ class _TableSheetState extends State<_TableSheet> {
           'The GSTIN was not saved: this server has not finished updating.'
         else if (gstinChanged)
           savedGstin.isEmpty ? 'Customer GSTIN removed.' : 'Customer GSTIN: $savedGstin.',
+        if (addressIgnored && details.address.isNotEmpty)
+          billCustomerAddressNotSaved
+        else if (addressChanged && !addressIgnored)
+          savedAddress.trim().isEmpty ? 'Address removed.' : 'Address added to the bill.',
       ].join(' '))));
       await _loadBill();
       widget.reload();
@@ -9801,43 +9819,67 @@ class _TableSheetState extends State<_TableSheet> {
   /// Shown to anyone who may edit it (so an unnamed table can be named), and to
   /// everyone else only when there is something to read. Neither the name nor
   /// the GSTIN is money, so a waiter's scoping does not remove them (C4).
+  ///
+  /// CLIENT ITEM 7 — the address's first line under them (two lines at most;
+  /// the paper has room for all five). Not money either, so a scoped waiter
+  /// reads it on their own table too. On a phone the button goes UNDER the
+  /// lines: beside them, its longer label would leave the name no room.
   Widget? _billCustomerHeader(ScaffoldMessengerState messenger, TextTheme text) {
     if (!_occupied || _bill == null) return null;
     final name = billCustomerNameSeed(_bill!['customer']);
     final gstin = _s(_bill!, 'customer_gstin', '').trim();
+    final address = billCustomerAddressLines(_bill!['customer_address']);
     final mayEdit = _mayEditBillCustomerName(widget.profile, _scope);
-    if (!mayEdit && name.isEmpty && gstin.isEmpty) return null;
+    if (!mayEdit && name.isEmpty && gstin.isEmpty && address.isEmpty) return null;
+    final lines = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(name.isEmpty ? 'No guest name on the bill' : name,
+          key: const ValueKey('table-bill-customer'),
+          style: name.isEmpty ? text.bodySmall : text.titleSmall,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis),
+      if (gstin.isNotEmpty) ...[
+        const SizedBox(height: 2),
+        Text('GSTIN $gstin', key: const ValueKey('table-bill-customer-gstin'), style: text.bodySmall),
+      ],
+      if (address.isNotEmpty) ...[
+        const SizedBox(height: 2),
+        Text(
+          address.length == 1 ? address.first : '${address.first} (+${address.length - 1} more)',
+          key: const ValueKey('table-bill-customer-address'),
+          style: text.bodySmall,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ],
+    ]);
+    final edit = !mayEdit
+        ? null
+        : ForkButton.ghost(
+            key: const ValueKey('table-bill-customer-name'),
+            label: billCustomerEditLabel,
+            icon: Icons.edit_outlined,
+            dense: true,
+            onPressed: () => _editBillCustomerName(messenger),
+          );
     return ForkCard(
       key: const ValueKey('table-bill-customer-header'),
       inset: true,
       padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
-      child: Row(children: [
-        Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(name.isEmpty ? 'No guest name on the bill' : name,
-                key: const ValueKey('table-bill-customer'),
-                style: name.isEmpty ? text.bodySmall : text.titleSmall,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis),
-            if (gstin.isNotEmpty) ...[
-              const SizedBox(height: 2),
-              Text('GSTIN $gstin', key: const ValueKey('table-bill-customer-gstin'), style: text.bodySmall),
-            ],
-          ]),
-        ),
-        if (mayEdit) ...[
-          const SizedBox(width: 8),
-          ForkButton.ghost(
-            key: const ValueKey('table-bill-customer-name'),
-            label: 'Edit name / GSTIN',
-            icon: Icons.edit_outlined,
-            dense: true,
-            onPressed: () => _editBillCustomerName(messenger),
-          ),
-        ],
-      ]),
+      child: LayoutBuilder(builder: (context, box) {
+        final narrow = box.maxWidth < 420;
+        final row = Row(children: [
+          Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
+          const SizedBox(width: 10),
+          Expanded(child: lines),
+          if (edit != null && !narrow) ...[const SizedBox(width: 8), edit],
+        ]);
+        if (edit == null || !narrow) return row;
+        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          row,
+          const SizedBox(height: 8),
+          Align(alignment: Alignment.centerRight, child: edit),
+        ]);
+      }),
     );
   }
 
@@ -11345,7 +11387,7 @@ class _BillPreviewDialog extends StatelessWidget {
     // same payload as the total; nothing is re-rounded here.
     final roundOff = billRoundOff(bill['round_off']);
     final billNo = _s(bill, 'bill_no', '');
-    // The customer slot — `Name:` / `Customer GSTIN:`.
+    // The customer slot — `Name:` / `Customer GSTIN:` / `Address:` (item 7).
     final customerLines = billCustomerLines(bill);
     // The label the paper gives the charge line: the configured percentage. It
     // labels a charge that is charged and nothing else — a removed charge has
@@ -11463,10 +11505,21 @@ class _BillPreviewDialog extends StatelessWidget {
                       // restaurant header and above the date / cashier block.
                       // "Name: <name>", or a bare "Name:" for a walk-in exactly as
                       // the paper leaves the slot blank; "Customer GSTIN:" only
-                      // when set. See [billCustomerLines].
-                      for (final l in customerLines)
-                        Text(l,
-                            key: ValueKey('bill-preview-customer-${l.startsWith('Customer GSTIN') ? 'gstin' : 'name'}'),
+                      // when set; client item 7 adds the address lines under it.
+                      // See [billCustomerLines].
+                      //
+                      // KEYED BY POSITION. The keys used to be the line's KIND
+                      // (name / gstin), and an address brings several lines of
+                      // one kind — which is a duplicate-key crash of the whole
+                      // preview for every bill that carries an address. The first
+                      // two keep the names tests and tools already read.
+                      for (var i = 0; i < customerLines.length; i++)
+                        Text(customerLines[i],
+                            key: ValueKey(i == 0
+                                ? 'bill-preview-customer-name'
+                                : (i == 1 && customerLines[i].startsWith('Customer GSTIN'))
+                                    ? 'bill-preview-customer-gstin'
+                                    : 'bill-preview-customer-$i'),
                             style: _ink),
                       _rule(),
                       // The date and the table on one line, the table in bold —
@@ -15797,15 +15850,24 @@ class _SegmentChip extends StatelessWidget {
 }
 
 // Month-by-month business summary, up to 3 years back.
-Widget historyModule(RestClient rest, Profile p) => _HistoryModule(rest: rest);
+//
+// CLIENT ITEM 8 — "Reprint bill should show up in History; old bills should be
+// reprintable from the history section." The profile is handed down now: it
+// used to be dropped right here, so every settled bill History opened was the
+// Reports drill-down's read-only sheet, with no Reprint and no name edit — for
+// the same people who reprint that bill from Accounting, on a screen the same
+// permission opens (/analytics/history and /print/bill/settled are both
+// validated on it).
+Widget historyModule(RestClient rest, Profile p) => _HistoryModule(rest: rest, profile: p);
 
 /// Holds History's reporting window. It opens WIDER than the 30-day default the
 /// other modules use — a month-by-month table cut to one month is a single row,
 /// which looks like a broken screen — but it is the same control, so a range
 /// picked here reads exactly like a range picked in Accounting.
 class _HistoryModule extends StatefulWidget {
-  const _HistoryModule({required this.rest});
+  const _HistoryModule({required this.rest, required this.profile});
   final RestClient rest;
+  final Profile profile;
   @override
   State<_HistoryModule> createState() => _HistoryModuleState();
 }
@@ -15829,6 +15891,7 @@ class _HistoryModuleState extends State<_HistoryModule> {
         widget.rest,
         _range,
         _setRange,
+        profile: widget.profile,
         key: ValueKey('history-${_range.from}-${_range.to}'),
       );
 }
@@ -15837,6 +15900,7 @@ Widget _historyBody(
   RestClient rest,
   DateRange range,
   ValueChanged<DateRange> onRange, {
+  required Profile profile,
   Key? key,
 }) => AsyncView<Map<String, dynamic>>(
       key: key,
@@ -15884,7 +15948,12 @@ Widget _historyBody(
           child: ListView(padding: AppSpacing.pageNarrow, children: [
             SectionHeader(
               title: 'History',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+              // The window is spelled out by the date chip directly under this
+              // header. On a phone this copy is wider than the room beside the
+              // title (2.0.1 overflowed by 9px at 360dp), so it is left out there.
+              trailing: MediaQuery.sizeOf(context).width < 420
+                  ? null
+                  : InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
             ),
             const SizedBox(height: AppSpacing.sm),
             // Every figure below is cut on this window, so it sits above them.
@@ -16002,6 +16071,7 @@ Widget _historyBody(
                             rest: rest,
                             month: m,
                             title: pretty('${m['month']}'),
+                            profile: profile,
                           ),
                         ),
                       );
@@ -16028,6 +16098,7 @@ Widget _historyBody(
                       rest: rest,
                       month: m,
                       title: pretty('${m['month']}'),
+                      profile: profile,
                     ),
                   ),
                   child: Row(children: [
@@ -16051,10 +16122,107 @@ Widget _historyBody(
                 ),
               );
             }),
+            // CLIENT ITEM 8 — the window's settled bills, on the page itself,
+            // with a search: an old bill is found by its number, table or
+            // cashier rather than three taps down a month. Each row opens the
+            // same sheet Accounting's does, Reprint and all.
+            const SizedBox(height: AppSpacing.xxl),
+            _HistorySettledBills(
+              key: ValueKey('history-bills-${range.from}-${range.to}'),
+              rest: rest,
+              range: range,
+              profile: profile,
+            ),
           ]),
         );
       },
     );
+
+/// CLIENT ITEM 8 — History's own settled-bill list: the page's window, a
+/// search box (with its clear), and Accounting's paged list, opened as a
+/// HISTORY surface — so a bill reprints and its name / GSTIN / address can be
+/// corrected here, and moving it to another till stays in Accounting.
+class _HistorySettledBills extends StatefulWidget {
+  const _HistorySettledBills({super.key, required this.rest, required this.range, required this.profile});
+  final RestClient rest;
+  final DateRange range;
+  final Profile profile;
+
+  @override
+  State<_HistorySettledBills> createState() => _HistorySettledBillsState();
+}
+
+class _HistorySettledBillsState extends State<_HistorySettledBills> {
+  final TextEditingController _search = TextEditingController();
+  Timer? _debounce;
+  String _term = '';
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Column(
+      key: const ValueKey('history-settled-bills'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // No range chip beside the title: the page's own date chip sets the
+        // window, and the sentence under it names it (a chip would not fit a
+        // phone beside the title).
+        const SectionHeader(title: 'Settled bills', padding: EdgeInsets.only(bottom: 6)),
+        Text('Every bill closed in ${widget.range.label()}, newest first — tap one to see it in full or reprint it.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        TextField(
+          key: const ValueKey('history-bill-search'),
+          controller: _search,
+          decoration: InputDecoration(
+            isDense: true,
+            hintText: 'Search bill no, table, cashier…',
+            prefixIcon: Icon(Icons.search, size: 18, color: AppColors.textTertiary),
+            suffixIcon: _term.isEmpty && _search.text.isEmpty
+                ? null
+                : IconButton(
+                    icon: const Icon(Icons.close, size: 16),
+                    tooltip: 'Clear search',
+                    onPressed: () {
+                      _debounce?.cancel();
+                      _search.clear();
+                      setState(() => _term = '');
+                    },
+                  ),
+          ),
+          onChanged: (v) {
+            _debounce?.cancel();
+            setState(() {});
+            _debounce = Timer(const Duration(milliseconds: 350), () {
+              if (mounted) setState(() => _term = v.trim());
+            });
+          },
+          onSubmitted: (v) {
+            _debounce?.cancel();
+            setState(() => _term = v.trim());
+          },
+        ),
+        const SizedBox(height: AppSpacing.md),
+        _ClosedBillsList(
+          rest: widget.rest,
+          profile: widget.profile,
+          surface: _ClosedBillSurface.history,
+          filter: _ClosedBillFilter(from: widget.range.from, to: widget.range.to, search: _term),
+          emptyCaption: _term.isEmpty
+              ? 'No bills were closed in ${widget.range.label()}.'
+              : 'No settled bill in ${widget.range.label()} matches "$_term".',
+        ),
+      ],
+    );
+  }
+}
 
 /// First and last calendar day of a "YYYY-MM" bucket, as the `from`/`to` the
 /// bills endpoint expects. Null when the bucket isn't a month.
@@ -16071,12 +16239,15 @@ Widget _historyBody(
 }
 
 /// What a History month card opens: the month's own metrics, then the settled
-/// bills that produced them — each of which opens the bill in full.
+/// bills that produced them — each of which opens the bill in full, with
+/// Reprint and the name / GSTIN / address edit for whoever holds their
+/// permission (client item 8).
 class _MonthDetailSheet extends StatelessWidget {
   final RestClient rest;
   final Map month;
   final String title;
-  const _MonthDetailSheet({required this.rest, required this.month, required this.title});
+  final Profile profile;
+  const _MonthDetailSheet({required this.rest, required this.month, required this.title, required this.profile});
 
   @override
   Widget build(BuildContext context) {
@@ -16118,7 +16289,8 @@ class _MonthDetailSheet extends StatelessWidget {
               ),
               const SizedBox(height: AppSpacing.lg),
               SectionHeader(title: 'Settled bills', padding: const EdgeInsets.only(bottom: 6)),
-              Text('Every bill closed in $title — tap one for its items, taxes, payment and who closed it.',
+              Text('Every bill closed in $title — tap one for its items, taxes, payment and who closed it, '
+                  'or to reprint it.',
                   style: text.bodySmall),
               const SizedBox(height: AppSpacing.md),
               if (range == null)
@@ -16127,6 +16299,8 @@ class _MonthDetailSheet extends StatelessWidget {
                 _ClosedBillsList(
                   rest: rest,
                   pageSize: 10,
+                  profile: profile,
+                  surface: _ClosedBillSurface.history,
                   filter: _ClosedBillFilter(from: range.from, to: range.to),
                   emptyCaption: 'No bills were closed in $title.',
                 ),
@@ -23005,7 +23179,22 @@ String _billTitle(Map b) {
   return table.isEmpty ? left : '$left · $table';
 }
 
-void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? profile, VoidCallback? onChanged]) {
+/// CLIENT ITEM 8 — WHERE a settled bill was opened from, which decides the one
+/// control the two write surfaces do not share. Both show Reprint and the name
+/// / GSTIN / address edit (same permission, same errand: correct it, then print
+/// the corrected copy). Only Accounting shows "Move to another till": that is a
+/// cash-up correction, and a cash-up is reconciled in Accounting. The Reports
+/// drill-down is neither — it opens the body alone, read-only.
+enum _ClosedBillSurface { accounting, history }
+
+void _openClosedBill(
+  BuildContext context,
+  RestClient rest,
+  Map bill, [
+  Profile? profile,
+  VoidCallback? onChanged,
+  _ClosedBillSurface surface = _ClosedBillSurface.accounting,
+]) {
   final id = _s(bill, 'id', '');
   if (id.isEmpty) return;
   showModalBottomSheet<void>(
@@ -23019,6 +23208,7 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? 
       title: _billTitle(bill),
       profile: profile,
       onChanged: onChanged,
+      surface: surface,
     ),
   );
 }
@@ -23028,7 +23218,9 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? 
 /// [onChanged] is told when the name / GSTIN on this bill was edited — from the
 /// row's own control (with the server's answer) or from the sheet (without).
 Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
-    [Profile? profile, void Function(Map<String, dynamic>? saved)? onChanged]) {
+    [Profile? profile,
+    void Function(Map<String, dynamic>? saved)? onChanged,
+    _ClosedBillSurface surface = _ClosedBillSurface.accounting]) {
   final text = Theme.of(context).textTheme;
   final method = _s(b, 'payment_method', '');
   final refunded = b['refunded'] == true;
@@ -23038,7 +23230,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
     padding: const EdgeInsets.only(bottom: 8),
     child: ForkCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      onTap: () => _openClosedBill(context, rest, b, profile, onChanged == null ? null : () => onChanged(null)),
+      onTap: () => _openClosedBill(context, rest, b, profile, onChanged == null ? null : () => onChanged(null), surface),
       child: Row(children: [
         Container(
           width: 36,
@@ -23071,8 +23263,10 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
           ]),
         ),
         const SizedBox(width: AppSpacing.md),
-        // ROUND 2 ITEM 1 — "Edit name / GSTIN" per past bill, behind the reprint
-        // gate (the widget draws nothing for anyone else).
+        // ROUND 2 ITEM 1 — "Edit name / GSTIN / address" per past bill, behind
+        // the reprint gate (the widget draws nothing for anyone else). The row
+        // does not know the address (the list never carries it), so the widget
+        // sends one only if it is typed.
         if (onChanged != null && _maySetSettledBillCustomer(profile))
           _EditSettledBillCustomerButton(
             key: ValueKey('closed-bill-row-edit-customer-${_s(b, 'id', '')}'),
@@ -23098,16 +23292,20 @@ class _ClosedBillsList extends StatefulWidget {
   final int pageSize;
   final String emptyCaption;
 
-  /// Whose permissions decide whether a settled bill may be MOVED to another
-  /// till (migration 038). Optional: a surface with no profile to hand shows the
-  /// bill exactly as it always did, read-only.
+  /// Whose permissions decide whether a settled bill may be reprinted, have its
+  /// name / GSTIN / address corrected, or be MOVED to another till (migration
+  /// 038). Optional: a surface with no profile to hand shows the bill read-only.
   final Profile? profile;
+
+  /// Which of those controls this list's bills get — see [_ClosedBillSurface].
+  final _ClosedBillSurface surface;
 
   const _ClosedBillsList({
     required this.rest,
     required this.filter,
     required this.emptyCaption,
     this.profile,
+    this.surface = _ClosedBillSurface.accounting,
     this.pageSize = 15,
   });
 
@@ -23228,7 +23426,7 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
           } else {
             setState(() => b.addAll(saved));
           }
-        }),
+        }, widget.surface),
       if (_hasMore)
         Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -23345,12 +23543,16 @@ class _ClosedBillSheet extends StatelessWidget {
   /// sheet repaints its row too.
   final VoidCallback? onChanged;
 
+  /// Accounting or History — History gets everything but the till move.
+  final _ClosedBillSurface surface;
+
   const _ClosedBillSheet({
     required this.rest,
     required this.billId,
     required this.title,
     this.profile,
     this.onChanged,
+    this.surface = _ClosedBillSurface.accounting,
   });
 
   @override
@@ -23391,13 +23593,15 @@ class _ClosedBillSheet extends StatelessWidget {
                       onChanged?.call();
                     },
                   ),
-                  misBillCounterAction(
-                    context,
-                    rest: rest,
-                    profile: profile!,
-                    billId: billId,
-                    onChanged: reload,
-                  ),
+                  // A cash-up correction, so Accounting's alone (client item 8).
+                  if (surface == _ClosedBillSurface.accounting)
+                    misBillCounterAction(
+                      context,
+                      rest: rest,
+                      profile: profile!,
+                      billId: billId,
+                      onChanged: reload,
+                    ),
                 ],
               ]),
             ),
@@ -23519,7 +23723,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
     // ROUND 2 ITEM 1 — `Name:` and `Customer GSTIN:` directly under the header
     // and above the date, the slot the printed bill carries them in, worded as
     // the paper words them (a walk-in's slot is a bare `Name:`, as on the
-    // paper). They replace the bare name chip.
+    // paper). They replace the bare name chip. Client item 7's `Address:` lines
+    // follow, one per stored line, as the paper prints them.
     for (final l in billCustomerLines(bill)) ...[
       const SizedBox(height: 4),
       Text(l, style: text.bodyMedium),

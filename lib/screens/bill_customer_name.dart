@@ -11,6 +11,12 @@
 // /bills/:billId/customer-details). One dialog, not two, so the two entry points
 // cannot disagree about what a valid GSTIN is.
 //
+// CLIENT ITEM 7 — "An option in the tables section to add the ADDRESS of a
+// guest to the bill, like name and GSTIN, especially for corporate parties."
+// A third, optional box in the same dialog, reached from the same places (and,
+// since client item 8, from History's settled bills too), sent by the same
+// omitted-means-unchanged rule, printed in the same slot under the GSTIN.
+//
 // The web has had the name since H6 ("Change name on bill…" in
 // bill-actions.tsx); the app did not, because nothing here called POST
 // /bills/customer-name. This mirrors the web's dialog rule for rule — seeded
@@ -74,11 +80,90 @@ String? billCustomerGstinError(String raw) {
   return billCustomerGstinInvalidMessage;
 }
 
+// ---------------------------------------------------------------------------
+// CLIENT ITEM 7 — THE ADDRESS
+// ---------------------------------------------------------------------------
+// The backend's rule (customer_address.ts), mirrored so the box can say what is
+// wrong before a round trip: line breaks kept, each line trimmed with inner
+// runs of spaces collapsed, blank lines dropped, empty clears. OVER THE LIMITS
+// IS REFUSED, NEVER CUT — the box shows a counter and the server's sentence
+// instead of a `maxLength` that would silently shorten a pasted address.
+
+/// Lines an address may have once blank ones are dropped (CUSTOMER_ADDRESS_MAX_LINES).
+const int billCustomerAddressMaxLines = 5;
+
+/// Characters the stored address may have, line breaks included (CUSTOMER_ADDRESS_MAX_CHARS).
+const int billCustomerAddressMaxChars = 250;
+
+/// The server's 400 sentence, word for word — the web shows the same.
+const String billCustomerAddressLimitMessage = 'Address can be at most 5 lines and 250 characters';
+
+/// The line under the box — the web's words (ADDRESS_HELP). The printer is sent
+/// ASCII, so an address in another script prints as question marks.
+const String billCustomerAddressHelp = 'Up to 5 lines. Leave it empty for none. Letters outside English print as "?".';
+
+/// What the paper puts before the address's first line.
+const String billCustomerAddressLabel = 'Address:';
+
+/// The sentence for a server that answered without keeping the address.
+const String billCustomerAddressNotSaved = 'The address was not saved: this server has not finished updating.';
+
+final RegExp _addressBreaks = RegExp('\r\n?|[\u0085\u2028\u2029]');
+final RegExp _addressControls = RegExp(r'[\x00-\x08\x0B-\x1F\x7F-\x9F]');
+
+/// The address as the server will store it — lines joined by `\n` — or '' when
+/// nothing is left (which clears it). Does NOT apply the limits; see
+/// [billCustomerAddressError].
+String normaliseBillCustomerAddress(String raw) => raw
+    .replaceAll(_addressBreaks, '\n')
+    .replaceAll('\t', ' ')
+    .replaceAll(_addressControls, '')
+    .split('\n')
+    .map((l) => l.replaceAll(RegExp(r'\s+'), ' ').trim())
+    .where((l) => l.isNotEmpty)
+    .join('\n');
+
+/// How much of each limit [raw] uses, measured as the server measures it.
+({int lines, int chars}) billCustomerAddressUsage(String raw) {
+  final value = normaliseBillCustomerAddress(raw);
+  return value.isEmpty ? (lines: 0, chars: 0) : (lines: value.split('\n').length, chars: value.length);
+}
+
+/// Null when [raw] is within the limits (or empty), otherwise
+/// [billCustomerAddressLimitMessage].
+String? billCustomerAddressError(String raw) {
+  final u = billCustomerAddressUsage(raw);
+  return u.lines > billCustomerAddressMaxLines || u.chars > billCustomerAddressMaxChars
+      ? billCustomerAddressLimitMessage
+      : null;
+}
+
+/// What the address box opens with, given a payload's `customer_address`: the
+/// stored value, normalised, or '' for none (a stored "null"/"undefined" is
+/// none, as on the paper).
+String billCustomerAddressSeed(Object? address) =>
+    billCustomerAddressLines(address).isEmpty ? '' : normaliseBillCustomerAddress('$address');
+
+/// THE ADDRESS AS THE PAPER PRINTS IT — one entry per stored line, only the
+/// first labelled; escpos.ts's customerAddressEntries and the web's
+/// billAddressLines, entry for entry. Empty for none, and a stored
+/// "null"/"undefined" is none.
+List<String> billCustomerAddressLines(Object? address) {
+  final value = '${address ?? ''}'.trim();
+  if (value.isEmpty || RegExp(r'^(null|undefined)$', caseSensitive: false).hasMatch(value)) return const [];
+  final lines = value.split(RegExp(r'\r?\n')).map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+  return [
+    for (var i = 0; i < lines.length; i++) i == 0 ? '$billCustomerAddressLabel ${lines[i]}' : lines[i],
+  ];
+}
+
 /// THE CUSTOMER SLOT — the lines the client's printed bill carries in their own
 /// ruled-off block, directly under the restaurant header (logo, name, legal
 /// entity, address, phone, GSTN) and ABOVE the date / cashier / bill-no block:
-/// `Name: <name>` always, worded as the client's bill words it, and
-/// `Customer GSTIN: <gstin>` directly under it, only when one is set.
+/// `Name: <name>` always, worded as the client's bill words it,
+/// `Customer GSTIN: <gstin>` directly under it, only when one is set, and
+/// (client item 7) `Address: <line 1>` then the rest of the address, one line
+/// each, only when one is set.
 ///
 /// A WALK-IN LEAVES THE SLOT BLANK — a bare `Name:` — because that is what the
 /// client's bill does and what escpos.ts now prints. "Guest" and "QR Guest" are
@@ -96,6 +181,7 @@ List<String> billCustomerLines(Map bill) {
   return [
     name.isEmpty ? 'Name:' : 'Name: $name',
     if (gstin.isNotEmpty) 'Customer GSTIN: $gstin',
+    ...billCustomerAddressLines(bill['customer_address']),
   ];
 }
 
@@ -123,17 +209,23 @@ bool _mayEditBillCustomerName(Profile p, FloorScope scope) =>
 /// the other would be stuck halfway through it. Null on a read-only surface.
 bool _maySetSettledBillCustomer(Profile? p) => _mayReprintSettledBill(p);
 
-/// What the dialog answers: the NORMALISED name ('' clears it) and the
-/// NORMALISED GSTIN ('' clears it).
-typedef BillCustomerDetails = ({String customer, String gstin});
+/// The label on every control that opens the dialog — the web's words.
+const String billCustomerEditLabel = 'Edit name / GSTIN / address';
 
-/// Asks for the name and GSTIN. Null when the dialog was dismissed.
+/// What the dialog answers: the NORMALISED name ('' clears it), the NORMALISED
+/// GSTIN ('' clears it), the NORMALISED address ('' clears it), and whether the
+/// address box was touched — a caller that did not know the address sends it
+/// only then, so an edit can never wipe an address it could not see.
+typedef BillCustomerDetails = ({String customer, String gstin, String address, bool addressTouched});
+
+/// Asks for the name, GSTIN and address. Null when the dialog was dismissed.
 Future<BillCustomerDetails?> _askBillCustomerDetails(
   BuildContext context, {
   required String title,
   required String explanation,
   required Object? currentName,
   required Object? currentGstin,
+  required Object? currentAddress,
 }) =>
     showDialog<BillCustomerDetails>(
       context: context,
@@ -142,6 +234,7 @@ Future<BillCustomerDetails?> _askBillCustomerDetails(
         explanation: explanation,
         initialName: billCustomerNameSeed(currentName),
         initialGstin: '${currentGstin ?? ''}'.trim(),
+        initialAddress: billCustomerAddressSeed(currentAddress),
       ),
     );
 
@@ -155,16 +248,17 @@ Future<BillCustomerDetails?> _askBillCustomerDetails(
 ///     with its own sentence): the API is a release behind the app. On the
 ///     settled route a 404 is also how the server says "Bill not found", which
 ///     is the server's sentence and shown as such.
-///   * Everything else — a malformed GSTIN (400), the column not migrated yet
-///     (503), a waiter refused (403) — is the server's own sentence, verbatim.
+///   * Everything else — a malformed GSTIN or an address over the limits (400),
+///     a column not migrated yet (503), a waiter refused (403) — is the
+///     server's own sentence, verbatim.
 String _billCustomerDetailsFailure(Object e, {required bool settled}) {
   if (e is OfflineUnavailable) {
     return 'Changing the name on a bill needs a connection — reconnect and try again.';
   }
   if (e is ApiException && e.status == 404 && !(settled && e.message.toLowerCase().contains('bill not found'))) {
     return settled
-        ? 'This server has not finished updating, so the name and GSTIN on a settled bill cannot be changed '
-            'from here yet. Ask your administrator to complete the update.'
+        ? 'This server has not finished updating, so the name, GSTIN and address on a settled bill cannot be '
+            'changed from here yet. Ask your administrator to complete the update.'
         : 'This server has not finished updating, so the name cannot be changed from here yet. '
             'Ask your administrator to complete the update.';
   }
@@ -177,12 +271,14 @@ class _BillCustomerNameDialog extends StatefulWidget {
     required this.explanation,
     required this.initialName,
     required this.initialGstin,
+    required this.initialAddress,
   });
 
   final String title;
   final String explanation;
   final String initialName;
   final String initialGstin;
+  final String initialAddress;
 
   @override
   State<_BillCustomerNameDialog> createState() => _BillCustomerNameDialogState();
@@ -191,16 +287,21 @@ class _BillCustomerNameDialog extends StatefulWidget {
 class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
   late final TextEditingController _ctrl = TextEditingController(text: widget.initialName);
   late final TextEditingController _gstinCtrl = TextEditingController(text: widget.initialGstin);
+  late final TextEditingController _addressCtrl = TextEditingController(text: widget.initialAddress);
 
   /// Shown only once Save has been tried, and cleared as soon as the box is
   /// edited: a GSTIN is typed a character at a time, and every one of the first
   /// fourteen is "wrong".
   String? _gstinError;
 
+  /// Did the person type in the address box, or press Clear?
+  bool _addressTouched = false;
+
   @override
   void dispose() {
     _ctrl.dispose();
     _gstinCtrl.dispose();
+    _addressCtrl.dispose();
     super.dispose();
   }
 
@@ -210,14 +311,24 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
       setState(() => _gstinError = error);
       return;
     }
+    // The address limit is already on screen as they type; Save simply will
+    // not go past it.
+    if (billCustomerAddressError(_addressCtrl.text) != null) return;
     Navigator.pop<BillCustomerDetails>(
       context,
-      (customer: normaliseBillCustomerName(_ctrl.text), gstin: normaliseBillCustomerGstin(_gstinCtrl.text)),
+      (
+        customer: normaliseBillCustomerName(_ctrl.text),
+        gstin: normaliseBillCustomerGstin(_gstinCtrl.text),
+        address: normaliseBillCustomerAddress(_addressCtrl.text),
+        addressTouched: _addressTouched,
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    final addressError = billCustomerAddressError(_addressCtrl.text);
+    final usage = billCustomerAddressUsage(_addressCtrl.text);
     return AlertDialog(
       title: Text(widget.title),
       content: SingleChildScrollView(
@@ -244,7 +355,8 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
             key: const ValueKey('bill-customer-gstin-field'),
             controller: _gstinCtrl,
             textCapitalization: TextCapitalization.characters,
-            textInputAction: TextInputAction.done,
+            // Next goes to the address box; the GSTIN is no longer the last field.
+            textInputAction: TextInputAction.next,
             // Upper-cased as it is typed, so what is on screen is what is saved.
             inputFormatters: [
               TextInputFormatter.withFunction((_, next) => next.copyWith(text: next.text.toUpperCase())),
@@ -252,12 +364,38 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
             onChanged: (_) {
               if (_gstinError != null) setState(() => _gstinError = null);
             },
-            onSubmitted: (_) => _save(),
             decoration: InputDecoration(
               labelText: 'Customer GSTIN (optional)',
               hintText: 'e.g. 29ABCDE1234F1Z5',
               helperText: 'For corporate parties. Leave empty for none.',
               errorText: _gstinError,
+              border: const OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 8),
+          // CLIENT ITEM 7 — the guest's address. ENTER IS A NEW LINE here, never
+          // Save: an address is typed as lines and printed as lines. No
+          // maxLength — the limit is refused, never cut — so the counter is the
+          // server's measure, drawn by hand.
+          TextField(
+            key: const ValueKey('bill-customer-address-field'),
+            controller: _addressCtrl,
+            keyboardType: TextInputType.multiline,
+            textInputAction: TextInputAction.newline,
+            textCapitalization: TextCapitalization.words,
+            minLines: 2,
+            maxLines: billCustomerAddressMaxLines,
+            onChanged: (_) => setState(() => _addressTouched = true),
+            decoration: InputDecoration(
+              labelText: 'Guest address (optional)',
+              hintMaxLines: 2,
+              hintText: 'e.g. 4th Floor, Prestige Tower\n12 Residency Road, Bengaluru 560025',
+              helperText: billCustomerAddressHelp,
+              helperMaxLines: 3,
+              errorText: addressError,
+              errorMaxLines: 3,
+              counterText: '${usage.lines}/$billCustomerAddressMaxLines lines · ${usage.chars}/$billCustomerAddressMaxChars',
+              alignLabelWithHint: true,
               border: const OutlineInputBorder(),
             ),
           ),
@@ -272,14 +410,19 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
           onPressed: () {
             _ctrl.clear();
             _gstinCtrl.clear();
-            setState(() => _gstinError = null);
+            _addressCtrl.clear();
+            setState(() {
+              _gstinError = null;
+              _addressTouched = true;
+            });
           },
           child: const Text('Clear'),
         ),
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
         FilledButton(
           key: const ValueKey('bill-customer-name-save'),
-          onPressed: _save,
+          // Off while the address is over a limit: the sentence above says why.
+          onPressed: addressError == null ? _save : null,
           child: const Text('Save'),
         ),
       ],
@@ -287,12 +430,19 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
   }
 }
 
-/// ROUND 2 ITEM 1 — "Edit name / GSTIN" on a SETTLED bill in Accounting.
+/// ROUND 2 ITEM 1 — "Edit name / GSTIN" on a SETTLED bill in Accounting, and
+/// (client item 8) in History. Client item 7 adds the address.
 ///
-/// POST /bills/:billId/customer-details changes the name and GSTIN and NOTHING
-/// ELSE — no money, no status, no timestamps; the server writes the audit line.
-/// [onSaved] gets the server's answer so the caller can repaint the row or
-/// re-read the sheet; nothing here assumes what the server stored.
+/// POST /bills/:billId/customer-details changes the name, GSTIN and address and
+/// NOTHING ELSE — no money, no status, no timestamps; the server writes the
+/// audit line. [onSaved] gets the server's answer so the caller can repaint the
+/// row or re-read the sheet; nothing here assumes what the server stored.
+///
+/// THE ADDRESS IS SENT ONLY WHEN THIS BUTTON KNOWS IT. The bill's own sheet
+/// reads the detail, which carries `customer_address`; a LIST ROW does not (the
+/// list never carries the address), so from a row the address goes out only if
+/// somebody typed in its box. Sending the row's "nothing" would wipe the
+/// address off the invoice.
 ///
 /// [compact] draws an icon for the list row; otherwise a labelled button for the
 /// bill's own sheet, beside "Reprint bill".
@@ -325,20 +475,29 @@ class _EditSettledBillCustomerButtonState extends State<_EditSettledBillCustomer
     final billId = _s(widget.bill, 'id', '');
     if (billId.isEmpty) return;
     final no = _s(widget.bill, 'bill_no', '');
+    final addressKnown = widget.bill.containsKey('customer_address');
+    final seedAddress = addressKnown ? billCustomerAddressSeed(widget.bill['customer_address']) : '';
     final details = await _askBillCustomerDetails(
       context,
-      title: no.isEmpty ? 'Name / GSTIN on this bill' : 'Name / GSTIN on Bill #$no',
-      explanation: 'This bill is settled. Only the name and GSTIN printed on it change — never its '
+      title: no.isEmpty ? 'Name / GSTIN / address on this bill' : 'Name / GSTIN / address on Bill #$no',
+      explanation: 'This bill is settled. Only the name, GSTIN and address printed on it change — never its '
           'amounts or payment. Reprint it afterwards for a corrected copy.',
       currentName: widget.bill['customer'],
       currentGstin: widget.bill['customer_gstin'],
+      currentAddress: seedAddress,
     );
     if (details == null || !mounted) return;
+    // ONLY A CHANGE GOES OUT — the web's addressToSend, rule for rule. An
+    // address re-sent unchanged is still an address write, and a database
+    // without migration 054's column refuses every one of those with a 503:
+    // a name correction must not fail for a field nobody touched.
+    final sendAddress = details.addressTouched && (!addressKnown || details.address != seedAddress);
     setState(() => _sending = true);
     try {
       final res = await widget.rest.post('/bills/${Uri.encodeComponent(billId)}/customer-details', {
         'customer': details.customer,
         'customer_gstin': details.gstin.isEmpty ? null : details.gstin,
+        if (sendAddress) 'customer_address': details.address.isEmpty ? null : details.address,
       });
       // The server's answer when it gave one: it normalises again (an empty
       // name comes back as "Guest").
@@ -349,10 +508,21 @@ class _EditSettledBillCustomerButtonState extends State<_EditSettledBillCustomer
         'customer_gstin': res is Map && res.containsKey('customer_gstin')
             ? res['customer_gstin']
             : (details.gstin.isEmpty ? null : details.gstin),
+        // Only when the answer carries it: a row that never knew the address
+        // must not start claiming one.
+        if (res is Map && res.containsKey('customer_address')) 'customer_address': res['customer_address'],
       };
       widget.onSaved(saved);
+      // A server a release behind keeps the name and GSTIN and ignores a field
+      // it has never heard of; say so rather than let the paper say it.
+      final addressIgnored =
+          sendAddress && details.address.isNotEmpty && !(res is Map && res.containsKey('customer_address'));
+      final what = sendAddress ? 'Name, GSTIN and address' : 'Name and GSTIN';
       messenger.showSnackBar(SnackBar(
-          content: Text(no.isEmpty ? 'Name and GSTIN updated on the bill.' : 'Name and GSTIN updated on Bill #$no.')));
+          content: Text([
+        no.isEmpty ? '$what updated on the bill.' : '$what updated on Bill #$no.',
+        if (addressIgnored) billCustomerAddressNotSaved,
+      ].join(' '))));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text(_billCustomerDetailsFailure(e, settled: true))));
     } finally {
@@ -366,7 +536,7 @@ class _EditSettledBillCustomerButtonState extends State<_EditSettledBillCustomer
     if (!_maySetSettledBillCustomer(widget.profile)) return const SizedBox.shrink();
     if (widget.compact) {
       return IconButton(
-        tooltip: 'Edit name / GSTIN',
+        tooltip: billCustomerEditLabel,
         visualDensity: VisualDensity.compact,
         icon: Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
         onPressed: _sending ? null : _edit,
@@ -377,7 +547,7 @@ class _EditSettledBillCustomerButtonState extends State<_EditSettledBillCustomer
       child: OutlinedButton.icon(
         onPressed: _sending ? null : _edit,
         icon: const Icon(Icons.person_outline, size: 18),
-        label: Text(_sending ? 'Saving…' : 'Edit name / GSTIN'),
+        label: Text(_sending ? 'Saving…' : billCustomerEditLabel),
       ),
     );
   }

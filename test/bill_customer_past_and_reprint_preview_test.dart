@@ -230,7 +230,7 @@ void main() {
       expect(_rowEdit, findsOneWidget);
 
       await _tap(tester, _rowEdit);
-      expect(find.text('Name / GSTIN on Bill #57'), findsOneWidget);
+      expect(find.text('Name / GSTIN / address on Bill #57'), findsOneWidget);
       expect(tester.widget<TextField>(_field).controller!.text, '', reason: 'never seeded with "Guest"');
       await tester.enterText(_field, '  Acme   Ltd ');
       await tester.enterText(_gstinField, '29abcde1234f1z5');
@@ -258,7 +258,7 @@ void main() {
 
       final detailReads = api.calls.where((c) => c == 'GET /bills/closed/b1').length;
       final listReads = api.calls.where((c) => c.startsWith('GET /bills/closed?')).length;
-      await _tap(tester, find.text('Edit name / GSTIN'));
+      await _tap(tester, find.text('Edit name / GSTIN / address'));
       expect(tester.widget<TextField>(_gstinField).controller!.text, '29ABCDE1234F1Z5');
       await tester.enterText(_field, 'Acme Pvt Ltd');
       await tester.enterText(_gstinField, '');
@@ -312,8 +312,8 @@ void main() {
       await _openBillSheet(tester);
       expect(find.text('Reprint bill'), findsNothing);
       expect(find.descendant(of: _sheetEdit, matching: find.byType(OutlinedButton)), findsNothing);
-      expect(find.text('Edit name / GSTIN'), findsNothing);
-      expect(find.byTooltip('Edit name / GSTIN'), findsNothing);
+      expect(find.text('Edit name / GSTIN / address'), findsNothing);
+      expect(find.byTooltip('Edit name / GSTIN / address'), findsNothing);
       // The lines are not money, so they are still read.
       expect(find.text('Name: Acme Ltd'), findsOneWidget);
     });
