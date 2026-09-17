@@ -1387,9 +1387,19 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final ncToday = _headlineNc(context, h);
 
   // "Today's report": a link, not a sheet — it IS the destination. Absent when
-  // this user can open none of the places it leads.
+  // this user can open none of the places it leads. Beside the title on a wide
+  // window; on a phone it joins the chips below instead, because beside the
+  // title it cut "Today at a glance" to "TODAY AT A GLA…" at 360px in Gaia.
   final report = _glanceResolve(nav, glanceDrillOf(h, 'header'));
   final narrow = MediaQuery.sizeOf(context).width < 760;
+  final reportLink = report == null
+      ? null
+      : ForkButton.subtle(
+          key: const ValueKey('glance-report'),
+          label: kGlanceReportButton,
+          icon: Icons.arrow_forward,
+          onPressed: _glanceGo(nav, report),
+        );
 
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
@@ -1410,15 +1420,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
           child: SectionHeader(
             title: 'Today at a glance',
             padding: const EdgeInsets.only(bottom: AppSpacing.md),
-            trailing: report == null
-                ? null
-                : ForkButton.subtle(
-                    key: const ValueKey('glance-report'),
-                    label: kGlanceReportButton,
-                    // A phone keeps the title's width for the title.
-                    icon: narrow ? null : Icons.arrow_forward,
-                    onPressed: _glanceGo(nav, report),
-                  ),
+            trailing: narrow ? null : reportLink,
           ),
         ),
         // The day, the zone and the month window these figures were cut on, and
@@ -1428,8 +1430,9 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
         // disagreement about the money. A Wrap, so the four never overflow a
         // phone — the bill count used to sit in the header's trailing slot,
         // which is now the report link's.
-        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty || (bills ?? 0) > 0) ...[
-          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
+        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty || (bills ?? 0) > 0 ||
+            (narrow && reportLink != null)) ...[
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, crossAxisAlignment: WrapCrossAlignment.center, children: [
             // Only when there is something to count. "0 bills settled" sitting
             // beside the sentence below would say the same thing twice, in two
             // voices, and one of them in a tag that normally means good news.
@@ -1465,6 +1468,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
                 onTap: () => _glanceFigureSheet(context, h, 'month_to_date', via: 'month'),
                 child: InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
               ),
+            if (narrow && reportLink != null) reportLink,
           ]),
           const SizedBox(height: AppSpacing.lg),
         ],
