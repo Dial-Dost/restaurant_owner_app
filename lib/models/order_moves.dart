@@ -110,13 +110,29 @@ String? movedAwayLine(Map order) {
 ({String title, String dishes}) moveOrderPickerRow(Map order) =>
     (title: moveOrderTitle(order), dishes: moveDishSummary(orderDishLines(order)));
 
+/// DOES THE KITCHEN HAVE THIS TICKET? One answer on both clients, and the one
+/// the server acts on: a KOT number means a docket printed, a bark means the
+/// pass announced it, and either is enough.
+///
+/// NOT THE BARK ALONE. Production barks almost none of its printed tickets
+/// (GGV: 79 of 80 in a fortnight), so the picker said "Not sent to the kitchen
+/// yet" under KOT 65 and the confirm said "nothing prints now" — and then the
+/// server printed a correction docket. A row with no `barked_at` key (a
+/// backend older than the field) reads as barked, as the rest of the app
+/// reads it.
+///
+/// PARITY: the dashboard's moveOrderKitchenHas (src/lib/table-move.ts) is the
+/// same rule, and both suites pin the same cases.
+bool moveOrderKitchenHas(Map order) =>
+    moveKotNos(order).isNotEmpty || !order.containsKey('barked_at') || order['barked_at'] != null;
+
 /// The body of "Move this order to 15?" — WHAT is moving, then what the kitchen
-/// will see. [barked] is whether the kitchen already has the ticket.
+/// will see, judged by [moveOrderKitchenHas] so it can never disagree with the
+/// picker row above it or with what the server then prints.
 String moveOrderConfirmBody({
   required Map order,
   required String fromTable,
   required String toTable,
-  required bool barked,
 }) {
   final dishes = moveDishSummary(orderDishLines(order), max: null);
   final what = dishes.isEmpty
@@ -124,7 +140,8 @@ String moveOrderConfirmBody({
       : moveKotNos(order).isEmpty
           ? '$dishes.\n\n'
           : '${moveOrderTitle(order)}: $dishes.\n\n';
-  return '$what${moveOrderKitchenSentence(fromTable: fromTable, toTable: toTable, barked: barked)}';
+  final sentence = moveOrderKitchenSentence(fromTable: fromTable, toTable: toTable, barked: moveOrderKitchenHas(order));
+  return '$what$sentence';
 }
 
 /// What the kitchen will see when an order moves — the sentence both clients

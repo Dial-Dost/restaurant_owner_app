@@ -10101,13 +10101,16 @@ class _TableSheetState extends State<_TableSheet> {
               Builder(builder: (_) {
                 final row = moveOrderPickerRow(o as Map);
                 final id = _s(o, 'id');
+                // A KOT number OR a bark — the rule the confirm, the dashboard
+                // and the server all use (moveOrderKitchenHas).
+                final kitchenHas = moveOrderKitchenHas(o);
                 return SimpleDialogOption(
                   key: ValueKey('move-order-pick-$id'),
                   onPressed: () => Navigator.pop(ctx, o),
                   child: ListTile(
                     dense: true,
                     isThreeLine: row.dishes.isNotEmpty,
-                    leading: Icon(_orderBarked(o) ? Icons.receipt_long : Icons.hourglass_empty),
+                    leading: Icon(kitchenHas ? Icons.receipt_long : Icons.hourglass_empty),
                     title: Text(
                       _scope.money ? '${row.title} · ${_money(o['total'] ?? o['subtotal'])}' : row.title,
                       maxLines: 1,
@@ -10116,7 +10119,7 @@ class _TableSheetState extends State<_TableSheet> {
                     subtitle: Text(
                       [
                         if (row.dishes.isNotEmpty) row.dishes,
-                        _orderBarked(o) ? 'The kitchen has this one' : 'Not sent to the kitchen yet',
+                        kitchenHas ? 'The kitchen has this one' : 'Not sent to the kitchen yet',
                       ].join('\n'),
                       key: ValueKey('move-order-dishes-$id'),
                       maxLines: 3,
@@ -10169,13 +10172,12 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (dest == null || dest.isEmpty || !mounted) return;
-    final barked = _orderBarked(order);
     // The confirm names WHAT is moving — every dish, even when there was only
     // one ticket and so no picker — before what the kitchen will see.
     final ok = await _confirm(
       context,
       'Move this order to $dest?',
-      moveOrderConfirmBody(order: order, fromTable: _name, toTable: dest, barked: barked),
+      moveOrderConfirmBody(order: order, fromTable: _name, toTable: dest),
     );
     if (!ok) return;
     try {

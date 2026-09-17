@@ -292,6 +292,16 @@ void main() {
 
 
   // ============================================================== the wiring
+  test('the wiring: the move picker and confirm judge the kitchen by moveOrderKitchenHas, never the bark alone', () {
+    final mod = File('lib/screens/modules.dart').readAsStringSync().replaceAll(String.fromCharCode(13), '');
+    final start = mod.indexOf('Future<void> _moveKot(');
+    final body = mod.substring(start, mod.indexOf('\n  }\n', start));
+    expect(start, greaterThan(-1));
+    expect(body, contains('final kitchenHas = moveOrderKitchenHas(o);'));
+    expect(body, contains('moveOrderConfirmBody(order: order, fromTable: _name, toTable: dest),'));
+    expect(body, isNot(contains('_orderBarked(')));
+  });
+
   test('the wiring: every order cancel is _cancelOrder, and only the Pending decline skips the rule', () {
     String read(String rel) => File(rel).readAsStringSync().replaceAll(String.fromCharCode(13), '');
     final mod = read('lib/screens/modules.dart');
@@ -478,6 +488,57 @@ void main() {
             'Correction docket KOT-65 is printing — tell the pass.'), findsOneWidget);
         await tester.pumpAndSettle();
         expect(api.writes.single.path, '/tables/move-order');
+        expect(api.writes.single.body, {'order_id': 'o-65', 'to_table': '15'});
+      }, variant: _variants);
+
+      // REVIEW FINDING — production barks almost no printed ticket (GGV: 79 of
+      // 80 in a fortnight), and the fixtures above are all barked. KOT 65 as it
+      // really stands: numbered, never barked. The picker and the confirm must
+      // say what the dashboard says and what the server then does — a
+      // correction docket prints — and only a ticket with neither a number nor
+      // a bark is "not sent".
+      testWidgets('ITEM 4 — an UN-barked KOT 65 is with the kitchen in the picker and the confirm; an unnumbered, unbarked one is not',
+          (tester) async {
+        final unbarked65 = {..._kot65(), 'barked_at': null};
+        final neverSent = {..._kot66(), 'kot_nos': <int>[], 'barked_at': null};
+        final api = await _mount(
+          tester,
+          _tablesRoutes(orders: [unbarked65, neverSent], bill: _bill(['o-65', 'o-66'], _ggvLines)),
+          _admin(),
+          system: system,
+          orders: false,
+        );
+        api.writeReplies['/tables/move-order'] = {
+          'success': true, 'order_id': 'o-65', 'from_table': '12', 'to_table': '15', 'kot_no': 65,
+          'items': const [{'name': 'KUNAFA BIRDS NEST', 'quantity': 1}],
+          'print': {'printed': true, 'kot_no': 65, 'tickets': 1},
+        };
+        await tester.tap(find.text('12').first);
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(_button('Move an order'));
+        await tester.tap(_button('Move an order'));
+        await tester.pumpAndSettle();
+        final picker = _texts(find.byType(SimpleDialog));
+        expect(picker, containsAll(<String>[
+          '1 × KUNAFA BIRDS NEST, 1 × STIR FRIED WATERCHESTNUT, 1 × TRUFFLE CREAM CHEESE\nThe kitchen has this one',
+          '2 × MOCKTAIL DEAL\nNot sent to the kitchen yet',
+        ]));
+        expect(find.descendant(of: find.byKey(const ValueKey('move-order-pick-o-65')), matching: find.byIcon(Icons.receipt_long)),
+            findsOneWidget);
+        expect(find.descendant(of: find.byKey(const ValueKey('move-order-pick-o-66')), matching: find.byIcon(Icons.hourglass_empty)),
+            findsOneWidget);
+        await tester.tap(find.byKey(const ValueKey('move-order-pick-o-65')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Table 15'));
+        await tester.pumpAndSettle();
+        final confirm = _texts(find.byType(AlertDialog).last).join(' | ');
+        expect(confirm, contains('KOT 65: 1 × KUNAFA BIRDS NEST, 1 × STIR FRIED WATERCHESTNUT, 1 × TRUFFLE CREAM CHEESE.'));
+        expect(confirm, contains('The kitchen already has a docket for 12, so a correction docket prints for 15 with the same KOT number.'));
+        expect(confirm, isNot(contains('has not been sent')));
+        await tester.tap(find.text('Confirm'));
+        await tester.pump();
+        expect(find.text('Moved to 15: 1 × KUNAFA BIRDS NEST. Correction docket KOT-65 is printing — tell the pass.'), findsOneWidget);
+        await tester.pumpAndSettle();
         expect(api.writes.single.body, {'order_id': 'o-65', 'to_table': '15'});
       }, variant: _variants);
 

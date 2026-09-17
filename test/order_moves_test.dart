@@ -96,19 +96,40 @@ void main() {
   group('the words both clients say', () {
     test('the confirm: WHAT moves, then what the kitchen sees', () {
       expect(
-        moveOrderConfirmBody(order: _kot65, fromTable: '12', toTable: '15', barked: true),
+        moveOrderConfirmBody(order: {..._kot65, 'barked_at': '2026-09-14T10:57:16Z'}, fromTable: '12', toTable: '15'),
         'KOT 65: 1 × KUNAFA BIRDS NEST, 1 × STIR FRIED WATERCHESTNUT, 1 × TRUFFLE CREAM CHEESE, 2 × Dal (Half).\n\n'
         'The kitchen already has a docket for 12, so a correction docket prints for 15 with the same KOT number. '
         '12 keeps its guests and its other orders.',
       );
       expect(
-        moveOrderConfirmBody(order: {'items': [{'name': 'Dal', 'quantity': 2}]}, fromTable: '12', toTable: '15', barked: false),
+        moveOrderConfirmBody(order: {'items': [{'name': 'Dal', 'quantity': 2}], 'barked_at': null}, fromTable: '12', toTable: '15'),
         '2 × Dal.\n\nThe kitchen has not been sent this order yet, so nothing prints now — it will print for 15 when it is sent.',
       );
       expect(
-        moveOrderConfirmBody(order: const {}, fromTable: '12', toTable: '15', barked: false),
+        moveOrderConfirmBody(order: const {'barked_at': null}, fromTable: '12', toTable: '15'),
         'The kitchen has not been sent this order yet, so nothing prints now — it will print for 15 when it is sent.',
       );
+    });
+
+    // REVIEW FINDING — production barks almost no printed ticket (GGV: 79 of 80
+    // in a fortnight). The same cases are pinned in the dashboard's
+    // src/lib/__tests__/table-move.test.ts.
+    test('the kitchen has a ticket when it carries a KOT number OR a bark — one rule on both clients', () {
+      expect(moveOrderKitchenHas({'kot_nos': [65], 'barked_at': null}), isTrue);
+      expect(moveOrderKitchenHas({'kot_nos': [], 'barked_at': '2026-09-14T10:57:16Z'}), isTrue);
+      expect(moveOrderKitchenHas({'kot_nos': [65], 'barked_at': '2026-09-14T10:57:16Z'}), isTrue);
+      expect(moveOrderKitchenHas({'kot_nos': [], 'barked_at': null}), isFalse);
+      expect(moveOrderKitchenHas({'kot_nos': [0, -1, 'x'], 'barked_at': null}), isFalse);
+      expect(moveOrderKitchenHas({'barked_at': null}), isFalse);
+      // A backend older than both fields: read as barked, as the rest of the app reads it.
+      expect(moveOrderKitchenHas(const {}), isTrue);
+    });
+
+    test('KOT 65, printed and never barked: the confirm says a correction prints — which is what the server does', () {
+      final body = moveOrderConfirmBody(order: {..._kot65, 'barked_at': null}, fromTable: '12', toTable: '15');
+      expect(body, startsWith('KOT 65: 1 × KUNAFA BIRDS NEST'));
+      expect(body, contains('The kitchen already has a docket for 12, so a correction docket prints for 15 with the same KOT number.'));
+      expect(body, isNot(contains('has not been sent')));
     });
 
     test('the kitchen sentence, alone (the dashboard puts it under each order)', () {
