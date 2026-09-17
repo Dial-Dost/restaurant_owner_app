@@ -5,11 +5,15 @@
 // Summary, Cover Size Summary, Settlement Summary — and the six that migrations
 // 034-039 finally gave data to: NC Summary, Service Charge Deny, Group Summary,
 // Variation Summary, Tip Summary and Counter Summary. Backed by /reports/mis/*,
-// all GETs, all read-only — nothing on this screen writes, so nothing on it can
-// reach the offline outbox. The one exception is the "Manage sessions" sheet,
-// which replaces the restaurant's saved time slots (PUT /reports/mis/time-slots):
-// a settings write, offered only to a caller the server marks `can_edit`, and
-// not on the outbox allowlist, so it is online-only by construction.
+// all GETs, all read-only — the reports themselves write nothing, so nothing
+// they do can reach the offline outbox. Two exceptions, both online-only by
+// construction because neither is on the outbox allowlist:
+//   * the "Manage sessions" sheet, which replaces the restaurant's saved time
+//     slots (PUT /reports/mis/time-slots), offered only to a caller the server
+//     marks `can_edit`;
+//   * EMAIL (client item 9): the Email button beside Export (Send now, for the
+//     report and days on screen) and the "Email reports" view — the address
+//     book, the schedules and the delivery history. See report_email.dart.
 //
 // WHY THIS IS A `part` OF modules.dart AND NOT ITS OWN LIBRARY. The drill-down
 // from a Discount or an Order Summary row has to open THE SAME BILL BODY the
@@ -143,9 +147,15 @@ final Map<String, Set<String>> _misHiddenColumns = <String, Set<String>>{};
 /// fourteen of fifteen tabs is a dead control.
 String _misBucket = 'day';
 
+/// Which view was open — the reports, or Email reports — for the session, like
+/// the tab: switching outlet remounts the module and must not throw the owner
+/// out of the address book they were editing.
+String _misView = 'report';
+
 /// Test seam: a suite must not inherit the previous test's tab or columns.
 void misResetReportMemory() {
   _misOpenTab = 0;
+  _misView = 'report';
   _misHiddenColumns.clear();
   _misBucket = 'day';
   TimeSlotMemory.reset();
@@ -254,9 +264,31 @@ class _ReportsViewState extends State<_ReportsView> {
   // widget (ModuleNavigator) is only legal once dependencies are resolved, and
   // whether this user can switch outlets at all is what decides if the call is
   // worth making. Guarded so a rebuild does not refetch.
+  /// The view on screen: 'report' or 'email'.
+  String _view = _misView;
+  int _focusSerial = -1;
+
+  void _setView(String next) => setState(() {
+        _view = next;
+        _misView = next;
+      });
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // A bell about an emailed report (its meta says module 'Reports'), or the
+    // Accounting card's "Open Email reports", lands on the Email reports view.
+    // "Scheduled email reports are waiting" names no delivery and no schedule:
+    // it carries view 'email' (and its kind), or it landed on the report grid.
+    final focus = ModuleNavigator.of(context)?.focusFor('Reports');
+    if (focus != null && focus.serial != _focusSerial) {
+      _focusSerial = focus.serial;
+      final t = focus.target;
+      if (t['view'] == 'email' || t['delivery_id'] != null || t['schedule_id'] != null || t['kind'] != null) {
+        _view = 'email';
+        _misView = 'email';
+      }
+    }
     if (_askedOutlets) return;
     _askedOutlets = true;
     if (ModuleNavigator.of(context)?.switchOutlet == null) return;
@@ -340,8 +372,22 @@ class _ReportsViewState extends State<_ReportsView> {
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SectionHeader(
           title: 'Reports',
-          trailing: narrow ? null : InfoChip(icon: Icons.calendar_today_outlined, label: _range.label()),
+          trailing: narrow || _view == 'email' ? null : InfoChip(icon: Icons.calendar_today_outlined, label: _range.label()),
         ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: _MisSegment(
+            key: const ValueKey('reports-view'),
+            options: const ['report', 'email'],
+            labels: const ['Reports', kEmailAreaTitle],
+            selected: _view,
+            onSelected: _setView,
+          ),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        if (_view == 'email')
+          Expanded(child: _EmailReportsPanel(rest: widget.rest))
+        else ...[
         // Every figure below is cut on this window and this outlet, so the
         // controls that set them sit above the figures, never beside them.
         _toolbar(context, report, narrow, nav),
@@ -355,6 +401,7 @@ class _ReportsViewState extends State<_ReportsView> {
         Container(height: 1, color: AppColors.divider),
         const SizedBox(height: AppSpacing.md),
         Expanded(child: pane),
+        ],
       ]),
     );
   }
@@ -1204,6 +1251,24 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               icon: Icons.download_outlined,
               dense: true,
               onPressed: _rows.isEmpty ? null : () {},
+            ),
+          ),
+        ),
+        // Email: the server builds and sends the files for whole days, so it
+        // waits for nothing on screen — only for somebody to choose addresses.
+        Tooltip(
+          message: kEmailButtonTooltip,
+          child: ForkButton.ghost(
+            key: const ValueKey('reports-email'),
+            label: kEmailButtonLabel,
+            icon: Icons.forward_to_inbox,
+            dense: true,
+            onPressed: () => _openEmailSend(
+              context,
+              rest: widget.rest,
+              reportKey: widget.report.key,
+              range: widget.range,
+              slotPhrase: AppliedTimeSlot.fromMeta(_meta)?.phrase,
             ),
           ),
         ),

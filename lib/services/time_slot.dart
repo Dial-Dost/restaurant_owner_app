@@ -404,6 +404,17 @@ const Map<String, String> _slotClampNotice = {
   'time_empty': 'Start and end were the same — showing all day',
 };
 
+/// The clamp names about the trading-day close (client item 9), not the dates:
+/// a close that could not be read, or one sent with a session, is dropped and
+/// the report is on calendar days. Neither shortens the range. The web's
+/// DAY_CLOSE_CLAMPS, word for word.
+const List<String> kDayCloseClamps = ['day_close_unparseable', 'day_close_with_slot'];
+
+const Map<String, String> _dayCloseClampNotice = {
+  'day_close_unparseable': 'That closing time could not be read — showing calendar days',
+  'day_close_with_slot': 'A session is on calendar days — closing time not applied',
+};
+
 /// What `meta.window.clamped` means for the footer.
 ///
 /// THE BUG THIS REPLACES: the server sends a LIST (`[]` when nothing was
@@ -414,12 +425,20 @@ const Map<String, String> _slotClampNotice = {
 ({bool range, String? slot}) clampNotices(Object? clamped) {
   if (clamped is! List) return (range: clamped == true, slot: null);
   final names = [for (final c in clamped) if (c is String) c];
-  final range = names.any((c) => !kSlotClamps.contains(c));
+  final range = names.any((c) => !kSlotClamps.contains(c) && !kDayCloseClamps.contains(c));
   String? slot;
   for (final c in names) {
     if (kSlotClamps.contains(c)) {
       slot = _slotClampNotice[c];
       break;
+    }
+  }
+  if (slot == null) {
+    for (final c in names) {
+      if (kDayCloseClamps.contains(c)) {
+        slot = _dayCloseClampNotice[c];
+        break;
+      }
     }
   }
   return (range: range, slot: slot);

@@ -238,6 +238,91 @@ void main() {
     await teardownBell(tester);
   });
 
+  testWidgets('a report bell opens Reports with the delivery, resolver or not (client item 9)', (tester) async {
+    List<Map<String, dynamic>> reportNotifs() => [
+          {
+            'id': 'r1',
+            'type': 'report',
+            'title': 'Daily reports sent — Wed 16 Sep (2 recipients)',
+            'body': 'Open Reports → Email reports to see where it went and download the files.',
+            'created_at': '2026-09-16T20:31:00Z',
+            'read_at': null,
+            'outlet_id': null,
+            'meta': {'module': 'Reports', 'delivery_id': 'd1', 'schedule_id': 's1'},
+          },
+        ];
+    for (final resolver in [true, false]) {
+      final api = _FakeApi(notifications: reportNotifs(), targets: {
+        if (resolver)
+          'r1': {
+            'notification_id': 'r1',
+            'type': 'report',
+            'module': 'Reports',
+            'entity': null,
+            'still_exists': true,
+            'visible_here': true,
+            'switch_outlet_id': null,
+            'meta': {'module': 'Reports', 'delivery_id': 'd1'},
+          },
+      });
+      final rest = await _signIn(api);
+      String? openedModule;
+      Map<String, dynamic>? openedTarget;
+      await pumpBell(tester, rest, visible: const ['Reports'], onOpen: (label, {Map<String, dynamic>? target}) {
+        openedModule = label;
+        openedTarget = target;
+      });
+      await tester.tap(find.textContaining('Daily reports sent'));
+      await tester.pumpAndSettle();
+      expect(openedModule, 'Reports', reason: resolver ? 'resolved' : 'fallback');
+      expect(openedTarget?['delivery_id'], 'd1', reason: 'the Reports module opens Email reports on it');
+      await teardownBell(tester);
+    }
+  });
+
+  testWidgets('"Scheduled email reports are waiting" opens Reports on the Email reports view, resolver or not', (tester) async {
+    const meta = {'module': 'Reports', 'view': 'email', 'kind': 'mail_not_configured', 'day': '2026-09-17'};
+    List<Map<String, dynamic>> notifs() => [
+          {
+            'id': 'm1',
+            'type': 'report',
+            'title': 'Scheduled email reports are waiting',
+            'body': 'Email is not set up on this server, so scheduled reports are not being sent.',
+            'created_at': '2026-09-17T02:31:00Z',
+            'read_at': null,
+            'outlet_id': null,
+            'meta': meta,
+          },
+        ];
+    for (final resolver in [true, false]) {
+      final api = _FakeApi(notifications: notifs(), targets: {
+        if (resolver)
+          'm1': {
+            'notification_id': 'm1',
+            'type': 'report',
+            'module': 'Reports',
+            'entity': null,
+            'still_exists': true,
+            'visible_here': true,
+            'switch_outlet_id': null,
+            'meta': meta,
+          },
+      });
+      final rest = await _signIn(api);
+      String? openedModule;
+      Map<String, dynamic>? openedTarget;
+      await pumpBell(tester, rest, visible: const ['Reports'], onOpen: (label, {Map<String, dynamic>? target}) {
+        openedModule = label;
+        openedTarget = target;
+      });
+      await tester.tap(find.textContaining('Scheduled email reports are waiting'));
+      await tester.pumpAndSettle();
+      expect(openedModule, 'Reports', reason: resolver ? 'resolved' : 'fallback');
+      expect(openedTarget?['view'], 'email', reason: 'Reports opens Email reports on it, not the report grid');
+      await teardownBell(tester);
+    }
+  });
+
   testWidgets('a KPI alert opens Analytics with nothing to focus', (tester) async {
     final api = _FakeApi(
       notifications: [
