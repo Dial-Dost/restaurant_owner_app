@@ -143,6 +143,19 @@ final Map<String, Set<String>> _misHiddenColumns = <String, Set<String>>{};
 /// fourteen of fifteen tabs is a dead control.
 String _misBucket = 'day';
 
+/// Open the pack on [key] next time it mounts — the report a jump from the
+/// Overview's "Today at a glance" box names (item 10). Same seam as the tab
+/// strip's own memory: the shell remounts the module on every jump, so this is
+/// read on arrival. An unknown key changes nothing rather than landing on a
+/// report nobody asked for.
+void misRememberReport(String key) {
+  final i = _misReports.indexWhere((r) => r.key == key);
+  if (i >= 0) _misOpenTab = i;
+}
+
+/// The key of the report the pack will open on. For tests.
+String get misOpenReportKey => _misReports[_misOpenTab.clamp(0, _misReports.length - 1)].key;
+
 /// Test seam: a suite must not inherit the previous test's tab or columns.
 void misResetReportMemory() {
   _misOpenTab = 0;
