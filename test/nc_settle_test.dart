@@ -34,6 +34,7 @@ import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+import 'package:restaurant_owner_app/widgets/table_bill.dart';
 
 /// PERM_NON_CHARGEABLE and the record-payment action, as the server names them.
 const String _permNc = 'b4e7a1c9-2d58-4f36-9a07-5c81e3b0d472';
@@ -741,6 +742,78 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byKey(const ValueKey('bill-preview-nc-value')), findsNothing);
       expect(find.textContaining('(NC)'), findsNothing);
+    });
+  });
+
+  // THE RUNNING-BILL SHEET, opened from the order pad's bill strip and from
+  // the Orders module's "View order". It printed a comped dish at its full
+  // price above a Subtotal that leaves that dish out (GetBillForTable keeps
+  // the line's price, marks it `nc: true`, and reports its value in
+  // `nc_total`), so the column did not add up.
+  group('the running-bill sheet', () {
+    Map<String, dynamic> comped() => _bill(subtotal: 700, grand: 808.5, ncTotal: 500, items: const [
+          {'name': 'Paneer Tikka', 'price': 350.0, 'quantity': 2},
+          {'name': 'Dal Makhani', 'price': 500.0, 'quantity': 1, 'nc': true},
+        ]);
+
+    Future<void> openSheet(WidgetTester tester, Map<String, dynamic> bill, {bool waiter = false}) async {
+      await tester.pumpWidget(const SizedBox());
+      tester.view.physicalSize = const Size(900, 1400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final api = _FakeApi({'/bill-for-table': bill},
+          actions: waiter ? const ['x'] : const ['*'], role: waiter ? 'waiter' : 'admin');
+      final auth = AuthController(api: api);
+      await auth.login('CSR Organics', 'staff', 'pw');
+      final rest = RestClient(auth);
+      await tester.pumpWidget(MaterialApp(
+        theme: AppTheme.dark(),
+        home: Builder(
+          builder: (ctx) => Scaffold(
+            body: Center(
+              child: TextButton(
+                onPressed: () => showTableBillSheet(ctx, rest: rest, tableName: 'T1', profile: rest.auth.profile),
+                child: const Text('open bill'),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open bill'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a comped dish reads "(NC)" at ₹0.00, the column adds up, and its value sits under the total',
+        (tester) async {
+      await openSheet(tester, comped());
+      expect(find.text('Dal Makhani (NC)  ×1'), findsOneWidget);
+      expect(find.text('Paneer Tikka  ×2'), findsOneWidget);
+      expect(find.text('₹0.00'), findsOneWidget, reason: 'the comped line');
+      expect(find.text('₹500.00'), findsOneWidget, reason: 'only the NC value row, never the comped line');
+      // The paid line and the Subtotal (and the running bill in the strip).
+      expect(find.text('₹700.00'), findsWidgets);
+      final nc = find.byKey(const ValueKey('table-bill-nc-value'));
+      expect(nc, findsOneWidget);
+      expect(find.descendant(of: nc, matching: find.text('NC value (not charged)')), findsOneWidget);
+      expect(find.descendant(of: nc, matching: find.text('₹500.00')), findsOneWidget);
+      expect(tester.getTopLeft(nc).dy, greaterThan(tester.getTopLeft(find.text('TOTAL PAYABLE')).dy),
+          reason: 'beside the total, never in it');
+    });
+
+    testWidgets('nothing comped: no marker and no NC row', (tester) async {
+      await openSheet(tester, _bill());
+      expect(find.textContaining('(NC)'), findsNothing);
+      expect(find.byKey(const ValueKey('table-bill-nc-value')), findsNothing);
+      expect(find.text('₹700.00'), findsOneWidget, reason: 'Paneer Tikka x2 at its full price');
+    });
+
+    testWidgets('a waiter sees the dishes as before: no figures, and no NC marker', (tester) async {
+      await openSheet(tester, comped(), waiter: true);
+      expect(find.text('Dal Makhani  ×1'), findsOneWidget);
+      expect(find.textContaining('(NC)'), findsNothing);
+      expect(find.textContaining('₹'), findsNothing);
+      expect(find.byKey(const ValueKey('table-bill-nc-value')), findsNothing);
     });
   });
 
