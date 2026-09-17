@@ -1204,7 +1204,13 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               ],
               _actionBar(context, narrow: true),
               const SizedBox(height: AppSpacing.md),
-              if (empty) SizedBox(height: 280, child: body) else body,
+              // A FLOOR, not a fixed height: at 1.3x text on a 360dp phone the
+              // empty state's wrapped caption needs more than 280px, and a fixed
+              // box cut it off. Under the floor it still centres, as it always did.
+              if (empty)
+                ConstrainedBox(constraints: const BoxConstraints(minHeight: 280), child: body)
+              else
+                body,
               const SizedBox(height: AppSpacing.md),
               _footer(context),
             ],
@@ -1233,7 +1239,25 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
         const SizedBox(height: AppSpacing.md),
         _actionBar(context, narrow: false),
         const SizedBox(height: AppSpacing.md),
-        Expanded(child: body),
+        // Rows bring the grid, which scrolls itself. The empty state does not,
+        // and the slot can be shorter than it: Sales Summary's chrome fills its
+        // 45% cap, so a pane from 430px up to roughly 600px leaves too little
+        // under the controls. So it scrolls here, never shorter than the slot,
+        // which keeps it centred exactly as before whenever it fits. Its own
+        // controller, not the route's: the chrome and the sidebar share that one.
+        Expanded(
+          child: empty
+              ? LayoutBuilder(
+                  builder: (context, slot) => SingleChildScrollView(
+                    primary: false,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(minHeight: slot.maxHeight),
+                      child: body,
+                    ),
+                  ),
+                )
+              : body,
+        ),
         const SizedBox(height: AppSpacing.sm),
         _footer(context),
       ]));
