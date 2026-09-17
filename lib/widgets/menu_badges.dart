@@ -286,22 +286,34 @@ class _MenuBadgesDialogState extends State<MenuBadgesDialog> {
               const SizedBox(height: AppSpacing.sm),
             ],
             Flexible(
+              // On a phone the empty state is taller than the room the dialog
+              // leaves it, and an overflowing Column pushes the starter-set
+              // button outside its own bounds, where a tap cannot reach it. So
+              // it scrolls; the min height keeps it centred in the full space
+              // wherever it already fits.
               child: _badges.isEmpty
-                  ? EmptyState(
-                      icon: Icons.sell_outlined,
-                      title: 'No badges yet',
-                      caption:
-                          'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
-                      action: ForkButton(
-                        label: 'Use the starter set (${widget.presets.length})',
-                        icon: Icons.auto_awesome,
-                        dense: true,
-                        onPressed: _busy || widget.presets.isEmpty
-                            ? null
-                            : () async {
-                                setState(() => _badges = List<MenuBadge>.from(widget.presets));
-                                await _persist();
-                              },
+                  ? LayoutBuilder(
+                      builder: (context, box) => SingleChildScrollView(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(minHeight: box.maxHeight),
+                          child: EmptyState(
+                            icon: Icons.sell_outlined,
+                            title: 'No badges yet',
+                            caption:
+                                'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
+                            action: ForkButton(
+                              label: 'Use the starter set (${widget.presets.length})',
+                              icon: Icons.auto_awesome,
+                              dense: true,
+                              onPressed: _busy || widget.presets.isEmpty
+                                  ? null
+                                  : () async {
+                                      setState(() => _badges = List<MenuBadge>.from(widget.presets));
+                                      await _persist();
+                                    },
+                            ),
+                          ),
+                        ),
                       ),
                     )
                   : ListView(

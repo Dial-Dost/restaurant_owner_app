@@ -237,6 +237,66 @@ void main() {
         }
       }, variant: _platforms);
 
+      testWidgets('the catalogue list after "Use the starter set" lays out without an error', (tester) async {
+        _viewport(tester);
+        final (rest, api) = await _signIn();
+        await _open(
+          tester,
+          system,
+          MenuBadgesDialog(
+            rest: rest,
+            initial: const [],
+            presets: _catalogue,
+            labelMax: 24,
+            usage: (id) => id == 'jain' ? 3 : 0,
+          ),
+        );
+        expect(tester.takeException(), isNull, reason: 'the empty state fits or scrolls; it never overflows');
+        expect(find.text('No badges yet'), findsOneWidget);
+
+        // Gaia's label is upper-case, and the button may sit below the fold of
+        // the (scrolling) empty state.
+        final starter = find.textContaining(RegExp('use the starter set', caseSensitive: false));
+        await tester.ensureVisible(starter);
+        await tester.pumpAndSettle();
+        await tester.tap(starter);
+        await tester.pumpAndSettle();
+
+        expect(tester.takeException(), isNull);
+        expect(api.writes.where((w) => w.method == 'PUT' && w.path == '/menu/badges'), hasLength(1));
+        expect(find.text('No badges yet'), findsNothing);
+        expect(find.byType(MenuBadgePill), findsWidgets);
+
+        // The list is lazy: walk it in the order it is drawn (by kind).
+        final list = find.descendant(of: find.byType(ListView), matching: find.byType(Scrollable));
+        final drawn = [for (final k in kMenuBadgeKinds) ..._catalogue.where((b) => b.kind == k)];
+        for (final b in drawn) {
+          final pill = find.widgetWithText(MenuBadgePill, b.label);
+          await tester.scrollUntilVisible(pill, 40, scrollable: list);
+          expect(pill, findsOneWidget);
+          if (b.id == 'jain') expect(find.text('3 dishes'), findsOneWidget);
+          expect(tester.takeException(), isNull, reason: b.label);
+        }
+      }, variant: _platforms);
+
+      testWidgets('on a phone the empty catalogue scrolls, and its starter-set button stays reachable', (tester) async {
+        // Real fonts overflow here too (Rustic at 360 wide, Gaia at 412): an
+        // overflowing Column put the button outside its own bounds, where no
+        // tap could land.
+        _viewport(tester, size: const Size(360, 740));
+        final (rest, _) = await _signIn();
+        await _open(
+          tester,
+          system,
+          MenuBadgesDialog(rest: rest, initial: const [], presets: _catalogue, labelMax: 24, usage: (_) => 0),
+        );
+        expect(tester.takeException(), isNull, reason: 'the empty state scrolls instead of overflowing');
+        final starter = find.textContaining(RegExp('use the starter set', caseSensitive: false));
+        await tester.ensureVisible(starter);
+        await tester.pumpAndSettle();
+        expect(starter.hitTestable(), findsOneWidget);
+      }, variant: _platforms);
+
       testWidgets('the bulk tagger lays out without an error', (tester) async {
         _viewport(tester);
         final (rest, _) = await _signIn();
