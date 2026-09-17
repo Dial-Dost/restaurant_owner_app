@@ -178,30 +178,38 @@ class _BackdropControls extends StatelessWidget {
       // The miniature: the real GradientBackdrop (same widget, same resolver),
       // with the two body inks sitting on its brightest region so the owner
       // SEES the readability the guard is promising.
-      ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: SizedBox(
-          height: 116,
-          child: GradientBackdrop(
-            heroHeight: 116,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Rustic Fork', style: text.titleMedium),
-                const SizedBox(height: 2),
-                Text('Covers 42 · APC ₹512 · 6 open bills', style: text.bodySmall),
-                const Spacer(),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    gradient: AppColors.cardGradient,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppColors.border),
+      //
+      // It is 116px whatever the device, so its ink samples keep one line and
+      // ignore the device's text size: on a 360dp phone they wrapped past the
+      // bottom even at 1x, and by 82px at 1.3x.
+      MediaQuery.withNoTextScaling(
+        child: ClipRRect(
+          key: const ValueKey('backdrop-preview'),
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            height: 116,
+            child: GradientBackdrop(
+              heroHeight: 116,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Rustic Fork', style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Text('Covers 42 · APC ₹512 · 6 open bills',
+                      style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: AppColors.cardGradient,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Text('Live preview — this is your backdrop',
+                        style: text.labelMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
                   ),
-                  child: Text('Live preview — this is your backdrop',
-                      style: text.labelMedium),
-                ),
-              ]),
+                ]),
+              ),
             ),
           ),
         ),

@@ -35590,7 +35590,8 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     final fsMul = _fontScale == 'small' ? 0.92 : (_fontScale == 'large' ? 1.1 : 1.0);
     final body = TextStyle(fontFamily: _font, fontFamilyFallback: const ['Inter', 'Roboto']);
     final serif = const TextStyle(fontFamily: 'Georgia', fontFamilyFallback: ['Times New Roman', 'serif']);
-    return ClipRRect(
+    final miniature = ClipRRect(
+      key: const ValueKey('guest-theme-preview'),
       borderRadius: BorderRadius.circular(22), // --rCard, a design constant
       child: Container(
         decoration: BoxDecoration(
@@ -35729,9 +35730,16 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                             child: Text('Rate us',
                                 style: body.copyWith(fontSize: 11.5 * fsMul, fontWeight: FontWeight.w500, color: ink)),
                           ),
-                          const Spacer(),
-                          Text(_font,
-                              style: body.copyWith(fontSize: 10, color: ink.withValues(alpha: 0.45))),
+                          const SizedBox(width: 8),
+                          // The font's name takes what the buttons leave, and
+                          // is the first thing to give way.
+                          Expanded(
+                            child: Text(_font,
+                                textAlign: TextAlign.right,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: body.copyWith(fontSize: 10, color: ink.withValues(alpha: 0.45))),
+                          ),
                         ]),
                       ]),
                     ),
@@ -35743,7 +35751,23 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
         ]),
       ),
     );
+    // A miniature of the guest page, so it is laid out the way a guest's phone
+    // lays it out: at the guest page's own type scale (Text size above), never
+    // the owner's device text size, and at least a phone's width. A narrower
+    // card shows it scaled down. Laid out in the card itself, an owner's phone
+    // wrapped its lines past the 268px it is, even at 1x.
+    return LayoutBuilder(builder: (context, box) {
+      final unscaled = MediaQuery.withNoTextScaling(child: miniature);
+      if (box.maxWidth >= _previewMinWidth) return unscaled;
+      return FittedBox(
+        fit: BoxFit.scaleDown,
+        alignment: Alignment.topLeft,
+        child: SizedBox(width: _previewMinWidth, child: unscaled),
+      );
+    });
   }
+
+  static const double _previewMinWidth = 380;
 
   // Retired keys this tenant still has stored. Shown read-only and clearly dead —
   // the guest design can't express them, and the backend keeps them untouched.

@@ -143,6 +143,10 @@ class _MenuBadgesDialogState extends State<MenuBadgesDialog> {
   /// menu still shows it.
   late List<MenuBadge> _committed;
   final _add = TextEditingController();
+
+  /// Keeps the name field (and its focus) when the add row switches between
+  /// one line and two, as it does when a phone rotates.
+  final _nameKey = GlobalKey();
   MenuBadgeKind _addKind = MenuBadgeKind.promo;
   bool _busy = false;
   bool _saved = false;
@@ -260,6 +264,148 @@ class _MenuBadgesDialogState extends State<MenuBadgesDialog> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    final header = <Widget>[
+      Text('GUEST MENU', style: text.labelSmall),
+      const SizedBox(height: 6),
+      Text('Menu badges', style: text.titleMedium),
+      const SizedBox(height: 6),
+      Text(
+        'Small labels guests see on a dish. Warnings and dietary badges are always shown; highlights are trimmed first when a card is tight. Nothing appears on your menu until you add one.',
+        style: text.bodySmall,
+      ),
+      const SizedBox(height: AppSpacing.lg),
+    ];
+    final error = _error == null ? null : Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger));
+    final footer = <Widget>[
+      const SizedBox(height: AppSpacing.md),
+      // In a phone's dialog the kind menu alone is most of the width at large
+      // text, so the new badge's name takes a line of its own there.
+      LayoutBuilder(builder: (context, box) => _addRow(narrow: box.maxWidth < 360)),
+      const SizedBox(height: AppSpacing.lg),
+      Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+        ForkButton(label: 'Done', icon: Icons.check, onPressed: () => Navigator.pop(context, _saved)),
+      ]),
+    ];
+
+    final Widget body;
+    if (_badges.isNotEmpty) {
+      body = Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        ...header,
+        if (error != null) ...[
+          error,
+          const SizedBox(height: AppSpacing.sm),
+        ],
+        Flexible(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              for (final kind in kMenuBadgeKinds)
+                if (_badges.any((b) => b.kind == kind)) ...[
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4, bottom: 6),
+                    child: Text(
+                      '${kMenuBadgeKindLabel[kind]!.toUpperCase()} — ${kMenuBadgeKindHint[kind]}',
+                      style: text.labelSmall,
+                    ),
+                  ),
+                  for (final b in _badges.where((x) => x.kind == kind))
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: ForkCard(
+                        inset: true,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        child: Row(children: [
+                          MenuBadgePill(badge: b, dense: false),
+                          const SizedBox(width: AppSpacing.md),
+                          Expanded(
+                            child: Text(
+                              b.derived
+                                  ? 'Automatic — on any dish listing "${b.allergen}"'
+                                  : widget.usage(b.id) > 0
+                                      ? '${widget.usage(b.id)} dish${widget.usage(b.id) == 1 ? '' : 'es'}'
+                                      : 'not used yet',
+                              style: text.bodySmall,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          Switch(
+                            value: b.enabled,
+                            onChanged: _busy ? null : (v) => _toggle(b, v),
+                          ),
+                          ForkIconButton(
+                            icon: Icons.edit_outlined,
+                            tooltip: 'Rename',
+                            onPressed: _busy ? null : () => _rename(b),
+                          ),
+                          const SizedBox(width: 4),
+                          ForkIconButton(
+                            icon: Icons.delete_outline,
+                            tooltip: 'Remove',
+                            onPressed: _busy ? null : () => _remove(b),
+                          ),
+                        ]),
+                      ),
+                    ),
+                ],
+            ],
+          ),
+        ),
+        ...footer,
+      ]);
+    } else {
+      // NO BADGES YET: the header scrolls with the empty state above the pinned
+      // add row and Done. The empty state used to take whatever height was left
+      // under a fixed header, which was never enough: its button was cut off
+      // even on a desktop, and on a phone at large text the header left it no
+      // height at all. A column with no height is never painted, so that raised
+      // no error, and the starter set, the one thing a first-run owner opens
+      // this for, was simply not there. Where it all fits, the empty state
+      // still sits centred in the space under the header, as before. An error
+      // is pinned with the add row, where scrolling cannot hide it.
+      body = Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Flexible(
+          child: LayoutBuilder(
+            builder: (context, slot) => SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: slot.maxHeight),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: header),
+                    EmptyState(
+                      icon: Icons.sell_outlined,
+                      title: 'No badges yet',
+                      caption:
+                          'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
+                      action: ForkButton(
+                        label: 'Use the starter set (${widget.presets.length})',
+                        icon: Icons.auto_awesome,
+                        dense: true,
+                        onPressed: _busy || widget.presets.isEmpty
+                            ? null
+                            : () async {
+                                setState(() => _badges = List<MenuBadge>.from(widget.presets));
+                                await _persist();
+                              },
+                      ),
+                    ),
+                    const SizedBox.shrink(),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (error != null) ...[
+          const SizedBox(height: AppSpacing.md),
+          error,
+        ],
+        ...footer,
+      ]);
+    }
+
     return Dialog(
       backgroundColor: Colors.transparent,
       child: Container(
@@ -272,141 +418,54 @@ class _MenuBadgesDialogState extends State<MenuBadgesDialog> {
         ),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 580),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('GUEST MENU', style: text.labelSmall),
-            const SizedBox(height: 6),
-            Text('Menu badges', style: text.titleMedium),
-            const SizedBox(height: 6),
-            Text(
-              'Small labels guests see on a dish. Warnings and dietary badges are always shown; highlights are trimmed first when a card is tight. Nothing appears on your menu until you add one.',
-              style: text.bodySmall,
-            ),
-            const SizedBox(height: AppSpacing.lg),
-            if (_error != null) ...[
-              Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
-              const SizedBox(height: AppSpacing.sm),
-            ],
-            Flexible(
-              // On a phone the empty state is taller than the room the dialog
-              // leaves it, and an overflowing Column pushes the starter-set
-              // button outside its own bounds, where a tap cannot reach it. So
-              // it scrolls; the min height keeps it centred in the full space
-              // wherever it already fits.
-              child: _badges.isEmpty
-                  ? LayoutBuilder(
-                      builder: (context, box) => SingleChildScrollView(
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(minHeight: box.maxHeight),
-                          child: EmptyState(
-                            icon: Icons.sell_outlined,
-                            title: 'No badges yet',
-                            caption:
-                                'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
-                            action: ForkButton(
-                              label: 'Use the starter set (${widget.presets.length})',
-                              icon: Icons.auto_awesome,
-                              dense: true,
-                              onPressed: _busy || widget.presets.isEmpty
-                                  ? null
-                                  : () async {
-                                      setState(() => _badges = List<MenuBadge>.from(widget.presets));
-                                      await _persist();
-                                    },
-                            ),
-                          ),
-                        ),
-                      ),
-                    )
-                  : ListView(
-                      shrinkWrap: true,
-                      children: [
-                        for (final kind in kMenuBadgeKinds)
-                          if (_badges.any((b) => b.kind == kind)) ...[
-                            Padding(
-                              padding: const EdgeInsets.only(top: 4, bottom: 6),
-                              child: Text(
-                                '${kMenuBadgeKindLabel[kind]!.toUpperCase()} — ${kMenuBadgeKindHint[kind]}',
-                                style: text.labelSmall,
-                              ),
-                            ),
-                            for (final b in _badges.where((x) => x.kind == kind))
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: ForkCard(
-                                  inset: true,
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                  child: Row(children: [
-                                    MenuBadgePill(badge: b, dense: false),
-                                    const SizedBox(width: AppSpacing.md),
-                                    Expanded(
-                                      child: Text(
-                                        b.derived
-                                            ? 'Automatic — on any dish listing "${b.allergen}"'
-                                            : widget.usage(b.id) > 0
-                                                ? '${widget.usage(b.id)} dish${widget.usage(b.id) == 1 ? '' : 'es'}'
-                                                : 'not used yet',
-                                        style: text.bodySmall,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    Switch(
-                                      value: b.enabled,
-                                      onChanged: _busy ? null : (v) => _toggle(b, v),
-                                    ),
-                                    ForkIconButton(
-                                      icon: Icons.edit_outlined,
-                                      tooltip: 'Rename',
-                                      onPressed: _busy ? null : () => _rename(b),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    ForkIconButton(
-                                      icon: Icons.delete_outline,
-                                      tooltip: 'Remove',
-                                      onPressed: _busy ? null : () => _remove(b),
-                                    ),
-                                  ]),
-                                ),
-                              ),
-                          ],
-                      ],
-                    ),
-            ),
-            const SizedBox(height: AppSpacing.md),
-            Row(children: [
-              Expanded(
-                child: TextField(
-                  controller: _add,
-                  enabled: !_busy,
-                  maxLength: widget.labelMax,
-                  decoration: const InputDecoration(
-                    labelText: 'New badge (e.g. Gluten free)',
-                    isDense: true,
-                    counterText: '',
-                  ),
-                  onSubmitted: (_) => _addBadge(),
-                ),
-              ),
-              const SizedBox(width: AppSpacing.sm),
-              DropdownButton<MenuBadgeKind>(
-                value: _addKind,
-                onChanged: _busy ? null : (v) => setState(() => _addKind = v ?? MenuBadgeKind.promo),
-                items: [
-                  for (final k in kMenuBadgeKinds)
-                    DropdownMenuItem(value: k, child: Text(kMenuBadgeKindLabel[k]!)),
-                ],
-              ),
-              const SizedBox(width: AppSpacing.sm),
-              ForkIconButton(icon: Icons.add, tooltip: 'Add badge', onPressed: _busy ? null : _addBadge),
-            ]),
-            const SizedBox(height: AppSpacing.lg),
-            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-              ForkButton(label: 'Done', icon: Icons.check, onPressed: () => Navigator.pop(context, _saved)),
-            ]),
-          ]),
+          child: body,
         ),
       ),
     );
+  }
+
+  /// The new badge's name, its kind and the add button: one line where they
+  /// fit, the name on a line of its own where they do not.
+  Widget _addRow({required bool narrow}) {
+    final name = TextField(
+      key: _nameKey,
+      controller: _add,
+      enabled: !_busy,
+      maxLength: widget.labelMax,
+      decoration: const InputDecoration(
+        labelText: 'New badge (e.g. Gluten free)',
+        isDense: true,
+        counterText: '',
+      ),
+      onSubmitted: (_) => _addBadge(),
+    );
+    final kind = DropdownButton<MenuBadgeKind>(
+      value: _addKind,
+      isExpanded: narrow,
+      onChanged: _busy ? null : (v) => setState(() => _addKind = v ?? MenuBadgeKind.promo),
+      items: [
+        for (final k in kMenuBadgeKinds)
+          DropdownMenuItem(
+            value: k,
+            child: Text(kMenuBadgeKindLabel[k]!, maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+      ],
+    );
+    final add = ForkIconButton(icon: Icons.add, tooltip: 'Add badge', onPressed: _busy ? null : _addBadge);
+    if (!narrow) {
+      return Row(children: [
+        Expanded(child: name),
+        const SizedBox(width: AppSpacing.sm),
+        kind,
+        const SizedBox(width: AppSpacing.sm),
+        add,
+      ]);
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      name,
+      const SizedBox(height: AppSpacing.sm),
+      Row(children: [Expanded(child: kind), const SizedBox(width: AppSpacing.sm), add]),
+    ]);
   }
 }
 
