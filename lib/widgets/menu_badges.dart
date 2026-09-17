@@ -50,14 +50,22 @@ class MenuBadgePill extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: faded ? AppColors.borderStrong : AppColors.edge(color)),
       ),
-      child: ChipLabel(
-        badge.label,
-        style: TextStyle(
-          fontSize: dense ? 10 : 11.5,
-          height: 1.35,
-          fontWeight: FontWeight.w600,
-          color: faded ? AppColors.textTertiary : color,
-        ),
+      // ChipLabel is a Flexible, so it must sit directly in a Flex. A one-child
+      // Row sized to the label is that Flex: the pill draws exactly as a bare
+      // label where it fits, and ellipsises the label where it does not.
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ChipLabel(
+            badge.label,
+            style: TextStyle(
+              fontSize: dense ? 10 : 11.5,
+              height: 1.35,
+              fontWeight: FontWeight.w600,
+              color: faded ? AppColors.textTertiary : color,
+            ),
+          ),
+        ],
       ),
     );
   }

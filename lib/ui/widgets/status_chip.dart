@@ -19,6 +19,13 @@ import '../theme/app_colors.dart';
 ///     child under `MainAxisSize.min` is laid out at its natural width and does
 ///     NOT assert, so ample space renders exactly as before.
 ///
+/// Being a [Flexible], it must be a DIRECT child of a Row/Column. A pill with no
+/// row of its own (just a padded label) still needs one:
+/// `Row(mainAxisSize: MainAxisSize.min, children: [ChipLabel(...)])`. Anywhere
+/// else, debug builds report "Incorrect use of ParentDataWidget" and release
+/// builds throw on the parent-data cast and replace the label with an
+/// ErrorWidget.
+///
 /// Truncation, never scaling: shrinking the glyphs would trade an overflow for
 /// type nobody can read, which is the opposite of what a 1.3x scale was asked
 /// for. Call sites that carry genuinely unbounded free text still cap the VALUE
