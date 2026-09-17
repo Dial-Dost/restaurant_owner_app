@@ -254,6 +254,37 @@ _FakeApi _waiter(Map<String, _Route> routes, {Map<String, dynamic>? scope = _wai
 
 _FakeApi _owner(Map<String, _Route> routes) => _FakeApi(routes);
 
+/// A waiter as a 2.0.1 server describes one: the nine pre-2.0.2 flags, and none
+/// of move_table / move_order / cancel_kot.
+const Map<String, dynamic> _waiterScope201 = {
+  'waiter_only': true,
+  'settle_bill': false,
+  'delete_table': false,
+  'edit_table': false,
+  'manage_table_sections': false,
+  'comp_item': false,
+  'waive_service_charge': false,
+  'void_order': true,
+  'view_roles': false,
+  'manage_roles': false,
+};
+
+/// The refusal a 2.0.1 server (origin/main next_party.ts billPrintedRefusal)
+/// answers a waiter's order on a printed table with: no add_to_printed_*.
+ApiException _billPrinted201() => ApiException.fromBody({
+      'error': "T1's bill has already been printed, so nothing more can be added to it. "
+          'Take a new party\'s order on T1 (next party). If it is for the same guests, ask a manager to add it and reprint the bill.',
+      'code': 'bill_printed',
+      'table': 'T1',
+      'next_party_table': 'T1 #2',
+      'next_party_action': 'Take it on T1 (next party)',
+      'print_count': 1,
+    }, billPrintedStatus);
+
+/// The spent card's promise, true only on a server that takes a waiter's
+/// addition to a printed bill (2.0.2).
+const String _addedCanBeReprinted = 'Anything you add to it can be printed again as an updated bill.';
+
 /// The refusal a 2.0.2 server answers a waiter's unconfirmed order with.
 ApiException _billPrinted() => ApiException.fromBody({
       'error': "T1's bill has already been printed, so nothing more can be added to it. "
@@ -579,6 +610,36 @@ void main() {
           'The printed bill no longer matches the bill. Print the updated bill before taking payment.');
     });
 
+    test('the settle warning never names one total twice: paper stale over a guest detail, not the amount', () {
+      // The merged server reads an address (or GSTIN) added after the print as
+      // stale paper, with printed_total == grand_total. "shows ₹2100.00; the
+      // bill is now ₹2100.00" told the cashier nothing had changed.
+      String money(double v) => '₹${v.toStringAsFixed(2)}';
+      const same = 'The printed bill (13:32) no longer matches the bill. Print the updated bill before taking payment.';
+      String? warn(double printed, double now, [String Function(double)? m]) => stalePaperSettleWarning(
+          paperStale: true, printedClock: '13:32', printedTotal: printed, grandTotal: now, money: m ?? money);
+      expect(warn(2100, 2100), same);
+      // Under half a paisa apart is the same total (floating-point noise).
+      expect(warn(2100, 2100.004), same);
+      expect(warn(2100.004, 2100), same);
+      // One paisa apart is a real change, and is named.
+      expect(warn(2100, 2100.01),
+          'The printed bill (13:32) shows ₹2100.00; the bill is now ₹2100.01. Print the updated bill before taking payment.');
+      expect(warn(2100.01, 2100),
+          'The printed bill (13:32) shows ₹2100.01; the bill is now ₹2100.00. Print the updated bill before taking payment.');
+      // Half a paisa is the line (the web's rule too): 0.6 paise apart, and shown apart, is named.
+      expect(warn(2100, 2100.006),
+          'The printed bill (13:32) shows ₹2100.00; the bill is now ₹2100.01. Print the updated bill before taking payment.');
+      // Two totals the reader would see as the same figure are not named either.
+      expect(warn(2100, 2100.3, (v) => '₹${v.round()}'), same);
+      // ...and sub-paisa noise stays quiet even where the figure shows it.
+      expect(warn(2100, 2100.004, (v) => '₹${v.toStringAsFixed(3)}'), same);
+      // Without a clock, the same sentence as the web's.
+      expect(
+          stalePaperSettleWarning(paperStale: true, printedTotal: 2100, grandTotal: 2100, money: money),
+          'The printed bill no longer matches the bill. Print the updated bill before taking payment.');
+    });
+
     test('the sentences', () {
       expect(printedStaysMessage(tableSentence: '12', root: '12'),
           "12's bill is printed. 12 stays on your floor in orange until a manager settles it. "
@@ -670,6 +731,39 @@ void main() {
       expect([managerOld.moveTable, managerOld.moveOrder], [true, true]);
       expect(Capability.moveTable.wireKey, 'move_table');
       expect(Capability.moveOrder.wireKey, 'move_order');
+    });
+
+    test('adding to a printed bill: a senior always; a waiter only on a server that takes the flag (2.0.2)', () {
+      Profile who(String role, Map<String, dynamic>? scope, {List<String> actions = const ['a1']}) =>
+          Profile.fromJson({
+            'role': role,
+            'role_all': [role],
+            'actions_set': actions,
+            'action_names': const ['View Tables'],
+            'scope': ?scope,
+          });
+      bool adds(Profile p) => FloorScope.of(p).addToPrinted;
+      expect(adds(who('waiter', _waiterScope)), isTrue);
+      // Any one of the three 2.0.2 flags says which server this is — whatever it answered.
+      for (final flag in const ['move_table', 'move_order', 'cancel_kot']) {
+        for (final answer in const [true, false]) {
+          final scope = {'waiter_only': true, flag: answer};
+          expect(RoleScope.serverTakesPrintedAdditions(who('waiter', scope)), isTrue, reason: '$scope');
+          expect(adds(who('waiter', scope)), isTrue, reason: '$scope');
+        }
+      }
+      // 2.0.1's block (nine flags, none of the three), no block at all, or a restore from an older build.
+      for (final scope in <Map<String, dynamic>?>[_waiterScope201, {'waiter_only': true}, null]) {
+        expect(RoleScope.serverTakesPrintedAdditions(who('waiter', scope)), isFalse, reason: '$scope');
+        expect(adds(who('waiter', scope)), isFalse, reason: '$scope');
+      }
+      // A senior on 2.0.1: 2.0.1 lets them add and reprint.
+      expect(adds(who('manager', const {'waiter_only': false, 'settle_bill': true})), isTrue);
+      expect(adds(who('manager', null)), isTrue);
+      expect(adds(who('admin', null, actions: const ['*'])), isTrue);
+      // The wildcard names the reader, not the server.
+      expect(RoleScope.serverTakesPrintedAdditions(who('admin', null, actions: const ['*'])), isFalse);
+      expect(Capability.cancelKot.wireKey, 'cancel_kot');
     });
   });
 
@@ -984,6 +1078,7 @@ void main() {
       expect(find.byKey(const ValueKey('table-printed-banner')), findsOneWidget);
       expect(find.byKey(const ValueKey('table-print-bill')), findsNothing, reason: 'the paper is up to date');
       expect(find.byKey(const ValueKey('table-print-spent')), findsOneWidget);
+      expect(find.textContaining(_addedCanBeReprinted), findsOneWidget);
       expect(find.byKey(const ValueKey('table-move-party')), findsOneWidget);
       expect(tester.getTopLeft(add).dy, lessThan(tester.getTopLeft(find.byKey(const ValueKey('table-print-spent'))).dy));
 
@@ -1048,6 +1143,51 @@ void main() {
 
       final owner = _owner(_floor([_printed('T1'), _seat('T1')]));
       await _mountFloor(tester, owner);
+      await _open(tester, 'T1');
+      final add = find.byKey(const ValueKey('table-manager-add-order'));
+      await _reveal(tester, add);
+      expect(tester.widget<ForkButton>(add).label, addToPrintedBillAction);
+      await tester.tap(add);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('add-to-printed-confirm')), findsOneWidget);
+    }, variant: _looks);
+
+    // Integration review: a 2.0.1 server does not know add_to_printed_bill and
+    // refuses every waiter order on a printed table. The sheet led with "Add to
+    // printed bill", its confirm promised "These items go on that bill", and the
+    // spent card promised an updated print that 2.0.1 never allows.
+    testWidgets('a 2.0.1 server: a waiter gets the plain "Add order", no promise about the printed bill, and 2.0.1\'s own answer',
+        (tester) async {
+      final api = _waiter(_floor([_printed('T1', stale: null), _seat('T1')], bill: _bill(stale: null)), scope: _waiterScope201)
+        ..refuse = (path, body) => path == '/orders' ? _billPrinted201() : null;
+      await _mountFloor(tester, api);
+      await _open(tester, 'T1');
+      expect(find.byKey(const ValueKey('table-add-to-printed')), findsNothing);
+      expect(find.byKey(const ValueKey('table-print-spent')), findsOneWidget);
+      expect(find.textContaining('A manager reprints it and settles the table'), findsOneWidget);
+      expect(find.textContaining(_addedCanBeReprinted), findsNothing);
+      // 2.0.1 had neither for a waiter.
+      expect(find.byKey(const ValueKey('table-move-party')), findsNothing);
+      expect(find.byKey(const ValueKey('table-print-bill')), findsNothing);
+
+      await _tapKey(tester, 'table-add-order');
+      expect(find.byKey(const ValueKey('add-to-printed-confirm')), findsNothing);
+      expect(find.byType(OrderEntryScreen), findsOneWidget);
+      expect(find.byKey(const ValueKey('order-adding-to-printed')), findsNothing);
+      await _addAndSend(tester);
+      expect(api.writes, isEmpty);
+      expect((api.attempts.single.body as Map).containsKey(addToPrintedBillKey), isFalse);
+      // The pad shows 2.0.1's refusal with its one answer; nothing names the printed bill.
+      expect(find.byKey(const ValueKey('order-bill-printed')), findsOneWidget);
+      expect(find.byKey(const ValueKey('order-take-on-next-party')), findsOneWidget);
+      expect(find.byKey(const ValueKey('order-add-to-printed')), findsNothing);
+      expect(find.byKey(const ValueKey('order-adding-to-printed')), findsNothing);
+    }, variant: _looks);
+
+    testWidgets('a 2.0.1 server: a senior still adds to the printed bill (2.0.1 allowed it), asked first', (tester) async {
+      final api = _FakeApi(_floor([_printed('T1', stale: null), _seat('T1')], bill: _bill(stale: null)),
+          role: 'manager', actions: const ['a1'], scope: const {'waiter_only': false, 'settle_bill': true});
+      await _mountFloor(tester, api);
       await _open(tester, 'T1');
       final add = find.byKey(const ValueKey('table-manager-add-order'));
       await _reveal(tester, add);
@@ -1203,8 +1343,8 @@ void main() {
   // ==========================================================================
 
   group('a settle against out-of-date paper warns, never blocks, and is recorded', () {
-    Future<_FakeApi> openSettle(WidgetTester tester, {required bool? stale}) async {
-      final bill = _bill(stale: stale, grand: 2220, printedTotal: 2100);
+    Future<_FakeApi> openSettle(WidgetTester tester, {required bool? stale, double grand = 2220}) async {
+      final bill = _bill(stale: stale, grand: grand, printedTotal: 2100);
       final api = _owner(_floor([_printed('T1', stale: stale)], bill: bill));
       await _mountFloor(tester, api);
       await _open(tester, 'T1');
@@ -1255,9 +1395,9 @@ void main() {
 
     // The table sheet's "Approve payment & close" settles the bill too, so it
     // asks the same question (review of 2.0.2: it used to skip it).
-    Future<_FakeApi> openApproval(WidgetTester tester, {required bool? stale}) async {
+    Future<_FakeApi> openApproval(WidgetTester tester, {required bool? stale, double grand = 2220}) async {
       final bill = {
-        ..._bill(stale: stale, grand: 2220, printedTotal: 2100),
+        ..._bill(stale: stale, grand: grand, printedTotal: 2100),
         'payment_status': 'pending_approval',
         'payment_method': 'Cash',
       };
@@ -1298,6 +1438,30 @@ void main() {
         expect(api.writes.map((w) => w.path).toList(), ['/bills/order/order-1/admin-approve-payment', '/bills/order/order-1/close']);
         expect(api.bodyOf('admin-approve-payment'), isNull);
       }
+    }, variant: _looks);
+
+    // Integration review: an address (or GSTIN) added after the print makes the
+    // paper stale while the total stays ₹2100.00. The card read "shows
+    // ₹2100.00; the bill is now ₹2100.00".
+    testWidgets('a guest detail changed after the print (same total): still warned, and one total is never named twice',
+        (tester) async {
+      final same = 'The printed bill ($_clock) no longer matches the bill. Print the updated bill before taking payment.';
+      final api = await openSettle(tester, stale: true, grand: 2100);
+      expect(find.byKey(const ValueKey('settle-stale-paper')), findsOneWidget);
+      expect(find.text(same), findsOneWidget);
+      expect(find.textContaining('the bill is now'), findsNothing);
+      expect(find.byKey(const ValueKey('settle-print-updated')), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('pay-settle')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('settle-anyway')));
+      await tester.pumpAndSettle();
+      expect((api.bodyOf('waiter-confirm-payment') as Map)['settled_with_stale_paper'], isTrue);
+
+      // The table sheet's approval asks in the same words.
+      await openApproval(tester, stale: true, grand: 2100);
+      expect(find.byKey(const ValueKey('settle-stale-paper-confirm')), findsOneWidget);
+      expect(find.text(same), findsOneWidget);
+      expect(find.textContaining('the bill is now'), findsNothing);
     }, variant: _looks);
 
     testWidgets('paper that matches, or that nobody can vouch for: no warning, no question, no flag',

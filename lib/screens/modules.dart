@@ -11633,8 +11633,11 @@ class _TableSheetState extends State<_TableSheet> {
       //
       // CLIENT ITEMS 1 AND 2: ON A PRINTED TABLE THE FIRST CONTROL IS "ADD TO
       // PRINTED BILL", and it asks before it opens the pad ([_addToPrinted]).
+      // Only on a server that takes it ([FloorScope.addToPrinted]): 2.0.1
+      // refuses every waiter order there, so the plain "Add order" stays and
+      // 2.0.1's own refusal offers the next party's seat.
       if (!_scope.seat) ...[
-        if (_occupied && _billPrinted)
+        if (_occupied && _billPrinted && _scope.addToPrinted)
           full(ForkButton(
             key: const ValueKey('table-add-to-printed'),
             label: addToPrintedBillAction,
@@ -11680,10 +11683,13 @@ class _TableSheetState extends State<_TableSheet> {
                 Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.textSecondary),
                 const SizedBox(width: 10),
                 Expanded(
+                  // The last sentence is a 2.0.2 server's promise: an older
+                  // one never marks the paper out of date, so a waiter can
+                  // never print an update there.
                   child: Text(
                     'Bill printed. A manager reprints it and settles the table '
-                    'from here — ask one if the guest needs another copy. '
-                    'Anything you add to it can be printed again as an updated bill.',
+                    'from here — ask one if the guest needs another copy.'
+                    '${_scope.addToPrinted ? ' Anything you add to it can be printed again as an updated bill.' : ''}',
                     style: text.bodySmall,
                   ),
                 ),

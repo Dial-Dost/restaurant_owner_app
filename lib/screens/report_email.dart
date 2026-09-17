@@ -50,6 +50,10 @@ String? _emailCode(Object e) {
 /// "reconnect" when the line is down.
 String _emailError(Object e) => e is ApiException ? e.message : '$e';
 
+/// Did GET /reports/email/config fail because this server has no such route
+/// (2.0.1)? [answer] is what the read produced: the config, or the error.
+bool _configRouteMissing(Object? answer) => answer is ApiException && emailRoutesMissing(answer.status);
+
 Widget _emailSheetFrame(BuildContext context, Widget child, {required bool narrow}) {
   if (narrow) return child;
   return Container(
@@ -138,6 +142,9 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
   /// failed send in place of the corrected one.
   LastSend? _last;
   ReportEmailConfig? _config;
+
+  /// The server has no email routes at all (2.0.1): [emailRoutesMissing].
+  bool _serverOutdated = false;
   List<BookEntry> _book = const [];
   bool _loaded = false;
   late List<String> _keys = [widget.reportKey];
@@ -160,12 +167,15 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
   }
 
   Future<void> _load() async {
-    final results = await Future.wait([
-      widget.rest.getMap('/reports/email/config').catchError((_) => <String, dynamic>{}),
-      widget.rest.getMap('/reports/email/recipients').catchError((_) => <String, dynamic>{}),
+    final results = await Future.wait<Object?>([
+      // The failure is KEPT: a 404 is a server older than this area, not a
+      // connection problem (_configRouteMissing).
+      widget.rest.getMap('/reports/email/config').then<Object?>((m) => m).catchError((Object e) => e),
+      widget.rest.getMap('/reports/email/recipients').then<Object?>((m) => m).catchError((_) => <String, dynamic>{}),
     ]);
     if (!mounted) return;
     setState(() {
+      _serverOutdated = _configRouteMissing(results[0]);
       _config = ReportEmailConfig.fromJson(results[0]);
       _book = [for (final b in BookEntry.listFromJson(results[1]) ?? const <BookEntry>[]) if (b.active) b];
       _loaded = true;
@@ -246,7 +256,7 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final config = _config;
-    final blocked = _loaded ? sendNowBlocked(config) : null;
+    final blocked = _loaded ? sendNowBlocked(config, serverOutdated: _serverOutdated) : null;
     final allRefused = _combined && config != null && !config.canUseAllOutlets;
     final max = config?.recipientsPerSend ?? kMaxRecipientsPerSend;
     final catalogue = config?.reports ?? kEmailableReports;
@@ -598,6 +608,14 @@ class _EmailReportsPanel extends StatefulWidget {
 
 class _EmailReportsPanelState extends State<_EmailReportsPanel> {
   ReportEmailConfig? _config;
+
+  /// THE SERVER PREDATES EMAILED REPORTS (2.0.1: the config read was a 404).
+  /// Its schedule routes read `report_key`/`format` and ignore the
+  /// `report_keys`/`formats` this form sends, so a New schedule would be stored
+  /// as a Sales CSV and an Edit would keep the old report — while this screen
+  /// said "Schedule created". So New schedule and Edit are not offered; Pause,
+  /// Resume, Run now and Delete send nothing 2.0.1 misreads and stay.
+  bool _serverOutdated = false;
   bool _asked = false;
   List<BookEntry> _book = const [];
   bool _bookFailed = false;
@@ -632,7 +650,9 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
 
   Future<void> _load() async {
     final results = await Future.wait<Object?>([
-      widget.rest.getMap('/reports/email/config').then<Object?>((m) => m).catchError((_) => null),
+      // The failure is KEPT: a 404 is a server older than this area, not a
+      // connection problem (_configRouteMissing).
+      widget.rest.getMap('/reports/email/config').then<Object?>((m) => m).catchError((Object e) => e),
       widget.rest.getMap('/reports/email/recipients').then<Object?>((m) => m).catchError((_) => null),
       widget.rest.getMap('/reports/schedules').then<Object?>((m) => m).catchError((_) => null),
       widget.rest.getMap('/reports/deliveries?limit=30').then<Object?>((m) => m).catchError((_) => null),
@@ -643,6 +663,7 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
     final deliveries = results[3] is Map ? (results[3] as Map)['deliveries'] : null;
     setState(() {
       _asked = true;
+      _serverOutdated = _configRouteMissing(results[0]);
       _config = ReportEmailConfig.fromJson(results[0]);
       _book = book ?? const [];
       _bookFailed = book == null;
@@ -836,7 +857,7 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
-    final banners = _asked ? configBanners(_config) : const <EmailBanner>[];
+    final banners = _asked ? configBanners(_config, serverOutdated: _serverOutdated) : const <EmailBanner>[];
     return RefreshIndicator(
       onRefresh: _load,
       child: ListView(
@@ -965,7 +986,8 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
         }),
         if (_addProblem != null)
           Text(_addProblem!, key: const ValueKey('email-add-problem'), style: text.bodySmall!.copyWith(color: AppColors.danger)),
-      ] else
+      ] else if (!_serverOutdated)
+        // On a 2.0.1 server the banner says why; the permission is not it.
         Text(kAddressBookReadOnly, key: const ValueKey('email-book-read-only'), style: text.bodySmall),
     ]);
   }
@@ -983,7 +1005,7 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
                 label: 'New schedule',
                 icon: Icons.add,
                 dense: true,
-                onPressed: _busy ? null : () => _edit(),
+                onPressed: _busy || _serverOutdated ? null : () => _edit(),
               ),
         padding: const EdgeInsets.only(bottom: 6),
       ),
@@ -1086,7 +1108,7 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
                   if (v == 'delete') _delete(s);
                 },
                 itemBuilder: (_) => [
-                  const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                  PopupMenuItem(value: 'edit', enabled: !_serverOutdated, child: const Text('Edit')),
                   PopupMenuItem(value: 'toggle', child: Text(on ? 'Pause' : 'Resume')),
                   const PopupMenuItem(value: 'delete', child: Text('Delete')),
                 ],

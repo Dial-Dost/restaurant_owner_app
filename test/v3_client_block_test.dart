@@ -47,6 +47,7 @@ class _FakeApi extends ApiClient {
     this.role = 'admin',
     this.roleAll,
     this.waiterOnly,
+    this.scopeExtras = const {},
     this.actionNames = const [
       'View Orders', 'Create Order', 'View Tables', 'Occupy Table',
       'View Menu', 'View Bills',
@@ -64,6 +65,9 @@ class _FakeApi extends ApiClient {
   /// The server's own `scope.waiter_only`, or null for a backend that predates
   /// the field (which is when — and only when — the local fallback answers).
   final bool? waiterOnly;
+
+  /// The rest of the server's `scope` block, sent beside [waiterOnly].
+  final Map<String, dynamic> scopeExtras;
 
   final List<String> actionNames;
 
@@ -92,7 +96,7 @@ class _FakeApi extends ApiClient {
           'emp_Fname': 'Ravi',
           'role': role,
           'role_all': roleAll ?? [role],
-          if (waiterOnly != null) 'scope': <String, dynamic>{'waiter_only': waiterOnly},
+          if (waiterOnly != null) 'scope': <String, dynamic>{'waiter_only': waiterOnly, ...scopeExtras},
           'actions_set': actions,
           'action_names': actionNames,
         }),
@@ -253,11 +257,17 @@ Widget _host(Widget child, {DesignSystem system = DesignSystem.rustic}) => GaiaS
 
 /// A waiter as the SERVER describes one: the primary role, the tenant's custom
 /// role beside it, and the server's own verdict.
+///
+/// A 2.0.2 server also sends move_table / move_order / cancel_kot in every
+/// session's scope — all three false for a waiter holding only 'a1' — and the
+/// orange sheet offers "Add to printed bill" only to a waiter whose server
+/// sent them (RoleScope.serverTakesPrintedAdditions).
 _FakeApi _waiterApi(Map<String, dynamic> routes, {bool? waiterOnly = true}) => _FakeApi(
       routes,
       role: 'waiter',
       roleAll: const ['waiter', _customRoleId],
       waiterOnly: waiterOnly,
+      scopeExtras: const {'move_table': false, 'move_order': false, 'cancel_kot': false},
       actions: const ['a1'],
     );
 

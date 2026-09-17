@@ -317,8 +317,26 @@ class ReportEmailConfig {
 /// One banner above the area: 'error', 'warning' or 'info'.
 typedef EmailBanner = ({String tone, String title, String? detail});
 
-List<EmailBanner> configBanners(ReportEmailConfig? c) {
+/// A SERVER OLDER THAN EMAILED REPORTS. 2.0.1 has no GET /reports/email/config
+/// and answers it with a 404; 2.0.2's route never answers 404. Any other
+/// failure (no connection, a 5xx, a refusal) is "we could not ask".
+bool emailRoutesMissing(int? status) => status == 404;
+
+/// What the area and the Send sheet say on such a server, instead of blaming
+/// the connection. App-only words: the web reads the same 404 as "could not
+/// ask" today.
+const String kServerPredatesEmailSentence = 'This server has not been updated for email reports yet';
+const String kServerPredatesEmailHint =
+    'Ask your administrator to update the server. Until then nothing can be emailed, and schedules cannot be '
+    'created or edited here. Reports can still be downloaded.';
+
+/// [serverOutdated] is [emailRoutesMissing] of the failed config read; it only
+/// speaks when there is no config.
+List<EmailBanner> configBanners(ReportEmailConfig? c, {bool serverOutdated = false}) {
   if (c == null) {
+    if (serverOutdated) {
+      return const [(tone: 'warning', title: kServerPredatesEmailSentence, detail: kServerPredatesEmailHint)];
+    }
     return const [
       (tone: 'warning', title: "Couldn't check the email settings", detail: 'Check the connection and reload. Nothing has been changed.'),
     ];
@@ -338,9 +356,12 @@ List<EmailBanner> configBanners(ReportEmailConfig? c) {
   return out;
 }
 
-/// Why Send now cannot be used, or null when it can.
-String? sendNowBlocked(ReportEmailConfig? c) {
-  if (c == null) return "Couldn't check the email settings — reload and try again.";
+/// Why Send now cannot be used, or null when it can. [serverOutdated] as for
+/// [configBanners].
+String? sendNowBlocked(ReportEmailConfig? c, {bool serverOutdated = false}) {
+  if (c == null) {
+    return serverOutdated ? kServerPredatesEmailSentence : "Couldn't check the email settings — reload and try again.";
+  }
   if (!c.schemaReady) return kSchemaPendingSentence;
   if (!c.emailAvailable) return kMailOffSentence;
   if (!c.sendNowEnabled) return kSendNowOffSentence;

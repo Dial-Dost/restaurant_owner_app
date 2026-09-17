@@ -179,10 +179,18 @@ const String settleAnywayLabel = 'Settle anyway';
 /// THE WARNING BEFORE A SETTLE AGAINST OUT-OF-DATE PAPER.
 ///
 /// "The printed bill (13:32) shows ₹2100.00; the bill is now ₹2220.00. Print the
-/// updated bill before taking payment." — or without the amounts when the
-/// reader was not sent them. Null unless the paper is KNOWN to be stale: the
+/// updated bill before taking payment." — or "The printed bill (13:32) no longer
+/// matches the bill. …" when the reader was not sent the amounts, or when the
+/// two totals are the same. Null unless the paper is KNOWN to be stale: the
 /// warning never fires on a guess, and it never blocks. The till books the
 /// current total either way, and "Settle anyway" is recorded.
+///
+/// THE SAME TOTAL IS NEVER NAMED TWICE. The paper also goes stale when only the
+/// guest's details change after the print (an address or a GSTIN: the server's
+/// paper digest carries them), and then printed_total == grand_total. "Shows
+/// ₹2100.00; the bill is now ₹2100.00" reads as if nothing changed, so the
+/// amounts are named only when they differ by at least half a paisa AND the
+/// reader would see two different figures.
 String? stalePaperSettleWarning({
   required bool? paperStale,
   String? printedClock,
@@ -193,8 +201,14 @@ String? stalePaperSettleWarning({
   if (paperStale != true) return null;
   final when = (printedClock ?? '').trim();
   final paper = when.isEmpty ? 'The printed bill' : 'The printed bill ($when)';
-  final amounts = printedTotal != null && grandTotal != null
-      ? '$paper shows ${money(printedTotal)}; the bill is now ${money(grandTotal)}.'
+  final printed = printedTotal == null ? null : money(printedTotal);
+  final now = grandTotal == null ? null : money(grandTotal);
+  final differ = printedTotal != null &&
+      grandTotal != null &&
+      (printedTotal - grandTotal).abs() >= 0.005 &&
+      printed != now;
+  final amounts = differ
+      ? '$paper shows $printed; the bill is now $now.'
       : '$paper no longer matches the bill.';
   return '$amounts Print the updated bill before taking payment.';
 }

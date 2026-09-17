@@ -219,6 +219,25 @@ void main() {
       expect(ReportEmailConfig.fromJson({...raw, 'reports': []})!.reports, hasLength(18));
     });
 
+    test('a server older than emailed reports (2.0.1: no config route, a 404) says so — not "check the connection"', () {
+      expect(emailRoutesMissing(404), isTrue);
+      for (final status in const <int?>[null, 400, 401, 403, 408, 500, 502, 503]) {
+        expect(emailRoutesMissing(status), isFalse, reason: '$status');
+      }
+      final banner = configBanners(null, serverOutdated: true).single;
+      expect(banner, (tone: 'warning', title: kServerPredatesEmailSentence, detail: kServerPredatesEmailHint));
+      expect(banner.title, isNot(contains("Couldn't check")));
+      expect(banner.detail, isNot(contains('connection')));
+      expect(sendNowBlocked(null, serverOutdated: true), kServerPredatesEmailSentence);
+      // Any other failure is still "could not ask".
+      expect(configBanners(null, serverOutdated: false).single.title, "Couldn't check the email settings");
+      expect(sendNowBlocked(null, serverOutdated: false), contains("Couldn't check"));
+      // A config that arrived decides; the flag only speaks when there is none.
+      final c = ReportEmailConfig.fromJson(raw);
+      expect(configBanners(c, serverOutdated: true), isEmpty);
+      expect(sendNowBlocked(c, serverOutdated: true), isNull);
+    });
+
     test('mail off is the server\'s sentence; the scheduler off is information', () {
       final off = ReportEmailConfig.fromJson({...raw, 'email_available': false, 'reason': 'SMTP_HOST is not set'});
       expect(configBanners(off).single.title, 'Email is not set up on this server');

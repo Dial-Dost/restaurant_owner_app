@@ -206,7 +206,9 @@ class _FakeApi extends ApiClient {
     }
     final base = Uri.parse('http://x$path').path;
     final hit = routes[base];
+    // A missing route answers as Express does: a 404 that is not JSON.
     if (hit == null) throw ApiException('No fake route for $base', 404);
+    if (hit is Exception) throw hit;
     return hit;
   }
 
@@ -469,6 +471,29 @@ void main() {
       await _tap(tester, find.byKey(const ValueKey('email-to-r1')));
       await _tap(tester, find.byKey(const ValueKey('email-send')));
       expect(api.writes, isEmpty);
+    });
+
+    testWidgets('a 2.0.1 server: the sheet says the server has not been updated, not "check the connection"; nothing is sent',
+        (tester) async {
+      final api = _FakeApi();
+      api.routes
+        ..remove('/reports/email/config')
+        ..remove('/reports/email/recipients');
+      await _mount(tester, api);
+      await _openSend(tester);
+      final blocked = find.byKey(const ValueKey('email-send-blocked'));
+      expect(blocked, findsOneWidget);
+      expect(find.descendant(of: blocked, matching: find.text(kServerPredatesEmailSentence)), findsOneWidget);
+      expect(find.textContaining("Couldn't check"), findsNothing);
+      await _tap(tester, find.byKey(const ValueKey('email-send')));
+      expect(api.writes, isEmpty);
+
+      // Any other failure is still "could not ask".
+      final down = _FakeApi(routes: {'/reports/email/config': ApiException('Connection refused', null)});
+      await _mount(tester, down);
+      await _openSend(tester);
+      expect(find.text("Couldn't check the email settings — reload and try again."), findsOneWidget);
+      expect(find.text(kServerPredatesEmailSentence), findsNothing);
     });
 
     testWidgets('an empty address book: Send is not offered, and the sheet says where to add one', (tester) async {

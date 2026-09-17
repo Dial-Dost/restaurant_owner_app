@@ -181,6 +181,21 @@ class RoleScope {
     return p.said(c) ?? fallback;
   }
 
+  /// DOES THIS SESSION COME FROM A SERVER THAT TAKES A WAITER'S ADDITION TO A
+  /// PRINTED BILL (2.0.2, `add_to_printed_bill`)?
+  ///
+  /// Every 2.0.2 session's `scope` block carries `move_table`, `move_order` and
+  /// `cancel_kot` (sessionCapabilities in the server's routes/_shared.ts, sent
+  /// by both login and /auth/me); a 2.0.1 block carries none of them. 2.0.1
+  /// does not know the flag and refuses EVERY waiter order on a printed table,
+  /// so on it a waiter must not be offered, or promised, an addition to the
+  /// printed bill. The answer is read off what the server sent, never off the
+  /// wildcard: `*` says who the reader is, not which server they talk to.
+  static bool serverTakesPrintedAdditions(Profile p) =>
+      p.said(Capability.moveTable) != null ||
+      p.said(Capability.moveOrder) != null ||
+      p.said(Capability.cancelKot) != null;
+
   /// True when [label] must be kept out of this user's nav on role grounds
   /// alone — i.e. even though their permissions and plan would allow it.
   static bool hidesModule(Profile p, String label) =>
@@ -394,6 +409,7 @@ class FloorScope {
     required this.managerOnlyAsks,
     this.moveTable = false,
     this.moveOrder = false,
+    this.addToPrinted = true,
   });
 
   /// "Seat guests & take order" — POST /occupy-table.
@@ -525,6 +541,14 @@ class FloorScope {
   /// replaced by it — the client asked for Move table, not for this.
   final bool moveOrder;
 
+  /// "Add to printed bill" — an order on a table whose bill has been printed,
+  /// sent with `add_to_printed_bill` after the reader says so (client items 1
+  /// and 2). A senior's always: every server lets them add and reprint. A
+  /// waiter's only on a server that takes the flag
+  /// ([RoleScope.serverTakesPrintedAdditions]); on 2.0.1 a waiter gets the plain
+  /// "Add order", which that server answers with its own next-party refusal.
+  final bool addToPrinted;
+
   /// [surface] says WHICH floor screen is asking — see [FloorSurface].
   ///
   /// IT DEFAULTS TO [FloorSurface.service], THE RESTRICTIVE ONE, and that
@@ -588,6 +612,7 @@ class FloorScope {
       managerOnlyAsks: !waiterOnly,
       moveTable: RoleScope.may(p, Capability.moveTable, fallback: !waiterOnly),
       moveOrder: !waiterOnly && RoleScope.may(p, Capability.moveOrder, fallback: true),
+      addToPrinted: !waiterOnly || RoleScope.serverTakesPrintedAdditions(p),
     );
   }
 }

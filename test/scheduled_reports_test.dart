@@ -12,6 +12,7 @@ import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
@@ -69,6 +70,9 @@ class _FakeApi extends ApiClient {
       return <String, dynamic>{'success': true};
     }
     final base = Uri.parse('http://x$path').path;
+    // A route the server has not got answers as Express does: a 404 page
+    // that is not JSON (body null). An exception in [routes] is thrown as is.
+    if (routes[base] case final Exception e) throw e;
     if (routes.containsKey(base)) return routes[base];
     throw ApiException('No fake route for $base', 404);
   }
@@ -396,6 +400,68 @@ void main() {
         'enabled': true,
         'recipient_ids': <String>[],
       });
+    });
+
+    // Integration review: on a 2.0.1 server (the app updated first, or a server
+    // rollback) New schedule POSTed report_keys/formats, which 2.0.1 ignores —
+    // it stored a Sales CSV and the app said "Schedule created"; an Edit to P&L
+    // kept GST and said "Schedule updated". And the area blamed the connection.
+    for (final system in DesignSystem.values) {
+      testWidgets('a 2.0.1 server: says it has not been updated, offers no New schedule or Edit, and keeps what 2.0.1 does take (${system.name})', (tester) async {
+        final routes = _routes(schedules: [
+          _schedule('s3', 'Month-end GST', 'monthly', reportKey: 'gst', hour: 9, minute: 7, dayOfMonth: 3),
+        ])
+          ..remove('/reports/email/config')
+          ..remove('/reports/email/recipients');
+        final api = await _mount(tester, routes, system: system);
+        expect(find.text(kServerPredatesEmailSentence), findsOneWidget);
+        expect(find.text(kServerPredatesEmailHint), findsOneWidget);
+        expect(find.text("Couldn't check the email settings"), findsNothing);
+        expect(find.textContaining('connection'), findsNothing);
+        expect(find.byKey(const ValueKey('email-book-read-only')), findsNothing,
+            reason: 'the Settings permission is not why the book cannot be changed');
+
+        final add = find.byKey(const ValueKey('email-new-schedule'));
+        expect(add, findsOneWidget);
+        expect((tester.widget(add) as dynamic).onPressed, isNull);
+        await _tap(tester, add);
+        expect(find.byKey(const ValueKey('schedule-save')), findsNothing);
+
+        await _tap(tester, find.descendant(of: _cardOf('Month-end GST'), matching: find.byType(PopupMenuButton<String>)));
+        final edit = find.ancestor(of: find.text('Edit'), matching: find.byType(PopupMenuItem<String>));
+        expect(tester.widget<PopupMenuItem<String>>(edit).enabled, isFalse);
+        await tester.tap(find.text('Edit'), warnIfMissed: false);
+        await tester.pumpAndSettle();
+        expect(find.text('Edit schedule'), findsNothing);
+        expect(find.byKey(const ValueKey('schedule-save')), findsNothing);
+        expect(api.writes, isEmpty);
+
+        // Pause, Run now and Delete are 2.0.1 routes that read only what they send.
+        await tester.tap(find.text('Pause').last);
+        await tester.pumpAndSettle();
+        expect(api.writes, ['PATCH /reports/schedules/s3']);
+        expect(_lastBody(api), {'enabled': false});
+        // Gaia paints button labels in upper case: find the button by its label.
+        await _tap(tester, find.descendant(
+            of: _cardOf('Month-end GST'),
+            matching: find.byWidgetPredicate((w) => w is ForkButton && w.label == 'Run now')));
+        expect(api.writes.last, 'POST /reports/schedules/s3/run-now');
+        await _menu(tester, 'Month-end GST', 'Delete');
+        await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+        await tester.pumpAndSettle();
+        expect(api.writes.last, 'DELETE /reports/schedules/s3');
+        expect(api.writes.where((w) => w.startsWith('POST /reports/schedules') && !w.endsWith('/run-now')), isEmpty);
+      }, variant: _platforms);
+    }
+
+    testWidgets('a config read that fails any other way is still "could not ask", and New schedule stays', (tester) async {
+      for (final failure in [ApiException('Connection refused', null), ApiException('Request failed (500).', 500)]) {
+        await _mount(tester, _routes()..['/reports/email/config'] = failure);
+        expect(find.text("Couldn't check the email settings"), findsOneWidget, reason: '$failure');
+        expect(find.text(kServerPredatesEmailSentence), findsNothing, reason: '$failure');
+        final add = find.byKey(const ValueKey('email-new-schedule'));
+        expect((tester.widget(add) as dynamic).onPressed, isNotNull, reason: '$failure');
+      }
     });
 
     testWidgets('an edit that does not touch the addresses leaves them alone — even one no longer in the book', (tester) async {
