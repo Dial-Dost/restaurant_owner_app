@@ -33044,6 +33044,10 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
             if (m.enabled && !m.online)
               Padding(
                 padding: const EdgeInsets.only(left: 16, bottom: 4),
+                // Each option is a checkbox beside its words. The Wrap hands each
+                // one at most the card's width, so the words are Flexible: on a
+                // 360dp phone they wrap under themselves instead of running past
+                // the card's edge (80px of "Require payment screenshot" did).
                 child: Wrap(spacing: 12, children: [
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33054,7 +33058,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(requiresScreenshot: v ?? false)),
                     ),
-                    Text('Require payment screenshot', style: text.bodySmall),
+                    Flexible(child: Text('Require payment screenshot', style: text.bodySmall)),
                   ]),
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33065,7 +33069,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(showToGuests: v ?? false)),
                     ),
-                    Text('Show on guest QR page', style: text.bodySmall),
+                    Flexible(child: Text('Show on guest QR page', style: text.bodySmall)),
                   ]),
                 ]),
               ),
@@ -33321,6 +33325,12 @@ class _MessagingSettingsCard extends StatefulWidget {
 }
 
 class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
+  static const _providers = [
+    ('none', 'Off (log only)'),
+    ('twilio', 'Twilio (SMS / WhatsApp)'),
+    ('meta', 'Meta WhatsApp Cloud API'),
+  ];
+
   late String _provider;
   late final TextEditingController _sender;
   late final TextEditingController _keyId;
@@ -33400,15 +33410,22 @@ class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
         const SizedBox(height: AppSpacing.lg),
         Text('PROVIDER', style: text.labelSmall),
         const SizedBox(height: 6),
+        // A dropdown that is not expanded is as wide as its widest choice, and
+        // "Twilio (SMS / WhatsApp)" at 1.3x is wider than a 360dp phone's card.
+        // Expanded, what the closed field shows is held to the field (which
+        // already spans the card and draws the arrow itself, so nothing moves on
+        // a desktop) and kept to one line. The open menu keeps the full words.
         DropdownButtonFormField<String>(
           initialValue: _provider,
+          isExpanded: true,
           dropdownColor: AppColors.cardRaised,
           borderRadius: AppRadius.controlAll,
           decoration: const InputDecoration(isDense: true),
-          items: const [
-            DropdownMenuItem(value: 'none', child: Text('Off (log only)')),
-            DropdownMenuItem(value: 'twilio', child: Text('Twilio (SMS / WhatsApp)')),
-            DropdownMenuItem(value: 'meta', child: Text('Meta WhatsApp Cloud API')),
+          items: [
+            for (final (value, label) in _providers) DropdownMenuItem(value: value, child: Text(label)),
+          ],
+          selectedItemBuilder: (_) => [
+            for (final (_, label) in _providers) Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
           ],
           onChanged: _busy ? null : (v) => setState(() => _provider = v ?? 'none'),
         ),
@@ -33792,7 +33809,9 @@ class _BrandingCardState extends State<_BrandingCard> {
         const SizedBox(height: 4),
         Text('Logo + colour shown to guests on the QR ordering & reservation pages.', style: text.bodySmall),
         const SizedBox(height: AppSpacing.lg),
-        Row(children: [
+        // A Wrap, not a Row: where the button does not fit beside the logo (a
+        // 360dp phone at large text) it goes under it, label whole.
+        Wrap(crossAxisAlignment: WrapCrossAlignment.center, spacing: AppSpacing.md, runSpacing: AppSpacing.sm, children: [
           Container(
             width: 64, height: 64,
             decoration: BoxDecoration(
@@ -33803,7 +33822,6 @@ class _BrandingCardState extends State<_BrandingCard> {
             ),
             child: _logo.isEmpty ? Icon(Icons.storefront, color: AppColors.textSecondary) : null,
           ),
-          const SizedBox(width: AppSpacing.md),
           ForkButton.ghost(
             label: _logo.isEmpty ? 'Upload logo' : 'Change logo',
             icon: Icons.upload,
