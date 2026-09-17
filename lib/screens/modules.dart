@@ -11654,7 +11654,10 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
         Text('Add inventory items first to build a recipe.', style: text.bodySmall)
       else
         for (int i = 0; i < _recipe.length; i++)
-          Row(children: [
+          // Keyed on the row itself (see [_groupCard]): the quantity box is an
+          // initialValue field, so without it removing a row left its quantity
+          // on screen beside the next ingredient.
+          Row(key: ObjectKey(_recipe[i]), children: [
             Expanded(
               flex: 3,
               child: DropdownButtonFormField<String>(
@@ -11678,7 +11681,11 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
                 onChanged: (v) => _recipe[i]['qty'] = double.tryParse(v) ?? 0,
               ),
             ),
-            IconButton(icon: const Icon(Icons.close, size: 16), onPressed: () => setState(() => _recipe.removeAt(i))),
+            IconButton(
+              icon: const Icon(Icons.close, size: 16),
+              tooltip: 'Remove ingredient',
+              onPressed: () => setState(() => _recipe.removeAt(i)),
+            ),
           ]),
     ]);
   }
@@ -11726,7 +11733,15 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
   Widget _groupCard(int gi) {
     final g = _modifiers[gi];
     final options = g['options'] as List;
+    // THE ROWS ARE KEYED ON THEIR OWN MAPS — found by the item 3 (2.0.1) sweep.
+    // These boxes are `TextFormField(initialValue:)`, which reads the value once,
+    // when the field is first built. Unkeyed, removing a group or an option that
+    // was not the last one shifted the list under fields that kept their text:
+    // the removed "Medium +40" stayed on screen, "Large +80" vanished, and a
+    // price typed into the box reading +40 was saved as Large's. Each map is its
+    // own object (never a const literal), so ObjectKey follows the row itself.
     return Padding(
+      key: ObjectKey(g),
       padding: const EdgeInsets.only(bottom: 8),
       child: ForkCard(
         inset: true,
@@ -11768,7 +11783,7 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
             ),
           ]),
           for (int oi = 0; oi < options.length; oi++)
-            Row(children: [
+            Row(key: ObjectKey(options[oi]), children: [
               Expanded(
                 flex: 3,
                 child: TextFormField(
@@ -11789,6 +11804,7 @@ class _MenuItemDialogState extends State<_MenuItemDialog> {
               ),
               IconButton(
                 icon: const Icon(Icons.close, size: 16),
+                tooltip: 'Remove option',
                 onPressed: () => setState(() => options.removeAt(oi)),
               ),
             ]),
@@ -33417,6 +33433,13 @@ class _TaxSettingsCardState extends State<_TaxSettingsCard> {
           ),
         for (int i = 0; i < _taxes.length; i++)
           Padding(
+            // KEYED ON THE TAX ITSELF — found by the item 3 (2.0.1) sweep. The name
+            // and rate are `TextFormField(initialValue:)`, read once when the box
+            // is built. Unkeyed, removing CGST from CGST / SGST / VAT left the boxes
+            // reading CGST 2.5 and SGST 2.5 while Save sent SGST 2.5 and VAT 5 (the
+            // boxes and the rate summary above them disagreed), and a rate typed
+            // into the box reading SGST changed VAT's — on every bill after Save.
+            key: ObjectKey(_taxes[i]),
             padding: const EdgeInsets.only(bottom: 8),
             child: Row(children: [
               Expanded(
@@ -33971,6 +33994,10 @@ class _PostersCardState extends State<_PostersCard> {
     final ratio = (w > 0 && h > 0) ? w / h : 16 / 9;
 
     return Padding(
+      // Keyed on the poster (found by the item 3 (2.0.1) sweep): the caption is an
+      // initialValue field, so after a delete an unkeyed tile kept the deleted
+      // poster's caption, and Enter saved that text onto the poster now beside it.
+      key: ValueKey('poster-${p['id']}'),
       padding: const EdgeInsets.only(bottom: 12),
       child: Container(
         padding: const EdgeInsets.all(12),
