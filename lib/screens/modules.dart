@@ -7037,7 +7037,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                   context, rest, [for (final r in allRows) if (!isNextPartyRow(r as Map)) r], reload),
             ),
         ];
-        return PrintedBacklogFilter(child: Scaffold(
+        return PrintedBacklogFilter(states: floorStates, child: Scaffold(
           backgroundColor: Colors.transparent,
           // See [FloorScope.addTable]: the floor's layout controls travel
           // together, and a waiter has none of them.
@@ -7958,8 +7958,8 @@ class _FloorSectionsState extends State<_FloorSections> {
     final text = Theme.of(context).textTheme;
     // CLIENT ITEMS 1 AND 2: the owner's "N Bill printed" chip narrows the floor
     // to the night-settle backlog ([PrintedBacklogFilter]). Service only.
-    final onlyPrinted =
-        widget.surface == FloorSurface.service && (PrintedBacklogFilter.maybeOf(context)?.value ?? false);
+    // Only while a printed table is there to show (PrintedBacklogFilter.activeOf).
+    final onlyPrinted = widget.surface == FloorSurface.service && PrintedBacklogFilter.activeOf(context);
     final all = [
       for (final r in widget.rows)
         if (!onlyPrinted || _floorState(r as Map, widget.profile) == FloorState.printed) r as Map,
@@ -10338,8 +10338,20 @@ class _TableSheetState extends State<_TableSheet> {
     final orderIds = (_bill?['order_ids'] as List?) ?? [];
     if (orderIds.isEmpty) return;
     final oid = '${orderIds.first}';
+    // CLIENT ITEMS 1 AND 2 — this settles the bill too, so it asks the payment
+    // sheet's question, off a fresh read (the sheet may have been open a while).
+    // A read that fails asks off the bill in hand; it never blocks.
+    Map? paper = _bill;
     try {
-      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) paper = r;
+    } catch (_) {/* the bill in hand */}
+    if (!mounted) return;
+    final stale = _stalePaperWarningOf(paper);
+    if (stale != null && !await _confirmStalePaperSettle(context, stale)) return;
+    try {
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment',
+          stale != null ? const {'settled_with_stale_paper': true} : null);
       await widget.rest.post('/bills/order/$oid/close');
       messenger.showSnackBar(const SnackBar(content: Text('Payment approved — table freed.')));
       _popAndReload();

@@ -151,7 +151,10 @@ class BillPrintedRefusal {
     this.addToPrintedLabel,
   });
 
-  /// The server's sentence, shown as it stands.
+  /// The server's sentence, shown as it stands — its 2.0.2 one
+  /// (`add_to_printed_message`) when it also offers [addToPrintedLabel],
+  /// because the 2.0.1 sentence sends the waiter to a manager for the very
+  /// thing that button does.
   final String message;
 
   /// The printed table.
@@ -177,7 +180,8 @@ class BillPrintedRefusal {
     final elsewhere = next.isNotEmpty && next.toLowerCase() != table.toLowerCase();
     final label = _str(body, 'next_party_action');
     final addLabel = _str(body, 'add_to_printed_action');
-    final message = _str(body, 'error');
+    final addMessage = addLabel.isNotEmpty ? _str(body, 'add_to_printed_message') : '';
+    final message = addMessage.isNotEmpty ? addMessage : _str(body, 'error');
     return BillPrintedRefusal(
       message: message.isNotEmpty
           ? message

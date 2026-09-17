@@ -1654,6 +1654,43 @@ class _PaymentSheet extends StatefulWidget {
   State<_PaymentSheet> createState() => _PaymentSheetState();
 }
 
+/// CLIENT ITEMS 1 AND 2 — THE ONE STALE-PAPER QUESTION, asked by every door
+/// that settles a bill: the payment sheet's "Settle & close" and the table
+/// sheet's "Approve payment & close". [warning] is stalePaperSettleWarning's
+/// sentence. True means "Settle anyway": the caller settles the same amount it
+/// always would and sends `settled_with_stale_paper`, which the server audits.
+/// It never blocks.
+Future<bool> _confirmStalePaperSettle(BuildContext context, String warning) async {
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      key: const ValueKey('settle-stale-paper-confirm'),
+      backgroundColor: AppColors.surface,
+      title: const Text('The printed bill is out of date'),
+      content: Text(warning),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(
+          key: const ValueKey('settle-anyway'),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text(settleAnywayLabel),
+        ),
+      ],
+    ),
+  );
+  return go == true;
+}
+
+/// The stale-paper warning for a /bill-for-table payload, or null when its
+/// paper is not KNOWN to be out of date. One reading for every settle door.
+String? _stalePaperWarningOf(Map? bill) => stalePaperSettleWarning(
+      paperStale: paperStaleOf(bill),
+      printedClock: _printedClock(bill),
+      printedTotal: printedTotalOf(bill),
+      grandTotal: bill == null ? null : _numOf(bill['grand_total'] ?? bill['total_amt']),
+      money: (v) => _money(v),
+    );
+
 class _PaymentSheetState extends State<_PaymentSheet> {
   // ---- the modes -------------------------------------------------------------
   //
@@ -1730,15 +1767,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   bool _printingUpdated = false;
 
   /// The warning, or null when the paper is not KNOWN to be out of date.
-  String? get _staleWarning => _ncMode
-      ? null
-      : stalePaperSettleWarning(
-          paperStale: paperStaleOf(_paperBill),
-          printedClock: _printedClock(_paperBill),
-          printedTotal: printedTotalOf(_paperBill),
-          grandTotal: _paperBill == null ? null : _numOf(_paperBill!['grand_total'] ?? _paperBill!['total_amt']),
-          money: (v) => _money(v),
-        );
+  String? get _staleWarning => _ncMode ? null : _stalePaperWarningOf(_paperBill);
 
   /// This server has no settle-nc route ([NcSettle.routeMissing]). Learned from
   /// the first attempt, for the life of this sheet. The pill and the ₹0 bill's
@@ -2199,24 +2228,8 @@ class _PaymentSheetState extends State<_PaymentSheet> {
     // CLIENT ITEMS 1 AND 2 — the paper is out of date: asked, never refused.
     final stale = _staleWarning;
     if (stale != null) {
-      final go = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          key: const ValueKey('settle-stale-paper-confirm'),
-          backgroundColor: AppColors.surface,
-          title: const Text('The printed bill is out of date'),
-          content: Text(stale),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-            FilledButton(
-              key: const ValueKey('settle-anyway'),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text(settleAnywayLabel),
-            ),
-          ],
-        ),
-      );
-      if (go != true || !mounted) return;
+      final go = await _confirmStalePaperSettle(context, stale);
+      if (!go || !mounted) return;
     }
     setState(() {
       _busy = true;

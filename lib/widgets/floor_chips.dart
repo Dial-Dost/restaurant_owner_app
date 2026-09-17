@@ -142,15 +142,29 @@ class FloorColourKey extends StatelessWidget {
 /// "ONLY THE PRINTED TABLES" — the owner's night-settle backlog, one tap on the
 /// "N Bill printed" legend chip away. Held above the Tables screen's tiles and
 /// read by the floor sections, so the chip and the grid cannot disagree.
+///
+/// [states] is the floor as the legend counts it. The filter narrows the floor
+/// only while one of them is printed ([activeOf], [printedBacklogFilterOn]):
+/// settling the last printed bill takes the chip away, and the request is then
+/// dropped, so the floor comes back whole and the next print does not narrow
+/// it by itself.
 class PrintedBacklogFilter extends StatefulWidget {
-  const PrintedBacklogFilter({super.key, required this.child});
+  const PrintedBacklogFilter({super.key, required this.states, required this.child});
 
+  final List<FloorState> states;
   final Widget child;
 
-  /// The filter in force above [context], or null when there is none (the
-  /// Floor plan, a test that mounts the sections alone).
+  /// The request above [context] (what the chip toggles), or null when there
+  /// is none (the Floor plan, a test that mounts the sections alone).
   static ValueNotifier<bool>? maybeOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<_PrintedBacklogScope>()?.notifier;
+
+  /// Whether the floor above [context] is narrowed to its printed tables now.
+  static bool activeOf(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<_PrintedBacklogScope>();
+    if (scope == null) return false;
+    return printedBacklogFilterOn(scope.notifier?.value ?? false, scope.states);
+  }
 
   @override
   State<PrintedBacklogFilter> createState() => _PrintedBacklogFilterState();
@@ -159,6 +173,21 @@ class PrintedBacklogFilter extends StatefulWidget {
 class _PrintedBacklogFilterState extends State<PrintedBacklogFilter> {
   final ValueNotifier<bool> _only = ValueNotifier<bool>(false);
 
+  bool get _anyPrinted => widget.states.contains(FloorState.printed);
+
+  @override
+  void didUpdateWidget(covariant PrintedBacklogFilter oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The last printed bill was settled with the filter on. The floor already
+    // reads it as off ([activeOf]); the request itself is dropped after this
+    // frame, because a notifier must not notify in the middle of a build.
+    if (_only.value && !_anyPrinted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_anyPrinted) _only.value = false;
+      });
+    }
+  }
+
   @override
   void dispose() {
     _only.dispose();
@@ -166,11 +195,19 @@ class _PrintedBacklogFilterState extends State<PrintedBacklogFilter> {
   }
 
   @override
-  Widget build(BuildContext context) => _PrintedBacklogScope(notifier: _only, child: widget.child);
+  Widget build(BuildContext context) =>
+      _PrintedBacklogScope(notifier: _only, states: widget.states, child: widget.child);
 }
 
 class _PrintedBacklogScope extends InheritedNotifier<ValueNotifier<bool>> {
-  const _PrintedBacklogScope({required super.notifier, required super.child});
+  const _PrintedBacklogScope({required super.notifier, required this.states, required super.child});
+
+  final List<FloorState> states;
+
+  @override
+  bool updateShouldNotify(_PrintedBacklogScope oldWidget) =>
+      super.updateShouldNotify(oldWidget) ||
+      oldWidget.states.contains(FloorState.printed) != states.contains(FloorState.printed);
 }
 
 /// One counted legend chip. The printed one is a toggle for [PrintedBacklogFilter].
@@ -185,7 +222,7 @@ class FloorLegendChip extends StatelessWidget {
     final chip = FloorChip(label: label, color: floorInk(state));
     final filter = state == FloorState.printed ? PrintedBacklogFilter.maybeOf(context) : null;
     if (filter == null) return chip;
-    final on = filter.value;
+    final on = PrintedBacklogFilter.activeOf(context);
     return Semantics(
       button: true,
       toggled: on,

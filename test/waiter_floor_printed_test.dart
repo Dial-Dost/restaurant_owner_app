@@ -263,8 +263,15 @@ ApiException _billPrinted() => ApiException.fromBody({
       'next_party_table': 'T1 #2',
       'next_party_action': 'Take it on T1 (next party)',
       'add_to_printed_action': "Add to T1's printed bill",
+      'add_to_printed_message': _addToPrintedMessage,
       'print_count': 1,
     }, billPrintedStatus);
+
+/// The 2.0.2 sentence beside "Add to T1's printed bill" (the server's
+/// addToPrintedBillRefusalMessage), which names that choice instead of sending
+/// the waiter to a manager for it.
+const String _addToPrintedMessage = "T1's bill has already been printed. Take a new party's order on T1 (next party), "
+    "or, if it is for the same guests, add it to T1's printed bill and print the updated bill.";
 
 // ------------------------------------------------------------------- looks --
 
@@ -618,6 +625,23 @@ void main() {
       expect(r.actionLabel, 'Take it on T1 (next party)');
       final old = BillPrintedRefusal.parse({...?_billPrinted().body, 'add_to_printed_action': null})!;
       expect(old.addToPrintedLabel, isNull, reason: 'a 2.0.1 server offers no such thing');
+      // Beside the button, the sentence that names it; without it, 2.0.1's.
+      expect(r.message, _addToPrintedMessage);
+      expect(r.message, isNot(contains('ask a manager')));
+      expect(old.message, startsWith("T1's bill has already been printed, so nothing more can be added to it."));
+      final blank = BillPrintedRefusal.parse({...?_billPrinted().body, 'add_to_printed_message': '  '})!;
+      expect(blank.message, old.message);
+    });
+
+    test('the "only printed" filter narrows the floor only while a printed table is there', () {
+      expect(printedBacklogFilterOn(true, const [FloorState.printed, FloorState.free]), isTrue);
+      expect(printedBacklogFilterOn(false, const [FloorState.printed]), isFalse);
+      // The night settle took the last one: its legend chip is gone, so the
+      // filter must not leave a blank floor.
+      const settled = [FloorState.free, FloorState.running];
+      expect(floorLegend(settled, withCounts: true).any((r) => r.state == FloorState.printed), isFalse);
+      expect(printedBacklogFilterOn(true, settled), isFalse);
+      expect(printedBacklogFilterOn(true, const []), isFalse);
     });
 
     test('the two moves: the server answers, the floor keeps Move an order a senior\'s', () {
@@ -773,6 +797,11 @@ void main() {
       expect(bps, contains('Print the updated bill before taking payment.'));
       expect(tm, contains("The printed bill moves with them. The guest's paper still says \${from.trim()}; "
           'the bill will show as \${to.trim()} (printed as \${from.trim()}).'));
+      // The web shows the server's 2.0.2 refusal sentence beside the same button.
+      expect(np, contains("const addMessage = addLabel ? str(b.add_to_printed_message) : '';"));
+      // ...and drops the printed filter with the last printed bill, as this floor does.
+      final fs = _read('Restaurant_Dashboard_UI/src/lib/floor-state.ts');
+      expect(fs, contains("requested && states.includes('printed');"));
     });
 
     test('server: the flag, the label, the banner and the two capabilities', () {
@@ -786,6 +815,13 @@ void main() {
       expect(np, contains('export const ADD_TO_PRINTED_BILL_KEY = "$addToPrintedBillKey";'));
       expect(np, contains("return `Add to \${tableSentenceName(table, parentTable ?? null)}'s printed bill`;"));
       expect(np, contains('add_to_printed_action: input.guest || write !== "order" ? null'));
+      // The sentence a 2.0.2 refusal carries beside that action, word for word.
+      expect(np, contains('add_to_printed_message: addToPrinted ? addToPrintedBillRefusalMessage(named, elsewhere ? nextNamed : null) : null,'));
+      expect(
+          np
+              .replaceAll(r'${named}', 'T1')
+              .replaceAll(r'${next}', 'T1 (next party)'),
+          contains(_addToPrintedMessage));
       expect(digest, contains('export const UPDATED_BILL_MARKER = "$updatedBillMarker";'));
       expect(digest, contains('`Replaces the bill printed \${c}` : "Replaces an earlier printed bill"'));
       for (final c in [Capability.moveTable, Capability.moveOrder]) {
@@ -853,6 +889,75 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byKey(const ValueKey('table-title-T4')), findsOneWidget);
       expect(find.byKey(const ValueKey('table-title-T1 #2')), findsOneWidget);
+    }, variant: _looks);
+
+    // The night settle with the backlog filter on: the last printed bill is
+    // approved and closed, its "1 Bill printed" chip leaves the legend, and the
+    // floor must come back whole — not stay blank with nothing to tap.
+    testWidgets('an owner: settling the LAST printed bill with the filter on shows every table again',
+        (tester) async {
+      final tables = [_printed('T1'), _row('T2')];
+      final bill = {..._bill(), 'payment_status': 'pending_approval', 'payment_method': 'Cash'};
+      final api = _owner(_floor(tables, bill: bill));
+      api.replies['/bills/order/order-1/close'] = (_) {
+        tables[0] = _row('T1'); // the next floor read: T1 settled and free
+        return {'success': true};
+      };
+      await _mountFloor(tester, api);
+      await tester.tap(find.byKey(const ValueKey('floor-legend-printed')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('table-title-T2')), findsNothing, reason: 'the filter is on');
+
+      await _open(tester, 'T1');
+      final approve = _fork('Approve payment & close');
+      await _reveal(tester, approve);
+      await tester.tap(approve);
+      await tester.pumpAndSettle();
+      expect(api.writes.map((w) => w.path).toList(), ['/bills/order/order-1/admin-approve-payment', '/bills/order/order-1/close']);
+
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const ValueKey('floor-legend-printed')), findsNothing);
+      expect(_legend(tester, FloorState.free), '2 Free');
+      for (final t in ['T1', 'T2']) {
+        expect(find.byKey(ValueKey('table-title-$t')), findsOneWidget, reason: '$t is hidden by a filter nobody can clear');
+      }
+      // ...and the request itself is gone: the next printed bill does not
+      // narrow the floor by itself.
+      final filter = PrintedBacklogFilter.maybeOf(tester.element(find.byKey(const ValueKey('table-title-T2'))));
+      expect(filter?.value, isFalse);
+    }, variant: _looks);
+
+    testWidgets('the filter is off in the VERY frame the last printed table goes, before its request is dropped',
+        (tester) async {
+      final seen = <({bool requested, bool active})>[];
+      const probe = ValueKey('printed-filter-probe');
+      Widget host(List<FloorState> states) => _host(PrintedBacklogFilter(
+            states: states,
+            child: Builder(builder: (context) {
+              seen.add((
+                requested: PrintedBacklogFilter.maybeOf(context)!.value,
+                active: PrintedBacklogFilter.activeOf(context),
+              ));
+              return const SizedBox(key: probe);
+            }),
+          ));
+      await tester.pumpWidget(host(const [FloorState.printed, FloorState.free]));
+      PrintedBacklogFilter.maybeOf(tester.element(find.byKey(probe)))!.value = true;
+      await tester.pump();
+      expect(seen.last, (requested: true, active: true));
+
+      seen.clear();
+      await tester.pumpWidget(host(const [FloorState.free, FloorState.free]));
+      // Not one frame of a blank floor...
+      expect(seen.first, (requested: true, active: false));
+      await tester.pumpAndSettle();
+      // ...and the request is dropped after it,
+      expect(seen.last, (requested: false, active: false));
+      // so the next printed bill does not narrow the floor by itself.
+      await tester.pumpWidget(host(const [FloorState.printed, FloorState.free]));
+      expect(seen.last, (requested: false, active: false));
+      // Nothing asked for, nothing printed: nothing to drop.
+      expect(PrintedBacklogFilter.activeOf(tester.element(find.byKey(probe))), isFalse);
     }, variant: _looks);
   });
 
@@ -1010,6 +1115,10 @@ void main() {
       expect(add, findsOneWidget);
       expect(tester.getCenter(add).dy, closeTo(tester.getCenter(take).dy, 1), reason: 'not one row');
       expect(find.text("Add to T1's printed bill"), findsOneWidget);
+      // The sentence above the two answers names them both — never "ask a manager".
+      final said = tester.widget<Text>(find.descendant(
+          of: find.byKey(const ValueKey('order-bill-printed')), matching: find.byType(Text)));
+      expect(said.data, _addToPrintedMessage);
       await tester.tap(add);
       await tester.pumpAndSettle();
       expect(api.attempts.map((w) => w.path).toList(), ['/orders', '/orders']);
@@ -1142,6 +1251,53 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('settle-print-updated')));
       await tester.pumpAndSettle();
       expect((api.to('/print/bill').single.body as Map)['table_name'], 'T1');
+    }, variant: _looks);
+
+    // The table sheet's "Approve payment & close" settles the bill too, so it
+    // asks the same question (review of 2.0.2: it used to skip it).
+    Future<_FakeApi> openApproval(WidgetTester tester, {required bool? stale}) async {
+      final bill = {
+        ..._bill(stale: stale, grand: 2220, printedTotal: 2100),
+        'payment_status': 'pending_approval',
+        'payment_method': 'Cash',
+      };
+      final api = _owner(_floor([_printed('T1', stale: stale)], bill: bill));
+      await _mountFloor(tester, api);
+      await _open(tester, 'T1');
+      final approve = _fork('Approve payment & close');
+      await _reveal(tester, approve);
+      await tester.tap(approve);
+      await tester.pumpAndSettle();
+      return api;
+    }
+
+    testWidgets('"Approve payment & close" on stale paper: the same warning; Cancel writes nothing; "Settle anyway" is recorded',
+        (tester) async {
+      var api = await openApproval(tester, stale: true);
+      expect(find.byKey(const ValueKey('settle-stale-paper-confirm')), findsOneWidget);
+      expect(
+          find.text('The printed bill ($_clock) shows ₹2100.00; the bill is now ₹2220.00. '
+              'Print the updated bill before taking payment.'),
+          findsOneWidget);
+      await tester.tap(find.descendant(
+          of: find.byKey(const ValueKey('settle-stale-paper-confirm')), matching: find.text('Cancel')));
+      await tester.pumpAndSettle();
+      expect(api.writes, isEmpty);
+
+      api = await openApproval(tester, stale: true);
+      await tester.tap(find.byKey(const ValueKey('settle-anyway')));
+      await tester.pumpAndSettle();
+      expect(api.writes.map((w) => w.path).toList(), ['/bills/order/order-1/admin-approve-payment', '/bills/order/order-1/close']);
+      expect(api.bodyOf('admin-approve-payment'), {'settled_with_stale_paper': true});
+    }, variant: _looks);
+
+    testWidgets('"Approve payment & close" on current or unknown paper: no question, no flag', (tester) async {
+      for (final stale in <bool?>[false, null]) {
+        final api = await openApproval(tester, stale: stale);
+        expect(find.byKey(const ValueKey('settle-stale-paper-confirm')), findsNothing, reason: '$stale');
+        expect(api.writes.map((w) => w.path).toList(), ['/bills/order/order-1/admin-approve-payment', '/bills/order/order-1/close']);
+        expect(api.bodyOf('admin-approve-payment'), isNull);
+      }
     }, variant: _looks);
 
     testWidgets('paper that matches, or that nobody can vouch for: no warning, no question, no flag',
@@ -1281,7 +1437,11 @@ void main() {
       expect(mod, isNot(contains('.retiresTable)')), reason: 'a C3 filter is back on the floor');
       expect(mod, contains('            : allRows;'));
       expect(mod, isNot(contains('every table you printed')));
-      expect(mod, contains('return PrintedBacklogFilter(child: Scaffold('));
+      expect(mod, contains('return PrintedBacklogFilter(states: floorStates, child: Scaffold('));
+      expect(mod, contains('final onlyPrinted = widget.surface == FloorSurface.service && PrintedBacklogFilter.activeOf(context);'));
+      final chips = read('lib/widgets/floor_chips.dart');
+      expect(chips, contains('final on = PrintedBacklogFilter.activeOf(context);'));
+      expect(chips, contains('if (mounted && !_anyPrinted) _only.value = false;'));
       expect(mod, contains('final floor = _floorState(table, profile);'));
       expect(mod, contains('FloorLegendChip(key: ValueKey(\'floor-legend-\${row.state.name}\')'));
       expect(mod, contains('const Padding(padding: EdgeInsets.only(bottom: 10), child: FloorColourKey()),'));
@@ -1306,6 +1466,31 @@ void main() {
       expect(cap, contains("stale != null ? const {'settled_with_stale_paper': true} : null);"));
       final mod = read('lib/screens/modules.dart');
       expect(mod, contains('paperBill: _bill,'));
+    });
+
+    test('EVERY settle door asks: each waiter-confirm and admin-approve call carries the flag', () {
+      // Every call site in the app, by file. A new one fails here until it
+      // asks the stale-paper question and sends what it answered.
+      final sites = <String, int>{};
+      for (final f in Directory('lib').listSync(recursive: true).whereType<File>()) {
+        if (!f.path.endsWith('.dart')) continue;
+        final src = f.readAsStringSync().replaceAll(String.fromCharCode(13), '');
+        final n = RegExp(r"rest\.post\('/bills/order/\$oid/(waiter-confirm-payment|admin-approve-payment)'").allMatches(src).length;
+        if (n > 0) sites[f.path.replaceAll(String.fromCharCode(92), '/')] = n;
+      }
+      expect(sites, {'lib/screens/mis_capture.dart': 2, 'lib/screens/modules.dart': 1});
+      final cap = read('lib/screens/mis_capture.dart');
+      expect(cap, contains("await widget.rest.post('/bills/order/\$oid/waiter-confirm-payment', body);"));
+      expect(cap, contains("await widget.rest.post('/bills/order/\$oid/admin-approve-payment',\n"
+          "          stale != null ? const {'settled_with_stale_paper': true} : null);"));
+      final mod = read('lib/screens/modules.dart');
+      expect(mod, contains("await widget.rest.post('/bills/order/\$oid/admin-approve-payment',\n"
+          "          stale != null ? const {'settled_with_stale_paper': true} : null);"));
+      // Both ask the ONE question, off the ONE reading.
+      expect(cap, contains('final go = await _confirmStalePaperSettle(context, stale);'));
+      expect(cap, contains('String? get _staleWarning => _ncMode ? null : _stalePaperWarningOf(_paperBill);'));
+      expect(mod, contains('final stale = _stalePaperWarningOf(paper);'));
+      expect(mod, contains('if (stale != null && !await _confirmStalePaperSettle(context, stale)) return;'));
     });
 
     test('Move table is on its own flag and never queued', () {

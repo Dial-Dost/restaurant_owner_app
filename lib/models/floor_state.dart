@@ -88,6 +88,15 @@ List<({FloorState state, String label, int count})> floorLegend(
   ];
 }
 
+/// IS THE OWNER'S "ONLY THE PRINTED BILLS" FILTER NARROWING THE FLOOR? Only
+/// when it was asked for AND a printed table is there to show. The counted
+/// legend drops a state with no table, so once the last printed bill is settled
+/// the chip that turns the filter off is gone — and a filter still in force
+/// would leave a blank floor with no control to clear it. The web's
+/// printedBacklogFilterOn, the same rule.
+bool printedBacklogFilterOn(bool requested, Iterable<FloorState> states) =>
+    requested && states.contains(FloorState.printed);
+
 /// "#2" — the small chip on a next-party seat, whose tile reads its root's
 /// number. Null for anything that is not a whole number of two or more.
 String? nextPartyBadge(Object? partyNo) {
