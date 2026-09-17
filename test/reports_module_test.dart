@@ -19,6 +19,8 @@ import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
+import 'search_contract.dart';
+
 /// Insights → Reports: the nine MIS / control reports.
 ///
 /// These are fraud-control documents, so the tests pin the promises that make a
@@ -1282,6 +1284,93 @@ void main() {
     await tester.tap(find.byTooltip('Clear search'));
     await tester.pumpAndSettle();
     expect(find.byTooltip('Clear search'), findsNothing);
+  });
+
+  // A report whose endpoint reads no search drops the term, box and all: a
+  // word left in the box would filter nothing, and the empty state would go on
+  // to blame it. The box is only built for the searchable reports, so what
+  // empties it is `_setTab` clearing the screen's controller while the box can
+  // still hear it. Without that, the next searchable report showed the old
+  // word, x and all, over a report that was not filtered by it.
+  final searchBox = find.byKey(const ValueKey('reports-search'));
+  String boxText(WidgetTester tester) =>
+      tester.widget<EditableText>(find.descendant(of: searchBox, matching: find.byType(EditableText))).controller.text;
+  String lastOrderSummary(_FakeApi api) =>
+      api.gets.lastWhere((g) => g.contains('/reports/mis/order-summary'), orElse: () => '');
+
+  testWidgets('a report that reads no search drops the term: back on a searchable one, the box is empty',
+      (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    await tester.enterText(searchBox, '101');
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pumpAndSettle();
+    expect(lastOrderSummary(api), contains('search=101'));
+
+    await _openTab(tester, 'Sales Summary');
+    expect(searchBox, findsNothing, reason: 'Sales Summary reads no search');
+    await _openTab(tester, 'Order Summary');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(boxText(tester), isEmpty, reason: 'the dropped term came back in the box');
+    expect(find.byTooltip('Clear search'), findsNothing);
+    expect(lastOrderSummary(api), isNot(contains('search=')));
+  }, variant: searchPlatforms);
+
+  testWidgets('a term still waiting out the debounce is dropped by the tab change too', (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    final sales = find.text('Sales Summary').first;
+    await tester.ensureVisible(sales);
+    await tester.pumpAndSettle();
+    final before = api.gets.length;
+
+    await tester.enterText(searchBox, '101');
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(sales);
+    await tester.pump();
+    expect(searchBox, findsNothing);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+
+    await _openTab(tester, 'Order Summary');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(boxText(tester), isEmpty);
+    expect(find.byTooltip('Clear search'), findsNothing);
+    expect(api.gets.skip(before).where((g) => g.contains('search=')), isEmpty,
+        reason: 'the word typed before the tab change was sent after it');
+  }, variant: searchPlatforms);
+
+  // CLIENT ITEM 6 (2.0.2): the MIS search is one of the app's registered search
+  // boxes (test/search_clear_registry_test.dart). Its contract row lives here,
+  // beside the fixtures it needs: the x, pressed where it is drawn, must send
+  // the next report request without `search=`.
+  searchContractRows('reports-search', (tester, ds) async {
+    await tester.pumpWidget(const SizedBox());
+    useSearchView(tester, onPhone ? null : const Size(1400, 1000));
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final fake = _FakeApi();
+    final auth = AuthController(api: fake);
+    await auth.login('CSR Organics', 'admin', 'admin123');
+    await tester.pumpWidget(searchThemed(
+      ds,
+      ModuleNavigator(
+        openModule: (_, {Map<String, dynamic>? target}) {},
+        visibleLabels: const ['Reports', 'History', 'Accounting'],
+        clearFocus: () {},
+        switchOutlet: (_) {},
+        child: Scaffold(backgroundColor: Colors.transparent, body: m.reportsModule(RestClient(auth), auth.profile!)),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    // The report it opens on reads a search (Gaia spells the tab names its own
+    // way, so the row does not go looking for one).
+    return SearchSurface(
+      field: find.byKey(const ValueKey('reports-search')),
+      typed: '101',
+      filtered: () => fake.gets.lastWhere((g) => g.contains('/reports/mis/')).contains('search='),
+    );
   });
 
   // ------------------------------------------------- pure export rendering --

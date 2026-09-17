@@ -81,7 +81,11 @@ Finder _searchField() =>
     find.ancestor(of: find.text('Search menu…'), matching: find.byType(TextField));
 
 void main() {
-  testWidgets('Escape while typing in a search box neither navigates nor loses the text',
+  // CLIENT ITEM 6 (2.0.2): the search box opted in, as this shell always
+  // allowed a field to — Escape on a box with text now CLEARS it. What has not
+  // changed: Escape while typing never navigates, whether the box has text or
+  // has just been emptied.
+  testWidgets('Escape while typing in a search box clears it, and never navigates',
       (tester) async {
     final auth = await _signIn(_menuRoutes);
     await _pumpShell(tester, auth);
@@ -96,10 +100,18 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     await tester.pumpAndSettle();
 
-    // Still on Menu — and the query the operator typed is still in the box.
+    // Still on Menu, the box is empty and the whole menu is back.
     expect(_activeTab(tester), 'Menu');
-    expect(find.widgetWithText(TextField, 'pan'), findsOneWidget);
-    expect(find.text('Search results'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'pan'), findsNothing);
+    expect(find.text('Search results'), findsNothing);
+    final box = tester.widget<EditableText>(find.descendant(of: _searchField(), matching: find.byType(EditableText)));
+    expect(box.controller.text, isEmpty);
+    expect(box.focusNode.hasFocus, isTrue, reason: 'the caret stays for the next word');
+
+    // A second Escape, on the empty box the caret is still in: still Menu.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(_activeTab(tester), 'Menu');
   });
 
   testWidgets('Escape outside a text field still walks the back trail', (tester) async {

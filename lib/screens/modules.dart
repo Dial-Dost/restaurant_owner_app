@@ -41,6 +41,7 @@ import '../services/tz_offsets.dart';
 import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/app_search_field.dart';
 import '../ui/widgets/charts.dart';
 import '../ui/widgets/date_range_picker.dart';
 import '../ui/widgets/empty_state.dart';
@@ -3921,14 +3922,48 @@ List<Map<String, dynamic>> _parseMenuRows(List<List<String>> rows) {
   return items;
 }
 
-Widget menuModule(RestClient rest, Profile p) {
-  // Selected category tab (0 = All). Captured by the builder closure so the
-  // choice survives AsyncView reloads after edits.
-  var tab = 0;
-  // Live search text — also captured, so a reload (edit/toggle/delete) keeps
-  // the operator inside the same result set.
-  var query = '';
-  return AsyncView<Map<String, dynamic>>(
+Widget menuModule(RestClient rest, Profile p) => _MenuModule(rest: rest, profile: p);
+
+/// The Menu module. A StatefulWidget for one reason: HomeShell calls
+/// `menuModule(rest, p)` on EVERY build of the shell, and the shell rebuilds on
+/// any MediaQuery change — the phone keyboard sliding away after a search, a
+/// window resize — and on any of its own setStates. When the tab and the search
+/// were locals of that function, each of those rebuilds made fresh ones, and the
+/// operator's search was wiped the moment the keyboard went down to show the
+/// results (CLIENT ITEM 6, 2.0.2). Held here, only a deliberate remount (the
+/// shell's refresh) starts the Menu afresh.
+class _MenuModule extends StatefulWidget {
+  const _MenuModule({required this.rest, required this.profile});
+
+  final RestClient rest;
+  final Profile profile;
+
+  @override
+  State<_MenuModule> createState() => _MenuModuleState();
+}
+
+class _MenuModuleState extends State<_MenuModule> {
+  // Selected category tab (0 = All). Survives AsyncView reloads after edits.
+  int tab = 0;
+  // The search the list is filtered on — also kept, so a reload (edit/toggle/
+  // delete) leaves the operator inside the same result set. Written only by
+  // the search box; the empty state's "Clear search" clears the box.
+  String query = '';
+  // Owned here rather than by the box: the box sits in a lazily built list and
+  // can be built away and back while the search should stay.
+  final TextEditingController _search = TextEditingController();
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rest = widget.rest;
+    final p = widget.profile;
+    return AsyncView<Map<String, dynamic>>(
       load: () async {
         final items = await rest.getList('/menu');
         // Enrich each item with its theoretical cost + margin (recipe/BOM based).
@@ -4419,7 +4454,12 @@ Widget menuModule(RestClient rest, Profile p) {
                 ForkButton.ghost(label: 'Queue pre-order menu', icon: Icons.timer_outlined, dense: true, onPressed: queueMenu),
               ]),
               const SizedBox(height: AppSpacing.lg),
-              _MenuSearchField(initial: query, onChanged: (v) => setTab(() => query = v)),
+              AppSearchField(
+                testId: 'menu-search',
+                hint: 'Search menu…',
+                controller: _search,
+                onQuery: (q) => setTab(() => query = q),
+              ),
               if (cats.isNotEmpty && !searching) ...[
                 const SizedBox(height: AppSpacing.xl),
                 ForkTabs(tabs: tabs, selected: tab, onSelected: (i) => setTab(() => tab = i)),
@@ -4435,7 +4475,7 @@ Widget menuModule(RestClient rest, Profile p) {
                       label: 'Clear search',
                       icon: Icons.clear,
                       dense: true,
-                      onPressed: () => setTab(() => query = ''),
+                      onPressed: _search.clear,
                     ),
                   )
                 else ...[
@@ -4467,62 +4507,6 @@ Widget menuModule(RestClient rest, Profile p) {
           );
         });
       },
-    );
-}
-
-// Menu search box. Owns (and disposes) its controller; [initial] seeds it and
-// re-syncs when the module clears the query from elsewhere (the empty-state
-// "Clear search" action), mirroring the order-entry search idiom.
-class _MenuSearchField extends StatefulWidget {
-  const _MenuSearchField({required this.initial, required this.onChanged});
-
-  final String initial;
-  final ValueChanged<String> onChanged;
-
-  @override
-  State<_MenuSearchField> createState() => _MenuSearchFieldState();
-}
-
-class _MenuSearchFieldState extends State<_MenuSearchField> {
-  late final TextEditingController _c = TextEditingController(text: widget.initial);
-
-  @override
-  void didUpdateWidget(_MenuSearchField old) {
-    super.didUpdateWidget(old);
-    if (widget.initial != _c.text) _c.text = widget.initial;
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  void _set(String v) {
-    widget.onChanged(v);
-    setState(() {/* refresh the clear button */});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return TextField(
-      controller: _c,
-      decoration: InputDecoration(
-        prefixIcon: const Icon(Icons.search, size: 18),
-        hintText: 'Search menu…',
-        isDense: true,
-        suffixIcon: _c.text.isEmpty
-            ? null
-            : IconButton(
-                icon: const Icon(Icons.clear, size: 18),
-                tooltip: 'Clear search',
-                onPressed: () {
-                  _c.clear();
-                  _set('');
-                },
-              ),
-      ),
-      onChanged: _set,
     );
   }
 }
@@ -5857,7 +5841,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
   // The term the SERVER is filtering on (the field debounces into it), so a
   // search spans the whole trail rather than the pages scrolled in so far.
   String _query = '';
-  Timer? _debounce;
 
   // Mirrors the backend's Audit_log_category enum, in the same order the web
   // dashboard lists it. 'All' is the absence of the filter, not a value.
@@ -5900,7 +5883,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
 
   @override
   void dispose() {
-    _debounce?.cancel();
     _scroll.dispose();
     _search.dispose();
     super.dispose();
@@ -6004,16 +5986,13 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
     if (pos.pixels >= pos.maxScrollExtent - 400) _load(append: true);
   }
 
-  // Typing re-queries the SERVER, so it filters the whole trail; the debounce
-  // keeps that to one request per pause rather than one per keystroke.
-  void _onSearchChanged(String v) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 300), () {
-      final next = v.trim();
-      if (!mounted || next == _query) return;
-      setState(() => _query = next);
-      _load();
-    });
+  // Typing re-queries the SERVER, so it filters the whole trail; the box's
+  // debounce keeps that to one request per pause rather than one per
+  // keystroke, and an emptied box re-queries at once.
+  void _onSearchQuery(String next) {
+    if (!mounted || next == _query) return;
+    setState(() => _query = next);
+    _load();
   }
 
   /// Every filter change funnels through here, because all of them share one
@@ -6121,8 +6100,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       _query.isNotEmpty || _category != 'All' || _from.isNotEmpty || _to.isNotEmpty;
 
   void _clearFilters() {
-    _search.clear();
-    _debounce?.cancel();
     _applyFilters(() {
       _preset = 0;
       _from = '';
@@ -6130,6 +6107,9 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       _category = 'All';
       _query = '';
     });
+    // After the reload above, so the box's '' finds the query already empty
+    // and does not send a second request.
+    _search.clear();
   }
 
   /// The window in words, in the RESTAURANT's zone — so the reader can tell a
@@ -6228,14 +6208,12 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-        child: TextField(
+        child: AppSearchField(
+          testId: 'audit-search',
+          hint: 'Filter by action, employee, or detail…',
           controller: _search,
-          decoration: const InputDecoration(
-            prefixIcon: Icon(Icons.search, size: 18),
-            hintText: 'Filter by action, employee, or detail…',
-            isDense: true,
-          ),
-          onChanged: _onSearchChanged,
+          debounce: const Duration(milliseconds: 300),
+          onQuery: _onSearchQuery,
         ),
       ),
       Padding(
@@ -15262,7 +15240,6 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
   String _sort = 'recent';
   String _segment = 'all';
   String _query = '';
-  Timer? _debounce;
 
   @override
   void initState() {
@@ -15289,7 +15266,6 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
 
   @override
   void dispose() {
-    _debounce?.cancel();
     _scroll.dispose();
     _searchField.dispose();
     super.dispose();
@@ -15441,14 +15417,22 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
     _load();
   }
 
-  void _onSearchChanged(String v) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 300), () {
-      final next = v.trim();
-      if (!mounted || next == _query) return;
-      _applyFilter(() => _query = next);
-    });
+  void _onSearchQuery(String next) {
+    if (!mounted || next == _query) return;
+    _applyFilter(() => _query = next);
   }
+
+  /// The one Guests search box, for both design systems: the Rustic column and
+  /// the Gaia bokeh list each place it, and the x, the debounce and the
+  /// clearing are the same in both. The controller is the State's because the
+  /// Gaia list builds the box lazily.
+  Widget _guestSearch() => AppSearchField(
+        testId: 'guests-search',
+        hint: 'Find a guest by name, phone or email…',
+        controller: _searchField,
+        debounce: const Duration(milliseconds: 300),
+        onQuery: _onSearchQuery,
+      );
 
   /// The number on a segment tab, or null when there is no honest one to show.
   ///
@@ -15519,15 +15503,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-        child: TextField(
-          controller: _searchField,
-          decoration: const InputDecoration(
-            prefixIcon: Icon(Icons.search, size: 18),
-            hintText: 'Find a guest by name, phone or email…',
-            isDense: true,
-          ),
-          onChanged: _onSearchChanged,
-        ),
+        child: _guestSearch(),
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -15606,15 +15582,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
               titleEmphasis: 'book.',
               sub: _spendBasis.isEmpty ? null : 'Spend basis \u00b7 $_spendBasis',
             ),
-            GaiaSearchField(
-              controller: _searchField,
-              hint: 'Find a guest by name, phone or email',
-              onChanged: _onSearchChanged,
-              onClear: () {
-                _searchField.clear();
-                _onSearchChanged('');
-              },
-            ),
+            _guestSearch(),
             const SizedBox(height: 14),
             Wrap(spacing: 6, runSpacing: 8, children: [
               for (final seg in _customerSegments)
@@ -21548,10 +21516,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   List _deliveries = [];
 
   // Settled-bill browser. The list is paged by _ClosedBillsList itself; this
-  // state only holds what the user filters it by. The term is applied on a
-  // short debounce so typing doesn't fire a request per keystroke.
+  // state only holds what the user filters it by. The box applies the term on
+  // a short debounce so typing doesn't fire a request per keystroke. The
+  // controller is kept here because the page is a lazily built list.
   final TextEditingController _billSearch = TextEditingController();
-  Timer? _billDebounce;
   String _billTerm = '';
   String? _billMethod;
 
@@ -21568,7 +21536,6 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
 
   @override
   void dispose() {
-    _billDebounce?.cancel();
     _billSearch.dispose();
     _scroll.dispose();
     super.dispose();
@@ -22445,34 +22412,14 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         const SizedBox(height: AppSpacing.md),
         Row(children: [
           Expanded(
-            child: TextField(
+            // The x follows the BOX, not the debounced term: it is there from
+            // the first keystroke (it used to wait out the 350ms).
+            child: AppSearchField(
+              testId: 'bills-search',
+              hint: 'Search bill no, table, customer…',
               controller: _billSearch,
-              decoration: InputDecoration(
-                isDense: true,
-                hintText: 'Search bill no, table, customer…',
-                prefixIcon: Icon(Icons.search, size: 18, color: AppColors.textTertiary),
-                suffixIcon: _billTerm.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close, size: 16),
-                        tooltip: 'Clear search',
-                        onPressed: () {
-                          _billDebounce?.cancel();
-                          _billSearch.clear();
-                          setState(() => _billTerm = '');
-                        },
-                      ),
-              ),
-              onChanged: (v) {
-                _billDebounce?.cancel();
-                _billDebounce = Timer(const Duration(milliseconds: 350), () {
-                  if (mounted) setState(() => _billTerm = v.trim());
-                });
-              },
-              onSubmitted: (v) {
-                _billDebounce?.cancel();
-                setState(() => _billTerm = v.trim());
-              },
+              debounce: const Duration(milliseconds: 350),
+              onQuery: (q) => setState(() => _billTerm = q),
             ),
           ),
           if (byMethod.isNotEmpty) ...[
@@ -32968,7 +32915,6 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
   // Seeded from the bundled table so the picker works offline, then replaced by
   // the server's list (the authority on what POST /restaurant/settings accepts).
   List<String> _zones = tzZoneNames;
-  final _search = TextEditingController();
   String _query = '';
 
   @override
@@ -32978,12 +32924,6 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
       final list = [for (final z in (m['timezones'] as List?) ?? const []) '$z'];
       if (mounted && list.isNotEmpty) setState(() => _zones = list);
     }).catchError((_) {/* offline — the bundled list still works */});
-  }
-
-  @override
-  void dispose() {
-    _search.dispose();
-    super.dispose();
   }
 
   @override
@@ -33008,15 +32948,11 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
             const SizedBox(height: 6),
             Text('Restaurant timezone', style: text.titleMedium),
             const SizedBox(height: AppSpacing.lg),
-            TextField(
-              controller: _search,
+            AppSearchField(
+              testId: 'tz-search',
+              label: 'Search (city or region)',
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Search (city or region)',
-                prefixIcon: Icon(Icons.search, size: 18),
-                isDense: true,
-              ),
-              onChanged: (v) => setState(() => _query = v),
+              onQuery: (q) => setState(() => _query = q),
             ),
             const SizedBox(height: AppSpacing.md),
             if (shown.isEmpty)
