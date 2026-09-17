@@ -115,9 +115,10 @@ Future<_FakeApi> _mount(
   List<String> actions = const ['*'],
   String role = 'admin',
   List<String> labels = const ['Tables', 'Orders', 'Menu', 'Settings'],
+  Size size = const Size(1400, 1400),
 }) async {
   await tester.pumpWidget(const SizedBox());
-  tester.view.physicalSize = const Size(1400, 1400);
+  tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
@@ -260,8 +261,10 @@ Future<_FakeApi> _openSettle(
   Map<String, dynamic>? tenders,
   List<String> actions = const ['*'],
   String role = 'admin',
+  Size size = const Size(1400, 1400),
 }) async {
-  final api = await _mount(tester, m.tablesModule, _routes(bill: bill, tenders: tenders), actions: actions, role: role);
+  final api = await _mount(tester, m.tablesModule, _routes(bill: bill, tenders: tenders),
+      actions: actions, role: role, size: size);
   await _openTable(tester);
   await _reveal(tester, find.text('Settle bill'));
   await tester.tap(find.text('Settle bill'));
@@ -277,6 +280,19 @@ Future<void> _tapVisible(WidgetTester tester, Key key) async {
   await tester.tap(find.byKey(key));
   await tester.pumpAndSettle();
 }
+
+/// Would a finger on [finder]'s centre land on it? False when it is clipped,
+/// covered, or under the keyboard's part of the screen.
+bool _reachable(WidgetTester tester, Finder finder) {
+  final target = tester.renderObject(finder);
+  return tester.hitTestOnBinding(tester.getCenter(finder)).path.any((e) => identical(e.target, target));
+}
+
+/// [key] inside the settle dialog's SCROLL, rather than pinned around it.
+Finder _inSheetScroll(Key key) => find.descendant(
+      of: find.descendant(of: find.byType(Dialog), matching: find.byType(SingleChildScrollView)),
+      matching: find.byKey(key),
+    );
 
 /// Choose NC and fill its form.
 Future<void> _fillNc(WidgetTester tester, {String kind = 'staff_meal', String reason = 'Team dinner', bool tapPill = true}) async {
@@ -549,6 +565,89 @@ void main() {
       expect(find.textContaining('Billing needs a connection'), findsOneWidget);
       expect(find.byKey(const ValueKey('pay-settle-nc')), findsOneWidget);
       expect(api.writes, isEmpty);
+    });
+  });
+
+  // A PHONE WITH THE KEYBOARD UP. The tests above pump at 1400x1400. At
+  // 360x640 a 260px keyboard leaves the dialog about 300px, and NC mode pinned
+  // a four-line paragraph under its headline (plus a four-line refusal while
+  // the form was incomplete): the enabled "Settle as NC" was pushed under the
+  // keyboard, 69px of overflow with the form complete.
+  group('the settle sheet on a phone', () {
+    const phone = Size(360, 640);
+
+    /// NC and a kind are chosen first (no keyboard), then the reason field is
+    /// tapped: the keyboard comes up, and the reason is typed under it.
+    Future<_FakeApi> ncWithKeyboard(WidgetTester tester, {required double keyboard, String? reason}) async {
+      final api = await _openSettle(tester, bill: _bill(ncTotal: 240), size: phone);
+      await _tapVisible(tester, const ValueKey('pay-method-NC'));
+      await _tapVisible(tester, const ValueKey('pay-nc-kind-staff_meal'));
+      tester.view.viewInsets = FakeViewPadding(bottom: keyboard);
+      await tester.pumpAndSettle();
+      await tester.showKeyboard(find.byKey(const ValueKey('pay-nc-reason')));
+      await tester.pumpAndSettle();
+      if (reason != null) {
+        await tester.enterText(find.byKey(const ValueKey('pay-nc-reason')), reason);
+        await tester.pumpAndSettle();
+      }
+      return api;
+    }
+
+    testWidgets('a complete form: nothing overflows, and "Settle as NC" is above the keyboard', (tester) async {
+      final api = await ncWithKeyboard(tester, keyboard: 260, reason: 'Team dinner');
+      expect(tester.takeException(), isNull, reason: 'the NC form overflowed its dialog');
+      final settle = find.byKey(const ValueKey('pay-settle-nc'));
+      expect(_pressOf(tester, const ValueKey('pay-settle-nc')), isNotNull);
+      expect(tester.getRect(settle).bottom, lessThanOrEqualTo(640.0 - 260),
+          reason: 'the button is under the keyboard');
+      expect(_reachable(tester, settle), isTrue);
+      // The headline's figure is pinned; what it is made of scrolls.
+      expect(find.byKey(const ValueKey('pay-nc-headline')), findsOneWidget);
+      expect(_inSheetScroll(const ValueKey('pay-nc-headline')), findsNothing);
+      expect(_inSheetScroll(const ValueKey('pay-nc-explanation')), findsOneWidget);
+
+      await tester.tap(settle);
+      await tester.pumpAndSettle();
+      expect(api.writes.where((w) => w.path.contains('settle-nc')), hasLength(1));
+    });
+
+    testWidgets('an incomplete form: its refusal scrolls while the keyboard is up, and is pinned again after',
+        (tester) async {
+      await ncWithKeyboard(tester, keyboard: 300);
+      expect(tester.takeException(), isNull, reason: 'the refusal pushed the form out of its dialog');
+      expect(_inSheetScroll(const ValueKey('pay-refusal')), findsOneWidget);
+      expect(tester.getRect(find.byKey(const ValueKey('pay-settle-nc'))).bottom, lessThanOrEqualTo(640.0 - 300));
+
+      tester.view.viewInsets = FakeViewPadding.zero;
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(find.byKey(const ValueKey('pay-refusal')), findsOneWidget);
+      expect(_inSheetScroll(const ValueKey('pay-refusal')), findsNothing,
+          reason: 'with room to spare the reason stands beside the button');
+    });
+
+    testWidgets('pressing "Settle as NC" puts the keyboard away, so its refusal is read beside the button',
+        (tester) async {
+      final api = await ncWithKeyboard(tester, keyboard: 260, reason: 'Team dinner');
+      expect(tester.testTextInput.isVisible, isTrue);
+      api.failOn = 'settle-nc';
+      api.failMessage = 'Another device changed this bill at the same moment. Refresh it and try again.';
+      api.failStatus = 409;
+      await tester.tap(find.byKey(const ValueKey('pay-settle-nc')));
+      await tester.pumpAndSettle();
+      expect(tester.testTextInput.isVisible, isFalse, reason: 'the keyboard stayed up over the refusal');
+      expect(find.text(api.failMessage), findsOneWidget);
+    });
+
+    testWidgets('the payment form fits too, with its approval line', (tester) async {
+      await _openSettle(tester, size: phone);
+      tester.view.viewInsets = const FakeViewPadding(bottom: 260);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull, reason: 'the payment form overflowed its dialog');
+      expect(_inSheetScroll(const ValueKey('pay-method-NC')), findsOneWidget);
+      expect(find.descendant(of: find.byType(SingleChildScrollView), matching: find.text('Approval is required before the bill closes and the table frees.')),
+          findsOneWidget);
+      expect(_reachable(tester, find.byKey(const ValueKey('pay-settle'))), isTrue);
     });
   });
 

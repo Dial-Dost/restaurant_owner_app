@@ -2020,6 +2020,12 @@ class _PaymentSheetState extends State<_PaymentSheet> {
 
   // ---- acts ----------------------------------------------------------------
 
+  /// A press that writes puts the keyboard away first. With the keyboard up,
+  /// the refusal and error lines ride at the foot of the scroll (see [build]),
+  /// where a line that explains a failed settle could sit below the fold. With
+  /// the keyboard down, they stand beside the button again.
+  void _putKeyboardAway() => FocusManager.instance.primaryFocus?.unfocus();
+
   void _addPart() {
     final c = _composed;
     if (c == null || _tenderCount >= _maxTenders) return;
@@ -2040,6 +2046,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// the table stays open. It is the whole reason POST /bills/tenders exists
   /// separately from the settle.
   Future<void> _recordPartPayment() async {
+    _putKeyboardAway();
     final tenders = _allDrafts;
     if (tenders.isEmpty) return;
     final messenger = ScaffoldMessenger.of(context);
@@ -2103,6 +2110,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// Settle, approve and close — the same three calls the old dialog made, with
   /// the body chosen by [_isSimpleSettle].
   Future<void> _settleAndClose() async {
+    _putKeyboardAway();
     final refusal = _settleRefusal;
     if (refusal != null) {
       setState(() => _error = refusal);
@@ -2174,6 +2182,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// there is no approve and no close to send. Refused offline like every
   /// `/bills` write (OutboxPolicy), and never queued.
   Future<void> _settleAsNc() async {
+    _putKeyboardAway();
     final refusal = _ncRefusal;
     if (refusal != null) {
       setState(() => _error = refusal);
@@ -2269,9 +2278,48 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final width = MediaQuery.sizeOf(context).width;
+    // THE KEYBOARD HALVES THIS DIALOG ON A PHONE, and only the middle of it
+    // scrolls. At 360x640 with the keyboard up there is about 300px for the
+    // headline, the form and the buttons. A four-line refusal pinned beside
+    // the button pushed the button under the keyboard. So did the NC
+    // headline's paragraph, which is why that paragraph is always in the
+    // scroll now. While the keyboard is up, the error, refusal and approval
+    // lines ride at the foot of the scroll, still directly above the buttons.
+    // A press that writes puts the keyboard away first ([_putKeyboardAway]),
+    // so a failed settle's reason is pinned beside the button again.
+    //
+    // Read here, above the Dialog, which strips the insets from its child.
+    // The Dialog follows the keyboard with no animation of its own (below).
+    // With its default 100ms lag, the lines were pinned again while the dialog
+    // was still keyboard-short, and it overflowed for those frames.
+    final keyboardUp = MediaQuery.viewInsetsOf(context).bottom > 0;
+    final notes = <Widget>[
+      if (_error != null) ...[
+        const SizedBox(height: 10),
+        Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
+      ],
+      // WHY "Settle & close" IS GREY, standing next to it. A disabled
+      // primary button on a money screen with no reason beside it is
+      // the dead-looking control this app has been bitten by before —
+      // and here the reason is always something the cashier can act
+      // on: take the rest, or record what has been paid.
+      if (_error == null && _refusalNow != null) ...[
+        const SizedBox(height: 10),
+        Text(_refusalNow!,
+            key: const ValueKey('pay-refusal'),
+            style: text.bodySmall!.copyWith(color: AppColors.warning)),
+      ],
+      // No approval follows an NC settle — nothing was taken.
+      if (!_ncMode) ...[
+        const SizedBox(height: AppSpacing.md),
+        Text('Approval is required before the bill closes and the table frees.', style: text.bodySmall),
+      ],
+    ];
     return Dialog(
       backgroundColor: Colors.transparent,
       insetPadding: const EdgeInsets.all(AppSpacing.lg),
+      // The keyboard's insets already move frame by frame on a phone.
+      insetAnimationDuration: Duration.zero,
       child: Container(
         width: math.min(480, width - 32),
         constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.9),
@@ -2291,6 +2339,10 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                 Flexible(
                   child: SingleChildScrollView(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                      if (_ncMode) ...[
+                        _ncExplanation(text),
+                        const SizedBox(height: AppSpacing.lg),
+                      ],
                       if (_counters.isNotEmpty) ...[
                         _tillRow(text),
                         const SizedBox(height: AppSpacing.lg),
@@ -2314,31 +2366,12 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                       // the pills alone, so NC can be chosen.
                       else if (_mayNc)
                         _methodPills(text, _busy || _uploading),
+                      if (keyboardUp) ...notes,
                     ]),
                   ),
                 ),
-                if (_error != null) ...[
-                  const SizedBox(height: 10),
-                  Text(_error!, style: text.bodySmall!.copyWith(color: AppColors.danger)),
-                ],
-                // WHY "Settle & close" IS GREY, standing next to it. A disabled
-                // primary button on a money screen with no reason beside it is
-                // the dead-looking control this app has been bitten by before —
-                // and here the reason is always something the cashier can act
-                // on: take the rest, or record what has been paid.
-                if (_error == null && _refusalNow != null) ...[
-                  const SizedBox(height: 10),
-                  Text(_refusalNow!,
-                      key: const ValueKey('pay-refusal'),
-                      style: text.bodySmall!.copyWith(color: AppColors.warning)),
-                ],
+                if (!keyboardUp) ...notes,
                 const SizedBox(height: AppSpacing.md),
-                // No approval follows an NC settle — nothing was taken.
-                if (!_ncMode) ...[
-                  Text('Approval is required before the bill closes and the table frees.',
-                      style: text.bodySmall),
-                  const SizedBox(height: AppSpacing.md),
-                ],
                 _actions(text),
               ]),
       ),
@@ -2398,11 +2431,9 @@ class _PaymentSheetState extends State<_PaymentSheet> {
 
   /// THE NC HEADLINE: nothing to pay, and what is being given away — the
   /// server's own figures off the open bill. What the guest would have paid is
-  /// said once, as information, and is in no report.
+  /// said once, as information, and is in no report ([_ncExplanation]).
   Widget _ncHeadline(TextTheme text) {
     final given = NcSettle.givenAway(_ncBill);
-    final would = NcSettle.wouldHaveCharged(_ncBill);
-    final comped = NcSettle.alreadyComped(_ncBill);
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text(
         widget.tableName.isEmpty ? 'SETTLE AS NC' : 'SETTLE AS NC · TABLE ${widget.tableName.toUpperCase()}',
@@ -2412,14 +2443,22 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       Text(NcSettle.headline(given, (v) => _money(v)),
           key: const ValueKey('pay-nc-headline'),
           style: text.titleLarge!.copyWith(color: AppColors.copperHi)),
-      const SizedBox(height: 6),
-      Text(
-        'Before tax, at the prices on the bill'
-        '${comped > 0 ? ', including ${_money(comped)} already comped dish by dish' : ''}.'
-        '${would > 0 ? ' The guest would have paid ${_money(would)} with service charge and tax — information only; it is in no report.' : ''}',
-        style: text.bodySmall,
-      ),
     ]);
+  }
+
+  /// What the NC headline's figure is made of, and what the guest would have
+  /// paid. The first thing in the SCROLL, not pinned under the headline: it runs
+  /// to four lines on a phone (see [build]).
+  Widget _ncExplanation(TextTheme text) {
+    final would = NcSettle.wouldHaveCharged(_ncBill);
+    final comped = NcSettle.alreadyComped(_ncBill);
+    return Text(
+      'Before tax, at the prices on the bill'
+      '${comped > 0 ? ', including ${_money(comped)} already comped dish by dish' : ''}.'
+      '${would > 0 ? ' The guest would have paid ${_money(would)} with service charge and tax — information only; it is in no report.' : ''}',
+      key: const ValueKey('pay-nc-explanation'),
+      style: text.bodySmall,
+    );
   }
 
   Widget _tillRow(TextTheme text) {
