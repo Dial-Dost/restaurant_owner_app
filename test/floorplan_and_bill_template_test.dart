@@ -6,7 +6,7 @@
 // the floor plan."
 //
 // D5 had already moved the CONTROLS apart. What it left behind was one tile for
-// both screens, so the Floor plan still painted the live floor (Occupied, the
+// both screens, so the Floor plan still painted the live floor (Running, the
 // bill, covers, the waiter) and a tap on it opened the service sheet with the
 // order, the bill and Settle. These tests pin the Floor plan as a layout editor
 // and the Tables screen as unchanged.
@@ -192,7 +192,10 @@ void main() {
 
       expect(find.text('T1'), findsWidgets);
       expect(painted, contains('4 seats · max 6'));
-      for (final live in ['Occupied', 'Seated', 'Reserved', 'Free', '₹', 'covers', 'APC', 'OTP', 'Ravi', 'PAID']) {
+      for (final live in [
+        'Occupied', 'Running', 'Bill printed', 'Printed', 'Seated', 'Reserved', 'Free', '₹', 'covers',
+        'APC', 'OTP', 'Ravi', 'PAID',
+      ]) {
         expect(painted.contains(live), isFalse, reason: 'the Floor plan showed "$live": $painted');
       }
     });
@@ -202,7 +205,7 @@ void main() {
       final painted = _painted(tester).join(' | ');
       expect(painted, contains('1 table'));
       expect(painted, contains('4 seats'));
-      expect(RegExp(r'\d+\s+(Occupied|Seated|Reserved|Free)').hasMatch(painted), isFalse);
+      expect(RegExp(r'\d+\s+(Occupied|Running|Bill printed|Seated|Reserved|Free)').hasMatch(painted), isFalse);
     });
 
     testWidgets('it does not even read who is waiting on a table or which booking it is in', (tester) async {
@@ -243,7 +246,9 @@ void main() {
     testWidgets('the Tables screen still shows the live floor, unchanged', (tester) async {
       await _mount(tester, plan: false);
       final painted = _painted(tester).join(' | ');
-      expect(painted, contains('Occupied'));
+      // "Running" since 2.0.2 (client items 1 and 2) — the state that was
+      // "Occupied", in its own fixed ink.
+      expect(painted, contains('Running'));
       expect(painted, contains('3 covers'));
       expect(painted, contains('₹1380.00'));
       expect(_button('Edit seating'), findsNothing);

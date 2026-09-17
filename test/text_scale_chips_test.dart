@@ -264,7 +264,8 @@ void main() {
             reason: 'the table tile overflowed at ${width}px / ${scale}x');
         // Still a usable tile: the name, the state and the seat guide survive.
         expect(find.text('T1'), findsOneWidget, reason: 'name lost at ${width}px / ${scale}x');
-        expect(find.text('Occupied'), findsNWidgets(2), reason: 'status lost at ${width}px / ${scale}x');
+        // "Running" since 2.0.2 (client items 1 and 2), drawn as a FloorChip.
+        expect(find.text('Running'), findsNWidgets(2), reason: 'status lost at ${width}px / ${scale}x');
         expect(find.text('12 seats · max 20'), findsNWidgets(2),
             reason: 'seat chip lost at ${width}px / ${scale}x');
         // Legible, not micro-typed away: the seat label is drawn at the scaled

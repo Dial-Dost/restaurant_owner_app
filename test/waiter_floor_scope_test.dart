@@ -408,7 +408,7 @@ void main() {
       expect(find.textContaining('apc'), findsNothing);
       expect(find.text('APC low'), findsNothing);
       // The table is still legibly a table: state, covers and the seat guide.
-      expect(find.text('Occupied'), findsWidgets);
+      expect(find.text('Running'), findsWidgets);
       expect(find.text('3 covers'), findsOneWidget);
     });
 
@@ -978,7 +978,7 @@ void main() {
 
   // THE "FLOOR PLAN" STRIP AT THE TOP OF TABLES.
   //
-  // "27 tables · 4 Occupied · 0 Reserved · 23 Free" is a fact about the
+  // "27 tables · 4 Running · 8 Bill printed · 23 Free" is a fact about the
   // RESTAURANT, sitting at the top of the screen a waiter lands on, above a grid
   // that is otherwise about their own tables. It also reads as a control: a
   // header, with a count, in exactly the place the floor-layout controls live
@@ -989,12 +989,13 @@ void main() {
   // failure this pins against is not "a waiter saw a chip", it is "the fix took
   // the floor read-out away from the person who runs the floor".
   group('the floor-plan summary strip', () {
-    // The SUMMARY chips are count-prefixed — '4 Occupied', '23 Free' — while an
-    // individual table tile carries a bare 'Occupied'. Matching the count is
+    // The SUMMARY chips are count-prefixed — '4 Running', '23 Free' — while an
+    // individual table tile (and a waiter's colour key) carries a bare
+    // 'Running'. Matching the count is
     // what separates "the house read-out is gone" from "the waiter can no longer
     // tell whether their own table is taken", which would be a far worse bug
     // than the one being fixed.
-    final summaryChip = RegExp(r'\d+\s+(Occupied|Reserved|Free)');
+    final summaryChip = RegExp(r'\d+\s+(Occupied|Running|Bill printed|Seated|Reserved|Free)');
 
     testWidgets('a waiter does not get it', (tester) async {
       await _mountFloor(tester, role: 'waiter');
