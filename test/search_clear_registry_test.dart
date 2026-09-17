@@ -612,8 +612,20 @@ void main() {
   test('the shared field is the only place an x is wired to a search', () {
     // Comments blanked, so the widget's own explanation cannot satisfy a check.
     final src = libSources.singleWhere((s) => s.path == 'lib/ui/widgets/app_search_field.dart').code;
-    // The listener is the only route from text to query …
-    expect(RegExp(r'_c\.addListener\(_onText\)').allMatches(src).length, 2);
+    // The listener is the only route from text to query, taken up in one
+    // place for the first controller and for any handed over later …
+    expect(RegExp(r'_c\.addListener\(_onText\)').allMatches(src).length, 1);
+    final listen = src.indexOf('void _listen() {');
+    expect(listen, greaterThan(0));
+    final added = src.indexOf('_c.addListener(_onText);', listen);
+    expect(added, greaterThan(listen));
+    expect(added, lessThan(src.indexOf('void dispose()', listen)), reason: 'the listener is taken up in _listen');
+    expect(RegExp(r'\b_listen\(\);').allMatches(src).length, 2);
+    // … what the screen has heard is kept with the controller, and a word
+    // still waiting keeps the box alive in a lazy list …
+    expect(src, contains('String get _heard => _heardBy[_c]'));
+    expect(src, contains('bool get wantKeepAlive => _pending != null;'));
+    expect(src, matches(RegExp(r'Widget build\(BuildContext context\) \{\s*super\.build\(context\);')));
     expect(src, isNot(contains('onChanged')));
     // … the x clears the controller and keeps the focus …
     expect(src, matches(RegExp(r'void _clear\(\) \{\s*_c\.clear\(\);\s*_focus\.requestFocus\(\);')));

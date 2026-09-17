@@ -36,6 +36,14 @@ import '../theme/app_colors.dart';
 ///     a parent rebuild cannot put a stale word back or wipe a live one.
 ///  5. One widget for both design systems. Gaia changes how it looks, never
 ///     how it clears.
+///  6. A word waiting out the debounce is not lost when the box is built away.
+///     While it waits, the box asks a lazily built list to keep it alive, as a
+///     focused TextField already does, so a fling past the list's cache
+///     (Settled bills, the Gaia guest list) still delivers it. And what the
+///     screen has heard is kept with the CONTROLLER, not with this State: a box
+///     built afresh over the same controller waits out a word its screen never
+///     heard, instead of taking it as sent. Nothing is sent once the box is
+///     gone, because the screen may be going with it.
 ///
 /// Escape clears a box that has text. On an empty box it is passed on,
 /// exactly as before: a dialog still closes, and the shell's back trail still
@@ -97,28 +105,43 @@ class AppSearchField extends StatefulWidget {
   State<AppSearchField> createState() => _AppSearchFieldState();
 }
 
-class _AppSearchFieldState extends State<AppSearchField> {
+class _AppSearchFieldState extends State<AppSearchField> with AutomaticKeepAliveClientMixin<AppSearchField> {
   TextEditingController? _owned;
   late TextEditingController _c;
   final FocusNode _focus = FocusNode(debugLabel: 'AppSearchField');
   late final Map<Type, Action<Intent>> _actions = {DismissIntent: _EscapeClears(this)};
   Timer? _pending;
 
-  /// The last query [AppSearchField.onQuery] was given. A screen that shows
-  /// its current query already knows it, so a new field does not repeat it.
-  late String _sent;
+  /// What each controller's screen has last been told, by whichever box was
+  /// showing it. Weak, so a controller that is dropped takes its entry along.
+  static final Expando<String> _heardBy = Expando<String>('AppSearchField.heard');
+
+  /// The last query [AppSearchField.onQuery] was given for [_c].
+  ///
+  /// This used to live on the State and start as the controller's text, on the
+  /// grounds that a screen already knows what its own controller holds. That
+  /// is true only while no box has had a word in it waiting. A box built away
+  /// mid-debounce took the word with it unsent, and the next box over the same
+  /// controller took it as sent. That box then showed "102" and its x over an
+  /// unfiltered list, and Enter did nothing, since "102" was the query it
+  /// believed was out already.
+  String get _heard => _heardBy[_c] ?? '';
+  set _heard(String query) => _heardBy[_c] = query;
 
   /// The text the listener last acted on. The controller also notifies on a
   /// caret move, which must not restart the debounce.
   late String _seen;
 
+  /// Keep this box while a word waits: a lazily built list would otherwise
+  /// dispose it, and the word, once it scrolled past the cache.
+  @override
+  bool get wantKeepAlive => _pending != null;
+
   @override
   void initState() {
     super.initState();
     _c = widget.controller ?? (_owned = TextEditingController(text: widget.initialQuery));
-    _seen = _c.text;
-    _sent = _c.text.trim();
-    _c.addListener(_onText);
+    _listen();
   }
 
   @override
@@ -127,28 +150,76 @@ class _AppSearchFieldState extends State<AppSearchField> {
     if (old.controller != widget.controller) {
       // A screen that hands over a different controller knows what it holds,
       // so it is taken as a fresh start rather than as an edit to report.
-      _pending?.cancel();
-      _pending = null;
+      // Handed back to an owned one, the box keeps its text, and with it what
+      // the screen has heard of that text.
+      _stopWaiting();
       _c.removeListener(_onText);
       final text = _c.text;
+      final heard = _heardBy[_c];
       _owned?.dispose();
       _owned = null;
-      _c = widget.controller ?? (_owned = TextEditingController(text: text));
-      _seen = _c.text;
-      _sent = _c.text.trim();
-      _c.addListener(_onText);
+      final given = widget.controller;
+      if (given != null) {
+        _c = given;
+      } else {
+        _c = _owned = TextEditingController(text: text);
+        _heardBy[_c] = heard;
+      }
+      _listen();
     }
     // Deliberately no `if (widget.initialQuery != _c.text) _c.text = ...`: that
     // re-seed is what let a shell rebuild wipe the Menu search.
   }
 
+  /// Starts on [_c]. A controller no box has shown before is the screen's own
+  /// start, so the screen knows what it holds: it is not news. A controller an
+  /// earlier box showed says what its screen heard, and a word the screen has
+  /// not heard is waited out again here, as if it had just been typed.
+  void _listen() {
+    _seen = _c.text;
+    final query = _c.text.trim();
+    final heard = _heardBy[_c];
+    if (heard == null) {
+      _heard = query;
+    } else if (heard != query) {
+      // Never sent from here: this runs inside a build, and the screen's
+      // setState is not allowed until it ends. So even an emptied box waits
+      // one timer tick.
+      _wait(query.isEmpty ? Duration.zero : widget.debounce);
+    }
+    _c.addListener(_onText);
+  }
+
   @override
   void dispose() {
+    // A word still waiting is dropped here, not sent. A lazy list keeps the
+    // box while a word waits, so what gets here mid-wait is a box whose screen
+    // may be going too, and a screen's onQuery must not run after that. A box
+    // built again over the same controller picks the word up (see _listen).
     _pending?.cancel();
+    _pending = null;
     _c.removeListener(_onText);
     _owned?.dispose();
     _focus.dispose();
     super.dispose();
+  }
+
+  void _wait(Duration delay) {
+    final wasWaiting = _pending != null;
+    _pending?.cancel();
+    _pending = Timer(delay, () {
+      _pending = null;
+      updateKeepAlive();
+      _send(_c.text.trim());
+    });
+    if (!wasWaiting) updateKeepAlive();
+  }
+
+  void _stopWaiting() {
+    if (_pending == null) return;
+    _pending!.cancel();
+    _pending = null;
+    updateKeepAlive();
   }
 
   void _onText() {
@@ -158,29 +229,24 @@ class _AppSearchFieldState extends State<AppSearchField> {
     _seen = text;
     if (hadText != text.isNotEmpty) setState(() {/* the x comes or goes */});
     if (text.trim().isEmpty) {
-      _pending?.cancel();
-      _pending = null;
+      _stopWaiting();
       _send('');
     } else if (widget.debounce == Duration.zero) {
+      _stopWaiting();
       _send(text.trim());
     } else {
-      _pending?.cancel();
-      _pending = Timer(widget.debounce, () {
-        _pending = null;
-        _send(_c.text.trim());
-      });
+      _wait(widget.debounce);
     }
   }
 
   void _send(String query) {
-    if (!mounted || query == _sent) return;
-    _sent = query;
+    if (!mounted || query == _heard) return;
+    _heard = query;
     widget.onQuery(query);
   }
 
   void _submit(String text) {
-    _pending?.cancel();
-    _pending = null;
+    _stopWaiting();
     _send(text.trim());
   }
 
@@ -191,6 +257,7 @@ class _AppSearchFieldState extends State<AppSearchField> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // the keep-alive above
     final gaia = Gaia.of(context);
     final compact = widget.compact;
     final glyph = compact ? 16.0 : 18.0;

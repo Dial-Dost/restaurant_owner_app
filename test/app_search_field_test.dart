@@ -215,6 +215,125 @@ void main() {
     expect(tester.takeException(), isNull);
   }, variant: searchPlatforms);
 
+  testWidgets('a box built away mid-debounce and back: the word its screen never heard is waited out again',
+      (tester) async {
+    // A screen that keeps its own controller (a box shown only for some
+    // reports, a row that moved) can lose the box while a word waits. The word
+    // is not sent from a box that is gone, but the next box over the same
+    // controller must not take it as sent: that box showed "102" and its x
+    // over an unfiltered list, and Enter did nothing.
+    final sent = <String>[];
+    final c = TextEditingController();
+    addTearDown(c.dispose);
+    Future<void> show(bool shown) => tester.pumpWidget(searchThemed(
+          DesignSystem.rustic,
+          Scaffold(
+            body: Column(children: [
+              if (shown)
+                AppSearchField(
+                  testId: 'probe',
+                  hint: 'Search bills…',
+                  controller: c,
+                  debounce: const Duration(milliseconds: 350),
+                  onQuery: sent.add,
+                ),
+            ]),
+          ),
+        ));
+    useSearchView(tester);
+    await show(true);
+    await tester.enterText(_field, '102');
+    await tester.pump(const Duration(milliseconds: 100));
+    await show(false);
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(sent, isEmpty, reason: 'nothing is sent from a box that is gone');
+
+    await show(true);
+    expect(searchBoxText(tester, _field), '102');
+    expect(_x, findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 349));
+    expect(sent, isEmpty, reason: 'the word waits out the debounce again, like fresh typing');
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(sent, ['102']);
+
+    // Again, and this time Enter: it sends at once, and only once.
+    await tester.enterText(_field, '1024');
+    await tester.pump(const Duration(milliseconds: 100));
+    await show(false);
+    await show(true);
+    await tester.showKeyboard(_field);
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pump();
+    expect(sent, ['102', '1024'], reason: 'Enter did nothing over a word the screen never heard');
+    await tester.pump(const Duration(seconds: 1));
+    expect(sent, ['102', '1024']);
+
+    // A word the screen DID hear is not news to the next box.
+    await show(false);
+    await show(true);
+    await tester.pump(const Duration(seconds: 1));
+    expect(sent, ['102', '1024']);
+
+    // An emptied box never waits, even one emptied while no box was listening:
+    // the next box tells the screen on the next timer tick (not from inside
+    // the build that made it, where the screen may not setState).
+    await show(false);
+    c.clear();
+    await show(true);
+    expect(sent, ['102', '1024']);
+    await tester.pump(Duration.zero);
+    expect(sent, ['102', '1024', '']);
+    expect(_x, findsNothing);
+    expect(tester.takeException(), isNull);
+  }, variant: searchPlatforms);
+
+  testWidgets('a box scrolled out of a lazy list mid-debounce still delivers its word, then lets go', (tester) async {
+    // Settled bills sits in the Accounting ListView and the Gaia guest box in
+    // the guest list. A fling past the list's cache disposes whatever it
+    // passes, and a box that had lost the caret (a click on the list, the
+    // phone keyboard put away) is not kept alive by the TextField itself.
+    final sent = <String>[];
+    final c = TextEditingController();
+    final scroll = ScrollController();
+    addTearDown(c.dispose);
+    addTearDown(scroll.dispose);
+    await _pump(
+      tester,
+      ListView(controller: scroll, children: [
+        AppSearchField(
+          testId: 'probe',
+          hint: 'Search bill no, table, customer…',
+          controller: c,
+          debounce: const Duration(milliseconds: 350),
+          onQuery: sent.add,
+        ),
+        for (var i = 0; i < 60; i++) SizedBox(height: 80, child: Text('bill $i')),
+      ]),
+    );
+    await tester.tapAt(tester.getCenter(_field), kind: searchPointer);
+    await tester.enterText(_field, '102');
+    await tester.pump(const Duration(milliseconds: 100));
+    FocusManager.instance.primaryFocus?.unfocus();
+    await tester.pump();
+    scroll.jumpTo(3000);
+    await tester.pump();
+    final alive = find.byKey(const ValueKey('probe'), skipOffstage: false);
+    expect(alive, findsOneWidget, reason: 'the list dropped the box, and its word, mid-wait');
+
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(sent, ['102']);
+    await tester.pumpAndSettle();
+    expect(alive, findsNothing, reason: 'the box is kept only while a word waits');
+
+    scroll.jumpTo(0);
+    await tester.pumpAndSettle();
+    expect(searchBoxText(tester, _field), '102');
+    expect(_x, findsOneWidget);
+    await tester.pump(const Duration(seconds: 1));
+    expect(sent, ['102'], reason: 'heard once is enough');
+    expect(tester.takeException(), isNull);
+  }, variant: searchPlatforms);
+
   for (final ds in DesignSystem.values) {
     testWidgets('the x: in the suffix, a 40px+ button, labelled, keeps focus (${ds.id})', (tester) async {
       final sent = <String>[];
