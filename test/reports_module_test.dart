@@ -20,6 +20,7 @@ import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/widgets/empty_state.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_tabs.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 /// Insights → Reports: the nine MIS / control reports.
@@ -93,6 +94,22 @@ const _salesSummary = {
   'by_order_type': [
     {'order_type': 'Dine-in', 'bills': 2, 'grand_total': 2000.0, 'share_pct': 100.0},
   ],
+};
+
+/// Sales Summary over a period that settled nothing. Its rows live under
+/// `series`, not `rows`, and its chrome (six tiles and the money ladder) is
+/// drawn whether or not there are any.
+final _emptySalesSummary = <String, dynamic>{
+  ..._salesSummary,
+  'totals': {
+    'gross': 0.0, 'discount': 0.0, 'net': 0.0, 'service_charge': 0.0,
+    'tax': 0.0, 'round_off': 0.0, 'grand_total': 0.0, 'refund': 0.0,
+    'refunded_tax': 0.0, 'bills': 0, 'covers': 0, 'discounted_bills': 0,
+    'estimated_discount_bills': 0, 'apc': 0.0, 'abv': 0.0,
+    'bills_without_covers': 0,
+  },
+  'series': <Map<String, dynamic>>[],
+  'by_order_type': <Map<String, dynamic>>[],
 };
 
 const _orderSummary = {
@@ -604,9 +621,18 @@ Future<_FakeApi> _mount(
 }
 
 /// Nine tabs do not fit a 1400px desktop, let alone a 390px phone — the strip
-/// scrolls, so a test has to scroll it exactly as a reader would.
+/// scrolls, so a test has to scroll it exactly as a reader would. The label is
+/// looked up inside the tab strip and in either case, because Gaia draws its
+/// tab labels in capitals.
 Future<void> _openTab(WidgetTester tester, String title) async {
-  final tab = find.text(title).first;
+  final tab = find
+      .descendant(
+        of: find.byType(ForkTabs),
+        matching: find.byWidgetPredicate(
+            (w) => w is Text && (w.data == title || w.data == title.toUpperCase()),
+            description: 'tab label "$title"'),
+      )
+      .first;
   await tester.ensureVisible(tab);
   await tester.pumpAndSettle();
   await tester.tap(tab);
@@ -1313,6 +1339,68 @@ void main() {
     expect(tester.getSize(find.byType(EmptyState)).height, greaterThan(280));
     expect(tester.takeException(), isNull);
   });
+
+  // AN EMPTY PERIOD IN A MID-HEIGHT DESKTOP WINDOW. From 430px of pane the
+  // desktop layout takes over, and Sales Summary's chrome fills its 45% cap, so
+  // the slot left under the controls was shorter than the empty state itself:
+  // 79px short at 680, 46 at 740 and 13 at 800 in Rustic Fork (89, 56 and 23 in
+  // Gaia). The empty state now scrolls inside that slot instead of overflowing it.
+  for (final system in DesignSystem.values) {
+    for (final height in const <double>[680, 740, 800]) {
+      testWidgets(
+          'an empty Sales Summary in a 1400x${height.toInt()} window scrolls, not overflows (${system.label})',
+          (tester) async {
+        await _mount(tester,
+            height: height,
+            system: system,
+            api: _FakeApi(extra: {'/reports/mis/sales-summary': _emptySalesSummary}));
+        await _openTab(tester, 'Sales Summary');
+        expect(tester.takeException(), isNull);
+        // The desktop layout, not the phone's: only the compact list pulls to refresh.
+        expect(find.byType(RefreshIndicator), findsNothing);
+
+        final empty = find.byType(EmptyState);
+        expect(empty, findsOneWidget);
+        // Measured against the Column: squeezed, it is shorter than its own
+        // caption; given room to scroll, it is exactly as tall as its content.
+        final content = find.descendant(of: empty, matching: find.byType(Column)).first;
+        final caption = find.textContaining('Sales Summary has no rows between');
+        expect(tester.getRect(caption).bottom, lessThanOrEqualTo(tester.getRect(content).bottom),
+            reason: 'the caption runs past the bottom of its own column');
+
+        // And nothing is out of reach: the caption scrolls into the slot.
+        await tester.ensureVisible(caption);
+        await tester.pumpAndSettle();
+        final slot = tester.getRect(find.ancestor(of: empty, matching: find.byType(Scrollable)).first);
+        final seen = tester.getRect(caption);
+        expect(seen.top, greaterThanOrEqualTo(slot.top));
+        expect(seen.bottom, lessThanOrEqualTo(slot.bottom));
+        expect(tester.takeException(), isNull);
+      }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android}));
+    }
+  }
+
+  // With room to spare nothing moves: the empty state is still the whole slot,
+  // its content still centred in it, and there is nothing to scroll.
+  for (final system in DesignSystem.values) {
+    testWidgets('a desktop empty state with room still fills its slot, centred (${system.label})',
+        (tester) async {
+      await _mount(tester,
+          height: 1000,
+          system: system,
+          api: _FakeApi(extra: {'/reports/mis/sales-summary': _emptySalesSummary}));
+      await _openTab(tester, 'Sales Summary');
+      expect(find.byType(RefreshIndicator), findsNothing);
+
+      final empty = find.byType(EmptyState);
+      final slot = find.ancestor(of: empty, matching: find.byType(Scrollable)).first;
+      expect(tester.getRect(empty), tester.getRect(slot));
+      expect(tester.state<ScrollableState>(slot).position.maxScrollExtent, 0);
+      final content = tester.getRect(find.descendant(of: empty, matching: find.byType(Column)).first);
+      expect(content.center.dy, closeTo(tester.getRect(empty).center.dy, 0.5));
+      expect(tester.takeException(), isNull);
+    });
+  }
 
   // -------------------------------------------------------------- search ---
 
