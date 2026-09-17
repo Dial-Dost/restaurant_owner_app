@@ -20,6 +20,7 @@ import '../models/bill_round_off.dart';
 import '../models/gross_net.dart';
 import '../models/kot_copy.dart';
 import '../models/kot_docket_settings.dart';
+import '../models/next_party.dart';
 import '../models/profile.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -58,6 +59,7 @@ import '../widgets/async_view.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
+import '../widgets/reprint_needed.dart';
 import '../widgets/outbox_chip.dart';
 import '../widgets/table_bill.dart';
 import 'order_entry.dart';
@@ -219,10 +221,17 @@ String _fmtDay(String iso) => iso.isEmpty ? '' : RestaurantTime.day(iso);
 String _fmtClock(String iso) => iso.isEmpty ? '' : RestaurantTime.clock(iso);
 
 // Pick a table from a dropdown of all tables (shows occupancy). Returns the name.
+//
+// A booking's table, so the ROOM's tables only: a next-party seat ("12 #2",
+// client item 6) exists while 12's bill is unpaid and is gone minutes later,
+// and the server refuses a booking on one.
 Future<String?> _pickTable(BuildContext context, RestClient rest) async {
   List tables;
   try {
-    tables = await rest.getList('/get-tables');
+    tables = [
+      for (final t in await rest.getList('/get-tables'))
+        if (!isNextPartyRow(t as Map)) t,
+    ];
   } catch (e) {
     if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     return null;
@@ -2032,8 +2041,13 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
         int countWhere(List l, bool Function(Map) f) => l.where((e) => f(e as Map)).length;
 
         final tablesBelow = countWhere(tables, (t) => t['apc_status'] == 'red' || t['apc_status'] == 'yellow');
-        final occupied = countWhere(tables, (t) => t['occupied'] == true);
-        final totalTables = tables.length;
+        // "N of M tables occupied" counts the ROOM (client item 6): the next
+        // party's seat at a printed 12 is a second name for a table already in
+        // M, and 12 is occupied while either has a party. Every party still
+        // counts in the covers below.
+        final roomUse = countRoomsInUse(tables, (t) => t['occupied'] == true);
+        final occupied = roomUse.inUse;
+        final totalTables = roomUse.rooms;
 
         final text = Theme.of(context).textTheme;
         final width = MediaQuery.sizeOf(context).width;
@@ -6946,8 +6960,17 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         //
         // Only on the SERVICE surface. The floor plan is a picture of the room,
         // and a room with a table missing out of it is not a floor plan.
-        final rows = surface != FloorSurface.service
-            ? allRows
+        //
+        // CLIENT ITEM 6 — AND THE ROOM HAS NO "12 #2" IN IT. A next-party seat
+        // ([isNextPartyRow]) is a second name for a table the plan already
+        // draws, opened by the server when 12's bill was printed and retired
+        // once it is idle; it is not furniture, so the layout editor never
+        // shows it. On the service surface it is an ordinary row and passes
+        // the C3 filter below on ITS OWN print state: the printed party at 12
+        // leaves the waiter's grid, and the tile for the next party at 12 is
+        // exactly what they are left with.
+        final List rows = surface != FloorSurface.service
+            ? [for (final r in allRows) if (!isNextPartyRow(r as Map)) r]
             : [
                 for (final r in allRows)
                   if (!BillPrintScope.of(p,
@@ -6975,8 +6998,16 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         // legend can never disagree with what is on screen.
         final occ = rows.where((r) => _tableState(r as Map).label == 'Occupied').length;
         final waiting = rows.where((r) => _tableState(r as Map).label == 'Seated').length;
-        final res = rows.where((r) => _tableState(r as Map).label == 'Reserved').length;
-        final free = rows.length - occ - waiting - res;
+        // A PARTY at "12 #2" is counted like any other (it is somebody to
+        // serve), but an idle next-party seat is not a free TABLE — 12 is
+        // already counted — and it carries 12's booking, so it would count a
+        // reservation twice. Free and Reserved are the room's.
+        final res = rows
+            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Reserved')
+            .length;
+        final free = rows
+            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Free')
+            .length;
         // A caller (an order notification's "Open T4") asked us to focus a table.
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
@@ -7024,7 +7055,10 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
               label: 'Delete a table',
               icon: Icons.delete_outline,
               dense: true,
-              onPressed: () => _deleteTableFromHeader(context, rest, allRows, reload),
+              // Room tables only: the server refuses a next-party seat, which
+              // closes by itself once it is idle (client item 6).
+              onPressed: () => _deleteTableFromHeader(
+                  context, rest, [for (final r in allRows) if (!isNextPartyRow(r as Map)) r], reload),
             ),
         ];
         return Scaffold(
@@ -7060,7 +7094,8 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
               // already taken instead of collecting "Table exists" from the
               // server halfway through.
               existing: [
-                for (final r in rows) _s(r as Map, 'table_name', ''),
+                for (final r in rows)
+                  if (!isNextPartyRow(r as Map)) _s(r, 'table_name', ''),
               ],
             ),
             icon: const Icon(Icons.add),
@@ -8498,7 +8533,14 @@ class _TableBox extends StatelessWidget {
   Widget build(BuildContext context) {
     if (surface == FloorSurface.plan) return _planTile(context);
     final text = Theme.of(context).textTheme;
+    // The HANDLE — what every request, the outbox tag and the paper use.
     final name = _s(table, 'table_name');
+    // CLIENT ITEM 6. "Same number for order taking for the next round of
+    // guests": a next-party seat's tile reads the ROOT's number, big, with a
+    // "Next party" chip beside the state. Its bill and KOT still say "12 #2",
+    // so two open bills for 12 stay apart at the till.
+    final nextParty = isNextPartyRow(table);
+    final shownName = tableDisplayName(table);
     // `occupied` here is the SEATING — a party is physically at this table —
     // and it is what every money-adjacent line below keys on. What the card
     // SAYS is a separate decision with three answers; see _tableState.
@@ -8618,7 +8660,11 @@ class _TableBox extends StatelessWidget {
           children: [
             Row(children: [
               Expanded(
-                child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: text.titleMedium),
+                child: Text(shownName,
+                    key: ValueKey('table-title-$name'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.titleMedium),
               ),
               if (paymentPending) StatusChip(label: 'PAID', color: AppColors.warning, dense: true),
               // Per-table honesty. An order taken during an outage is saved on
@@ -8649,6 +8695,12 @@ class _TableBox extends StatelessWidget {
                       color: stateColor,
                       dense: true),
                 ),
+                if (nextParty)
+                  StatusChip(
+                      key: ValueKey('next-party-chip-$name'),
+                      label: nextPartyChip,
+                      color: AppColors.info,
+                      dense: true),
                 ?apcTick,
               ],
             ),
@@ -9227,16 +9279,32 @@ class _TableSheetState extends State<_TableSheet> {
   // [misServiceChargeBlock] — and a bill that already carries a waiver prints
   // without the charge from here too, because the server applies the waiver to
   // every print.
-  Future<bool> _thermalPrint(ScaffoldMessengerState messenger) async {
+  ///
+  /// CLIENT ITEM 6: every successful print answers `next_party_table` — the
+  /// seat the server opened (or found) for the next guests at this number -
+  /// and the sentence that names it. It is kept in [_nextPartySeat] for the
+  /// caller and said here unless [announceNextParty] is off (the waiter's path
+  /// says it in its own, longer line). The floor behind this sheet is re-read
+  /// so a manager sees the new tile without leaving the bill.
+  Future<bool> _thermalPrint(ScaffoldMessengerState messenger, {bool announceNextParty = true}) async {
     try {
-      await widget.rest.post('/print/bill', {'table_name': _name});
-      messenger.showSnackBar(const SnackBar(content: Text('Printing bill…'), duration: Duration(seconds: 3)));
+      final res = await widget.rest.post('/print/bill', {'table_name': _name});
+      _nextPartySeat = nextPartyAfterPrint(res);
+      final seat = _nextPartySeat.message;
+      final say = announceNextParty && seat != null;
+      messenger.showSnackBar(SnackBar(
+          content: Text(say ? 'Printing bill… $seat' : 'Printing bill…'),
+          duration: Duration(seconds: say ? 6 : 3)));
+      if (_nextPartySeat.table != null) widget.reload();
       return true;
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
       return false;
     }
   }
+
+  /// What the last print said about the next party's seat; see [_thermalPrint].
+  ({String? table, String? message}) _nextPartySeat = (table: null, message: null);
 
   /// C3 — HAS THIS TABLE'S BILL ALREADY BEEN PRINTED?
   ///
@@ -9449,7 +9517,8 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (ok != true) return;
-    if (!await _thermalPrint(messenger)) return;
+    final retires = BillPrintScope.of(widget.profile, printed: true).retiresTable;
+    if (!await _thermalPrint(messenger, announceNextParty: !retires)) return;
     // ---- REQUIREMENT C3: the one print, and what it costs the waiter --------
     //
     // Asked as the state the print PUTS this reader in — "printed: true" — so
@@ -9460,9 +9529,14 @@ class _TableSheetState extends State<_TableSheet> {
     if (!BillPrintScope.of(widget.profile, printed: true).retiresTable) return;
     await PrintedBills.instance.mark(widget.profile.resId, widget.profile.outletId, _name);
     if (!mounted) return;
+    // CLIENT ITEM 6: the table's NUMBER is not gone with it. The line names
+    // the seat the server opened for the next guests ("Seat the next party at
+    // 12 (next party).") — the tile the waiter will find on the floor below.
+    final seat = _nextPartySeat.message;
     messenger.showSnackBar(SnackBar(
-        content: Text('$_name is printed and with a manager to settle. '
-            'It has come off your tables.')));
+        duration: Duration(seconds: seat == null ? 4 : 7),
+        content: Text('${tableSentenceNameOf(widget.table)} is printed and with a manager to settle. '
+            'It has come off your tables.${seat == null ? '' : ' $seat'}')));
     // The sheet closes and the floor reloads WITHOUT this table — that is the
     // whole of "clear/reset from their view". NOTHING IS WRITTEN to the table:
     // it is still occupied, still owes the money, and is still on every
@@ -9516,8 +9590,16 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (dest == null || dest.isEmpty) return;
     try {
-      await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
-      messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      final res = await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
+      // CLIENT ITEM 6: moved onto a table whose bill is already printed — its
+      // paper is now short, and the line offers the reprint of THAT table.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: dest);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
+      } else if (mounted) {
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger, lead: 'Moved $name to Table $dest.');
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -9833,8 +9915,21 @@ class _TableSheetState extends State<_TableSheet> {
     );
     if (src == null || src.isEmpty) return;
     try {
-      await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
-      messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      final res = await widget.rest.post('/bills/merge', {'from_table': src, 'to_table': _name});
+      // CLIENT ITEM 6: merged into this table after its bill was printed (the
+      // "same guests, one more round" case) — the paper is short until it is
+      // reprinted, and the line offers exactly that.
+      final reprint = ReprintNeeded.parse(res, fallbackTable: _name);
+      if (reprint == null) {
+        messenger.showSnackBar(SnackBar(content: Text('Merged Table $src into $_name.')));
+      } else if (mounted) {
+        // This sheet IS that table: the reprint is its own Print, next-party
+        // line and all.
+        await askToReprint(context, widget.rest, reprint,
+            messenger: messenger,
+            lead: 'Merged Table $src into $_name.',
+            printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);
+      }
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -10212,11 +10307,20 @@ class _TableSheetState extends State<_TableSheet> {
         child: SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Row(children: [
-              Expanded(child: Text('Table $_name', style: text.headlineMedium)),
+              // "Table 12 (next party)" for a next-party seat (client item 6) -
+              // the number the waiter tapped, in the words the web uses too.
+              Expanded(child: Text('Table ${tableSentenceNameOf(widget.table)}', style: text.headlineMedium)),
               StatusChip(label: _state.label, color: _state.color),
             ]),
             const SizedBox(height: 10),
             Wrap(spacing: 6, runSpacing: 6, children: [
+              // ...and the name its KOT and bill will print, so the paper the
+              // cashier holds can be matched to this tile.
+              if (isNextPartyRow(widget.table))
+                InfoChip(
+                    key: const ValueKey('next-party-bill-name'),
+                    icon: Icons.receipt_long_outlined,
+                    label: 'Bill reads $_name'),
               if (_seats.isNotEmpty) InfoChip(icon: Icons.event_seat_outlined, label: _seats),
               if (_clubbedWith.isNotEmpty)
                 InfoChip(icon: Icons.link, label: 'Clubbed with ${_clubbedWith.join(' + ')}'),
@@ -12507,6 +12611,14 @@ class _TableSeatingDialogState extends State<_TableSeatingDialog> {
     final name = _name.text.trim();
     if (_adding && name.isEmpty) {
       setState(() => _error = 'Give the table a name (e.g. T7).');
+      return;
+    }
+    // "12 #2" is the server's to make (client item 6): its own sentence,
+    // before the request rather than after it — for every name a run makes.
+    if (_adding &&
+        (isReservedPartyName(name) ||
+            allocateTableNames(name, _runCount, widget.existingNames).names.any(isReservedPartyName))) {
+      setState(() => _error = reservedTableNameError);
       return;
     }
     final cap = int.tryParse(_capacity.text.trim());
@@ -19479,11 +19591,10 @@ Widget _analyticsBody(
         double num0(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
         String money(double v) => '₹${v.toStringAsFixed(0)}';
 
-        final revenueByTable = orders
-            .map((o) => (label: 'Table ${_s(o as Map, 'table_name', '—')}', value: num0(o['total'])))
-            .where((d) => d.value > 0)
-            .toList()
-          ..sort((a, b) => b.value.compareTo(a.value));
+        // TABLE-WISE (client item 6): a next-party seating at 12 is reported as
+        // 12, and each seating's money is added in under that label — the web
+        // dashboard's table-wise summary, grouped the same way.
+        final tableRevenue = revenueByTable(orders);
         final staffApc = incentives
             .map((e) => (label: _s(e as Map, 'employee_name', 'Staff'), value: num0(e['mean_apc'])))
             .where((d) => d.value > 0)
@@ -20643,16 +20754,16 @@ Widget _analyticsBody(
                 Gaia.of(context)
                     ? _strataShare(
                         context,
-                        revenueByTable.take(8).toList(),
+                        tableRevenue.take(8).toList(),
                         money,
-                        total: revenueByTable.fold<double>(0, (a, d) => a + d.value),
+                        total: tableRevenue.fold<double>(0, (a, d) => a + d.value),
                         remainderLabel: 'Other tables',
                         caption: 'Thickness is each table’s share of the'
                             ' period’s table revenue.',
                       )
-                    : _barChart(context, revenueByTable.take(8).toList(), money),
+                    : _barChart(context, tableRevenue.take(8).toList(), money),
                 onDownload: () => dl('revenue-by-table', const ['Table', 'Revenue'],
-                    [for (final d in revenueByTable.take(8)) [d.label, money(d.value)]])),
+                    [for (final d in tableRevenue.take(8)) [d.label, money(d.value)]])),
             const SizedBox(height: AppSpacing.lg),
           ],
           if (vis('staff')) ...[

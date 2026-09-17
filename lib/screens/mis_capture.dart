@@ -1121,7 +1121,20 @@ final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive:
 ///     the commit and the print) — that, and never "removed".
 ///
 /// The web dashboard's `serviceChargeRemovalSentence` says the same words.
+///
+/// CLIENT ITEM 6: a bill that PRINTED also opened (or found) the seat for the
+/// next party at this number, and the line says where it is — the server's
+/// own sentence, after everything above and only when there was paper.
 ({String message, Duration shown}) serviceChargeRemovalOutcome(Object? response) {
+  final base = _serviceChargeRemovalBase(response);
+  final r = response is Map ? response : const {};
+  final seat = r['printed'] == true ? nextPartyAfterPrint(r).message : null;
+  if (seat == null) return base;
+  final longer = base.shown < const Duration(seconds: 6) ? const Duration(seconds: 6) : base.shown;
+  return (message: '${base.message} $seat', shown: longer);
+}
+
+({String message, Duration shown}) _serviceChargeRemovalBase(Object? response) {
   final r = response is Map ? response : const {};
   final created = r['waiver_created'] == true;
   final printed = r['printed'] == true;
