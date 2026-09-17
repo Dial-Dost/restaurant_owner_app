@@ -1712,6 +1712,11 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   // The open bill it quotes from is read fresh in [_load].
   Map? _ncBill;
   bool _ncMode = false;
+
+  /// This server has no settle-nc route ([NcSettle.routeMissing]). Learned from
+  /// the first attempt, for the life of this sheet. The pill and the ₹0 bill's
+  /// auto-open both step aside, so "Settle & close" is there to use.
+  bool _ncUnsupported = false;
   String _ncKind = '';
   final TextEditingController _ncReason = TextEditingController();
   late final TextEditingController _ncAuthorisedBy =
@@ -1810,7 +1815,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       // A ₹0 bill whose dishes were all comped IS an NC bill: it opens as one
       // and is never offered as a ₹0 UPI settle (what installed 2.0.0 tills
       // sent). A refusal re-read keeps the form open if NC is still possible.
-      _ncMode = _mayNc && _ncBlocker == null && (_ncMode || NcSettle.opensAsNc(ncBill));
+      _ncMode = _ncOffered && _ncBlocker == null && (_ncMode || NcSettle.opensAsNc(ncBill));
       // Keep the cashier's pick if it is still on offer; otherwise UPI, as the
       // sheet always opened on, or the first mode this restaurant takes.
       if (!_modes.any((m) => m.id == _method) && _modes.isNotEmpty) {
@@ -1919,6 +1924,10 @@ class _PaymentSheetState extends State<_PaymentSheet> {
         compItem: _mayDo(widget.profile, Capability.compItem, _permNonChargeable),
         settleBill: FloorScope.of(widget.profile).settle,
       );
+
+  /// Is the NC pill on offer: may this session settle as NC, and does this
+  /// server know how?
+  bool get _ncOffered => _mayNc && !_ncUnsupported;
 
   /// Why the NC pill is unavailable, or null. Money already taken, parts being
   /// composed or a discount on the bill each stop it — see [NcSettle.blocker].
@@ -2194,6 +2203,20 @@ class _PaymentSheetState extends State<_PaymentSheet> {
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
       if (!mounted) return;
+      // AN OLDER SERVER, with no settle-nc route. Its 404 page says only
+      // "Request failed (404).", and a fully comped ₹0 bill opens in NC mode,
+      // where "Settle as NC" is the only action. Without this the manager is
+      // left on a form that cannot work. Nothing was written, and re-reading
+      // the bill would only reopen that form, so there is no re-read.
+      if (e is ApiException && NcSettle.routeMissing(status: e.status, body: e.body)) {
+        setState(() {
+          _busy = false;
+          _ncUnsupported = true;
+          _ncMode = false;
+          _error = kNcSettleUnsupported;
+        });
+        return;
+      }
       setState(() {
         _busy = false;
         _error = _captureError(e);
@@ -2669,7 +2692,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
   /// them, which is NOT a mode (see [NcSettle]). Shared by the composer and the
   /// NC form, so either can switch to the other.
   Widget _methodPills(TextTheme text, bool locked) {
-    final ncBlocked = _mayNc ? _ncBlocker : null;
+    final ncBlocked = _ncOffered ? _ncBlocker : null;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text(_ncMode ? 'SETTLE AS' : (_drafts.isEmpty ? 'PAYMENT METHOD' : 'NEXT PART'), style: text.labelSmall),
       const SizedBox(height: 8),
@@ -2688,7 +2711,7 @@ class _PaymentSheetState extends State<_PaymentSheet> {
                       _error = null;
                     }),
           ),
-        if (_mayNc)
+        if (_ncOffered)
           // Greyed, with the reason under it, when the server would refuse it.
           Opacity(
             opacity: ncBlocked == null ? 1 : 0.45,

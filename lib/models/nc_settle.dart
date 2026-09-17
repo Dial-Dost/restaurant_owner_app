@@ -40,6 +40,14 @@ const String kNcSettleButton = 'Settle as NC';
 const String kNcWholeBillOnly =
     'Settle as NC covers the whole bill. To give part of it away, comp dishes individually, then take the rest.';
 
+/// What the settle sheet says when the server has no settle-nc route: a
+/// backend older than 2.0.1, or one rolled back under this app, which the
+/// auto-updater cannot downgrade. App-only words: a web dashboard is always
+/// served by its own backend.
+const String kNcSettleUnsupported =
+    'This server does not offer Settle as NC yet. Settle with a payment mode instead, '
+    'or ask for the server to be updated.';
+
 double _num(Object? v) {
   if (v is num) return v.isFinite ? v.toDouble() : 0;
   final n = double.tryParse('${v ?? ''}'.trim());
@@ -103,6 +111,16 @@ abstract final class NcSettle {
     if (value(bill) <= 0 && alreadyComped(bill) <= 0) return 'There is nothing on this table to settle.';
     return null;
   }
+
+  /// Did the settle fail because this server has NO settle-nc route at all?
+  ///
+  /// Read off the refusal's status and its decoded body. An older backend
+  /// answers an unknown route with Express's own 404 page, which is HTML and
+  /// decodes to nothing (`ApiException.body` null). The 2.0.1 route answers
+  /// every refusal it writes, a 404 included, with a JSON body, and that
+  /// refusal is about the bill, not the server, so it stays an ordinary
+  /// refusal.
+  static bool routeMissing({required int? status, required Object? body}) => status == 404 && body == null;
 
   /// Is the form complete? Kind, reason AND authoriser — the reason stays
   /// required for a whole-bill NC.

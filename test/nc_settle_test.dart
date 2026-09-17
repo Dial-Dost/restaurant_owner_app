@@ -56,6 +56,12 @@ class _FakeApi extends ApiClient {
   bool offline = false;
   String failOn = '';
   String failMessage = 'refused';
+  int failStatus = 400;
+
+  /// Refuse with a body that decodes to nothing: what an older server's own
+  /// "Cannot POST" page is to this app.
+  bool failWithoutBody = false;
+
   final Map<String, Object?> replies = <String, Object?>{};
 
   @override
@@ -79,7 +85,9 @@ class _FakeApi extends ApiClient {
   Future<dynamic> request(String method, String path, String token, [Object? body, String? outletId]) async {
     if (offline) throw ApiException('Connection failed');
     calls.add('$method $path');
-    if (failOn.isNotEmpty && path.contains(failOn)) throw ApiException(failMessage, 400);
+    if (failOn.isNotEmpty && path.contains(failOn)) {
+      throw ApiException.fromBody(failWithoutBody ? null : {'error': failMessage}, failStatus);
+    }
     if (method != 'GET') {
       writes.add((method: method, path: path, body: body));
       return replies.containsKey(path) ? replies[path] : <String, dynamic>{'success': true};
@@ -541,6 +549,63 @@ void main() {
       expect(find.textContaining('Billing needs a connection'), findsOneWidget);
       expect(find.byKey(const ValueKey('pay-settle-nc')), findsOneWidget);
       expect(api.writes, isEmpty);
+    });
+  });
+
+  // AN OLDER SERVER. A 2.0.1 till can meet a backend without the settle-nc
+  // route: before that backend is deployed, or after it is rolled back (the
+  // auto-updater cannot downgrade the app). Express answers the unknown route
+  // with its own HTML 404, which this app could only call "Request failed
+  // (404).", and a fully comped ₹0 bill opens in NC mode with no other action.
+  group('a server without the settle-nc route', () {
+    testWidgets('the pill steps aside, the sheet says why, and "Settle & close" is back', (tester) async {
+      final api = await _openSettle(
+        tester,
+        bill: _bill(subtotal: 0, grand: 0, ncTotal: 760),
+        tenders: _tenders(grand: 0),
+      );
+      api.failOn = 'settle-nc';
+      api.failStatus = 404;
+      api.failWithoutBody = true;
+      await _fillNc(tester, kind: 'complimentary', reason: 'Owner guests', tapPill: false);
+      final readsBefore = api.calls.where((c) => c.contains('/bill-for-table')).length;
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+
+      expect(find.text(kNcSettleUnsupported), findsOneWidget);
+      expect(find.text('Request failed (404).'), findsNothing);
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsNothing);
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsNothing,
+          reason: 'offered again on a server that has no route');
+      expect(find.byKey(const ValueKey('pay-nc-headline')), findsNothing);
+      expect(api.calls.where((c) => c.contains('/bill-for-table')).length, readsBefore,
+          reason: 're-reading the bill reopens the NC form');
+      expect(_pressOf(tester, const ValueKey('pay-settle')), isNotNull);
+
+      // The ₹0 settle this server has always taken.
+      await _tapVisible(tester, const ValueKey('pay-settle'));
+      expect(api.wrote('waiter-confirm-payment'), isTrue);
+      expect(api.writes.where((w) => w.path.contains('settle-nc')), isEmpty);
+    });
+
+    testWidgets('CONTROL — a 404 the 2.0.1 route writes itself is an ordinary refusal: NC stays', (tester) async {
+      final api = await _openSettle(tester);
+      api.failOn = 'settle-nc';
+      api.failStatus = 404;
+      api.failMessage = 'That order is not open on this outlet.';
+      await _fillNc(tester);
+      await _tapVisible(tester, const ValueKey('pay-settle-nc'));
+      expect(find.text(api.failMessage), findsOneWidget);
+      expect(find.text(kNcSettleUnsupported), findsNothing);
+      expect(find.byKey(const ValueKey('pay-settle-nc')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pay-method-NC')), findsOneWidget);
+    });
+
+    test('only a bodiless 404 means the route is missing', () {
+      expect(NcSettle.routeMissing(status: 404, body: null), isTrue);
+      expect(NcSettle.routeMissing(status: 404, body: const {'error': 'Order not found'}), isFalse);
+      expect(NcSettle.routeMissing(status: 400, body: null), isFalse);
+      expect(NcSettle.routeMissing(status: null, body: null), isFalse, reason: 'an outage is not an old server');
+      expect(NcSettle.routeMissing(status: 503, body: null), isFalse);
     });
   });
 
