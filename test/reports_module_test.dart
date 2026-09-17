@@ -15,7 +15,10 @@ import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
 import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/empty_state.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
@@ -256,6 +259,18 @@ const _itemWise = {
   'page': {'limit': 100, 'offset': 0, 'total': 1, 'has_more': false},
   'bill_level_discount': 100.0,
   'category_exact': false,
+};
+
+/// The same report over a period that sold nothing.
+final _emptyItemWise = <String, dynamic>{
+  ..._itemWise,
+  'rows': <Map<String, dynamic>>[],
+  'totals': {
+    'items': 0, 'qty': 0, 'gross_amount': 0.0, 'discount_amount': 0.0,
+    'net_amount': 0.0, 'dine_in_qty': 0, 'takeaway_qty': 0, 'delivery_qty': 0, 'other_qty': 0,
+  },
+  'page': {'limit': 100, 'offset': 0, 'total': 0, 'has_more': false},
+  'bill_level_discount': 0.0,
 };
 
 const _billEdit = {
@@ -540,14 +555,27 @@ class _FakeApi extends ApiClient {
   List<String> get gets => calls.where((c) => c.startsWith('GET ')).toList();
 }
 
-Widget _host(Widget child, {void Function(String)? switchOutlet}) => MaterialApp(
-      theme: AppTheme.dark(),
-      home: ModuleNavigator(
-        openModule: (_, {Map<String, dynamic>? target}) {},
-        visibleLabels: const ['Reports', 'History', 'Accounting'],
-        clearFocus: () {},
-        switchOutlet: switchOutlet ?? (_) {},
-        child: Scaffold(backgroundColor: Colors.transparent, body: child),
+Widget _host(
+  Widget child, {
+  void Function(String)? switchOutlet,
+  DesignSystem system = DesignSystem.rustic,
+  double textScale = 1.0,
+}) =>
+    GaiaScope(
+      system: system,
+      child: MaterialApp(
+        theme: system == DesignSystem.gaia ? GaiaTheme.dark() : AppTheme.dark(),
+        builder: (context, child) => MediaQuery(
+          data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(textScale)),
+          child: child!,
+        ),
+        home: ModuleNavigator(
+          openModule: (_, {Map<String, dynamic>? target}) {},
+          visibleLabels: const ['Reports', 'History', 'Accounting'],
+          clearFocus: () {},
+          switchOutlet: switchOutlet ?? (_) {},
+          child: Scaffold(backgroundColor: Colors.transparent, body: child),
+        ),
       ),
     );
 
@@ -557,6 +585,8 @@ Future<_FakeApi> _mount(
   double height = 1000,
   _FakeApi? api,
   void Function(String)? switchOutlet,
+  DesignSystem system = DesignSystem.rustic,
+  double textScale = 1.0,
 }) async {
   await tester.pumpWidget(const SizedBox());
   tester.view.physicalSize = Size(width, height);
@@ -567,7 +597,8 @@ Future<_FakeApi> _mount(
   final auth = AuthController(api: fake);
   await auth.login('CSR Organics', 'admin', 'admin123');
   final rest = RestClient(auth);
-  await tester.pumpWidget(_host(m.reportsModule(rest, auth.profile!), switchOutlet: switchOutlet));
+  await tester.pumpWidget(_host(m.reportsModule(rest, auth.profile!),
+      switchOutlet: switchOutlet, system: system, textScale: textScale));
   await tester.pumpAndSettle();
   return fake;
 }
@@ -1225,6 +1256,62 @@ void main() {
     await tester.tap(find.text('101').first);
     await tester.pumpAndSettle();
     expect(api.gets.any((c) => c.contains('/reports/mis/bill/')), isTrue);
+  });
+
+  // AN EMPTY PERIOD ON A PHONE WITH LARGE TEXT. The compact layout used to put
+  // the empty state in a FIXED 280px box. At 1.3x on a 360dp phone the icon,
+  // the title and a caption wrapped to several lines need more than that, so
+  // the column overflowed: 26px in Rustic Fork, 57px in Gaia, whose type is
+  // taller. 280 is a floor now, not a ceiling.
+  for (final system in DesignSystem.values) {
+    testWidgets('an empty period on a 360dp phone at 1.3x text fits its box (${system.label})',
+        (tester) async {
+      await _mount(
+        tester,
+        width: 360,
+        height: 900,
+        system: system,
+        textScale: 1.3,
+        api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}),
+      );
+      expect(find.byKey(const ValueKey('reports-cards')), findsNothing);
+
+      // At 1.3x the summary tiles push the empty state below the fold, into the
+      // list's cache area: built, but not painted — and an overflow is only
+      // reported when it paints. So bring it on screen first, as a reader would.
+      final empty = find.byType(EmptyState, skipOffstage: false);
+      expect(empty, findsOneWidget);
+      await tester.ensureVisible(empty);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      expect(tester.getSize(empty).height, greaterThan(280),
+          reason: 'at 1.3x the empty state needs more than the old 280');
+      // Measured against the Column, not the padded EmptyState: an overflow
+      // smaller than the 40px padding (Rustic's 26) still lands inside the
+      // outer box, but never inside the Column that was squeezed.
+      final content = tester.getRect(find.descendant(of: empty, matching: find.byType(Column)).first);
+      final caption = tester.getRect(find.textContaining('Item Wise has no rows between'));
+      expect(caption.bottom, lessThanOrEqualTo(content.bottom),
+          reason: 'the caption runs past the bottom of its own column');
+    }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android}));
+  }
+
+  testWidgets('at normal text size the phone empty state keeps its 280px, and the desktop fills the pane',
+      (tester) async {
+    // Growing with the text must not change the look anyone already has: at 1x
+    // the phone box is the same 280px it always was...
+    await _mount(tester,
+        width: 360, height: 900, api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}));
+    expect(tester.getSize(find.byType(EmptyState, skipOffstage: false)).height, 280);
+
+    // ...and the desktop never had the box: its empty state takes whatever the
+    // pane leaves under the controls, as the grid would.
+    await _mount(tester, api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}));
+    expect(find.text('Nothing in this period'), findsOneWidget);
+    expect(find.byKey(const ValueKey('reports-grid')), findsNothing);
+    expect(tester.getSize(find.byType(EmptyState)).height, greaterThan(280));
+    expect(tester.takeException(), isNull);
   });
 
   // -------------------------------------------------------------- search ---

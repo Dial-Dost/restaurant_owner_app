@@ -1168,7 +1168,13 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               ],
               _actionBar(context, narrow: true),
               const SizedBox(height: AppSpacing.md),
-              if (empty) SizedBox(height: 280, child: body) else body,
+              // A FLOOR, not a fixed height: at 1.3x text on a 360dp phone the
+              // empty state's wrapped caption needs more than 280px, and a fixed
+              // box cut it off. Under the floor it still centres, as it always did.
+              if (empty)
+                ConstrainedBox(constraints: const BoxConstraints(minHeight: 280), child: body)
+              else
+                body,
               const SizedBox(height: AppSpacing.md),
               _footer(context),
             ],
