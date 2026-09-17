@@ -21,7 +21,8 @@
 //   docket: "The font sizes must be smaller in the KOT." Standard is their
 //   reference ticket exactly, and what a NULL column / anything
 //   unrecognised mean. IT SIZES THE REFERENCE DOCKET ONLY: the classic text
-//   docket prints in the printer's own font and ignores it.
+//   docket prints in the printer's own font, at its normal size (never
+//   stretched — client item 5), and ignores it.
 //
 // READS FORGIVE, WRITES ARE EXACT. A stored value this app does not recognise
 // reads as the default. A save only ever sends one of the listed words, which
@@ -85,7 +86,7 @@ const List<KotDocketOption> kotPrintStyleOptions = [
   (
     value: kotPrintStyleClassic,
     label: 'Classic text docket',
-    detail: 'The plain ticket this system printed before. Use it if the new one does not print.',
+    detail: "Plain text in the printer's own font, at its normal size. Use it if the new one does not print.",
   ),
 ];
 
@@ -113,7 +114,7 @@ const List<KotDocketOption> kotTextSizeOptions = [
 /// The sentence under the size choice — the web card's KOT_TEXT_SIZE_HELP.
 const String kotTextSizeHelp =
     "Applies to the new docket only. The classic text docket prints in the printer's own font "
-    'and ignores this setting.';
+    'at its normal size, and ignores this setting.';
 
 /// Shown under the size choice while the classic docket is the selected style.
 const String kotTextSizeClassicNote =
@@ -182,3 +183,62 @@ String kotDocketSavedMessage(String key, String saved, {required String style}) 
       ? 'Saved. It applies when the kitchen is back on the new docket.'
       : 'The next kitchen docket prints at the $saved size.';
 }
+
+// ---------------------------------------------------------------------------
+// "PRINT A TEST KOT" — the card's third control (client item 5).
+//
+// The server has always had POST /print/test (the Print permission). It prints
+// one slip in THIS restaurant's docket style and text size, on its own roll,
+// through the routing a real ticket takes — the answer to "what will the
+// kitchen get?" after changing either setting. Nothing called it; the web card
+// and this card now do, in the same words (src/lib/kot-print-style.ts).
+//
+// ONLINE ONLY: every /print write is refused offline by OutboxPolicy (never
+// queued — a test slip printed an hour late tests nothing), and the card shows
+// [kotTestPrintOffline] for it. ONE TAP, ONE SLIP: the button is disabled while
+// the request is out. A REFUSAL (403 without the Print permission) is shown in
+// the server's own sentence.
+// ---------------------------------------------------------------------------
+
+/// The existing route, and the one body the card sends to it.
+const String kotTestPrintPath = '/print/test';
+const Map<String, String> kotTestPrintBody = {'role': 'kot'};
+
+const String kotTestPrintLabel = 'Print a test KOT';
+const String kotTestPrintSending = 'Sending a test KOT…';
+const String kotTestPrintHelp =
+    'Sends one test docket to the kitchen printer in the style and size chosen above, '
+    'so you can check the paper before service.';
+const String kotTestPrintSentTitle = 'Test KOT sent';
+const String kotTestPrintFailedTitle = "Couldn't print a test KOT";
+const String kotTestPrintOffline = 'A test KOT needs a connection — reconnect and try again.';
+
+/// What the server did with the slip, in one sentence — the web card's
+/// kotTestPrintOutcome, word for word.
+///
+/// POST /print/test answers `{results: [{role, mode, reason, destination, …}]}`.
+/// 'directed' went to one named printer; 'broadcast' went to every connected
+/// device, each printing it on its own kitchen printer — and when the routed
+/// printer's device is offline, the owner should know that is why. A reply this
+/// card cannot read still means the request was accepted.
+String kotTestPrintOutcome(Object? reply) {
+  final raw = reply is Map ? reply['results'] : null;
+  if (raw is! List) return "Sent. Check the kitchen printer's paper.";
+  final results = raw.whereType<Map>().toList();
+  if (results.isEmpty) return 'Nothing was sent to print.';
+  final first = results.first;
+  final d = first['destination'];
+  final destination = d is String && d.trim().isNotEmpty ? d.trim() : null;
+  if (first['mode'] == 'directed') {
+    return 'Sent to ${destination ?? 'the kitchen printer'}. Check the paper there.';
+  }
+  if (first['reason'] == 'no_device_online' && destination != null) {
+    return '$destination is not online, so every connected device with a kitchen printer '
+        'was asked to print it. Check the paper.';
+  }
+  return 'Every connected device with a kitchen printer was asked to print it. Check the paper.';
+}
+
+/// The snackbar lines: the web toast's title and description, on one line.
+String kotTestPrintSentMessage(Object? reply) => '$kotTestPrintSentTitle — ${kotTestPrintOutcome(reply)}';
+String kotTestPrintFailedMessage(String sentence) => '$kotTestPrintFailedTitle — $sentence';

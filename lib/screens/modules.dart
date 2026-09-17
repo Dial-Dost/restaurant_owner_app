@@ -32356,6 +32356,13 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
 // A 200 whose settings document lacks the key (a backend rolled back since the
 // page loaded, which ignores the key) stored nothing: kotDocketSaved throws,
 // and the card reverts with kotDocketNotSupported rather than confirming.
+//
+// "PRINT A TEST KOT" (client item 5) posts the existing POST /print/test for
+// the kitchen role: one slip in the style and size above, so whoever changed
+// either reads the paper now instead of at the next order. Online only (the
+// outbox refuses every /print write offline, and this says so); disabled while
+// the request is out, so one tap is one slip; a refusal shows the server's
+// sentence. The route checks the Print permission, not the settings one.
 class _KotDocketCard extends StatefulWidget {
   final RestClient rest;
   final String initialStyle;
@@ -32370,6 +32377,30 @@ class _KotDocketCardState extends State<_KotDocketCard> {
   late String _style = widget.initialStyle;
   late String _size = widget.initialTextSize;
   bool _busy = false;
+  bool _testing = false;
+
+  Future<void> _testPrint() async {
+    if (_testing) return;
+    setState(() => _testing = true);
+    String message;
+    try {
+      final reply = await widget.rest.post(kotTestPrintPath, kotTestPrintBody);
+      message = kotTestPrintSentMessage(reply);
+    } on OfflineUnavailable {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    } on ApiException catch (e) {
+      // A status is the server's answer — show its sentence. No status never
+      // reached anyone.
+      message = kotTestPrintFailedMessage(e.status == null ? kotTestPrintOffline : e.message);
+    } catch (_) {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    }
+    if (!mounted) return;
+    setState(() => _testing = false);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
 
   void _put(String key, String value) {
     if (key == kotPrintStyleKey) {
@@ -32469,6 +32500,18 @@ class _KotDocketCardState extends State<_KotDocketCard> {
             style: text.bodySmall!.copyWith(fontWeight: FontWeight.w600),
           ),
         ],
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(
+            key: const ValueKey('kot-test-print'),
+            label: _testing ? kotTestPrintSending : kotTestPrintLabel,
+            icon: Icons.print_outlined,
+            onPressed: _testing ? null : _testPrint,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(kotTestPrintHelp, style: text.bodySmall),
       ]),
     );
   }

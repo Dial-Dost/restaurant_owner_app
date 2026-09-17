@@ -18,6 +18,7 @@
 //   * the card is actually on the Settings screen, seeded from the settings
 //     document (built, and called).
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -29,17 +30,39 @@ import 'package:restaurant_owner_app/models/profile.dart';
 import 'package:restaurant_owner_app/screens/modules.dart' as m;
 import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
+import 'package:restaurant_owner_app/services/outbox.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
 import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 // ------------------------------------------------------------------ the fake
 
 class _FakeApi extends ApiClient {
-  _FakeApi(this.settings, {this.refuse, this.ignores = const {}});
+  _FakeApi(
+    this.settings, {
+    this.refuse,
+    this.ignores = const {},
+    this.printReply,
+    this.printRefuse,
+    this.printOffline = false,
+    this.printGate,
+  });
+
+  /// What POST /print/test answers (a directed slip by default).
+  final Object? printReply;
+
+  /// When set, POST /print/test is refused with this.
+  final ApiException? printRefuse;
+
+  /// When true, POST /print/test never reaches a server.
+  final bool printOffline;
+
+  /// When set, POST /print/test waits for it — a request still in flight.
+  final Completer<void>? printGate;
 
   final Map<String, dynamic> settings;
 
@@ -80,6 +103,12 @@ class _FakeApi extends ApiClient {
       [Object? body, String? outletId]) async {
     if (method != 'GET') {
       writes.add((method: method, path: path, body: body));
+      if (path == kotTestPrintPath) {
+        if (printGate != null) await printGate!.future;
+        if (printOffline) throw const SocketException('Network is unreachable');
+        if (printRefuse != null) throw printRefuse!;
+        return printReply ?? _directedReply;
+      }
       if (refuse != null) throw refuse!;
       // The real route answers with the whole settings document, the new value
       // in it.
@@ -97,10 +126,18 @@ class _FakeApi extends ApiClient {
   }
 }
 
-Widget _host(Widget child) => GaiaScope(
-      system: DesignSystem.rustic,
+/// POST /print/test's answer when the kitchen role is routed to a printer.
+const Map<String, dynamic> _directedReply = {
+  'results': [
+    {'role': 'kot', 'jobId': 'job-1', 'mode': 'directed', 'reason': 'routed', 'destination': 'Kitchen Epson'},
+  ],
+  'skipped': 0,
+};
+
+Widget _host(Widget child, {DesignSystem system = DesignSystem.rustic}) => GaiaScope(
+      system: system,
       child: MaterialApp(
-        theme: AppTheme.dark(),
+        theme: system == DesignSystem.gaia ? GaiaTheme.dark() : AppTheme.dark(),
         home: ModuleNavigator(
           openModule: (_, {Map<String, dynamic>? target}) {},
           visibleLabels: const ['Settings'],
@@ -120,16 +157,17 @@ Map<String, dynamic> _unchosen() => <String, dynamic>{'kot_print_style': 'refere
 bool _picked(WidgetTester tester, String key, String value) => tester.widget<ForkCard>(_choice(key, value)).selected;
 
 /// Mount Settings and scroll until [target] is built.
-Future<void> _mountAndScrollTo(WidgetTester tester, _FakeApi api, Finder target, String what) async {
+Future<void> _mountAndScrollTo(WidgetTester tester, _FakeApi api, Finder target, String what,
+    {DesignSystem system = DesignSystem.rustic, Size logical = const Size(1400, 2600), double dpr = 1.0}) async {
   await tester.pumpWidget(const SizedBox());
-  tester.view.physicalSize = const Size(1400, 2600);
-  tester.view.devicePixelRatio = 1.0;
+  tester.view.physicalSize = logical * dpr;
+  tester.view.devicePixelRatio = dpr;
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
   final auth = AuthController(api: api);
   await auth.login('Gaia Test', 'asha', 'pw');
   final rest = RestClient(auth);
-  await tester.pumpWidget(_host(m.settingsModule(rest, rest.auth.profile!)));
+  await tester.pumpWidget(_host(m.settingsModule(rest, rest.auth.profile!), system: system));
   await tester.pumpAndSettle();
   final list = find.byType(Scrollable).first;
   for (var i = 0; i < 40 && target.evaluate().isEmpty; i++) {
@@ -217,7 +255,9 @@ void main() {
       ]);
       expect(kotPrintStyleOptions.map((o) => o.detail), [
         'Clear type, laid out like the printed ticket you approved. Its size is set below.',
-        'The plain ticket this system printed before. Use it if the new one does not print.',
+        // Client item 5: the classic docket is no longer the stretched one it
+        // printed before — it prints at the printer's normal size.
+        "Plain text in the printer's own font, at its normal size. Use it if the new one does not print.",
       ]);
       expect(
           kotPrintStyleHelp,
@@ -244,11 +284,23 @@ void main() {
 
     test('the size says it is for the new docket only, and the classic docket ignores it', () {
       expect(kotTextSizeHelp,
-          "Applies to the new docket only. The classic text docket prints in the printer's own font and ignores this setting.");
+          "Applies to the new docket only. The classic text docket prints in the printer's own font at its normal size, and ignores this setting.");
       expect(kotTextSizeClassicNote,
           'Your kitchens are on the classic text docket, so this size is not used until you switch back.');
       // The style's detail no longer promises LARGER type: the size is a choice now.
       expect(kotPrintStyleOptions.first.detail, isNot(contains(RegExp('larger', caseSensitive: false))));
+    });
+
+    test('the test KOT button, in the web card\'s words', () {
+      expect(kotTestPrintLabel, 'Print a test KOT');
+      expect(kotTestPrintSending, 'Sending a test KOT…');
+      expect(kotTestPrintHelp,
+          'Sends one test docket to the kitchen printer in the style and size chosen above, so you can check the paper before service.');
+      expect(kotTestPrintSentTitle, 'Test KOT sent');
+      expect(kotTestPrintFailedTitle, "Couldn't print a test KOT");
+      expect(kotTestPrintOffline, 'A test KOT needs a connection — reconnect and try again.');
+      expect(kotTestPrintPath, '/print/test');
+      expect(kotTestPrintBody, {'role': 'kot'});
     });
 
     test('the not-stored sentence is the web card\'s', () {
@@ -295,6 +347,186 @@ void main() {
           'Saved. It applies when the kitchen is back on the new docket.');
     });
   });
+
+  group('what a test KOT did — the web card\'s sentences', () {
+    Map<String, dynamic> reply(Map<String, dynamic> r) => {
+          'results': [
+            {'role': 'kot', 'jobId': 'j1', ...r},
+          ],
+          'skipped': 0,
+        };
+
+    test('names where the slip went', () {
+      expect(kotTestPrintOutcome(reply({'mode': 'directed', 'reason': 'routed', 'destination': 'Kitchen Epson'})),
+          'Sent to Kitchen Epson. Check the paper there.');
+      expect(kotTestPrintOutcome(reply({'mode': 'directed', 'reason': 'routed', 'destination': null})),
+          'Sent to the kitchen printer. Check the paper there.');
+      expect(
+          kotTestPrintOutcome(reply({'mode': 'broadcast', 'reason': 'no_device_online', 'destination': 'Kitchen Epson'})),
+          'Kitchen Epson is not online, so every connected device with a kitchen printer was asked to print it. '
+          'Check the paper.');
+      for (final reason in ['no_route', 'flag_off', 'schema_missing', 'unpersisted', 'route_lookup_failed']) {
+        expect(kotTestPrintOutcome(reply({'mode': 'broadcast', 'reason': reason, 'destination': null})),
+            'Every connected device with a kitchen printer was asked to print it. Check the paper.',
+            reason: reason);
+      }
+      expect(kotTestPrintOutcome({'results': <Object>[], 'skipped': 0}), 'Nothing was sent to print.');
+      for (final odd in <Object?>[null, 'ok', 1, <Object>[], <String, dynamic>{}, {'results': 'x'}]) {
+        expect(kotTestPrintOutcome(odd), "Sent. Check the kitchen printer's paper.", reason: '$odd');
+      }
+    });
+
+    test('the snackbar lines carry the web toast\'s title and sentence', () {
+      expect(kotTestPrintSentMessage(_directedReply), 'Test KOT sent — Sent to Kitchen Epson. Check the paper there.');
+      expect(kotTestPrintFailedMessage(kotTestPrintOffline),
+          "Couldn't print a test KOT — A test KOT needs a connection — reconnect and try again.");
+    });
+
+    test('a test KOT is never saved to send later', () {
+      // Every /print write is refused offline — a slip printed an hour late
+      // tests nothing, and the kitchen printer would print it mid-service.
+      final d = OutboxPolicy.decide('POST', kotTestPrintPath);
+      expect(d.queueable, isFalse);
+      expect(d.refusal, OutboxPolicy.printing);
+    });
+  });
+
+  final platforms = TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android});
+  final testButton = find.byKey(const ValueKey('kot-test-print'));
+  // The button's own words, whatever the theme does to them (Gaia sets button
+  // labels in capitals).
+  String label(WidgetTester tester) => tester.widget<ForkButton>(testButton).label;
+  bool enabled(WidgetTester tester) => tester.widget<ForkButton>(testButton).onPressed != null;
+
+  for (final system in DesignSystem.values) {
+    group('the test KOT button — ${system.name}', () {
+      testWidgets('ONE TAP SENDS EXACTLY ONE POST /print/test, and says where the slip went', (tester) async {
+        final gate = Completer<void>();
+        final api = _FakeApi(_unchosen(), printGate: gate);
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        expect(label(tester), kotTestPrintLabel);
+        expect(enabled(tester), isTrue);
+        expect(find.text(kotTestPrintHelp), findsOneWidget);
+
+        await tester.tap(testButton);
+        await tester.pump();
+        // In flight: the button says so and does not take a second tap.
+        expect(label(tester), kotTestPrintSending);
+        expect(enabled(tester), isFalse);
+        await tester.tap(testButton, warnIfMissed: false);
+        await tester.pump();
+        expect(api.writes, hasLength(1));
+
+        gate.complete();
+        await tester.pumpAndSettle();
+        expect(api.writes.single.method, 'POST');
+        expect(api.writes.single.path, '/print/test');
+        expect(api.writes.single.body, {'role': 'kot'});
+        expect(find.text(kotTestPrintSentMessage(_directedReply)), findsOneWidget);
+        expect(label(tester), kotTestPrintLabel, reason: 'ready again');
+        expect(enabled(tester), isTrue);
+        // Nothing else was written: the settings are untouched.
+        expect(api.writes.where((w) => w.path == '/restaurant/settings'), isEmpty);
+
+        // A second press afterwards is a second slip.
+        await _tap(tester, testButton);
+        expect(api.writes, hasLength(2));
+      }, variant: platforms);
+
+      testWidgets("a refusal is shown in the server's own sentence", (tester) async {
+        const sentence =
+            'Your role does not have permission for this action. Ask an admin to grant it in Roles & Permissions.';
+        final api = _FakeApi(_unchosen(),
+            printRefuse: ApiException(sentence, 403, sentence, 'Action not permitted'));
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        await _tap(tester, testButton);
+        expect(api.writes.single.path, kotTestPrintPath);
+        expect(find.text(kotTestPrintFailedMessage(sentence)), findsOneWidget);
+        expect(label(tester), kotTestPrintLabel, reason: 'ready again');
+        expect(enabled(tester), isTrue);
+      }, variant: platforms);
+
+      testWidgets('a broadcast slip says where it went instead', (tester) async {
+        final reply = <String, dynamic>{
+          'results': [
+            {'role': 'kot', 'jobId': 'job-2', 'mode': 'broadcast', 'reason': 'no_device_online', 'destination': 'Kitchen Epson'},
+          ],
+          'skipped': 0,
+        };
+        final api = _FakeApi(_unchosen(), printReply: reply);
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        await _tap(tester, testButton);
+        expect(find.text(kotTestPrintSentMessage(reply)), findsOneWidget);
+        expect(kotTestPrintSentMessage(reply), contains('Kitchen Epson is not online'));
+      }, variant: platforms);
+
+      testWidgets('offline, it says a test KOT needs a connection and saves nothing for later', (tester) async {
+        await Outbox.instance.debugReset();
+        final api = _FakeApi(_unchosen(), printOffline: true);
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        await _tap(tester, testButton);
+        expect(api.writes, hasLength(1), reason: 'one attempt');
+        expect(find.text(kotTestPrintFailedMessage(kotTestPrintOffline)), findsOneWidget);
+        expect(Outbox.instance.hasPending, isFalse);
+        expect(label(tester), kotTestPrintLabel, reason: 'ready again');
+      }, variant: platforms);
+
+      testWidgets('fits a 360dp phone: nothing on the card runs past its edge', (tester) async {
+        // THIS CARD ONLY. At this width the Settings page's payment-mode rows
+        // already overflow (a separate, known defect in _PaymentSettingsCard), so
+        // an error counts here only when it was raised against a widget this
+        // card's source built — and, independently of any error, every box the
+        // card lays out must sit inside the card.
+        final src = File('lib/screens/modules.dart').readAsStringSync().replaceAll('\r\n', '\n').split('\n');
+        final from = src.indexWhere((l) => l.startsWith('class _KotDocketCard ')) + 1;
+        final to = src.indexWhere((l) => l.startsWith('class _TimezoneCard ')) + 1;
+        expect(from, greaterThan(0));
+        expect(to, greaterThan(from));
+        final ours = <String>[];
+        final previous = FlutterError.onError;
+        FlutterError.onError = (details) {
+          final text = details.toString();
+          final hit = RegExp(r'modules\.dart:(\d+):').allMatches(text).any((m) {
+            final line = int.parse(m.group(1)!);
+            return line >= from && line < to;
+          });
+          if (hit || text.contains('_KotDocketCard')) ours.add(text);
+        };
+        try {
+          final api = _FakeApi({'kot_print_style': 'classic', 'kot_text_size': 'small'});
+          await _mountAndScrollTo(tester, api, testButton, 'the test KOT button',
+              system: system, logical: const Size(360, 780), dpr: 3.0);
+          // The classic note (the longest line on the card) is laid out with it.
+          await tester.ensureVisible(find.byKey(const ValueKey('kot-text-size-classic-note')));
+          await tester.pumpAndSettle();
+          await _tap(tester, testButton);
+          expect(api.writes.single.body, {'role': 'kot'});
+
+          final card = find.ancestor(of: testButton, matching: find.byType(ForkCard)).first;
+          final cardBox = tester.renderObject<RenderBox>(card);
+          final cardRect = cardBox.localToGlobal(Offset.zero) & cardBox.size;
+          expect(cardRect.left, greaterThanOrEqualTo(0));
+          expect(cardRect.right, lessThanOrEqualTo(360));
+          final outside = <String>[];
+          var measured = 0;
+          for (final e in find.descendant(of: card, matching: find.byWidgetPredicate((_) => true)).evaluate()) {
+            final ro = e.renderObject;
+            if (ro is! RenderBox || !ro.hasSize || !ro.attached) continue;
+            measured++;
+            final r = ro.localToGlobal(Offset.zero) & ro.size;
+            if (r.left < cardRect.left - 0.5 || r.right > cardRect.right + 0.5) {
+              outside.add('${e.widget.runtimeType} $r outside $cardRect');
+            }
+          }
+          expect(measured, greaterThan(20));
+          expect(outside, isEmpty);
+        } finally {
+          FlutterError.onError = previous;
+        }
+        expect(ours, isEmpty);
+      }, variant: platforms);
+    });
+  }
 
   group('the Settings screen', () {
     testWidgets('A BACKEND WITHOUT THE KEYS SHOWS NO KOT DOCKET CARD — it prints classic and stores neither',
@@ -439,6 +671,11 @@ void main() {
       // One save path, through the settings write.
       final card = src.substring(src.indexOf('class _KotDocketCardState'));
       expect(card, contains("widget.rest.post('/restaurant/settings', {key: value})"));
+      // …and the test KOT goes to the existing route, once per press, from a
+      // button that is off while it is in flight.
+      expect('widget.rest.post(kotTestPrintPath, kotTestPrintBody)'.allMatches(src).length, 1);
+      expect(card, contains('onPressed: _testing ? null : _testPrint,'));
+      expect(card, contains("key: const ValueKey('kot-test-print'),"));
     });
   });
 }
