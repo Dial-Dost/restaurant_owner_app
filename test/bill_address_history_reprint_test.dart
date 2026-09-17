@@ -8,13 +8,17 @@
 //     (over 5 lines or 250 characters is the server's sentence and Save is
 //     off), on the live table and on a settled bill;
 //   * the live save sends the address only when it CHANGED; a settled list
-//     row (which never carries the address) sends one only if it was typed —
-//     a name fix must not wipe an address the row could not see;
+//     row (which never carries the address) reads the bill first, so its
+//     dialog shows the address it edits — and when that read fails, the row
+//     sends an address only if one was typed: neither Clear nor a name fix
+//     may wipe an address nobody on the screen could see;
 //   * a server before item 7 that ignores the field is called out;
 //   * the bill preview prints the address under the GSTIN and above the date,
 //     keyed by position (the old per-kind keys crashed on a second address
 //     line), and the settled sheet shows the same lines;
-//   * the table header shows the first line and fits a 360dp phone.
+//   * the table header shows the first line, with its (long) button UNDER the
+//     lines at every width: a 360dp phone, the 470-525dp windows where the
+//     button beside the lines squeezed or overflowed, and the Windows till.
 //
 // Item 8: "Reprint bill should show up in History; old bills should be
 // reprintable from the history section."
@@ -31,6 +35,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -65,6 +70,8 @@ class _FakeApi extends ApiClient {
     this.liveKnowsAddress = true,
     this.serverKnowsAddress = true,
     this.detailAddress = _address,
+    this.detailKnowsAddress = true,
+    this.detailFails = false,
   });
 
   final String role;
@@ -81,6 +88,12 @@ class _FakeApi extends ApiClient {
 
   /// The settled bill's address (the DETAIL carries it; the list never does).
   Object? detailAddress;
+
+  /// False: the detail has no `customer_address` key (a server before item 7).
+  final bool detailKnowsAddress;
+
+  /// True: GET /bills/closed/b1 fails (offline, a 500) — the row cannot read it.
+  final bool detailFails;
   Object? liveCustomer = 'Acme Pvt Ltd';
   Object? liveGstin = '29ABCDE1234F1Z5';
   Object? settledCustomer = 'Acme Pvt Ltd';
@@ -123,7 +136,7 @@ class _FakeApi extends ApiClient {
 
   Map<String, dynamic> get _detail => {
         ..._row,
-        'customer_address': detailAddress,
+        if (detailKnowsAddress) 'customer_address': detailAddress,
         'items_subtotal': 4000.00,
         'taxable_base': 4000.00,
         'service_charge': 400.00,
@@ -209,7 +222,10 @@ class _FakeApi extends ApiClient {
         ],
       };
     }
-    if (path.startsWith('/bills/closed/b1')) return _detail;
+    if (path.startsWith('/bills/closed/b1')) {
+      if (detailFails) throw ApiException('Unable to fetch this bill', 500);
+      return _detail;
+    }
     if (path.startsWith('/bills/closed')) return {'bills': [_row], 'total': 1, 'has_more': false};
     if (path.startsWith('/billing-counters')) {
       return {
@@ -320,7 +336,41 @@ final Finder _tillMove = find.byKey(const ValueKey('bill-counter-move'));
 final Finder _nameField = find.byKey(const ValueKey('bill-customer-name-field'));
 final Finder _addressField = find.byKey(const ValueKey('bill-customer-address-field'));
 final Finder _save = find.byKey(const ValueKey('bill-customer-name-save'));
+final Finder _clear = find.byKey(const ValueKey('bill-customer-name-clear'));
 final Finder _headerEdit = find.byKey(const ValueKey('table-bill-customer-name'));
+
+/// The Text under [text] is laid out on the ONE line its words need — at its
+/// natural width, not wrapped into a column narrower than itself.
+void _expectOneLine(WidgetTester tester, Finder text) {
+  final paragraph = tester.renderObject<RenderParagraph>(find.descendant(of: text, matching: find.byType(RichText)));
+  final natural = TextPainter(
+    text: paragraph.text,
+    textDirection: paragraph.textDirection,
+    textScaler: paragraph.textScaler,
+    strutStyle: paragraph.strutStyle,
+    textHeightBehavior: paragraph.textHeightBehavior,
+  )..layout();
+  addTearDown(natural.dispose);
+  final words = paragraph.text.toPlainText();
+  expect(paragraph.size.height, moreOrLessEquals(natural.height, epsilon: 0.5), reason: '"$words" is on one line');
+  expect(paragraph.size.width, greaterThanOrEqualTo(natural.width - 0.5), reason: '"$words" is not squeezed');
+}
+
+/// The live table's header as a phone and the till must both draw it: the
+/// guest's lines keep a real column, the name and the GSTIN each keep their
+/// one line, and the edit button sits UNDER the lines, inside the card.
+void _expectHeaderLaidOut(WidgetTester tester) {
+  final card = tester.getRect(find.byKey(const ValueKey('table-bill-customer-header')));
+  final lines = tester.getRect(find.byKey(const ValueKey('table-bill-customer-lines')));
+  final button = tester.getRect(_headerEdit);
+  expect(lines.width, greaterThanOrEqualTo(200), reason: 'the lines keep a real column');
+  _expectOneLine(tester, find.byKey(const ValueKey('table-bill-customer')));
+  _expectOneLine(tester, find.byKey(const ValueKey('table-bill-customer-gstin')));
+  expect(button.top, greaterThan(tester.getRect(find.byKey(const ValueKey('table-bill-customer-address'))).bottom),
+      reason: 'the button sits under the lines');
+  expect(button.left, greaterThanOrEqualTo(card.left));
+  expect(button.right, lessThanOrEqualTo(card.right));
+}
 
 Future<void> _openT1(WidgetTester tester) async {
   await tester.tap(find.text('T1').first);
@@ -375,6 +425,28 @@ void main() {
       expect(m.billCustomerAddressLimitMessage, 'Address can be at most 5 lines and 250 characters');
       expect(m.billCustomerAddressHelp, 'Up to 5 lines. Leave it empty for none. Letters outside English print as "?".');
       expect(m.billCustomerEditLabel, 'Edit name / GSTIN / address');
+      expect(m.billCustomerAddressNotSaved,
+          'The address was not saved: this server has not finished updating. Ask your administrator to complete the update.');
+    });
+
+    test('what goes out: only a change, and never an empty box nobody could see behind', () {
+      bool send(String address, {String seed = '', required bool known, bool touched = true}) =>
+          m.billCustomerAddressToSend(address: address, seed: seed, known: known, touched: touched);
+      // Untouched: nothing, known or not.
+      expect(send(_address, seed: _address, known: true, touched: false), isFalse);
+      expect(send('', known: false, touched: false), isFalse);
+      // Known: only a change — tidying and undoing are not changes; emptying is.
+      expect(send(_address, seed: _address, known: true), isFalse);
+      expect(send('  4th  Floor, Prestige Tower \n\n12 Residency Road\nBengaluru 560025 ', seed: _address, known: true), isFalse);
+      expect(send('Tower B', seed: _address, known: true), isTrue);
+      expect(send('', seed: _address, known: true), isTrue, reason: 'the address was on screen, and Clear cleared it');
+      expect(send('Tower B', known: true), isTrue);
+      expect(send('', known: true), isFalse, reason: 'known to be empty and still empty');
+      // NOT known: only something typed. Clear, or a line typed and deleted,
+      // is not a request to wipe an address nobody saw.
+      expect(send('Tower B', known: false), isTrue);
+      expect(send('', known: false), isFalse);
+      expect(send(' \n\t ', known: false), isFalse);
     });
 
     test('the slot: Name, GSTIN, then the address one line each, the first labelled', () {
@@ -498,6 +570,22 @@ void main() {
         expect(api.writesTo('/bills/customer-name').single, {'table_name': 'T1', 'customer': 'Acme Ltd'});
       }, variant: _platforms);
 
+      testWidgets('…and Clear against it sends no address either (no wipe, no 503 before 054)', (tester) async {
+        final api = await _mount(tester, _FakeApi(liveKnowsAddress: false), m.tablesModule, system);
+        await _openT1(tester);
+        await _tap(tester, _headerEdit);
+        await tester.tap(_clear);
+        await tester.pump();
+        await tester.enterText(_nameField, 'Beta Corp');
+        await tester.enterText(_addressField, 'x');
+        await tester.enterText(_addressField, '');
+        await tester.tap(_save);
+        await tester.pumpAndSettle();
+        expect(api.writesTo('/bills/customer-name').single,
+            {'table_name': 'T1', 'customer': 'Beta Corp', 'customer_gstin': null});
+        expect(find.textContaining('Address removed.'), findsNothing);
+      }, variant: _platforms);
+
       testWidgets('the preview prints the address under the GSTIN and above the date — no duplicate-key crash', (tester) async {
         // Two identical lines: the case a text-derived key would collide on.
         await _mount(tester, _FakeApi(liveAddress: 'Bengaluru\nBengaluru\nKarnataka 560025'), m.tablesModule, system);
@@ -552,14 +640,49 @@ void main() {
         expect(tester.takeException(), isNull, reason: 'the dialog fits the phone too');
         expect(_addressField, findsOneWidget);
       }, variant: _platforms);
+
+      // The windows where the button BESIDE the lines squeezed the name to
+      // nothing (470-525dp; the Gaia card overflowed at 490-510) and the
+      // Windows till, where the card stops at the bottom sheet's 640px and the
+      // name got 128-157px: "Acme Pvt Ltd" and the GSTIN wrapped.
+      for (final size in const <Size>[
+        Size(470, 1600),
+        Size(490, 1600),
+        Size(500, 1600),
+        Size(510, 1600),
+        Size(525, 1600),
+        Size(1280, 800),
+        Size(1920, 1080),
+      ]) {
+        testWidgets('the header at ${size.width.toInt()}x${size.height.toInt()}: the name and GSTIN keep their line, '
+            'the button sits under them', (tester) async {
+          final api = _FakeApi()..liveAddress = '4th Floor, Prestige Tower\n12 Residency Road';
+          await _mount(tester, api, m.tablesModule, system, size: size);
+          await _openT1(tester);
+          expect(tester.takeException(), isNull);
+          _expectHeaderLaidOut(tester);
+        }, variant: _platforms);
+      }
+
+      testWidgets('the header on the till with a larger text size: still no squeeze, no overflow', (tester) async {
+        tester.platformDispatcher.textScaleFactorTestValue = 1.3;
+        addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+        await _mount(tester, _FakeApi(), m.tablesModule, system, size: const Size(1280, 800));
+        await _openT1(tester);
+        expect(tester.takeException(), isNull);
+        _expectHeaderLaidOut(tester);
+      }, variant: _platforms);
     });
 
     group('ITEM 7 — the address on a settled bill [$system]', () {
-      testWidgets('the ROW edit never wipes what it cannot see: the list carries no address, so none is sent',
+      testWidgets('a ROW edit reads the bill first: the dialog shows its address, and a name fix leaves it alone',
           (tester) async {
         final api = await _mount(tester, _FakeApi(), m.accountingModule, system);
+        final before = api.calls.length;
         await _tap(tester, _rowEdit);
-        expect(tester.widget<TextField>(_addressField).controller!.text, '');
+        // The list row has no address; the dialog's box has the invoice's.
+        expect(api.calls.sublist(before), contains('GET /bills/closed/b1'));
+        expect(tester.widget<TextField>(_addressField).controller!.text, _address);
         await tester.enterText(_nameField, 'Acme Ltd');
         await tester.tap(_save);
         await tester.pumpAndSettle();
@@ -567,6 +690,51 @@ void main() {
             {'customer': 'Acme Ltd', 'customer_gstin': '29ABCDE1234F1Z5'});
         expect(find.text('Name and GSTIN updated on Bill #57.'), findsOneWidget);
       }, variant: _platforms);
+
+      testWidgets('from a row, Clear clears the address the dialog SHOWED', (tester) async {
+        final api = await _mount(tester, _FakeApi(), m.accountingModule, system);
+        await _tap(tester, _rowEdit);
+        expect(tester.widget<TextField>(_addressField).controller!.text, _address);
+        await tester.tap(_clear);
+        await tester.pump();
+        await tester.enterText(_nameField, 'Beta Corp');
+        await tester.tap(_save);
+        await tester.pumpAndSettle();
+        expect(api.writesTo('/bills/b1/customer-details').single,
+            {'customer': 'Beta Corp', 'customer_gstin': null, 'customer_address': null});
+        expect(find.text('Name, GSTIN and address updated on Bill #57.'), findsOneWidget);
+      }, variant: _platforms);
+
+      for (final (label, api) in <(String, _FakeApi Function())>[
+        ('the bill cannot be read', () => _FakeApi(detailFails: true)),
+        ('the server sends no address', () => _FakeApi(detailKnowsAddress: false)),
+      ]) {
+        testWidgets('when $label, a row\'s Clear does NOT wipe the address it never showed', (tester) async {
+          final fake = await _mount(tester, api(), m.accountingModule, system);
+          await _tap(tester, _rowEdit);
+          expect(tester.widget<TextField>(_addressField).controller!.text, '');
+          expect(tester.widget<TextField>(_nameField).controller!.text, 'Acme Pvt Ltd', reason: "the row's own name");
+          await tester.tap(_clear);
+          await tester.pump();
+          await tester.enterText(_nameField, 'Beta Corp');
+          // A line typed and deleted again is not an address either.
+          await tester.enterText(_addressField, 'x');
+          await tester.enterText(_addressField, '');
+          await tester.tap(_save);
+          await tester.pumpAndSettle();
+          expect(fake.writesTo('/bills/b1/customer-details').single, {'customer': 'Beta Corp', 'customer_gstin': null});
+          expect(find.text('Name and GSTIN updated on Bill #57.'), findsOneWidget);
+        }, variant: _platforms);
+
+        testWidgets('when $label, an address TYPED from a row is still sent', (tester) async {
+          final fake = await _mount(tester, api(), m.accountingModule, system);
+          await _tap(tester, _rowEdit);
+          await tester.enterText(_addressField, '12 MG Road');
+          await tester.tap(_save);
+          await tester.pumpAndSettle();
+          expect((fake.writesTo('/bills/b1/customer-details').single)['customer_address'], '12 MG Road');
+        }, variant: _platforms);
+      }
 
       testWidgets('the SHEET shows the address as the paper prints it, and sends it only when it changes',
           (tester) async {
@@ -627,7 +795,7 @@ void main() {
       }, variant: _platforms);
 
       testWidgets('a server that ignores the address is called out on a settled bill too', (tester) async {
-        await _mount(tester, _FakeApi(serverKnowsAddress: false), m.accountingModule, system);
+        await _mount(tester, _FakeApi(serverKnowsAddress: false, detailKnowsAddress: false), m.accountingModule, system);
         await _tap(tester, _rowEdit);
         await tester.enterText(_addressField, '12 MG Road');
         await tester.tap(_save);
@@ -774,6 +942,24 @@ void main() {
       expect(drill, isNot(contains('_ClosedBillSheet')));
       expect(drill, isNot(contains('_ReprintSettledBillButton')));
       expect(drill, isNot(contains('profile')));
+    });
+
+    test('both address writers ask the one rule; a row reads the bill before it edits it', () {
+      final dialog = File('lib/screens/bill_customer_name.dart').readAsStringSync().replaceAll('\r\n', '\n');
+      String method(String src, String start) {
+        final at = src.indexOf(start);
+        expect(at, greaterThan(-1), reason: start);
+        return src.substring(at, src.indexOf('\n  }\n', at));
+      }
+
+      expect(method(modules, 'Future<void> _editBillCustomerName('), contains('billCustomerAddressToSend('));
+      final settled = method(dialog, 'Future<void> _edit() async {');
+      expect(settled, contains('billCustomerAddressToSend('));
+      expect(settled, contains("widget.rest.getMap('/bills/closed/"));
+      // The header's layout is not chosen by width any more (see its comment).
+      final header = method(modules, 'Widget? _billCustomerHeader(');
+      expect(header, isNot(contains('LayoutBuilder')));
+      expect(header, isNot(contains('maxWidth')));
     });
 
     test('platform sanity', () {

@@ -9767,7 +9767,14 @@ class _TableSheetState extends State<_TableSheet> {
     if (details == null) return;
     final name = details.customer;
     final gstinChanged = details.gstin != normaliseBillCustomerGstin(currentGstin);
-    final addressChanged = addressKnown ? details.address != currentAddress : details.addressTouched;
+    // See [billCustomerAddressToSend]: against a server that sends no address,
+    // an emptied box is not a request to clear one nobody here could see.
+    final addressChanged = billCustomerAddressToSend(
+      address: details.address,
+      seed: currentAddress,
+      known: addressKnown,
+      touched: details.addressTouched,
+    );
     try {
       final res = await widget.rest.post('/bills/customer-name', {
         'table_name': _name,
@@ -9822,8 +9829,16 @@ class _TableSheetState extends State<_TableSheet> {
   ///
   /// CLIENT ITEM 7 — the address's first line under them (two lines at most;
   /// the paper has room for all five). Not money either, so a scoped waiter
-  /// reads it on their own table too. On a phone the button goes UNDER the
-  /// lines: beside them, its longer label would leave the name no room.
+  /// reads it on their own table too.
+  ///
+  /// THE BUTTON SITS UNDER THE LINES AT EVERY WIDTH, not only on a phone. Its
+  /// label, "Edit name / GSTIN / address", is 376px wide in Rustic Fork and
+  /// 412px in the Gaia skin (wider again with a larger text size), and this
+  /// card is never much wider than 600px, because a Material bottom sheet
+  /// stops at 640. Beside the lines, that label left the name 128–157px on the
+  /// Windows till, so "Acme Pvt Ltd" and the GSTIN wrapped, and it overflowed
+  /// the Gaia card in 490–510dp windows. No width suits "beside" for this
+  /// label, so the header never switches layouts.
   Widget? _billCustomerHeader(ScaffoldMessengerState messenger, TextTheme text) {
     if (!_occupied || _bill == null) return null;
     final name = billCustomerNameSeed(_bill!['customer']);
@@ -9831,7 +9846,8 @@ class _TableSheetState extends State<_TableSheet> {
     final address = billCustomerAddressLines(_bill!['customer_address']);
     final mayEdit = _mayEditBillCustomerName(widget.profile, _scope);
     if (!mayEdit && name.isEmpty && gstin.isEmpty && address.isEmpty) return null;
-    final lines = Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    final lines =
+        Column(key: const ValueKey('table-bill-customer-lines'), crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(name.isEmpty ? 'No guest name on the bill' : name,
           key: const ValueKey('table-bill-customer'),
           style: name.isEmpty ? text.bodySmall : text.titleSmall,
@@ -9852,34 +9868,30 @@ class _TableSheetState extends State<_TableSheet> {
         ),
       ],
     ]);
-    final edit = !mayEdit
-        ? null
-        : ForkButton.ghost(
-            key: const ValueKey('table-bill-customer-name'),
-            label: billCustomerEditLabel,
-            icon: Icons.edit_outlined,
-            dense: true,
-            onPressed: () => _editBillCustomerName(messenger),
-          );
     return ForkCard(
       key: const ValueKey('table-bill-customer-header'),
       inset: true,
       padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
-      child: LayoutBuilder(builder: (context, box) {
-        final narrow = box.maxWidth < 420;
-        final row = Row(children: [
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
           Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
           const SizedBox(width: 10),
           Expanded(child: lines),
-          if (edit != null && !narrow) ...[const SizedBox(width: 8), edit],
-        ]);
-        if (edit == null || !narrow) return row;
-        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          row,
+        ]),
+        if (mayEdit) ...[
           const SizedBox(height: 8),
-          Align(alignment: Alignment.centerRight, child: edit),
-        ]);
-      }),
+          Align(
+            alignment: Alignment.centerRight,
+            child: ForkButton.ghost(
+              key: const ValueKey('table-bill-customer-name'),
+              label: billCustomerEditLabel,
+              icon: Icons.edit_outlined,
+              dense: true,
+              onPressed: () => _editBillCustomerName(messenger),
+            ),
+          ),
+        ],
+      ]),
     );
   }
 
@@ -23266,7 +23278,8 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
         // ROUND 2 ITEM 1 — "Edit name / GSTIN / address" per past bill, behind
         // the reprint gate (the widget draws nothing for anyone else). The row
         // does not know the address (the list never carries it), so the widget
-        // sends one only if it is typed.
+        // reads the bill before its dialog opens, and without that read sends an
+        // address only if one is typed.
         if (onChanged != null && _maySetSettledBillCustomer(profile))
           _EditSettledBillCustomerButton(
             key: ValueKey('closed-bill-row-edit-customer-${_s(b, 'id', '')}'),

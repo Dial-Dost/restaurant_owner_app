@@ -105,8 +105,11 @@ const String billCustomerAddressHelp = 'Up to 5 lines. Leave it empty for none. 
 /// What the paper puts before the address's first line.
 const String billCustomerAddressLabel = 'Address:';
 
-/// The sentence for a server that answered without keeping the address.
-const String billCustomerAddressNotSaved = 'The address was not saved: this server has not finished updating.';
+/// The sentence for a server that answered without keeping the address — the
+/// web's ADDRESS_NOT_SAVED_MESSAGE, word for word (the web's
+/// bill-customer-address test compares the two).
+const String billCustomerAddressNotSaved =
+    'The address was not saved: this server has not finished updating. Ask your administrator to complete the update.';
 
 final RegExp _addressBreaks = RegExp('\r\n?|[\u0085\u2028\u2029]');
 final RegExp _addressControls = RegExp(r'[\x00-\x08\x0B-\x1F\x7F-\x9F]');
@@ -136,6 +139,33 @@ String? billCustomerAddressError(String raw) {
   return u.lines > billCustomerAddressMaxLines || u.chars > billCustomerAddressMaxChars
       ? billCustomerAddressLimitMessage
       : null;
+}
+
+/// DOES THIS SAVE SEND THE ADDRESS — the web's addressToSend, rule for rule.
+///
+///   * untouched — no. There is nothing new to say.
+///   * touched, and the dialog KNEW the address (its payload carried
+///     `customer_address`) — only if the box now differs from what it opened
+///     with. Typing and undoing is not a change.
+///   * touched, and it did NOT know (a server that sends no such key, or a
+///     settled row whose detail could not be read) — only if something is IN
+///     the box. An empty box there is not "clear it": nobody on this screen saw
+///     an address to clear, so Clear, or a line typed and deleted again, must
+///     not take one off the invoice.
+///
+/// Only a change goes out, and on purpose: every address write — an unchanged
+/// one, or an empty one — is refused with a 503 by a database without
+/// migration 054's column, which would turn a plain name correction into a
+/// failure over a field nobody meant to touch.
+bool billCustomerAddressToSend({
+  required String address,
+  required String seed,
+  required bool known,
+  required bool touched,
+}) {
+  if (!touched) return false;
+  final now = normaliseBillCustomerAddress(address);
+  return known ? now != normaliseBillCustomerAddress(seed) : now.isNotEmpty;
 }
 
 /// What the address box opens with, given a payload's `customer_address`: the
@@ -213,9 +243,10 @@ bool _maySetSettledBillCustomer(Profile? p) => _mayReprintSettledBill(p);
 const String billCustomerEditLabel = 'Edit name / GSTIN / address';
 
 /// What the dialog answers: the NORMALISED name ('' clears it), the NORMALISED
-/// GSTIN ('' clears it), the NORMALISED address ('' clears it), and whether the
-/// address box was touched — a caller that did not know the address sends it
-/// only then, so an edit can never wipe an address it could not see.
+/// GSTIN ('' clears it), the NORMALISED address ('' clears it — when the caller
+/// knew there was one), and whether the address box was touched. Whether the
+/// address goes out at all is [billCustomerAddressToSend]'s answer, so an edit
+/// can never wipe an address it could not see.
 typedef BillCustomerDetails = ({String customer, String gstin, String address, bool addressTouched});
 
 /// Asks for the name, GSTIN and address. Null when the dialog was dismissed.
@@ -438,11 +469,14 @@ class _BillCustomerNameDialogState extends State<_BillCustomerNameDialog> {
 /// audit line. [onSaved] gets the server's answer so the caller can repaint the
 /// row or re-read the sheet; nothing here assumes what the server stored.
 ///
-/// THE ADDRESS IS SENT ONLY WHEN THIS BUTTON KNOWS IT. The bill's own sheet
-/// reads the detail, which carries `customer_address`; a LIST ROW does not (the
-/// list never carries the address), so from a row the address goes out only if
-/// somebody typed in its box. Sending the row's "nothing" would wipe the
-/// address off the invoice.
+/// THE ADDRESS IS SEEN BEFORE IT IS EDITED. The bill's own sheet reads the
+/// detail, which carries `customer_address`; a LIST ROW does not (the list never
+/// carries the address), so a row reads GET /bills/closed/:id first and opens
+/// the dialog with the address the invoice really carries. When that read fails
+/// (offline, or a server that sends no such key) the box opens empty and the
+/// address goes out only if somebody typed one — see
+/// [billCustomerAddressToSend]. Sending the row's "nothing" would wipe an
+/// address off the invoice that nobody on this screen had seen.
 ///
 /// [compact] draws an icon for the list row; otherwise a labelled button for the
 /// bill's own sheet, beside "Reprint bill".
@@ -475,23 +509,42 @@ class _EditSettledBillCustomerButtonState extends State<_EditSettledBillCustomer
     final billId = _s(widget.bill, 'id', '');
     if (billId.isEmpty) return;
     final no = _s(widget.bill, 'bill_no', '');
-    final addressKnown = widget.bill.containsKey('customer_address');
-    final seedAddress = addressKnown ? billCustomerAddressSeed(widget.bill['customer_address']) : '';
+    // A row's map has no address: read the bill itself, so the dialog shows the
+    // address it is about to edit. The detail's name and GSTIN seed the dialog
+    // too — one document, rather than a row that may be a poll old beside a
+    // fresh address. A failed read is not a reason to refuse the edit.
+    var bill = widget.bill;
+    if (!bill.containsKey('customer_address')) {
+      setState(() => _sending = true);
+      try {
+        final detail = await widget.rest.getMap('/bills/closed/${Uri.encodeComponent(billId)}');
+        if (detail.containsKey('customer_address')) bill = detail;
+      } catch (_) {
+        // Offline, refused or gone: the row's own name and GSTIN, address unknown.
+      } finally {
+        if (mounted) setState(() => _sending = false);
+      }
+    }
+    if (!mounted) return;
+    final addressKnown = bill.containsKey('customer_address');
+    final seedAddress = addressKnown ? billCustomerAddressSeed(bill['customer_address']) : '';
     final details = await _askBillCustomerDetails(
       context,
       title: no.isEmpty ? 'Name / GSTIN / address on this bill' : 'Name / GSTIN / address on Bill #$no',
       explanation: 'This bill is settled. Only the name, GSTIN and address printed on it change — never its '
           'amounts or payment. Reprint it afterwards for a corrected copy.',
-      currentName: widget.bill['customer'],
-      currentGstin: widget.bill['customer_gstin'],
+      currentName: bill['customer'],
+      currentGstin: bill['customer_gstin'],
       currentAddress: seedAddress,
     );
     if (details == null || !mounted) return;
-    // ONLY A CHANGE GOES OUT — the web's addressToSend, rule for rule. An
-    // address re-sent unchanged is still an address write, and a database
-    // without migration 054's column refuses every one of those with a 503:
-    // a name correction must not fail for a field nobody touched.
-    final sendAddress = details.addressTouched && (!addressKnown || details.address != seedAddress);
+    // ONLY A CHANGE GOES OUT — see [billCustomerAddressToSend].
+    final sendAddress = billCustomerAddressToSend(
+      address: details.address,
+      seed: seedAddress,
+      known: addressKnown,
+      touched: details.addressTouched,
+    );
     setState(() => _sending = true);
     try {
       final res = await widget.rest.post('/bills/${Uri.encodeComponent(billId)}/customer-details', {

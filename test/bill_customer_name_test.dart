@@ -437,9 +437,10 @@ void main() {
       await tester.pumpAndSettle();
 
       // Clear clears all THREE boxes. This fixture's bill carries no
-      // `customer_address` key (a server before client item 7), so the cleared
-      // address box goes out as null — which such a server ignores.
-      expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': '', 'customer_address': null});
+      // `customer_address` key (a server before client item 7), so nobody saw
+      // an address and the empty box is not sent: the request is exactly the
+      // 2.0.1 one (an address write would be a 503 before migration 054).
+      expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': ''});
       expect(find.text('Name cleared — the bill will print without a guest name.'), findsOneWidget);
       expect(_headerName(tester), 'No guest name on the bill');
     });
