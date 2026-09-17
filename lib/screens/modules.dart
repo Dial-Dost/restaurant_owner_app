@@ -33044,6 +33044,10 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
             if (m.enabled && !m.online)
               Padding(
                 padding: const EdgeInsets.only(left: 16, bottom: 4),
+                // Each option is a checkbox beside its words. The Wrap hands each
+                // one at most the card's width, so the words are Flexible: on a
+                // 360dp phone they wrap under themselves instead of running past
+                // the card's edge (80px of "Require payment screenshot" did).
                 child: Wrap(spacing: 12, children: [
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33054,7 +33058,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(requiresScreenshot: v ?? false)),
                     ),
-                    Text('Require payment screenshot', style: text.bodySmall),
+                    Flexible(child: Text('Require payment screenshot', style: text.bodySmall)),
                   ]),
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33065,7 +33069,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(showToGuests: v ?? false)),
                     ),
-                    Text('Show on guest QR page', style: text.bodySmall),
+                    Flexible(child: Text('Show on guest QR page', style: text.bodySmall)),
                   ]),
                 ]),
               ),
