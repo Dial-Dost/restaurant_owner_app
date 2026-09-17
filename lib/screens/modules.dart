@@ -16432,13 +16432,13 @@ class _HistorySettledBills extends StatefulWidget {
 }
 
 class _HistorySettledBillsState extends State<_HistorySettledBills> {
+  // The page's own controller, as Accounting's list keeps one: the box sits in
+  // a lazily built page, and the word must outlive the box being built away.
   final TextEditingController _search = TextEditingController();
-  Timer? _debounce;
   String _term = '';
 
   @override
   void dispose() {
-    _debounce?.cancel();
     _search.dispose();
     super.dispose();
   }
@@ -16457,36 +16457,15 @@ class _HistorySettledBillsState extends State<_HistorySettledBills> {
         Text('Every bill closed in ${widget.range.label()}, newest first — tap one to see it in full or reprint it.',
             style: text.bodySmall),
         const SizedBox(height: AppSpacing.md),
-        TextField(
-          key: const ValueKey('history-bill-search'),
+        // The shared box (client item 6): its x is there from the first
+        // keystroke, clears the box and the query at once, and Enter searches
+        // without waiting out the debounce.
+        AppSearchField(
+          testId: 'history-bill-search',
+          hint: 'Search bill no, table, cashier…',
           controller: _search,
-          decoration: InputDecoration(
-            isDense: true,
-            hintText: 'Search bill no, table, cashier…',
-            prefixIcon: Icon(Icons.search, size: 18, color: AppColors.textTertiary),
-            suffixIcon: _term.isEmpty && _search.text.isEmpty
-                ? null
-                : IconButton(
-                    icon: const Icon(Icons.close, size: 16),
-                    tooltip: 'Clear search',
-                    onPressed: () {
-                      _debounce?.cancel();
-                      _search.clear();
-                      setState(() => _term = '');
-                    },
-                  ),
-          ),
-          onChanged: (v) {
-            _debounce?.cancel();
-            setState(() {});
-            _debounce = Timer(const Duration(milliseconds: 350), () {
-              if (mounted) setState(() => _term = v.trim());
-            });
-          },
-          onSubmitted: (v) {
-            _debounce?.cancel();
-            setState(() => _term = v.trim());
-          },
+          debounce: const Duration(milliseconds: 350),
+          onQuery: (q) => setState(() => _term = q),
         ),
         const SizedBox(height: AppSpacing.md),
         _ClosedBillsList(

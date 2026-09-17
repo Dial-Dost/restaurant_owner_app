@@ -198,6 +198,25 @@ final Map<String, Object> _settings = {
   },
 };
 
+/// History (client item 8): one month with trade, and the page's own
+/// settled-bill list under it.
+final Map<String, Object> _history = {
+  '/analytics/history': <String, dynamic>{
+    'series': [
+      {
+        'month': RestaurantTime.isoDate(DateTime.now()).substring(0, 7),
+        'revenue': 1000.0,
+        'bills': 2,
+        'orders': 2,
+        'avg_bill': 500.0,
+        'new_customers': 0,
+        'feedback_count': 0,
+      },
+    ],
+  },
+  '/bills/closed': _closedBills,
+};
+
 const _simulation = <String, Object>{
   'POST /simulation/run': <String, dynamic>{
     'current': {'covers': 100, 'apc': 400, 'revenue': 40000, 'labour_cost': 6000, 'food_cost': 12800, 'marketing_per_day': 0, 'net_profit': 16200, 'tat_min': 42},
@@ -376,6 +395,18 @@ void main() {
     await _scrollTo(tester, find.byKey(const ValueKey('bills-search')));
     return SearchSurface(
       field: find.byKey(const ValueKey('bills-search')),
+      typed: '102',
+      filtered: () => api.lastSearched('/bills/closed'),
+    );
+  });
+
+  // History → Settled bills: the page's own list (client item 8), on the same
+  // shared box as Accounting's.
+  searchContractRows('history-bill-search', (tester, ds) async {
+    final api = await _mountModule(tester, ds, m.historyModule, _history);
+    await _scrollTo(tester, find.byKey(const ValueKey('history-bill-search')));
+    return SearchSurface(
+      field: find.byKey(const ValueKey('history-bill-search')),
       typed: '102',
       filtered: () => api.lastSearched('/bills/closed'),
     );
@@ -598,6 +629,7 @@ void main() {
       'audit-search',
       'guests-search',
       'bills-search',
+      'history-bill-search',
       'tz-search',
       'tag-dishes-search',
       'reports-search',
