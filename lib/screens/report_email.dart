@@ -133,8 +133,10 @@ class _EmailSendSheet extends StatefulWidget {
 }
 
 class _EmailSendSheetState extends State<_EmailSendSheet> {
-  /// ONE per opening — every retry of this send carries it.
-  final String _requestId = newClientRequestId();
+  /// The last send's id: reused only by a retry of the SAME choices before a
+  /// final answer (requestIdFor). One id per opening once replayed an old
+  /// failed send in place of the corrected one.
+  LastSend? _last;
   ReportEmailConfig? _config;
   List<BookEntry> _book = const [];
   bool _loaded = false;
@@ -172,8 +174,10 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
 
   Future<void> _send() async {
     final messenger = ScaffoldMessenger.of(context);
+    // A fresh id is only USED when this is not a retry of the last send.
+    final fresh = newClientRequestId();
     final built = buildSendBody(
-      clientRequestId: _requestId,
+      clientRequestId: fresh,
       reportKeys: _keys,
       formats: _formats,
       from: widget.from,
@@ -187,9 +191,13 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
       setState(() => _error = built.error);
       return;
     }
+    final key = sendBodyKey(built.body!);
+    final current = LastSend(requestIdFor(_last, key, () => fresh), key);
+    _last = current;
     setState(() {
       _error = null;
       _sending = true;
+      _delivery = null;
     });
     try {
       // The combined scope is in the BODY; the request itself runs as the
@@ -197,7 +205,7 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
       final home = widget.rest.auth.profile?.outletId;
       final res = await widget.rest.post(
         '/reports/email/send',
-        built.body,
+        {...built.body!, 'client_request_id': current.id},
         _combined && home != null && home.isNotEmpty ? home : null,
       );
       final id = res is Map ? '${res['delivery_id'] ?? ''}' : '';
@@ -211,7 +219,7 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
           if (d is Map) {
             last = d;
             setState(() => _delivery = d);
-            if (isSettledStatus('${d['status']}')) {
+            if (isResting(d)) {
               timedOut = false;
               break;
             }
@@ -220,7 +228,9 @@ class _EmailSendSheetState extends State<_EmailSendSheet> {
           // A poll that fails is not a failed send; the history has the answer.
         }
       }
-      final outcome = sendOutcome(last, timedOut: timedOut);
+      // A FINAL answer ends this id: the next press is a new send.
+      if (last != null && isFinalDelivery(last)) current.settled = true;
+      final outcome = sendOutcome(last, timedOut: timedOut, wallOf: RestaurantTime.wallOf);
       messenger.showSnackBar(SnackBar(content: Text('${outcome.title}. ${outcome.description}')));
       if (mounted && last != null && '${last['status']}' == 'delivered') Navigator.of(context).pop();
     } catch (e) {
@@ -644,10 +654,14 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
     _schedulePoll();
   }
 
-  /// A delivery still in flight refreshes the history by itself.
+  /// A delivery still in flight — or waiting for the server's retry — refreshes
+  /// the history by itself, for [kWatchMaxAge] after it was asked for (the
+  /// web's cap). Uncapped, a row that never settled re-read the history every
+  /// six seconds for as long as the panel stayed open.
   void _schedulePoll() {
     _poll?.cancel();
-    final inFlight = _deliveries.any((d) => !isSettledStatus('${d['status']}'));
+    final now = DateTime.now();
+    final inFlight = _deliveries.any((d) => isWatched(d, now));
     if (!inFlight) return;
     _poll = Timer(kPollInterval * 3, () async {
       try {
@@ -1147,6 +1161,7 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
     final sent = rows.where((r) => r.outcome == 'sent').length;
     final expanded = _open == id;
     final error = _s(d, 'error', '');
+    final retry = retryCaption(d, RestaurantTime.wallOf);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
@@ -1185,8 +1200,11 @@ class _EmailReportsPanelState extends State<_EmailReportsPanel> {
         ),
         if (error.isNotEmpty) ...[
           const SizedBox(height: 2),
-          Text(_capped(error, 160), style: text.bodySmall!.copyWith(color: AppColors.danger)),
+          Text(_capped(error, 160),
+              style: text.bodySmall!.copyWith(color: isFinalDelivery(d) ? AppColors.danger : AppColors.textTertiary)),
         ],
+        if (retry.isNotEmpty)
+          Text(retry, key: ValueKey('email-delivery-retry-$id'), style: text.bodySmall),
         if (expanded) ...[
           const SizedBox(height: AppSpacing.sm),
           if (rows.isNotEmpty) _OutcomeList(rows: rows),
@@ -1389,7 +1407,11 @@ class _EmailScheduleEditorState extends State<_EmailScheduleEditor> {
         const SizedBox(height: AppSpacing.md),
         DropdownButtonFormField<String>(
           key: const ValueKey('schedule-channel'),
-          initialValue: _f.channel == 'email' && !emailOk ? 'inbox' : (_f.channel == 'email' ? 'email' : 'inbox'),
+          // What the FORM holds, always — the web's select does the same. A
+          // stored email schedule on a server without mail shows "Email (not
+          // set up on this server)": showing "In-app inbox" while the form
+          // kept 'email' saved an email schedule the owner never saw.
+          initialValue: _f.channel == 'email' ? 'email' : 'inbox',
           isExpanded: true,
           dropdownColor: AppColors.cardRaised,
           borderRadius: AppRadius.controlAll,

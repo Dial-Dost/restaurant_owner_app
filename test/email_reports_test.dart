@@ -25,7 +25,10 @@ import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 /// Pinned, on Windows AND Android, in the Rustic Fork AND Gaia skins:
 ///   * the Email button sits beside Export and sends THE REPORT ON SCREEN for
 ///     THE DAYS ON SCREEN, whole days only, to addresses picked from the book,
-///     with one request id per opening — a retry is the same send;
+///     with the same request id only for a retry of the same choices before a
+///     final answer — change the addresses after a failure and it is a NEW send;
+///   * a failure the server will retry says "Not sent yet", and the history
+///     says when; the history stops refreshing a row after fifteen minutes;
 ///   * it tells the truth while the server works: it polls the delivery and
 ///     says what happened to each address, and closes only on a real "Sent";
 ///   * "Email is not set up on this server" is said, and Send is not offered;
@@ -97,6 +100,9 @@ Map<String, dynamic> _delivery(
   String? artifact,
   String? scheduleId,
   String? error,
+  bool? isFinal,
+  String? nextAttemptAt,
+  String createdAt = '2026-09-16T20:30:00.000Z',
 }) =>
     {
       'id': id,
@@ -126,7 +132,9 @@ Map<String, dynamic> _delivery(
       'artifact_truncated': false,
       'error': error,
       'files': files,
-      'created_at': '2026-09-16T20:30:00.000Z',
+      'created_at': createdAt,
+      'final': ?isFinal,
+      'next_attempt_at': nextAttemptAt,
     };
 
 class _Call {
@@ -370,6 +378,66 @@ void main() {
       expect((api.writes.last.body as Map)['client_request_id'], isNot(ids[0]));
     });
 
+    for (final system in DesignSystem.values) {
+      testWidgets('after a FINAL failure, changing the addresses is a NEW send — never a replay of the old one (${system.name})', (tester) async {
+        final api = _FakeApi(routes: {
+          '/reports/deliveries/del-9': {
+            'delivery': _delivery('del-9', status: 'failed', isFinal: true, recipients: ['owner@gaia.test'], sent: const [],
+                refused: const ['owner@gaia.test'], error: 'No address accepted this report: 1 refused by the mail service, 0 skipped.'),
+          },
+        });
+        await _mount(tester, api, system: system);
+        await _openSend(tester);
+        await _tap(tester, find.byKey(const ValueKey('email-to-r1')));
+        await _tap(tester, find.byKey(const ValueKey('email-send')));
+        await _poll(tester);
+        expect(find.textContaining("Couldn't send. No address accepted this report"), findsOneWidget);
+        expect(find.text('SEND NOW'), findsOneWidget, reason: 'a failed send keeps the sheet open');
+
+        // The owner swaps the address and presses Send again.
+        await _tap(tester, find.byKey(const ValueKey('email-to-r1')));
+        await _tap(tester, find.byKey(const ValueKey('email-to-r2')));
+        await _tap(tester, find.byKey(const ValueKey('email-send')));
+        await _poll(tester);
+        final sends = [for (final w in api.writes) w.body as Map];
+        expect(sends, hasLength(2));
+        expect(sends[1]['recipient_ids'], ['r2']);
+        expect(sends[1]['client_request_id'], matches(_uuid));
+        expect(sends[1]['client_request_id'], isNot(sends[0]['client_request_id']),
+            reason: 'the same id is answered with the OLD failed delivery, and r2 is never mailed');
+
+        // …and the very same choices after that final answer are sent again, deliberately.
+        await _tap(tester, find.byKey(const ValueKey('email-send')));
+        await _poll(tester);
+        expect(api.writes, hasLength(3));
+        expect((api.writes.last.body as Map)['client_request_id'], isNot(sends[1]['client_request_id']));
+      }, variant: _platforms);
+    }
+
+    testWidgets('a failure the server will retry says "Not sent yet" — and Send again with the same choices is the SAME send', (tester) async {
+      final api = _FakeApi(routes: {
+        '/reports/deliveries/del-9': {
+          'delivery': _delivery('del-9', status: 'failed', isFinal: false, nextAttemptAt: '2026-09-17T20:35:00.000Z',
+              recipients: ['owner@gaia.test'], sent: const [], refused: const [], error: '421 4.7.0 try again later'),
+        },
+      });
+      await _mount(tester, api);
+      await _openSend(tester);
+      await _tap(tester, find.byKey(const ValueKey('email-to-r1')));
+      await _tap(tester, find.byKey(const ValueKey('email-send')));
+      await _poll(tester);
+      expect(find.textContaining('Not sent yet. 421 4.7.0 try again later The server tries again at 18 Sep, 02:05.'), findsOneWidget);
+      expect(find.textContaining("Couldn't send"), findsNothing);
+      // One read was enough: nothing changes before the retry.
+      expect(api.calls.where((c) => c.path == '/reports/deliveries/del-9'), hasLength(1));
+
+      await _tap(tester, find.byKey(const ValueKey('email-send')));
+      await _poll(tester);
+      final ids = [for (final w in api.writes) (w.body as Map)['client_request_id']];
+      expect(ids, hasLength(2));
+      expect(ids[1], ids[0], reason: 'the server answers it with the same delivery — no second email');
+    }, variant: _platforms);
+
     testWidgets('a closing time and more reports: GST is calendar only, and the close rides in the window', (tester) async {
       final api = _FakeApi();
       await _mount(tester, api);
@@ -578,6 +646,72 @@ void main() {
           focus: const ModuleFocusRequest(moduleLabel: 'Reports', target: {'delivery_id': 'd1'}, serial: 1));
       expect(find.byKey(const ValueKey('email-reports-panel')), findsOneWidget);
     });
+
+    for (final system in DesignSystem.values) {
+      testWidgets('"Scheduled email reports are waiting" opens the Email reports view too — it names no delivery (${system.name})', (tester) async {
+        for (final target in const <Map<String, dynamic>>[
+          {'module': 'Reports', 'view': 'email', 'kind': 'mail_not_configured', 'day': '2026-09-17'},
+          // A bell rung before the view was named still says what it is about.
+          {'module': 'Reports', 'kind': 'mail_not_configured', 'day': '2026-09-17'},
+        ]) {
+          await _mount(tester, _FakeApi(), system: system, focus: ModuleFocusRequest(moduleLabel: 'Reports', target: target, serial: 1));
+          expect(find.byKey(const ValueKey('email-reports-panel')), findsOneWidget, reason: '$target');
+        }
+        // …while a Reports focus that names nothing about email stays on the reports.
+        await _mount(tester, _FakeApi(), system: system,
+            focus: const ModuleFocusRequest(moduleLabel: 'Reports', target: {'module': 'Reports'}, serial: 1));
+        expect(find.byKey(const ValueKey('email-reports-panel')), findsNothing);
+      }, variant: _platforms);
+    }
+
+    testWidgets('history: a failure the server will retry says so, and when; a final one says Failed', (tester) async {
+      final api = _FakeApi(routes: {
+        '/reports/deliveries': {
+          'deliveries': [
+            _delivery('d1', status: 'failed', isFinal: false, nextAttemptAt: '2026-09-17T20:35:00.000Z',
+                sent: const [], refused: const [], error: '421 try again later'),
+            _delivery('d2', status: 'failed', isFinal: true, sent: const [], error: 'No address accepted this report'),
+          ],
+        },
+      });
+      await _mount(tester, api);
+      await _openArea(tester);
+      await _tap(tester, find.byKey(const ValueKey('email-delivery-d2')));
+      expect(find.text(kWillRetryLabel), findsOneWidget);
+      expect(find.text('Failed'), findsOneWidget);
+      expect(find.byKey(const ValueKey('email-delivery-retry-d1')), findsOneWidget);
+      expect(find.text('The server tries again at 18 Sep, 02:05.'), findsOneWidget);
+      expect(find.byKey(const ValueKey('email-delivery-retry-d2')), findsNothing);
+      expect(api.writes, isEmpty);
+    }, variant: _platforms);
+
+    testWidgets('the history refreshes an unfinished row for fifteen minutes, then stops', (tester) async {
+      int reads(_FakeApi api) => api.calls.where((c) => c.path.startsWith('/reports/deliveries?')).length;
+      Map<String, dynamic> sending(Duration age) => {
+            'deliveries': [
+              _delivery('d1', status: 'sending', sent: const [], refused: const [],
+                  createdAt: DateTime.now().toUtc().subtract(age).toIso8601String()),
+            ],
+          };
+
+      final stale = _FakeApi(routes: {'/reports/deliveries': sending(const Duration(minutes: 16))});
+      await _mount(tester, stale);
+      await _openArea(tester);
+      final before = reads(stale);
+      await tester.pump(kPollInterval * 4);
+      await tester.pumpAndSettle();
+      expect(reads(stale), before, reason: 'a row that never settles must not re-read the history every six seconds forever');
+
+      final live = _FakeApi(routes: {'/reports/deliveries': sending(const Duration(minutes: 1))});
+      await _mount(tester, live);
+      await _openArea(tester);
+      final start = reads(live);
+      await tester.pump(kPollInterval * 4);
+      await tester.pumpAndSettle();
+      expect(reads(live), greaterThan(start), reason: 'a recent one still turns into "Sent" by itself');
+      await tester.pumpWidget(const SizedBox());
+    });
+
   });
 
   group('phones', () {

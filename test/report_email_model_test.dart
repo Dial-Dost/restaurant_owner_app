@@ -11,8 +11,9 @@ import 'package:restaurant_owner_app/services/time_slot.dart';
 ///
 ///   * which reports may be read on which kind of day, and the server's own
 ///     refusal sentence for the rest;
-///   * the exact Send-now body: whole days only (never a session filter), one
-///     request id per sheet, the combined scope in the BODY;
+///   * the exact Send-now body: whole days only (never a session filter), the
+///     same request id only for a retry of the same choices, the combined
+///     scope in the BODY;
 ///   * one word per delivery state and one outcome per address, the same as
 ///     the web dashboard's src/lib/report-email.ts — read from its checkout
 ///     when it sits beside this one, and the backend's catalogue the same way;
@@ -90,6 +91,11 @@ void main() {
       expect(reportListPhrase(['sales_summary']), 'Sales Summary');
       expect(reportListPhrase(['void_kot', 'sales_summary']), 'Void KOT and Sales Summary');
       expect(reportListPhrase(['item_wise', 'discount', 'void_kot', 'bill_edit']), 'Item Wise, Discount and 2 more');
+      // Up to `max`, every title is named — three once ran together as "Item WiseDiscountVoid KOT".
+      expect(reportListPhrase(['item_wise', 'discount', 'void_kot'], max: 3), 'Item Wise, Discount and Void KOT');
+      expect(reportListPhrase(['item_wise', 'discount'], max: 3), 'Item Wise and Discount');
+      expect(reportListPhrase(['item_wise'], max: 3), 'Item Wise');
+      expect(reportListPhrase(['item_wise', 'discount', 'void_kot', 'bill_edit'], max: 3), 'Item Wise, Discount, Void KOT and 1 more');
       expect(reportListPhrase(kMisEmailKeys), 'All 15 MIS reports');
       expect(reportListPhrase([for (final r in kEmailableReports) r.key]), 'All reports');
       expect(orderedReportKeys(['pnl', 'item_wise', 'nope', 'item_wise']), ['item_wise', 'pnl']);
@@ -153,6 +159,34 @@ void main() {
       final ids = {for (var i = 0; i < 200; i++) newClientRequestId()};
       expect(ids, hasLength(200));
       expect(ids.every(isRequestId), isTrue);
+    });
+
+    test('the SAME id only for a true retry: same body, no final answer yet', () {
+      var n = 0;
+      String mint() => 'id-${++n}';
+      final key = sendBodyKey(_send(to_: const ['r1', 'r2']).body!);
+      // The id is not part of what is asked; the order of the ticks is not either.
+      expect(sendBodyKey(_send(id: '3d6f0a51-8a7e-4c1b-9d2e-5f4a3b2c1d0e', to_: const ['r2', 'r1']).body!), key);
+      expect(requestIdFor(null, key, mint), 'id-1');
+      // A dropped response, pressed again: the same send.
+      final last = LastSend('id-1', key);
+      expect(requestIdFor(last, key, mint), 'id-1');
+      // After a failure the owner changes something: a NEW send, never a replay of the old one.
+      for (final changed in [
+        _send(to_: const ['r1']),
+        _send(keys: const ['void_kot'], to_: const ['r1', 'r2']),
+        _send(formats: const ['csv'], to_: const ['r1', 'r2']),
+        _send(to: '2026-09-17', to_: const ['r1', 'r2']),
+        _send(close: '02:00', to_: const ['r1', 'r2']),
+        _send(all: true, to_: const ['r1', 'r2']),
+      ]) {
+        final k = sendBodyKey(changed.body!);
+        expect(k, isNot(key));
+        expect(requestIdFor(last, k, mint), isNot('id-1'));
+      }
+      // The same choices after a FINAL answer: sent again, deliberately.
+      last.settled = true;
+      expect(requestIdFor(last, key, () => 'fresh'), 'fresh');
     });
 
     test('refusal codes read as a person would act on them', () {
@@ -238,8 +272,37 @@ void main() {
       expect(deliveryStatus({'status': 'sending'}).label, 'Sending');
       expect(deliveryStatus({'status': 'rendered'}).label, 'Building');
       expect(deliveryStatus({'status': 'claimed'}).label, 'Queued');
-      expect(['delivered', 'failed', 'abandoned'].every(isSettledStatus), isTrue);
-      expect(['claimed', 'rendered', 'sending'].any(isSettledStatus), isFalse);
+      expect(['delivered', 'failed', 'abandoned'].every((s) => isFinalDelivery({'status': s})), isTrue);
+      expect(['claimed', 'rendered', 'sending'].any((s) => isFinalDelivery({'status': s})), isFalse);
+    });
+
+    test('a failure the server will retry is not final, and says when', () {
+      final waiting = {
+        'status': 'failed', 'final': false, 'error': '421 try again later',
+        'next_attempt_at': '2026-09-17T20:35:00.000Z', 'timezone': 'Asia/Kolkata',
+      };
+      expect(isFinalDelivery(waiting), isFalse);
+      expect(isResting(waiting), isTrue);
+      expect(deliveryStatus(waiting), (label: kWillRetryLabel, tone: 'pending'));
+      expect(retryCaption(waiting, _ist), 'The server tries again at 18 Sep, 02:05.');
+      expect(retryCaption({...waiting, 'next_attempt_at': null}, _ist), 'The server tries again shortly.');
+      expect(retryCaption(waiting), 'The server tries again shortly.');
+      expect(retryCaption({...waiting, 'final': true}, _ist), '');
+      expect(retryCaption({'status': 'sending', 'final': false}, _ist), '');
+      expect(deliveryStatus({'status': 'failed', 'final': true}), (label: 'Failed', tone: 'bad'));
+      expect(isResting({'status': 'sending', 'final': false}), isFalse);
+    });
+
+    test('the history watches an unfinished row for fifteen minutes, the web\'s cap', () {
+      final now = DateTime.utc(2026, 9, 17, 12);
+      String ago(int min) => now.subtract(Duration(minutes: min)).toIso8601String();
+      expect(kWatchMaxAge, const Duration(minutes: 15));
+      expect(isWatched({'status': 'sending', 'created_at': ago(14)}, now), isTrue);
+      expect(isWatched({'status': 'sending', 'created_at': ago(16)}, now), isFalse, reason: 'a row that never settles stops the polling');
+      expect(isWatched({'status': 'failed', 'final': false, 'created_at': ago(1)}, now), isTrue);
+      expect(isWatched({'status': 'failed', 'final': true, 'created_at': ago(1)}, now), isFalse);
+      expect(isWatched({'status': 'delivered', 'created_at': ago(1)}, now), isFalse);
+      expect(isWatched({'status': 'claimed', 'created_at': 'not a date'}, now), isFalse);
     });
 
     test('where it came from — a 2.0.1 server sends no kind, and the key still tells', () {
@@ -280,6 +343,16 @@ void main() {
       expect(partial.title, 'Sent to 1 address');
       expect(partial.description, contains('1 refused by the mail service'));
       expect(partial.description, contains('may have received it twice'));
+      // Not final: the server retries it — never "Couldn't send", never an invitation to send twice.
+      final later = sendOutcome({
+        'status': 'failed', 'final': false, 'channel': 'email', 'error': '421 try again later',
+        'next_attempt_at': '2026-09-17T20:35:00.000Z', 'timezone': 'Asia/Kolkata',
+      }, timedOut: true, wallOf: _ist);
+      expect(later, (
+        title: 'Not sent yet',
+        description: '421 try again later The server tries again at 18 Sep, 02:05. Its result will appear in Email reports → History; pressing Send again with the same choices does not send it twice.',
+        bad: false,
+      ));
       final failed = sendOutcome({'status': 'failed', 'error': 'Every address was refused'}, timedOut: false);
       expect(failed, (title: "Couldn't send", description: 'Every address was refused', bad: true));
       expect(sendOutcome({'status': 'sending'}, timedOut: true).title, 'Still sending');
@@ -377,7 +450,7 @@ void main() {
       for (final w in [
         kEmailAreaTitle, kEmailButtonLabel, kEmailButtonTooltip, kMailOffSentence, kMailOffHint, kSchemaPendingSentence,
         kSchedulerOffSentence, kSendNowOffSentence, kTestEmailLabel, kAddressBookTitle, kAddressBookEmpty,
-        kAddressBookReadOnly, kWholeDaysNote, kCalendarDaysOnly, kAllMisReports,
+        kAddressBookReadOnly, kWholeDaysNote, kCalendarDaysOnly, kAllMisReports, kWillRetryLabel, 'Not sent yet',
         ...kFormatLabels.values, ...kWindowModeLabels.values, ...kRecipientOutcomeLabels.values,
       ]) {
         expect(web, contains("'${w.replaceAll("'", "\\'")}'"), reason: w);

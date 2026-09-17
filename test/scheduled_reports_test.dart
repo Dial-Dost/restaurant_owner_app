@@ -437,6 +437,54 @@ void main() {
       expect(find.text('In-app inbox (notification bell)'), findsWidgets, reason: 'a new schedule starts on the inbox');
     });
 
+    for (final system in DesignSystem.values) {
+      testWidgets('mail off: a stored EMAIL schedule opens as email — the screen shows what the form holds, and saves it (${system.name})', (tester) async {
+        final api = await _mount(
+          tester,
+          _routes(
+            config: {'email_available': false, 'schema_ready': true, 'scheduler': {'enabled': false}, 'can_edit_recipients': true},
+            schedules: [
+              _schedule('s1', 'Nightly close', 'daily',
+                  reportKeys: ['sales_summary'], formats: ['xlsx'], windowMode: 'trading_day', channel: 'email',
+                  recipients: ['owner@gaia.test'], hour: 2),
+            ],
+          ),
+          system: system,
+        );
+        await _menu(tester, 'Nightly close', 'Edit');
+        final channel = find.byKey(const ValueKey('schedule-channel'));
+        await _reveal(tester, channel);
+        expect(find.descendant(of: channel, matching: find.text('Email (not set up on this server)')), findsOneWidget);
+        expect(find.descendant(of: channel, matching: find.text('In-app inbox (notification bell)')), findsNothing,
+            reason: 'showing the inbox while the form holds email saved an email schedule nobody saw');
+        expect(find.text('Send to (up to 10, from the address book)'), findsOneWidget);
+        await _tap(tester, find.byKey(const ValueKey('schedule-save')));
+        expect(api.writes, ['PATCH /reports/schedules/s1']);
+        expect(_lastBody(api)['channel'], 'email');
+        expect(_lastBody(api).containsKey('recipient_ids'), isFalse, reason: 'the addresses were not touched');
+      }, variant: _platforms);
+    }
+
+    testWidgets('…and choosing the in-app inbox there is exactly what is saved', (tester) async {
+      final api = await _mount(
+        tester,
+        _routes(
+          config: {'email_available': false, 'schema_ready': true, 'scheduler': {'enabled': false}, 'can_edit_recipients': true},
+          schedules: [
+            _schedule('s1', 'Nightly close', 'daily',
+                reportKeys: ['sales_summary'], formats: ['xlsx'], windowMode: 'trading_day', channel: 'email',
+                recipients: ['owner@gaia.test'], hour: 2),
+          ],
+        ),
+      );
+      await _menu(tester, 'Nightly close', 'Edit');
+      await _pick(tester, 'schedule-channel', 'In-app inbox (notification bell)');
+      expect(find.text('Send to (up to 10, from the address book)'), findsNothing);
+      await _tap(tester, find.byKey(const ValueKey('schedule-save')));
+      expect(_lastBody(api)['channel'], 'inbox');
+      expect(_lastBody(api)['recipient_ids'], <String>[]);
+    }, variant: _platforms);
+
     testWidgets('reading writes nothing; run-now and pause go to their own routes', (tester) async {
       final api = await _mount(tester, _routes(schedules: [_schedule('s1', 'Morning sales', 'daily')]));
       expect(api.writes, isEmpty, reason: 'opening Email reports must not trigger a report run');

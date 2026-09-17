@@ -277,11 +277,13 @@ class _ReportsViewState extends State<_ReportsView> {
     super.didChangeDependencies();
     // A bell about an emailed report (its meta says module 'Reports'), or the
     // Accounting card's "Open Email reports", lands on the Email reports view.
+    // "Scheduled email reports are waiting" names no delivery and no schedule:
+    // it carries view 'email' (and its kind), or it landed on the report grid.
     final focus = ModuleNavigator.of(context)?.focusFor('Reports');
     if (focus != null && focus.serial != _focusSerial) {
       _focusSerial = focus.serial;
       final t = focus.target;
-      if (t['view'] == 'email' || t['delivery_id'] != null || t['schedule_id'] != null) {
+      if (t['view'] == 'email' || t['delivery_id'] != null || t['schedule_id'] != null || t['kind'] != null) {
         _view = 'email';
         _misView = 'email';
       }

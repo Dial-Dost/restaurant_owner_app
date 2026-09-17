@@ -7,7 +7,8 @@
 //
 // Everything the Email reports area and the Send-now sheet DECIDE, by value:
 // which reports may be read on which kind of day, the exact body Send now
-// posts (never a session filter, one request id per send), what each delivery
+// posts (never a session filter, one request id per SEND — a retry of the
+// same choices reuses it, anything else gets a new one), what each delivery
 // state and each address outcome is called, what a schedule's next run covers.
 // The screens (screens/report_email.dart) only lay these out.
 //
@@ -27,6 +28,7 @@
 //
 // PURE: no Flutter, no network. Same discipline as nc_settle.dart.
 
+import 'dart:convert';
 import 'dart:math' as math;
 
 // --- The catalogue ------------------------------------------------------------
@@ -123,12 +125,16 @@ List<String> orderedReportKeys(Iterable<String> keys) {
 }
 
 /// "Sales Summary and Void KOT", "All 15 MIS reports", "Item Wise, Discount and 2 more".
+/// Up to [max] titles are all named, the last joined with "and": three under
+/// max 3 once ran together as "Item WiseDiscountVoid KOT".
 String reportListPhrase(List<String> keys, {int max = 2}) {
   final titles = [for (final k in keys) reportTitle(k)];
   if (titles.isEmpty) return 'No reports';
   if (titles.length == kEmailableReports.length) return 'All reports';
   if (titles.length == kMisEmailKeys.length && keys.every(kMisEmailKeys.contains)) return kAllMisReports;
-  if (titles.length <= max) return titles.join(titles.length == 2 ? ' and ' : '');
+  if (titles.length <= max) {
+    return titles.length == 1 ? titles.first : '${titles.sublist(0, titles.length - 1).join(', ')} and ${titles.last}';
+  }
   return '${titles.take(max).join(', ')} and ${titles.length - max} more';
 }
 
@@ -422,8 +428,8 @@ String? addressProblem(String email, List<BookEntry> book, int max) {
 final RegExp _uuidRe = RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', caseSensitive: false);
 bool isRequestId(String v) => _uuidRe.hasMatch(v);
 
-/// ONE id per sheet, made when it opens and reused by every retry of that send:
-/// the server answers a repeat as a replay of the same delivery.
+/// A fresh request id (a v4 UUID). The server answers a repeated id as a replay
+/// of the delivery it already made — see [requestIdFor] for when one is reused.
 String newClientRequestId([math.Random? rng]) {
   final r = rng ?? math.Random.secure();
   final b = List<int>.generate(16, (_) => r.nextInt(256));
@@ -432,6 +438,38 @@ String newClientRequestId([math.Random? rng]) {
   final h = b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
   return '${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
 }
+
+/// What a Send-now body asks for, without its id — equal keys, equal sends.
+String sendBodyKey(Map body) {
+  List<String> sorted(Object? v) => [for (final x in (v is List ? v : const [])) '$x']..sort();
+  final w = body['window'] is Map ? body['window'] as Map : const {};
+  return jsonEncode([
+    sorted(body['report_keys']),
+    sorted(body['formats']),
+    '${w['from'] ?? ''}',
+    '${w['to'] ?? ''}',
+    '${w['day_close'] ?? ''}',
+    '${body['outlet_scope'] ?? ''}',
+    sorted(body['recipient_ids']),
+  ]);
+}
+
+/// The last id a sheet sent, what it asked for, and whether its delivery is final.
+class LastSend {
+  LastSend(this.id, this.bodyKey);
+  final String id;
+  final String bodyKey;
+  bool settled = false;
+}
+
+/// THE ID FOR THIS PRESS OF "Send". The same id ONLY for a true retry: the same
+/// reports, days, formats, scope and addresses, and no final answer yet. The
+/// server answers a repeated id with the delivery it already made — so one id
+/// for the whole sheet turned "change the addresses after a failure and press
+/// Send again" into a replay of the OLD failed send, and the corrected choice
+/// was never sent.
+String requestIdFor(LastSend? last, String bodyKey, [String Function()? mint]) =>
+    last != null && !last.settled && last.bodyKey == bodyKey ? last.id : (mint ?? newClientRequestId)();
 
 /// The POST /reports/email/send body, or the sentence that stops it.
 ({Map<String, dynamic>? body, String? error}) buildSendBody({
@@ -478,13 +516,15 @@ String newClientRequestId([math.Random? rng]) {
 
 // --- Deliveries -------------------------------------------------------------------
 
+const String kWillRetryLabel = 'Will retry';
+
 /// One word per state, the same on web and app; tone is 'ok', 'bad' or 'pending'.
 ({String label, String tone}) deliveryStatus(Map d) {
   switch ('${d['status'] ?? ''}') {
     case 'delivered':
       return (label: d['channel'] == 'email' ? 'Sent' : 'Delivered', tone: 'ok');
     case 'failed':
-      return (label: 'Failed', tone: 'bad');
+      return isFinalDelivery(d) ? (label: 'Failed', tone: 'bad') : (label: kWillRetryLabel, tone: 'pending');
     case 'abandoned':
       return (label: 'Missed', tone: 'bad');
     case 'sending':
@@ -508,7 +548,40 @@ String deliveryKind(Map d) {
   return 'Scheduled';
 }
 
-bool isSettledStatus(String status) => status == 'delivered' || status == 'failed' || status == 'abandoned';
+/// FINAL = nothing more will happen to this row without a person, as the server
+/// says (`final`). A 'failed' row with attempts left is RETRIED at
+/// next_attempt_at: calling every 'failed' final told the owner "Couldn't send"
+/// for an email that went out minutes later — and invited a second send of it.
+/// A server that does not say reads the old way.
+bool isFinalDelivery(Map d) {
+  final status = '${d['status'] ?? ''}';
+  if (status == 'delivered' || status == 'abandoned') return true;
+  return status == 'failed' && d['final'] != false;
+}
+
+/// Nothing will change for a while: final, or failed and waiting for its retry.
+/// The Send-now sheet stops watching here.
+bool isResting(Map d) => '${d['status'] ?? ''}' == 'failed' || isFinalDelivery(d);
+
+/// "The server tries again at 18 Sep, 02:05." — or '' when it will not.
+String retryCaption(Map d, [DateTime? Function(String iso)? wallOf]) {
+  if ('${d['status'] ?? ''}' != 'failed' || isFinalDelivery(d)) return '';
+  final next = d['next_attempt_at'];
+  final at = next is String && next.isNotEmpty && wallOf != null && wallOf(next) != null ? wallClock(next, wallOf) : '';
+  return at.isEmpty ? 'The server tries again shortly.' : 'The server tries again at $at.';
+}
+
+/// How long a screen keeps refreshing a row that has not finished — the web's
+/// WATCH_MAX_MS. Without it a row that never settles re-read the history every
+/// six seconds for as long as the panel stayed open.
+const Duration kWatchMaxAge = Duration(minutes: 15);
+
+/// Whether the history should keep refreshing for [d] at [now].
+bool isWatched(Map d, DateTime now) {
+  if (isFinalDelivery(d)) return false;
+  final created = DateTime.tryParse('${d['created_at'] ?? ''}');
+  return created != null && now.difference(created) < kWatchMaxAge;
+}
 
 /// ONE OUTCOME PER ADDRESS, matched case-insensitively.
 List<({String email, String outcome})> recipientOutcomes(Map d, [List<String> scheduled = const []]) {
@@ -532,7 +605,11 @@ List<({String email, String outcome})> recipientOutcomes(Map d, [List<String> sc
 }
 
 /// The message a finished (or still running) send ends with.
-({String title, String description, bool bad}) sendOutcome(Map? d, {required bool timedOut}) {
+({String title, String description, bool bad}) sendOutcome(
+  Map? d, {
+  required bool timedOut,
+  DateTime? Function(String iso)? wallOf,
+}) {
   const onItsWay = 'The email is on its way. Its result will appear in Email reports → History.';
   if (d == null) return (title: 'Queued', description: onItsWay, bad: false);
   final rows = recipientOutcomes(d);
@@ -548,6 +625,15 @@ List<({String email, String outcome})> recipientOutcomes(Map d, [List<String> sc
     return (
       title: 'Sent to $sent address${sent == 1 ? '' : 'es'}',
       description: extra.isNotEmpty ? '${extra.join('; ')}.' : 'The files are also kept in Email reports → History.',
+      bad: false,
+    );
+  }
+  if (status == 'failed' && !isFinalDelivery(d)) {
+    final err = d['error'];
+    return (
+      title: 'Not sent yet',
+      description: '${err is String && err.isNotEmpty ? '$err ' : ''}${retryCaption(d, wallOf)} '
+          'Its result will appear in Email reports → History; pressing Send again with the same choices does not send it twice.',
       bad: false,
     );
   }
