@@ -32363,6 +32363,9 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
 // outbox refuses every /print write offline, and this says so); disabled while
 // the request is out, so one tap is one slip; a refusal shows the server's
 // sentence. The route checks the Print permission, not the settings one.
+// The button is also off while a pick is saving, and the picks are off while a
+// test is out (kotDocketLocks): the server builds the slip from the settings as
+// they are when the request lands, and a pick has already moved the card.
 class _KotDocketCard extends StatefulWidget {
   final RestClient rest;
   final String initialStyle;
@@ -32379,8 +32382,10 @@ class _KotDocketCardState extends State<_KotDocketCard> {
   bool _busy = false;
   bool _testing = false;
 
+  KotDocketLocks get _locks => kotDocketLocks(saving: _busy, testing: _testing);
+
   Future<void> _testPrint() async {
-    if (_testing) return;
+    if (_locks.testDisabled) return;
     setState(() => _testing = true);
     String message;
     try {
@@ -32412,7 +32417,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
 
   Future<void> _save(String key, String value) async {
     final previous = key == kotPrintStyleKey ? _style : _size;
-    if (_busy || value == previous) return;
+    if (_locks.choicesDisabled || value == previous) return;
     setState(() {
       _put(key, value);
       _busy = true;
@@ -32453,7 +32458,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
         inset: true,
         selected: on,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        onTap: _busy ? null : () => _save(key, o.value),
+        onTap: _locks.choicesDisabled ? null : () => _save(key, o.value),
         child: Row(children: [
           Icon(
             on ? Icons.radio_button_checked : Icons.radio_button_unchecked,
@@ -32507,7 +32512,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
             key: const ValueKey('kot-test-print'),
             label: _testing ? kotTestPrintSending : kotTestPrintLabel,
             icon: Icons.print_outlined,
-            onPressed: _testing ? null : _testPrint,
+            onPressed: _locks.testDisabled ? null : _testPrint,
           ),
         ),
         const SizedBox(height: 4),

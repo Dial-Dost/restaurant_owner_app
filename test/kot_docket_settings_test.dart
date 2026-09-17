@@ -16,7 +16,13 @@
 //   * a pick is saved at once, ONE key per save, and put back if refused;
 //   * an owner on the classic docket is told the size does nothing there;
 //   * the card is actually on the Settings screen, seeded from the settings
-//     document (built, and called).
+//     document (built, and called);
+//   * "Print a test KOT" waits out a pick that is still saving, and a pick
+//     waits out a test in flight — the server builds the slip from the
+//     settings as they are when the request lands, so a test pressed mid-save
+//     prints the setting the card has already moved away from;
+//   * a slip no device printed says what happens to it: the server keeps it
+//     for the minutes its reply names, for a kitchen device that connects late.
 
 import 'dart:async';
 import 'dart:io';
@@ -50,7 +56,11 @@ class _FakeApi extends ApiClient {
     this.printRefuse,
     this.printOffline = false,
     this.printGate,
+    this.saveGate,
   });
+
+  /// When set, POST /restaurant/settings waits for it — a pick still saving.
+  final Completer<void>? saveGate;
 
   /// What POST /print/test answers (a directed slip by default).
   final Object? printReply;
@@ -109,6 +119,7 @@ class _FakeApi extends ApiClient {
         if (printRefuse != null) throw printRefuse!;
         return printReply ?? _directedReply;
       }
+      if (path == '/restaurant/settings' && saveGate != null) await saveGate!.future;
       if (refuse != null) throw refuse!;
       // The real route answers with the whole settings document, the new value
       // in it.
@@ -364,16 +375,74 @@ void main() {
       expect(
           kotTestPrintOutcome(reply({'mode': 'broadcast', 'reason': 'no_device_online', 'destination': 'Kitchen Epson'})),
           'Kitchen Epson is not online, so every connected device with a kitchen printer was asked to print it. '
-          'Check the paper.');
+          'Check the paper. If nothing came out, it may still print when a kitchen device connects.');
       for (final reason in ['no_route', 'flag_off', 'schema_missing', 'unpersisted', 'route_lookup_failed']) {
         expect(kotTestPrintOutcome(reply({'mode': 'broadcast', 'reason': reason, 'destination': null})),
-            'Every connected device with a kitchen printer was asked to print it. Check the paper.',
+            'Every connected device with a kitchen printer was asked to print it. Check the paper. '
+            'If nothing came out, it may still print when a kitchen device connects.',
             reason: reason);
       }
       expect(kotTestPrintOutcome({'results': <Object>[], 'skipped': 0}), 'Nothing was sent to print.');
       for (final odd in <Object?>[null, 'ok', 1, <Object>[], <String, dynamic>{}, {'results': 'x'}]) {
         expect(kotTestPrintOutcome(odd), "Sent. Check the kitchen printer's paper.", reason: '$odd');
       }
+    });
+
+    test('a broadcast slip names the window the server keeps it for — the web card\'s words', () {
+      Map<String, dynamic> broadcast(Map<String, dynamic> r, Object? minutes) => {
+            'results': [
+              {'role': 'kot', 'jobId': 'j1', 'mode': 'broadcast', ...r},
+            ],
+            'skipped': 0,
+            'replayMinutes': minutes,
+          };
+      expect(
+          kotTestPrintOutcome(broadcast({'reason': 'no_device_online', 'destination': 'Kitchen Epson'}, 5)),
+          'Kitchen Epson is not online, so every connected device with a kitchen printer was asked to print it. '
+          'Check the paper. If nothing came out, it prints on the first kitchen device to connect within 5 minutes, '
+          'and not after that.');
+      expect(
+          kotTestPrintOutcome(broadcast({'reason': 'no_route', 'destination': null}, 5)),
+          'Every connected device with a kitchen printer was asked to print it. Check the paper. '
+          'If nothing came out, it prints on the first kitchen device to connect within 5 minutes, and not after that.');
+      expect(kotTestPrintReplayNote({'replayMinutes': 1}),
+          'If nothing came out, it prints on the first kitchen device to connect within 1 minute, and not after that.');
+      // JSON may carry a whole number as 5.0; the web reads that as 5 too.
+      expect(kotTestPrintReplayNote({'replayMinutes': 5.0}), contains('within 5 minutes,'));
+      for (final odd in <Object?>[null, 0, -5, 2.5, '5', double.nan, double.infinity, true]) {
+        expect(kotTestPrintReplayNote({'replayMinutes': odd}),
+            'If nothing came out, it may still print when a kitchen device connects.',
+            reason: '$odd');
+      }
+      expect(kotTestPrintReplayNote(null), 'If nothing came out, it may still print when a kitchen device connects.');
+      // A slip sent to a named, online printer says nothing about later.
+      expect(
+          kotTestPrintOutcome({
+            'results': [
+              {'mode': 'directed', 'destination': 'Kitchen Epson'},
+            ],
+            'replayMinutes': 5,
+          }),
+          'Sent to Kitchen Epson. Check the paper there.');
+    });
+
+    test('the card\'s controls lock each other out — the web card\'s rule', () {
+      for (final canEdit in [true, false]) {
+        for (final loading in [true, false]) {
+          for (final saving in [true, false]) {
+            for (final testing in [true, false]) {
+              final l = kotDocketLocks(canEdit: canEdit, loading: loading, saving: saving, testing: testing);
+              final state = '$canEdit/$loading/$saving/$testing';
+              expect(l.testDisabled, loading || saving || testing, reason: state);
+              expect(l.choicesDisabled, !canEdit || loading || saving || testing, reason: state);
+            }
+          }
+        }
+      }
+      // What this app's card passes: saving and testing only.
+      expect(kotDocketLocks(saving: false, testing: false), (choicesDisabled: false, testDisabled: false));
+      expect(kotDocketLocks(saving: true, testing: false), (choicesDisabled: true, testDisabled: true));
+      expect(kotDocketLocks(saving: false, testing: true), (choicesDisabled: true, testDisabled: true));
     });
 
     test('the snackbar lines carry the web toast\'s title and sentence', () {
@@ -446,18 +515,81 @@ void main() {
         expect(enabled(tester), isTrue);
       }, variant: platforms);
 
-      testWidgets('a broadcast slip says where it went instead', (tester) async {
+      testWidgets('a broadcast slip says where it went instead, and how long it waits for a late device',
+          (tester) async {
         final reply = <String, dynamic>{
           'results': [
             {'role': 'kot', 'jobId': 'job-2', 'mode': 'broadcast', 'reason': 'no_device_online', 'destination': 'Kitchen Epson'},
           ],
           'skipped': 0,
+          'replayMinutes': 5,
         };
         final api = _FakeApi(_unchosen(), printReply: reply);
         await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
         await _tap(tester, testButton);
         expect(find.text(kotTestPrintSentMessage(reply)), findsOneWidget);
         expect(kotTestPrintSentMessage(reply), contains('Kitchen Epson is not online'));
+        expect(kotTestPrintSentMessage(reply), contains('within 5 minutes, and not after that.'));
+      }, variant: platforms);
+
+      testWidgets('A PICK STILL SAVING HOLDS THE TEST BUTTON — the slip would print the old size', (tester) async {
+        final gate = Completer<void>();
+        final api = _FakeApi(_unchosen(), saveGate: gate);
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        final small = _choice(kotTextSizeKey, 'small');
+        await tester.ensureVisible(small);
+        await tester.pumpAndSettle();
+        await tester.tap(small);
+        await tester.pump();
+        // The card has moved, the save has not landed.
+        expect(_picked(tester, kotTextSizeKey, 'small'), isTrue);
+        expect(api.writes.single.path, '/restaurant/settings');
+        expect(enabled(tester), isFalse, reason: 'the server would still build the slip at the standard size');
+        await tester.ensureVisible(testButton);
+        await tester.pump();
+        await tester.tap(testButton, warnIfMissed: false);
+        await tester.pump();
+        expect(api.writes.where((w) => w.path == kotTestPrintPath), isEmpty);
+        // The other picks wait too: one save at a time.
+        expect(tester.widget<ForkCard>(_choice(kotPrintStyleKey, 'classic')).onTap, isNull);
+
+        gate.complete();
+        await tester.pumpAndSettle();
+        expect(_picked(tester, kotTextSizeKey, 'small'), isTrue);
+        expect(enabled(tester), isTrue, reason: 'saved: the slip now prints at the size the card shows');
+        await _tap(tester, testButton);
+        expect(api.writes.map((w) => w.path), ['/restaurant/settings', kotTestPrintPath]);
+      }, variant: platforms);
+
+      testWidgets('A TEST IN FLIGHT HOLDS THE PICKS — the card would show a size the slip does not have',
+          (tester) async {
+        final gate = Completer<void>();
+        final api = _FakeApi(_unchosen(), printGate: gate);
+        await _mountAndScrollTo(tester, api, testButton, 'the test KOT button', system: system);
+        await tester.tap(testButton);
+        await tester.pump();
+        expect(label(tester), kotTestPrintSending);
+        for (final (key, value) in [
+          (kotTextSizeKey, 'small'),
+          (kotTextSizeKey, 'large'),
+          (kotPrintStyleKey, 'classic'),
+        ]) {
+          expect(tester.widget<ForkCard>(_choice(key, value)).onTap, isNull, reason: '$key=$value');
+        }
+        final classic = _choice(kotPrintStyleKey, 'classic');
+        await tester.ensureVisible(classic);
+        await tester.pump();
+        await tester.tap(classic, warnIfMissed: false);
+        await tester.pump();
+        expect(api.writes.map((w) => w.path), [kotTestPrintPath], reason: 'no save while the test is out');
+        expect(_picked(tester, kotPrintStyleKey, 'reference'), isTrue);
+
+        gate.complete();
+        await tester.pumpAndSettle();
+        expect(tester.widget<ForkCard>(classic).onTap, isNotNull);
+        await _tap(tester, classic);
+        expect(api.writes.last.body, {'kot_print_style': 'classic'});
+        expect(_picked(tester, kotPrintStyleKey, 'classic'), isTrue);
       }, variant: platforms);
 
       testWidgets('offline, it says a test KOT needs a connection and saves nothing for later', (tester) async {
@@ -674,7 +806,13 @@ void main() {
       // …and the test KOT goes to the existing route, once per press, from a
       // button that is off while it is in flight.
       expect('widget.rest.post(kotTestPrintPath, kotTestPrintBody)'.allMatches(src).length, 1);
-      expect(card, contains('onPressed: _testing ? null : _testPrint,'));
+      expect(card, contains('onPressed: _locks.testDisabled ? null : _testPrint,'));
+      // …and the button and the picks lock each other out, through the shared
+      // rule, in the handlers as well as on the controls.
+      expect(card, contains('KotDocketLocks get _locks => kotDocketLocks(saving: _busy, testing: _testing);'));
+      expect(card, contains('onTap: _locks.choicesDisabled ? null : () => _save(key, o.value),'));
+      expect(card, contains('if (_locks.testDisabled) return;'));
+      expect(card, contains('if (_locks.choicesDisabled || value == previous) return;'));
       expect(card, contains("key: const ValueKey('kot-test-print'),"));
     });
   });
