@@ -51,10 +51,9 @@ class MenuBadgePill extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: faded ? AppColors.borderStrong : AppColors.edge(color)),
       ),
-      // ChipLabel is a Flexible, so it has to sit directly in a Row — like every
-      // other pill's label. Straight inside the Container it was a
-      // ParentDataWidget error on every pill drawn (a failed assertion in
-      // debug; in release the flex parent-data cast cannot succeed either).
+      // ChipLabel is a Flexible, so it must sit directly in a Flex. A one-child
+      // Row sized to the label is that Flex: the pill draws exactly as a bare
+      // label where it fits, and ellipsises the label where it does not.
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -288,22 +287,34 @@ class _MenuBadgesDialogState extends State<MenuBadgesDialog> {
               const SizedBox(height: AppSpacing.sm),
             ],
             Flexible(
+              // On a phone the empty state is taller than the room the dialog
+              // leaves it, and an overflowing Column pushes the starter-set
+              // button outside its own bounds, where a tap cannot reach it. So
+              // it scrolls; the min height keeps it centred in the full space
+              // wherever it already fits.
               child: _badges.isEmpty
-                  ? EmptyState(
-                      icon: Icons.sell_outlined,
-                      title: 'No badges yet',
-                      caption:
-                          'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
-                      action: ForkButton(
-                        label: 'Use the starter set (${widget.presets.length})',
-                        icon: Icons.auto_awesome,
-                        dense: true,
-                        onPressed: _busy || widget.presets.isEmpty
-                            ? null
-                            : () async {
-                                setState(() => _badges = List<MenuBadge>.from(widget.presets));
-                                await _persist();
-                              },
+                  ? LayoutBuilder(
+                      builder: (context, box) => SingleChildScrollView(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(minHeight: box.maxHeight),
+                          child: EmptyState(
+                            icon: Icons.sell_outlined,
+                            title: 'No badges yet',
+                            caption:
+                                'Your menu looks exactly as it does today. Start from the set suggested for Indian restaurants, then edit or remove anything you do not want.',
+                            action: ForkButton(
+                              label: 'Use the starter set (${widget.presets.length})',
+                              icon: Icons.auto_awesome,
+                              dense: true,
+                              onPressed: _busy || widget.presets.isEmpty
+                                  ? null
+                                  : () async {
+                                      setState(() => _badges = List<MenuBadge>.from(widget.presets));
+                                      await _persist();
+                                    },
+                            ),
+                          ),
+                        ),
                       ),
                     )
                   : ListView(
