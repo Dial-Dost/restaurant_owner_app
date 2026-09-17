@@ -239,8 +239,9 @@ class _ReportsViewState extends State<_ReportsView> {
     }
   }
 
+  // The box's text. Kept here because the box is only built for the reports
+  // that read a search, and is built away and back as the tabs change.
   final TextEditingController _searchCtl = TextEditingController(text: '');
-  Timer? _searchDebounce;
   String _search = '';
 
   // The outlet list behind the scope selector. Loaded lazily and best-effort:
@@ -270,7 +271,6 @@ class _ReportsViewState extends State<_ReportsView> {
 
   @override
   void dispose() {
-    _searchDebounce?.cancel();
     _searchCtl.dispose();
     super.dispose();
   }
@@ -281,29 +281,25 @@ class _ReportsViewState extends State<_ReportsView> {
   }
 
   void _setTab(int i) {
+    // A term the new report's endpoint does not read would sit in a visible
+    // box filtering nothing, and the empty state would go on to say "no rows
+    // match" about a search that was never applied. Dropped, loudly, by the
+    // field disappearing with it.
+    final drop = !_misReports[i].searchable;
     setState(() {
       _tab = i;
       _misOpenTab = i;
-      // A term the new report's endpoint does not read would sit in a visible
-      // box filtering nothing, and the empty state would go on to say "no rows
-      // match" about a search that was never applied. Dropped, loudly, by the
-      // field disappearing with it.
-      if (!_misReports[i].searchable && _search.isNotEmpty) {
-        _search = '';
-        _searchCtl.clear();
-        _searchDebounce?.cancel();
-      }
+      if (drop) _search = '';
     });
+    // Cleared after, so the box's own '' finds the search already empty. It
+    // also cancels a word still waiting out the debounce.
+    if (drop) _searchCtl.clear();
   }
 
-  void _onSearch(String v) {
-    _searchDebounce?.cancel();
-    // A keystroke must not be a request: these queries scan a whole window.
-    _searchDebounce = Timer(const Duration(milliseconds: 450), () {
-      if (!mounted) return;
-      final t = v.trim();
-      if (t != _search) setState(() => _search = t);
-    });
+  // A keystroke must not be a request: these queries scan a whole window, so
+  // the box debounces what it sends here.
+  void _onSearchQuery(String q) {
+    if (mounted && q != _search) setState(() => _search = q);
   }
 
   @override
@@ -400,42 +396,16 @@ class _ReportsViewState extends State<_ReportsView> {
         if (report.searchable)
         SizedBox(
           width: narrow ? double.infinity : 260,
-          // Listens to the controller, not to _search: the clear affordance has
-          // to appear on the first keystroke, while the QUERY deliberately waits
-          // out the debounce. Scoped here so a keystroke rebuilds one field and
-          // not the grid under it.
-          child: ValueListenableBuilder<TextEditingValue>(
-            valueListenable: _searchCtl,
-            builder: (context, value, _) => TextField(
-            key: const ValueKey('reports-search'),
+          // The x follows the box from the first keystroke, while the QUERY
+          // waits out the debounce. A keystroke rebuilds the box, not the grid
+          // under it.
+          child: AppSearchField(
+            testId: 'reports-search',
+            hint: _misSearchHint(report),
             controller: _searchCtl,
-            onChanged: _onSearch,
-            onSubmitted: (v) {
-              _searchDebounce?.cancel();
-              final t = v.trim();
-              if (t != _search) setState(() => _search = t);
-            },
-            style: const TextStyle(fontSize: 13),
-            decoration: InputDecoration(
-              isDense: true,
-              hintText: _misSearchHint(report),
-              prefixIcon: const Icon(Icons.search, size: 16),
-              prefixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 30),
-              suffixIcon: value.text.isEmpty
-                  ? null
-                  : IconButton(
-                      icon: const Icon(Icons.close, size: 15),
-                      tooltip: 'Clear search',
-                      onPressed: () {
-                        _searchCtl.clear();
-                        _searchDebounce?.cancel();
-                        if (_search.isNotEmpty) setState(() => _search = '');
-                      },
-                    ),
-              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              border: OutlineInputBorder(borderRadius: AppRadius.inputAll),
-            ),
-            ),
+            debounce: const Duration(milliseconds: 450),
+            compact: true,
+            onQuery: _onSearchQuery,
           ),
         ),
         // Time-wise: Sales Summary only — see [_misBucket].

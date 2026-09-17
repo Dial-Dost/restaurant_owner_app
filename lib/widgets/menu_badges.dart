@@ -24,6 +24,7 @@ import '../services/api_client.dart';
 import '../services/rest_client.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/app_search_field.dart';
 import '../ui/widgets/empty_state.dart';
 import '../ui/widgets/fork_button.dart';
 import '../ui/widgets/fork_card.dart';
@@ -423,7 +424,6 @@ class MenuBadgeTagDialog extends StatefulWidget {
 
 class _MenuBadgeTagDialogState extends State<MenuBadgeTagDialog> {
   final Map<String, List<String>> _edits = {};
-  final _search = TextEditingController();
   String _query = '';
   bool _busy = false;
   String? _error;
@@ -431,12 +431,6 @@ class _MenuBadgeTagDialogState extends State<MenuBadgeTagDialog> {
   /// Only hand-taggable badges. A derived one is not a tag — offering it as a
   /// toggle would be offering a switch that does nothing.
   List<MenuBadge> get _taggable => widget.catalogue.where((b) => b.enabled && !b.derived).toList();
-
-  @override
-  void dispose() {
-    _search.dispose();
-    super.dispose();
-  }
 
   String _id(Map<dynamic, dynamic> it) => '${it['id'] ?? ''}';
 
@@ -545,10 +539,10 @@ class _MenuBadgeTagDialogState extends State<MenuBadgeTagDialog> {
               style: text.bodySmall,
             ),
             const SizedBox(height: AppSpacing.lg),
-            TextField(
-              controller: _search,
-              decoration: const InputDecoration(labelText: 'Search dishes or categories', isDense: true),
-              onChanged: (v) => setState(() => _query = v),
+            AppSearchField(
+              testId: 'tag-dishes-search',
+              label: 'Search dishes or categories',
+              onQuery: (q) => setState(() => _query = q),
             ),
             const SizedBox(height: AppSpacing.md),
             if (taggable.isNotEmpty && visible.isNotEmpty)

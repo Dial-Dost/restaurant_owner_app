@@ -12,6 +12,7 @@ import '../services/outbox.dart';
 import '../services/phone_validation.dart';
 import '../services/rest_client.dart';
 import '../ui/theme/app_colors.dart';
+import '../ui/widgets/app_search_field.dart';
 import '../ui/widgets/fork_card.dart';
 import '../ui/widgets/skeleton.dart';
 import '../ui/widgets/status_chip.dart';
@@ -102,14 +103,11 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
   // can be held still when the note and Send button appear or go (see [_setQty]).
   final ScrollController _menuScroll = ScrollController();
   final GlobalKey _headerKey = GlobalKey();
-  // ITEM 3 (2.0.1) — the menu search's text. The field used to have no
-  // controller, so its text lived in the TextField's private one and the clear
-  // button could only reset [_query]: the list came back unfiltered, the x went
-  // away, and the word stayed in the box for the next keystroke to add to
-  // ("dal" + "n" = "daln", "No items match"). [_query] is still what the filter
-  // reads; the two are set together, in onChanged and in the clear button, and
-  // anything else that ever changes the search must set both.
-  final TextEditingController _searchCtrl = TextEditingController();
+  // ITEM 3 (2.0.1) / CLIENT ITEM 6 (2.0.2) — what the menu list is filtered
+  // on. The box used to keep its own text while the x could only reset this,
+  // so the word stayed for the next keystroke to add to ("dal" + "n" = "daln",
+  // "No items match"). The box is now the shared [AppSearchField], and this is
+  // only ever written by its onQuery: whatever empties the box empties this.
   String _query = '';
   bool _sending = false;
   String? _error;
@@ -224,7 +222,6 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     _phoneCtrl.dispose();
     _addrCtrl.dispose();
     _coversCtrl.dispose();
-    _searchCtrl.dispose();
     _menuScroll.dispose();
     _draftRev.dispose();
     super.dispose();
@@ -585,31 +582,12 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
                     ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-                    child: TextField(
-                      key: const ValueKey('order-search'),
-                      controller: _searchCtrl,
-                      decoration: InputDecoration(
-                        prefixIcon: const Icon(Icons.search),
-                        hintText: 'Search menu…',
-                        isDense: true,
-                        border: const OutlineInputBorder(),
-                        suffixIcon: _query.isEmpty
-                            ? null
-                            : IconButton(
-                                key: const ValueKey('order-search-clear'),
-                                icon: const Icon(Icons.clear),
-                                tooltip: 'Clear search',
-                                // ITEM 3 (2.0.1) — the TEXT goes, not just the
-                                // filter. clear() does not call onChanged, so
-                                // [_query] is reset here too. Focus stays in the
-                                // box: the waiter is about to type the next dish.
-                                onPressed: () {
-                                  _searchCtrl.clear();
-                                  setState(() => _query = '');
-                                },
-                              ),
-                      ),
-                      onChanged: (v) => setState(() => _query = v),
+                    // The x empties the BOX and the filter together, and focus
+                    // stays in it: the waiter is about to type the next dish.
+                    child: AppSearchField(
+                      testId: 'order-search',
+                      hint: 'Search menu…',
+                      onQuery: (q) => setState(() => _query = q),
                     ),
                   ),
                   if (_count > 0) _orderFields(),

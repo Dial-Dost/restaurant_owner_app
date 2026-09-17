@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -10,7 +8,6 @@ import 'package:restaurant_owner_app/services/api_client.dart';
 import 'package:restaurant_owner_app/services/auth_controller.dart';
 import 'package:restaurant_owner_app/services/outbox.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
-import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 
 import 'text_field_scan.dart';
@@ -32,8 +29,14 @@ import 'text_field_scan.dart';
 ///   * clearing never touches the order being built;
 ///   * and, as a sweep (test/text_field_scan.dart), no clear button in the app
 ///     sits in or beside a text field it cannot reach: no uncontrolled field
-///     with a suffix button, no uncontrolled field at all bar the keyed
-///     initialValue rows, and no onClear that skips its own controller.
+///     with a suffix button, and no uncontrolled field at all bar the keyed
+///     initialValue rows.
+///
+/// CLIENT ITEM 6 (2.0.2) took the same complaint to every search box: they are
+/// all the shared AppSearchField now, held to one pressed-not-scanned contract
+/// by test/search_clear_registry_test.dart. This sweep only saw fields without
+/// a controller, so it passed a controlled box whose x reset only the filter;
+/// the contract is what catches that shape now.
 
 class _FakeApi extends ApiClient {
   _FakeApi(this.role);
@@ -176,7 +179,7 @@ void main() {
   test('no text field in the app has a clear button that cannot reach its text', () {
     // The bug's shape is text the button cannot reach. Read with
     // test/text_field_scan.dart (every file under lib/, comments left out,
-    // each argument found wherever it falls), it can come back three ways:
+    // each argument found wherever it falls), it can come back two ways:
     //
     //  1. a field with no `controller:` whose decoration carries a suffix
     //     button. Whatever that button does, it cannot reach the box. A plain
@@ -187,11 +190,11 @@ void main() {
     //     allowed at all, except the `initialValue:` boxes in keyed list rows,
     //     and those are pinned one by one, key and all, in
     //     test/row_remove_keeps_fields_in_step_test.dart.
-    //  3. a box that is controlled, but through a widget whose x sits beside
-    //     the field and calls back for the clearing (GaiaSearchField, used by
-    //     the Guests book). The widget cannot clear the text itself, so every
-    //     call that passes `controller: X` and `onClear:` must clear that
-    //     same X in its onClear, inline or in the method it names.
+    //
+    // A third rule used to read every `onClear:` handed to GaiaSearchField,
+    // whose x sat beside its field and called back for the clearing. That
+    // widget is gone (2.0.2): every search box is AppSearchField, whose x
+    // clears its own controller.
     final offenders = <String>[];
     final fields = libTextFields;
     for (final f in fields) {
@@ -206,90 +209,22 @@ void main() {
     }
     expect(fields.length, greaterThan(100), reason: 'the scan must actually be reading the app');
     expect(fields.where((f) => f.args.containsKey('controller')).length, greaterThan(100));
-
-    var clearCalls = 0;
-    for (final s in libSources) {
-      for (final m in RegExp(r'(?<![\w.])onClear\s*:').allMatches(s.code)) {
-        final call = s.callAround(m.start);
-        final onClear = call?.args['onClear'];
-        final controller = call?.args['controller'];
-        if (onClear == null || controller == null) continue;
-        clearCalls++;
-        final body = RegExp(r'^[\w.]+$').hasMatch(onClear) ? s.bodyOf(onClear.split('.').last) ?? '' : onClear;
-        final clears = RegExp(RegExp.escape(controller) + r'''\s*\.\s*(clear\s*\(\s*\)|text\s*=\s*(''|""))''');
-        if (!clears.hasMatch(body)) {
-          offenders.add('${call!.where}: ${call.name}(controller: $controller) has an onClear that never clears $controller');
-        }
-      }
-    }
-    expect(clearCalls, greaterThanOrEqualTo(1), reason: 'the Guests book search is one; the scan must find it');
     expect(offenders, isEmpty, reason: 'a clear button that cannot reach the text it sits by');
   });
 
-  testWidgets('the Gaia search box shows its x only while the box has text, and cannot clear it by itself', (tester) async {
-    // GaiaSearchField's x sits BESIDE its TextField and hands the clearing to
-    // the screen, which is why the sweep above reads every onClear. Here: the
-    // Guests book's wiring empties the box and the x goes; a callback that
-    // forgets the controller leaves the word, and the x, on screen.
-    final ctl = TextEditingController();
-    addTearDown(ctl.dispose);
-    final searched = <String>[];
-    Future<void> pump(VoidCallback onClear) async {
-      await tester.pumpWidget(MaterialApp(
-        theme: GaiaTheme.dark(),
-        home: Scaffold(
-          body: GaiaSearchField(
-            controller: ctl,
-            hint: 'Find a guest by name, phone or email',
-            onChanged: searched.add,
-            onClear: onClear,
-          ),
-        ),
-      ));
-    }
-
-    final field = find.byType(TextField);
-    final x = find.byIcon(Icons.close);
-    String box() => tester.widget<EditableText>(find.descendant(of: field, matching: find.byType(EditableText))).controller.text;
-
-    // As modules.dart wires it for the Guests book.
-    await pump(() {
-      ctl.clear();
-      searched.add('');
-    });
-    expect(x, findsNothing, reason: 'nothing to clear yet');
-    await tester.enterText(field, 'asha');
-    await tester.pump();
-    expect(x, findsOneWidget);
-    await tester.tap(x);
-    await tester.pump();
-    expect(box(), isEmpty);
-    expect(x, findsNothing);
-    expect(searched.last, '', reason: 'the list is searched again with nothing');
-    await tester.enterText(field, '${box()}r');
-    await tester.pump();
-    expect(box(), 'r', reason: 'the next word is a new search');
-
-    // A callback that only resets the search.
-    await pump(() => searched.add(''));
-    await tester.tap(x);
-    await tester.pump();
-    expect(box(), 'r');
-    expect(x, findsOneWidget);
-  }, variant: _platforms);
-
-  test('the pad wires its search through the controller, both ways', () {
-    final src = File('lib/screens/order_entry.dart').readAsStringSync();
-    expect(src, contains('final TextEditingController _searchCtrl = TextEditingController();'));
-    expect(src, contains('_searchCtrl.dispose();'));
-    final field = RegExp(r"key: const ValueKey\('order-search'\),[\s\S]*?onChanged: \(v\) => setState\(\(\) => _query = v\),")
-        .firstMatch(src)
-        ?.group(0);
-    expect(field, isNotNull);
-    expect(field, contains('controller: _searchCtrl,'));
-    expect(field, matches(RegExp(r'_searchCtrl\.clear\(\);\s*setState\(\(\) => _query = \x27\x27\);')));
-    // Any other writer of _query would have to set the box too; there are none
-    // (the declaration aside, the two writes are onChanged and the x).
-    expect(RegExp(r'(?<!String )_query = ').allMatches(src).length, 2);
+  test("the pad's search is the shared box, and only its onQuery moves the filter", () {
+    // Read without comments, so this file's history in them cannot pass it.
+    final pad = libSources.singleWhere((s) => s.path == 'lib/screens/order_entry.dart');
+    final boxes = pad.calls(const {'AppSearchField'}).toList();
+    expect(boxes, hasLength(1));
+    expect(boxes.single.args['testId'], "'order-search'");
+    expect(boxes.single.args['onQuery'], '(q) => setState(() => _query = q)');
+    // No box of its own any more, and no second writer of the filter: whatever
+    // empties the box (the x, Escape, select-all and delete) empties the list's
+    // query with it, because the box is the only thing that writes it.
+    expect(pad.calls(const {'TextField', 'TextFormField'}).where((f) => f.argText.contains('Search')), isEmpty);
+    expect(RegExp(r'(?<![\w.])_query\s*=(?!=)').allMatches(pad.code).length, 2,
+        reason: 'the declaration and the onQuery, nothing else');
+    expect(pad.code, isNot(contains('_searchCtrl')));
   });
 }

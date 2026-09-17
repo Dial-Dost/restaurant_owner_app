@@ -19,6 +19,8 @@ import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
+import 'search_contract.dart';
+
 /// Insights → Reports: the nine MIS / control reports.
 ///
 /// These are fraud-control documents, so the tests pin the promises that make a
@@ -1282,6 +1284,37 @@ void main() {
     await tester.tap(find.byTooltip('Clear search'));
     await tester.pumpAndSettle();
     expect(find.byTooltip('Clear search'), findsNothing);
+  });
+
+  // CLIENT ITEM 6 (2.0.2): the MIS search is one of the app's registered search
+  // boxes (test/search_clear_registry_test.dart). Its contract row lives here,
+  // beside the fixtures it needs: the x, pressed where it is drawn, must send
+  // the next report request without `search=`.
+  searchContractRows('reports-search', (tester, ds) async {
+    await tester.pumpWidget(const SizedBox());
+    useSearchView(tester, onPhone ? null : const Size(1400, 1000));
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final fake = _FakeApi();
+    final auth = AuthController(api: fake);
+    await auth.login('CSR Organics', 'admin', 'admin123');
+    await tester.pumpWidget(searchThemed(
+      ds,
+      ModuleNavigator(
+        openModule: (_, {Map<String, dynamic>? target}) {},
+        visibleLabels: const ['Reports', 'History', 'Accounting'],
+        clearFocus: () {},
+        switchOutlet: (_) {},
+        child: Scaffold(backgroundColor: Colors.transparent, body: m.reportsModule(RestClient(auth), auth.profile!)),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    // The report it opens on reads a search (Gaia spells the tab names its own
+    // way, so the row does not go looking for one).
+    return SearchSurface(
+      field: find.byKey(const ValueKey('reports-search')),
+      typed: '101',
+      filtered: () => fake.gets.lastWhere((g) => g.contains('/reports/mis/')).contains('search='),
+    );
   });
 
   // ------------------------------------------------- pure export rendering --
