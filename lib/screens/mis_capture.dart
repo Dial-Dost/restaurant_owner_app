@@ -221,6 +221,7 @@ class _CaptureReasonDialog extends StatefulWidget {
     this.headline,
     this.danger = false,
     this.extra,
+    this.reasonOptional = false,
   });
 
   final String title;
@@ -246,6 +247,12 @@ class _CaptureReasonDialog extends StatefulWidget {
   /// quantity stepper). Rendered above the reason field.
   final Widget? extra;
 
+  /// True ONLY for the service-charge waiver (client item, 2.0.1: "the reason
+  /// should not be mandatory"). Its kind and its second name stay required; the
+  /// comp, the void, the cancel, the tender void and every reversal keep a
+  /// mandatory reason, which is why this is opt-in and defaults to false.
+  final bool reasonOptional;
+
   @override
   State<_CaptureReasonDialog> createState() => _CaptureReasonDialogState();
 }
@@ -265,7 +272,7 @@ class _CaptureReasonDialogState extends State<_CaptureReasonDialog> {
 
   bool get _ready {
     if (widget.kinds.isNotEmpty && _kind.isEmpty) return false;
-    if (_reason.text.trim().isEmpty) return false;
+    if (!widget.reasonOptional && _reason.text.trim().isEmpty) return false;
     if (widget.needsAuthoriser && _authorisedBy.text.trim().isEmpty) return false;
     return true;
   }
@@ -296,101 +303,115 @@ class _CaptureReasonDialogState extends State<_CaptureReasonDialog> {
           borderRadius: AppRadius.cardAll,
           border: Border.all(color: AppColors.borderStrong),
         ),
-        child: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            Text(widget.title.toUpperCase(), style: text.labelSmall),
-            if (widget.headline != null) ...[
-              const SizedBox(height: 6),
-              Text(widget.headline!,
-                  style: text.displaySmall!.copyWith(
-                      color: widget.danger ? AppColors.danger : AppColors.copperHi)),
-            ],
-            const SizedBox(height: 8),
-            Text(widget.subtitle, style: text.bodySmall),
-            if (widget.extra != null) ...[
-              const SizedBox(height: AppSpacing.lg),
-              widget.extra!,
-            ],
-            if (widget.kinds.isNotEmpty) ...[
-              const SizedBox(height: AppSpacing.lg),
-              Text('WHY', style: text.labelSmall),
-              const SizedBox(height: 8),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                for (final (value, label) in widget.kinds)
-                  _CapturePill(
-                    key: ValueKey('capture-kind-$value'),
-                    label: label,
-                    selected: _kind == value,
-                    onTap: () => setState(() => _kind = value),
-                  ),
-              ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            TextField(
-              key: const ValueKey('capture-reason'),
-              controller: _reason,
-              autofocus: true,
-              minLines: 2,
-              maxLines: 3,
-              maxLength: 400,
-              textCapitalization: TextCapitalization.sentences,
-              onChanged: (_) => setState(() {}),
-              decoration: const InputDecoration(
-                labelText: 'Reason',
-                alignLabelWithHint: true,
-                helperText: 'In your own words. It goes on the control report, verbatim.',
-              ),
-            ),
-            if (widget.needsAuthoriser) ...[
-              const SizedBox(height: 4),
-              TextField(
-                key: const ValueKey('capture-authoriser'),
-                controller: _authorisedBy,
-                onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
-                  labelText: 'Authorised by (username)',
-                  helperText: 'The staff member who approved it. Yours is filled in — '
-                      'change it if someone else said yes.',
-                  helperMaxLines: 3,
-                ),
-              ),
-              const SizedBox(height: 6),
-              // What this control IS and IS NOT, said plainly on the screen where
-              // the name is typed. It is not proof anyone was standing there;
-              // this system has no step-up credential and pretending otherwise
-              // would be a worse control than an honest one.
-              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'The name is checked against your staff list and against this same '
-                    'permission. Who is acting is taken from your own sign-in and cannot be typed.',
-                    style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+        // The fields scroll; Cancel and Confirm do not. On a 360dp phone this form
+        // is taller than the screen, and with the buttons at the foot of the scroll
+        // a waiver that needs no typing still needed a scroll before its one tap.
+        // Pinned under the fields they stay on screen, above the keyboard too:
+        // Dialog pads itself by the keyboard's height.
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Flexible(
+            child: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Text(widget.title.toUpperCase(), style: text.labelSmall),
+                if (widget.headline != null) ...[
+                  const SizedBox(height: 6),
+                  Text(widget.headline!,
+                      style: text.displaySmall!.copyWith(
+                          color: widget.danger ? AppColors.danger : AppColors.copperHi)),
+                ],
+                const SizedBox(height: 8),
+                Text(widget.subtitle, style: text.bodySmall),
+                if (widget.extra != null) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  widget.extra!,
+                ],
+                if (widget.kinds.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  Text('WHY', style: text.labelSmall),
+                  const SizedBox(height: 8),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    for (final (value, label) in widget.kinds)
+                      _CapturePill(
+                        key: ValueKey('capture-kind-$value'),
+                        label: label,
+                        selected: _kind == value,
+                        onTap: () => setState(() => _kind = value),
+                      ),
+                  ]),
+                ],
+                const SizedBox(height: AppSpacing.lg),
+                TextField(
+                  key: const ValueKey('capture-reason'),
+                  controller: _reason,
+                  // The keyboard comes up for a reason the act cannot go without. The
+                  // waiver's is optional and its commonest use is the kind as chosen, the
+                  // name as filled, Confirm: on a phone a keyboard would only cover that.
+                  autofocus: !widget.reasonOptional,
+                  minLines: 2,
+                  maxLines: 3,
+                  maxLength: 400,
+                  textCapitalization: TextCapitalization.sentences,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    labelText: widget.reasonOptional ? misOptionalReasonLabel : 'Reason',
+                    alignLabelWithHint: true,
+                    helperText: widget.reasonOptional
+                        ? 'Optional. If you add one, it goes on the control report, verbatim.'
+                        : 'In your own words. It goes on the control report, verbatim.',
                   ),
                 ),
+                if (widget.needsAuthoriser) ...[
+                  const SizedBox(height: 4),
+                  TextField(
+                    key: const ValueKey('capture-authoriser'),
+                    controller: _authorisedBy,
+                    onChanged: (_) => setState(() {}),
+                    decoration: const InputDecoration(
+                      labelText: 'Authorised by (username)',
+                      helperText: 'The staff member who approved it. Yours is filled in — '
+                          'change it if someone else said yes.',
+                      helperMaxLines: 3,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  // What this control IS and IS NOT, said plainly on the screen where
+                  // the name is typed. It is not proof anyone was standing there;
+                  // this system has no step-up credential and pretending otherwise
+                  // would be a worse control than an honest one.
+                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Icon(Icons.info_outline, size: 13, color: AppColors.textTertiary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'The name is checked against your staff list and against this same '
+                        'permission. Who is acting is taken from your own sign-in and cannot be typed.',
+                        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textTertiary),
+                      ),
+                    ),
+                  ]),
+                ],
               ]),
-            ],
-            const SizedBox(height: AppSpacing.lg),
-            Wrap(
-              alignment: WrapAlignment.end,
-              spacing: AppSpacing.sm,
-              runSpacing: AppSpacing.sm,
-              children: [
-                ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
-                ForkButton(
-                  key: const ValueKey('capture-confirm'),
-                  label: widget.confirmLabel,
-                  icon: Icons.check,
-                  dense: true,
-                  // Disabled until it could succeed, rather than posting a body
-                  // the server would refuse with a field name nobody typed.
-                  onPressed: _ready ? _submit : null,
-                ),
-              ],
             ),
-          ]),
-        ),
+          ),
+          const SizedBox(height: AppSpacing.lg),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.sm,
+            children: [
+              ForkButton.ghost(label: 'Cancel', dense: true, onPressed: () => Navigator.pop(context)),
+              ForkButton(
+                key: const ValueKey('capture-confirm'),
+                label: widget.confirmLabel,
+                icon: Icons.check,
+                dense: true,
+                // Disabled until it could succeed, rather than posting a body
+                // the server would refuse with a field name nobody typed.
+                onPressed: _ready ? _submit : null,
+              ),
+            ],
+          ),
+        ]),
       ),
     );
   }
@@ -1179,6 +1200,49 @@ final RegExp _serviceChargeLineName = RegExp(r'service\s*charge', caseSensitive:
   );
 }
 
+// ------------------------------------ the waiver's reason is optional (2.0.1) --
+//
+// "When waiving a service charge, the reason should not be mandatory and should
+// be left as optional." The waiver's reason only: the kind (chosen already) and
+// the authoriser stay required, and every other act on this file keeps its
+// mandatory reason. The server stores a missing reason as NULL where migration
+// 051 allows it, and refuses exactly as before where it does not.
+
+/// The reason box's label on the waiver form. The web dashboard says the same.
+const String misOptionalReasonLabel = 'Reason (optional)';
+
+/// The body of POST /bills/service-charge-waiver/print for a new waiver.
+///
+/// A blank reason is left OUT, not sent as "": a server from before the change
+/// refused "" in its schema with a sentence nobody could act on, while an
+/// absent reason gets its own clean refusal.
+Map<String, dynamic> serviceChargeRemovalBody({
+  required String tableName,
+  required String kind,
+  required String reason,
+  required String authorisedBy,
+}) {
+  final why = reason.trim();
+  return <String, dynamic>{
+    // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
+    // bill and mints one when the table has none, which is the case a guest
+    // asks about before the bill has been raised.
+    'table_name': tableName,
+    'waiver_kind': kind,
+    if (why.isNotEmpty) 'reason': why,
+    'authorised_by': authorisedBy,
+  };
+}
+
+/// Who took the charge off, and why when they said: `“Long wait” — asha,
+/// authorised by manager01`, or `asha, authorised by manager01` for a waiver
+/// recorded without a reason — never a quoted dash standing in for one.
+String serviceChargeWaiverAttribution(Map waiver) {
+  final why = '${waiver['reason'] ?? ''}'.trim();
+  final who = '${_s(waiver, 'waived_by_username')}, authorised by ${_s(waiver, 'authorised_by_username')}';
+  return why.isEmpty ? who : '“$why” — $who';
+}
+
 /// The waiver block on the table sheet: either the one control that takes the
 /// charge off and prints, or the live waiver with its reprint and the control
 /// to put the charge back.
@@ -1245,8 +1309,7 @@ Widget misServiceChargeBlock(
             ),
           ],
           const SizedBox(height: 4),
-          Text('“${_s(w, 'reason')}” — ${_s(w, 'waived_by_username')}, '
-              'authorised by ${_s(w, 'authorised_by_username')}',
+          Text(serviceChargeWaiverAttribution(w),
               style: text.bodySmall!.copyWith(fontStyle: FontStyle.italic)),
           const SizedBox(height: 10),
           Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
@@ -1383,19 +1446,20 @@ Future<void> _removeServiceChargeAndPrint(
       kinds: _scWaiverKinds,
       needsAuthoriser: true,
       suggestedAuthoriser: profile.employeeUsername,
+      reasonOptional: true,
     ),
   );
   if (answer == null) return;
   try {
-    final res = await rest.post('/bills/service-charge-waiver/print', {
-      // The TABLE, not the bill id: WaiveServiceCharge resolves the table's open
-      // bill and mints one when the table has none, which is the case a guest
-      // asks about before the bill has been raised.
-      'table_name': tableName,
-      'waiver_kind': answer.kind,
-      'reason': answer.reason,
-      'authorised_by': answer.authorisedBy,
-    });
+    final res = await rest.post(
+      '/bills/service-charge-waiver/print',
+      serviceChargeRemovalBody(
+        tableName: tableName,
+        kind: answer.kind,
+        reason: answer.reason,
+        authorisedBy: answer.authorisedBy,
+      ),
+    );
     final outcome = serviceChargeRemovalOutcome(res);
     messenger.showSnackBar(SnackBar(content: Text(outcome.message), duration: outcome.shown));
   } catch (e) {
