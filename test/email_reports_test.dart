@@ -236,13 +236,14 @@ Future<RestClient> _mount(
   DesignSystem system = DesignSystem.rustic,
   String? outlet,
   ModuleFocusRequest? focus,
+  bool resetMemory = true,
 }) async {
   await tester.pumpWidget(const SizedBox());
   tester.view.physicalSize = Size(width, height);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
   SharedPreferences.setMockInitialValues(<String, Object>{});
-  m.misResetReportMemory();
+  if (resetMemory) m.misResetReportMemory();
   final auth = AuthController(api: api);
   await auth.login('CSR Organics', 'admin', 'admin123');
   if (outlet != null) auth.selectOutlet(outlet);
@@ -638,6 +639,24 @@ void main() {
       await _tap(tester, find.byKey(const ValueKey('email-delivery-d3')));
       expect(find.text('Waiting'), findsOneWidget);
       expect(api.writes, isEmpty);
+    });
+
+    testWidgets('the view is remembered across a remount, but a "Today at a glance" jump lands on its report', (tester) async {
+      await _mount(tester, _FakeApi());
+      await _openArea(tester);
+      // The shell remounts the module (an outlet switch): still the address book.
+      await _mount(tester, _FakeApi(), resetMemory: false);
+      expect(find.byKey(const ValueKey('email-reports-panel')), findsOneWidget);
+      // The glance primes its report (item 10) before the shell remounts it.
+      m.misRememberReport('item_wise');
+      await _mount(tester, _FakeApi(), resetMemory: false);
+      expect(find.byKey(const ValueKey('email-reports-panel')), findsNothing);
+      expect(m.misOpenReportKey, 'item_wise');
+      // A key the pack does not know changes neither the tab nor the view.
+      await _openArea(tester);
+      m.misRememberReport('no_such_report');
+      await _mount(tester, _FakeApi(), resetMemory: false);
+      expect(find.byKey(const ValueKey('email-reports-panel')), findsOneWidget);
     });
 
     testWidgets('a bell about an emailed report opens the Email reports view', (tester) async {

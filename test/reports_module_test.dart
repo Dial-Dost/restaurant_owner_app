@@ -1256,7 +1256,13 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.byKey(const ValueKey('reports-grid')), findsNothing);
+    // At 520px the ladder may start just below the fold: since 2.0.2 the
+    // Reports / Email reports switch (item 9) and the order-type split (item
+    // 10) sit above it. It is reached by the same one ordinary scroll.
+    await tester.scrollUntilVisible(find.text('Money ladder'), 100,
+        scrollable: find.descendant(of: find.byType(ListView), matching: find.byType(Scrollable)).first);
     expect(find.text('Money ladder'), findsOneWidget);
+    expect(tester.takeException(), isNull);
 
     // The rows are below the fold of ONE ordinary vertical scroll — no pinned
     // header fighting for the same pixels, nothing clipped.

@@ -19,6 +19,7 @@ import '../config.dart';
 import '../models/bill_round_off.dart';
 import '../models/cancel_kot.dart';
 import '../models/floor_state.dart';
+import '../models/glance_drill.dart';
 import '../models/gross_net.dart';
 import '../models/kot_copy.dart';
 import '../models/kot_docket_settings.dart';
@@ -1018,6 +1019,10 @@ Widget _recordHeadRow(
 // [beforeJump] runs only when the jump is actually taken, just before the shell
 // switches module — the place to set up the destination (its reporting window,
 // say) without touching it when the sheet is merely closed.
+//
+// [secondaryJumpTo] is a second, quieter "View in <Module>" for a sheet whose
+// figure has two honest homes (item 10: a payment mode's report AND its bills),
+// gated and primed exactly like the first.
 Future<void> _detailSheet(
   BuildContext context, {
   required String eyebrow,
@@ -1026,9 +1031,13 @@ Future<void> _detailSheet(
   String? jumpTo,
   Map<String, dynamic>? jumpTarget,
   VoidCallback? beforeJump,
+  String? secondaryJumpTo,
+  VoidCallback? beforeSecondaryJump,
 }) {
   final nav = ModuleNavigator.of(context);
   final canJump = jumpTo != null && (nav?.canOpen(jumpTo) ?? false);
+  final canJump2 =
+      secondaryJumpTo != null && secondaryJumpTo != jumpTo && (nav?.canOpen(secondaryJumpTo) ?? false);
   return showDialog<void>(
     context: context,
     builder: (ctx) {
@@ -1068,8 +1077,21 @@ Future<void> _detailSheet(
                 runSpacing: AppSpacing.sm,
                 children: [
                   ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+                  if (canJump2)
+                    ForkButton.ghost(
+                      key: const ValueKey('sheet-jump-secondary'),
+                      label: 'View in $secondaryJumpTo',
+                      icon: Icons.arrow_forward,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        beforeSecondaryJump?.call();
+                        nav!.openModule(secondaryJumpTo);
+                      },
+                    ),
                   if (canJump)
                     ForkButton(
+                      key: const ValueKey('sheet-jump'),
                       label: 'View in $jumpTo',
                       icon: Icons.arrow_forward,
                       dense: true,
@@ -1252,8 +1274,22 @@ Color _stageColor(String status) {
 /// Under the figures, when the server sent them: today's takings BY PAYMENT
 /// METHOD — see [_headlineByMethod].
 ///
+/// EVERY ELEMENT LEADS SOMEWHERE — client item 10: "The entire 'Today at a
+/// glance' section needs to be made clickable; each option in it must be
+/// clickable." Each figure, chip, count, note and line opens a sheet built from
+/// THIS payload (no extra read, so it works on a cached one), footed by a jump
+/// pinned to the server's day (models/glance_drill.dart); a pure count jumps
+/// straight there, and the header carries a "Today's report" link. There is no
+/// card-wide tap: nesting it over these would be the hit-target fight the stat
+/// cards below already document. Each wrapper is a [_TapRow], which adds no
+/// geometry, so the box still reads as the one box of bare columns H1 asked for.
+/// A destination this user cannot open is dropped (the next fallback is tried);
+/// the sheet still opens, so no element is ever a dead tap.
+///
 /// [columns] lays the figures out; the call site owns the breakpoints.
-List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2}) {
+/// [openBills] is the Overview's own open-bill count (null when not fetched),
+/// which the empty-day sentence adds.
+List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2, int? openBills}) {
   // State one. "Not fetched" — which is not "fetched and empty", and is why the
   // Overview's load() keeps this entry's raw null instead of coalescing it.
   if (headline == null) return const [];
@@ -1270,6 +1306,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final h = headline;
 
   final text = Theme.of(context).textTheme;
+  final nav = ModuleNavigator.of(context);
 
   /// One figure: the server's label, the money, the server's definition under
   /// it. Null when the server did not send this metric — an unnamed money
@@ -1281,44 +1318,57 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
     final label = '${f['label'] ?? ''}'.trim();
     if (label.isEmpty) return null;
     final hint = '${f['hint'] ?? ''}'.trim();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-        const SizedBox(height: AppSpacing.xs),
-        // Scaled down, never clipped. A six-figure total cut off mid-number is
-        // the one thing on this card nobody can work around — there is no hover
-        // on a till screen, and the digits that go missing are the expensive
-        // ones. Same treatment the week-on-week delta gets in the stat cards.
-        FittedBox(
-          fit: BoxFit.scaleDown,
-          alignment: Alignment.centerLeft,
-          child: Text(
-            // _money prints an em dash for a value the server omitted, which is
-            // the whole point: a figure that never arrived must not read as
-            // zero takings.
-            _money(f['value']),
-            maxLines: 1,
-            softWrap: false,
-            style: text.displaySmall!.copyWith(fontSize: 22, color: AppColors.textPrimary),
+    return _glanceTap(
+      key: ValueKey('glance-$key'),
+      semantics: '$label ${_money(f['value'])}, opens details',
+      onTap: () => _glanceFigureSheet(context, h, key),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // The chevron is the affordance a touch screen has instead of a hover
+          // wash. Beside the label and never in its way: the label keeps its
+          // two lines and gives up width to the 14px glyph, not the other way.
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Flexible(
+              child: Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+            ),
+            Icon(Icons.chevron_right, size: 14, color: AppColors.textTertiary),
+          ]),
+          const SizedBox(height: AppSpacing.xs),
+          // Scaled down, never clipped. A six-figure total cut off mid-number is
+          // the one thing on this card nobody can work around — there is no hover
+          // on a till screen, and the digits that go missing are the expensive
+          // ones. Same treatment the week-on-week delta gets in the stat cards.
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              // _money prints an em dash for a value the server omitted, which is
+              // the whole point: a figure that never arrived must not read as
+              // zero takings.
+              _money(f['value']),
+              maxLines: 1,
+              softWrap: false,
+              style: text.displaySmall!.copyWith(fontSize: 22, color: AppColors.textPrimary),
+            ),
           ),
-        ),
-        if (hint.isNotEmpty) ...[
-          const SizedBox(height: 3),
-          Text(hint,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text(hint,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+          ],
         ],
-      ],
+      ),
     );
   }
 
   // The order the requirement lists them in, which is also the order they read
   // in: today's pair, the online pair beside it, what is in the drawer, then
   // the month standing behind all of it.
-  const order = ['today_net', 'today_gross', 'online_net', 'online_gross', 'cash_collection', 'month_to_date'];
+  const order = kGlanceFigureKeys;
 
   // Built with a plain loop rather than a collection-if: `figure` returns null
   // for a metric the payload did not carry, and dropping it is the only honest
@@ -1347,30 +1397,89 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final byMethod = _headlineByMethod(context, h, columns: columns);
   final ncToday = _headlineNc(context, h);
 
+  // "Today's report": a link, not a sheet — it IS the destination. Absent when
+  // this user can open none of the places it leads. Beside the title on a wide
+  // window; on a phone it joins the chips below instead, because beside the
+  // title it cut "Today at a glance" to "TODAY AT A GLA…" at 360px in Gaia.
+  final report = _glanceResolve(nav, glanceDrillOf(h, 'header'));
+  final narrow = MediaQuery.sizeOf(context).width < 760;
+  final reportLink = report == null
+      ? null
+      : ForkButton.subtle(
+          key: const ValueKey('glance-report'),
+          label: kGlanceReportButton,
+          icon: Icons.arrow_forward,
+          onPressed: _glanceGo(nav, report),
+        );
+
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
     // and not tiles for the same reason: six cards in a row is six boxes, which
     // is the layout this requirement exists to replace.
     ForkCard(
+      key: const ValueKey('glance-box'),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SectionHeader(
-          title: 'Today at a glance',
-          padding: const EdgeInsets.only(bottom: AppSpacing.md),
-          // Only when there is something to count. "0 bills settled" sitting
-          // beside the sentence below would say the same thing twice, in two
-          // voices, and one of them in a tag that normally means good news.
-          trailing: (bills != null && bills > 0) ? TickTag('$bills bill(s) settled') : null,
+        // The title explains how the box is cut; the link beside it opens the
+        // day's report. Two different answers, so two different targets.
+        _glanceTap(
+          key: const ValueKey('glance-header'),
+          semantics: 'Today at a glance, how today is cut',
+          // The report link lives inside this row, so its own button node must
+          // survive: the row names itself and keeps its children.
+          mergeChildren: false,
+          onTap: () => _glanceDaySheet(context, h, 'header'),
+          child: SectionHeader(
+            title: 'Today at a glance',
+            padding: const EdgeInsets.only(bottom: AppSpacing.md),
+            trailing: narrow ? null : reportLink,
+          ),
         ),
-        // The day, the zone and the month window these figures were cut on.
-        // Printed because the owner is being asked to trust six numbers against
-        // their own reports: without the boundaries, a disagreement about which
-        // day it is looks exactly like a disagreement about the money.
-        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty) ...[
-          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
-            if (today.isNotEmpty) InfoChip(icon: Icons.today, label: _fmtDay(today)),
-            if (zoneCaption.isNotEmpty) InfoChip(icon: Icons.public, label: zoneCaption),
+        // The day, the zone and the month window these figures were cut on, and
+        // how many bills are behind them. Printed because the owner is being
+        // asked to trust six numbers against their own reports: without the
+        // boundaries, a disagreement about which day it is looks exactly like a
+        // disagreement about the money. A Wrap, so the four never overflow a
+        // phone — the bill count used to sit in the header's trailing slot,
+        // which is now the report link's.
+        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty || (bills ?? 0) > 0 ||
+            (narrow && reportLink != null)) ...[
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, crossAxisAlignment: WrapCrossAlignment.center, children: [
+            // Only when there is something to count. "0 bills settled" sitting
+            // beside the sentence below would say the same thing twice, in two
+            // voices, and one of them in a tag that normally means good news.
+            if (bills != null && bills > 0)
+              _glanceTap(
+                key: const ValueKey('glance-bills'),
+                semantics: "$bills bills settled today, opens the day's bills",
+                onTap: _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'bills'))) ??
+                    () => _glanceCountSheet(context, h),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: TickTag('$bills bill(s) settled'),
+                ),
+              ),
+            if (today.isNotEmpty)
+              _glanceTap(
+                key: const ValueKey('glance-day'),
+                semantics: '${_fmtDay(today)}, how today is cut',
+                onTap: () => _glanceDaySheet(context, h, 'day'),
+                child: InfoChip(icon: Icons.today, label: _fmtDay(today)),
+              ),
+            if (zoneCaption.isNotEmpty)
+              _glanceTap(
+                key: const ValueKey('glance-zone'),
+                semantics: '$zoneCaption, how today is cut',
+                onTap: () => _glanceDaySheet(context, h, 'zone'),
+                child: InfoChip(icon: Icons.public, label: zoneCaption),
+              ),
             if (monthFrom.isNotEmpty)
-              InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
+              _glanceTap(
+                key: const ValueKey('glance-month'),
+                semantics: 'Month from ${_fmtDay(monthFrom)}, opens month to date',
+                onTap: () => _glanceFigureSheet(context, h, 'month_to_date', via: 'month'),
+                child: InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
+              ),
+            if (narrow && reportLink != null) reportLink,
           ]),
           const SizedBox(height: AppSpacing.lg),
         ],
@@ -1387,12 +1496,25 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
           // the other is indistinguishable from a bug in whichever one they
           // checked second. Matching the web exactly is worth more than the
           // marginally tidier layout, so the divergence was removed.
-          Text(
-            monthFrom.isEmpty
-                ? 'Nothing has been settled yet today. Month to date still counts every earlier day.'
-                : 'Nothing has been settled yet today. Month to date still counts every day since '
-                    '${_fmtDay(monthFrom)}.',
-            style: text.bodySmall!.copyWith(color: AppColors.textSecondary),
+          //
+          // It leads to the FLOOR (item 10): on an empty day the money is still
+          // on the tables, and the open-bill count this page already fetched
+          // says how much of it there is.
+          _glanceTap(
+            key: const ValueKey('glance-nothing-settled'),
+            semantics: 'Nothing has been settled yet today, opens the floor',
+            onTap: _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'nothing_settled'))) ??
+                () => _glanceDaySheet(context, h, 'day'),
+            child: Text(
+              [
+                monthFrom.isEmpty
+                    ? 'Nothing has been settled yet today. Month to date still counts every earlier day.'
+                    : 'Nothing has been settled yet today. Month to date still counts every day since '
+                        '${_fmtDay(monthFrom)}.',
+                if (openBills != null) glanceOpenBillsSentence(openBills),
+              ].join(' '),
+              style: text.bodySmall!.copyWith(color: AppColors.textSecondary),
+            ),
           ),
           const SizedBox(height: AppSpacing.lg),
         ],
@@ -1412,6 +1534,312 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   ];
 }
 
+/// A glance element as a control: the click cursor and hover wash of [_TapRow]
+/// (no geometry of its own) and ONE button node for a screen reader, named by
+/// [semantics] rather than by the loose texts inside it.
+Widget _glanceTap({
+  Key? key,
+  required Widget child,
+  required VoidCallback onTap,
+  required String semantics,
+  bool mergeChildren = true,
+}) =>
+    Semantics(
+      key: key,
+      button: true,
+      label: semantics,
+      onTap: onTap,
+      excludeSemantics: mergeChildren,
+      child: _TapRow(onTap: onTap, child: child),
+    );
+
+/// The destination [drill] resolves to for this user, or null.
+GlanceTarget? _glanceResolve(ModuleNavigator? nav, GlanceDrill? drill) =>
+    (nav == null || drill == null) ? null : drill.resolve(nav.canOpen);
+
+/// A direct jump to [t], or null when there is nowhere to go.
+VoidCallback? _glanceGo(ModuleNavigator? nav, GlanceTarget? t) {
+  if (nav == null || t == null) return null;
+  return () {
+    _primeGlanceJump(t);
+    nav.openModule(t.module);
+  };
+}
+
+/// Set the destination up to show the SAME number the owner tapped, just before
+/// the shell switches to it (the shell remounts the module on every jump, so it
+/// reads this on arrival). Session memory, not a focus request: none of these
+/// modules reads a focus, and a request left parked on the shell would reset
+/// the window again on the next remount, after the owner had moved the chip.
+///
+///  * Reports — the report tab, the server's day (or month), and ALL DAY: a
+///    remembered "Lunch" would show a slice that cannot equal the tile.
+///  * Accounting — the window, and a one-shot bill-list filter that also
+///    scrolls to the settled bills when the jump is about them.
+///  * History — the window.
+///  * Analytics — the window. It is where a figure falls back to for a user
+///    whose plan or role hides Reports, and its one date control would
+///    otherwise open on whatever it last showed (the last 30 days, first time).
+void _primeGlanceJump(GlanceTarget t) {
+  final window = glanceWindowOf(t);
+  switch (t.module) {
+    case 'Reports':
+      if (t.report != null) misRememberReport(t.report!);
+      if (window != null) DateRangeMemory.remember('reports', window);
+      if (t.slotAll) TimeSlotMemory.remember('reports', TimeSlotSelection.allDay);
+    case 'Accounting':
+      if (window != null) DateRangeMemory.remember('accounting', window);
+      AccountingBillFilter.remember(t.method, reveal: t.bills);
+    case 'History':
+      if (window != null) DateRangeMemory.remember('history', window);
+    case 'Analytics':
+      if (window != null) DateRangeMemory.remember('analytics', window);
+  }
+}
+
+/// A glance sheet: [_detailSheet], with its jump and secondary jump resolved
+/// from [drill] for this user and primed on the way out.
+Future<void> _glanceSheet(
+  BuildContext context, {
+  required String eyebrow,
+  required String title,
+  required List<Widget> children,
+  GlanceDrill? drill,
+}) {
+  final nav = ModuleNavigator.of(context);
+  final canOpen = nav?.canOpen ?? (_) => false;
+  final jump = drill?.resolve(canOpen);
+  final second = drill?.resolveSecondary(canOpen);
+  return _detailSheet(
+    context,
+    eyebrow: eyebrow,
+    title: title,
+    jumpTo: jump?.module,
+    beforeJump: jump == null ? null : () => _primeGlanceJump(jump),
+    secondaryJumpTo: second?.module,
+    beforeSecondaryJump: second == null ? null : () => _primeGlanceJump(second),
+    children: children,
+  );
+}
+
+TextStyle _glanceNote() => TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
+
+/// "Today at a glance · 17 Sep" — every sheet says which day it is about.
+String _glanceEyebrow(Map h, String label) {
+  final today = '${h['today'] ?? ''}';
+  return today.isEmpty ? label : '$label · ${_fmtDay(today)}';
+}
+
+/// A figure's sheet. [via] names the element that opened it when that is not
+/// the figure itself (the month chip opens the month to date sheet), so its
+/// jump is that element's.
+Future<void> _glanceFigureSheet(BuildContext context, Map h, String key, {String? via}) {
+  if (key == 'cash_collection') return _glanceCashSheet(context, h);
+  final f = h[key] is Map ? h[key] as Map : const {};
+  final label = '${f['label'] ?? ''}'.trim();
+  final hint = '${f['hint'] ?? ''}'.trim();
+  final text = Theme.of(context).textTheme;
+  final drill = glanceDrillOf(h, via ?? key);
+  final value = _money(f['value']);
+  final note = _glanceNote();
+
+  switch (key) {
+    case 'today_net':
+    case 'today_gross':
+      final ladder = h['today_ladder'];
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          _detailRow(context, 'Bills settled today', '${_int(h['today_bills']) ?? 0}'),
+          // The steps between Net and Gross, rung by rung, when the server sent
+          // them. An older backend sends none, and a missing ladder is not a
+          // ladder of zeros — so it is left out, not drawn as ₹0.00.
+          if (ladder is Map) ...[
+            const SizedBox(height: AppSpacing.sm),
+            for (final (rung, name) in kGlanceLadder)
+              _detailRow(
+                context,
+                name,
+                (rung == 'discount' || rung == 'refund') && _numOf(ladder[rung]) > 0
+                    ? '− ${_money(ladder[rung])}'
+                    : _money(ladder[rung]),
+                trailing: (rung == 'net' && key == 'today_net') || (rung == 'grand_total' && key == 'today_gross')
+                    ? 'this figure'
+                    : null,
+              ),
+          ],
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+          if (key == 'today_gross') ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(kGlanceGrossAddsUp, style: note),
+          ],
+        ],
+      );
+    case 'online_net':
+    case 'online_gross':
+      final bills = _int(h['today_online_bills']);
+      final zero = _numOf((h['online_gross'] as Map?)?['value']) == 0 && (bills ?? 0) == 0;
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          if (bills != null) _detailRow(context, 'Online bills today', '$bills'),
+          for (final k in const ['online_net', 'online_gross'])
+            if (h[k] is Map) _detailRow(context, '${(h[k] as Map)['label']}', _money((h[k] as Map)['value'])),
+          const SizedBox(height: AppSpacing.sm),
+          Text(kGlanceOnlineRule, style: note),
+          // The owner's most likely reading of ₹0 here is "Zomato is missing".
+          // It is not: at the table it is a payment mode, and it is counted —
+          // under the by-method block.
+          if (zero) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(kGlanceOnlineNone, style: text.bodySmall!.copyWith(color: AppColors.textPrimary)),
+          ],
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+        ],
+      );
+    default: // month_to_date
+      final today = '${h['today'] ?? ''}';
+      final from = '${h['month_from'] ?? ''}';
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          if (_int(h['month_bills']) != null) _detailRow(context, 'Bills settled this month', '${_int(h['month_bills'])}'),
+          if (from.isNotEmpty && today.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(glanceMonthSentence(_fmtDay(from), _fmtDay(today)), style: text.bodySmall),
+          ],
+          const SizedBox(height: AppSpacing.sm),
+          Text(kGlanceSettledClock, style: note),
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+        ],
+      );
+  }
+}
+
+/// "How today is cut": the day, the zone, the clock a bill counts on. Opened by
+/// the header, the day chip and the zone chip; the zone chip's jump is Settings
+/// (where the zone is set — admin only, which the shell decides) and, for anyone
+/// who cannot open it, the day's report.
+Future<void> _glanceDaySheet(BuildContext context, Map h, String key) {
+  final today = '${h['today'] ?? ''}';
+  final monthFrom = '${h['month_from'] ?? ''}';
+  final zone = '${h['timezone'] ?? ''}'.trim();
+  final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
+  final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone ($offset)');
+  final nav = ModuleNavigator.of(context);
+  var drill = glanceDrillOf(h, key);
+  if (key == 'zone' && _glanceResolve(nav, drill) == null) drill = glanceDrillOf(h, 'day');
+  final bills = _int(h['today_bills']);
+  return _glanceSheet(
+    context,
+    eyebrow: 'Today at a glance',
+    title: kGlanceDayTitle,
+    drill: drill,
+    children: [
+      if (today.isNotEmpty) Text(glanceDaySentence(_fmtDay(today), zoneCaption), style: Theme.of(context).textTheme.bodySmall),
+      const SizedBox(height: AppSpacing.sm),
+      if (today.isNotEmpty) _detailRow(context, 'Today', _fmtDay(today)),
+      if (zoneCaption.isNotEmpty) _detailRow(context, 'Time zone', zoneCaption),
+      if (monthFrom.isNotEmpty) _detailRow(context, 'Month from', _fmtDay(monthFrom)),
+      if (bills != null) _detailRow(context, 'Bills settled today', '$bills'),
+      const SizedBox(height: AppSpacing.sm),
+      Text(kGlanceSettledClock, style: _glanceNote()),
+    ],
+  );
+}
+
+/// The bill count's own sheet — only for a user who can open none of the
+/// places the count leads, so the tag is never a dead tap.
+Future<void> _glanceCountSheet(BuildContext context, Map h) => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: '${_int(h['today_bills']) ?? 0} bill(s) settled',
+      drill: glanceDrillOf(h, 'bills'),
+      children: [
+        Text(kGlanceSettledClock, style: _glanceNote()),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceNoDestination, style: _glanceNote()),
+      ],
+    );
+
+/// Cash collection's sheet: the Cash row's own sheet when there is one (they
+/// are one number — the server reads the tile off the row), a plain "no cash"
+/// sheet when there is not. Its jumps are the tile's: the Settlement Summary,
+/// and the Cash register as a separately labelled second place.
+Future<void> _glanceCashSheet(BuildContext context, Map h) {
+  final rows = h['today_by_method'];
+  final cash = rows is List
+      ? rows.whereType<Map>().where((m) => '${m['method'] ?? ''}'.trim().toLowerCase() == 'cash').firstOrNull
+      : null;
+  final f = h['cash_collection'] is Map ? h['cash_collection'] as Map : const {};
+  final drill = glanceDrillOf(h, 'cash_collection');
+  if (cash != null) {
+    final section = h['by_method'] is Map ? h['by_method'] as Map : const {};
+    return _headlineMethodSheet(
+      context,
+      mode: cash,
+      share: _glanceShareOf(h, cash),
+      label: '${section['label'] ?? ''}'.trim(),
+      hint: '${section['hint'] ?? ''}'.trim(),
+      today: '${h['today'] ?? ''}',
+      splitBills: _int(h['today_split_bills']) ?? 0,
+      drill: drill,
+      extra: [
+        if ('${f['hint'] ?? ''}'.trim().isNotEmpty) Text('${f['hint']}'.trim(), style: _glanceNote()),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceDrawerNote, style: _glanceNote()),
+      ],
+    );
+  }
+  return _glanceSheet(
+    context,
+    eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+    title: '${'${f['label'] ?? ''}'.trim()} · ${_money(f['value'])}',
+    drill: drill,
+    children: [
+      Text(kGlanceNoCash, style: Theme.of(context).textTheme.bodySmall),
+      if ('${f['hint'] ?? ''}'.trim().isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text('${f['hint']}'.trim(), style: _glanceNote()),
+      ],
+      const SizedBox(height: AppSpacing.sm),
+      Text(kGlanceDrawerNote, style: _glanceNote()),
+    ],
+  );
+}
+
+/// A mode's share of today: the server's, else computed; a dash — never 0% —
+/// with nothing to divide by. Same rule as the web's modeSharePct.
+String _glanceShareOf(Map h, Map m) {
+  final s = m['share_pct'];
+  if (s is num) return '${s.toStringAsFixed(1)}%';
+  final g = h['today_gross'];
+  final rows = h['today_by_method'];
+  final total = (g is Map && g['value'] is num)
+      ? (g['value'] as num).toDouble()
+      : (rows is List ? rows.whereType<Map>().fold<double>(0, (a, r) => a + _numOf(r['amount'])) : 0.0);
+  if (!(total > 0)) return '–';
+  return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
+}
+
 /// TODAY BY PAYMENT METHOD, inside the headline box. Client ask: "How much money
 /// from each payment method made in the day has to be shown."
 ///
@@ -1429,9 +1857,11 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
 /// (the nothing-settled sentence above already says so), or when the block has
 /// no label (an unnamed list of money — the rule `figure` applies above).
 ///
-/// Each row opens a drill-down with a jump to Accounting. Not Reports: the
-/// report pack takes no focus target, so a jump there would land on whichever
-/// report was open last.
+/// Each row opens a drill-down whose jump is the Settlement Summary on that day
+/// — the report that computes these rows, Unallocated and refunds included —
+/// with that mode's own bills in Accounting as a second place (item 10). The
+/// label jumps straight to the report; the split note and the warning open
+/// their own sheets.
 Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final raw = h['today_by_method'];
   if (raw is! List) return null;
@@ -1443,6 +1873,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final hint = section is Map ? '${section['hint'] ?? ''}'.trim() : '';
 
   final text = Theme.of(context).textTheme;
+  final nav = ModuleNavigator.of(context);
   // The server's Today's gross sale — the figure the rows add up to. Summed
   // here only if a payload somehow carried rows without it.
   final grossFig = h['today_gross'];
@@ -1465,14 +1896,16 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       : (unallocatedBills == 1 ? "1 bill's" : "$unallocatedBills bills'");
   final today = '${h['today'] ?? ''}';
 
-  // The server's share, else computed; a dash — never 0% — with nothing to
-  // divide by. Same rule as the web's modeSharePct.
-  String shareOf(Map m) {
-    final s = m['share_pct'];
-    if (s is num) return '${s.toStringAsFixed(1)}%';
-    if (!(total > 0)) return '–';
-    return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
-  }
+  void openRow(Map m, {GlanceDrill? drill}) => _headlineMethodSheet(
+        context,
+        mode: m,
+        share: _glanceShareOf(h, m),
+        label: label,
+        hint: hint,
+        today: today,
+        splitBills: splitBills,
+        drill: drill ?? glanceDrillOf(h, 'by_method_row', rowMethod: '${m['method']}'.trim()),
+      );
 
   final rows = <Widget>[];
   for (final m in modes) {
@@ -1483,7 +1916,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     final amount = _numOf(m['amount']);
     final bills = _int(m['bills']) ?? 0;
     final refund = _numOf(m['refund']);
-    final share = shareOf(m);
+    final share = _glanceShareOf(h, m);
     final isUnallocated = method == 'Unallocated';
     rows.add(Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
       HBarRow(
@@ -1495,38 +1928,47 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
         value: _money(amount),
         color: isUnallocated ? AppColors.warning : null,
         tooltip: '$modeLabel · ${_money(amount)} · $bills bill(s) · $share of today',
-        onTap: () => _headlineMethodSheet(
-          context,
-          mode: m,
-          share: share,
-          label: label,
-          hint: hint,
-          today: today,
-          splitBills: splitBills,
-        ),
+        onTap: () => openRow(m),
       ),
       // The counts go on their own line UNDER the bar, not in HBarRow's `sub`.
       // That row gives only its label, so a bill count and a share beside the
       // figure overflowed a 360px phone by 99px once the day ran to eight
       // digits. A wrapping line cannot, and it is the web block's layout too.
-      Text(
-        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: text.bodySmall!.copyWith(fontSize: 11),
+      // Part of the row's tap target (item 10): it is that row's detail.
+      _glanceTap(
+        key: ValueKey('glance-mode-count-$method'),
+        semantics: '$modeLabel, $bills bills, opens details',
+        onTap: () => openRow(m),
+        child: Text(
+          '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: text.bodySmall!.copyWith(fontSize: 11),
+        ),
       ),
     ]));
   }
 
+  // The label is a direct jump to the report these rows are; for someone who
+  // cannot open it, a sheet listing the modes, so it never taps into nothing.
+  final labelJump = _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'by_method')));
+
   return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-    Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-    if (hint.isNotEmpty) ...[
-      const SizedBox(height: 3),
-      Text(hint,
-          maxLines: 3,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
-    ],
+    _glanceTap(
+      key: const ValueKey('glance-by-method'),
+      semantics: '$label, opens the Settlement Summary',
+      onTap: labelJump ?? () => _glanceByMethodSheet(context, h, modes, label, hint),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        if (hint.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(hint,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+        ],
+      ]),
+    ),
     const SizedBox(height: AppSpacing.sm),
     // One across on a phone, two or three on wider windows — the web's
     // 1 / 2 / 3 grid, keyed off the headline's own column count.
@@ -1536,28 +1978,73 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     // row here.
     if (splitBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
-      Text(
-        '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
-        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+      _glanceTap(
+        key: const ValueKey('glance-split'),
+        semantics: '$splitBills bills paid across more than one method, opens details',
+        onTap: () => _glanceSplitSheet(context, h, splitBills),
+        child: Text(
+          '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
+          style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+        ),
       ),
     ],
     // LOUD: the one line that means something is wrong. It should always be 0,
     // and it is wrong in EITHER direction — a split whose parts exceed the bill
     // books a negative residual — and wrong even when the residuals cancel. Same
-    // words as the web's unallocatedWarning.
+    // words as the web's unallocatedWarning. It opens the Unallocated row's own
+    // sheet, whose jump is the Split bills that need looking at.
     if (unallocated != 0 || unallocatedBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
-      Text(
-        unallocated != 0
-            ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
-                'do not add up to their totals and need looking at.'
-            : '$whose split amounts do not add up to their totals and need looking at '
-                '(the differences cancel out to ${_money(0)} today).',
-        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+      _glanceTap(
+        key: const ValueKey('glance-unallocated'),
+        semantics: 'Unallocated money, opens details',
+        onTap: () => unallocatedRow.isEmpty
+            ? _glanceSplitSheet(context, h, splitBills, key: 'unallocated')
+            : openRow(unallocatedRow.first, drill: glanceDrillOf(h, 'unallocated')),
+        child: Text(
+          unallocated != 0
+              ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
+                  'do not add up to their totals and need looking at.'
+              : '$whose split amounts do not add up to their totals and need looking at '
+                  '(the differences cancel out to ${_money(0)} today).',
+          style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+        ),
       ),
     ],
   ]);
 }
+
+/// The by-method label's sheet, for a user who cannot open the report.
+Future<void> _glanceByMethodSheet(BuildContext context, Map h, List<Map> modes, String label, String hint) =>
+    _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, label),
+      title: kGlanceByMethodTitle,
+      drill: glanceDrillOf(h, 'by_method'),
+      children: [
+        for (final m in modes)
+          _detailRow(context, PaymentModes.reportName(m, '${m['method']}'.trim()), _money(m['amount']),
+              trailing: '${_int(m['bills']) ?? 0} bill(s)'),
+        if (hint.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(hint, style: _glanceNote()),
+        ],
+      ],
+    );
+
+/// The split note's sheet: what a bill paid in parts does to the rows, and a
+/// jump to those bills.
+Future<void> _glanceSplitSheet(BuildContext context, Map h, int splitBills, {String key = 'split'}) => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: '$splitBills bill(s) paid across more than one method',
+      drill: glanceDrillOf(h, key),
+      children: [
+        Text(kGlanceSplitRule, style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceBillListNote, style: _glanceNote()),
+      ],
+    );
 
 /// NON-CHARGEABLE TODAY, under the by-method block (client item 5). A bill
 /// settled as NC took 0.00, so it has no row among the modes (the server drops
@@ -1565,55 +2052,63 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
 /// drawer that never came in. So it is its own labelled line — `today_nc`,
 /// server-authored — shown even on a day when no mode took anything. The web
 /// `headline-stats.tsx` draws the same line. Null when there is nothing today,
-/// or the payload is from a backend without it.
+/// or the payload is from a backend without it. It opens a sheet whose jump is
+/// the NC Summary for the day (item 10).
 Widget? _headlineNc(BuildContext context, Map h) {
   final nc = NcSettle.headlineNc(h);
   if (nc == null) return null;
   final text = Theme.of(context).textTheme;
-  return Column(
-    key: const ValueKey('headline-nc'),
-    crossAxisAlignment: CrossAxisAlignment.start,
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-      const SizedBox(height: 4),
-      Text(NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v)), style: text.titleSmall),
-      if (nc.hint.isNotEmpty) ...[
-        const SizedBox(height: 3),
-        Text(nc.hint,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+  final line = NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v));
+  return _glanceTap(
+    key: const ValueKey('glance-nc'),
+    semantics: '${nc.label}, $line, opens details',
+    onTap: () => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: nc.label,
+      drill: glanceDrillOf(h, 'nc'),
+      children: [
+        _detailRow(context, 'NC bills', '${nc.bills}'),
+        _detailRow(context, 'Given away', _money(nc.value)),
+        if (nc.hint.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(nc.hint, style: _glanceNote()),
+        ],
       ],
-    ],
+    ),
+    child: Column(
+      key: const ValueKey('headline-nc'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        const SizedBox(height: 4),
+        Text(line, style: text.titleSmall),
+        if (nc.hint.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(nc.hint,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+        ],
+      ],
+    ),
   );
 }
 
-/// The Accounting window the by-method drill-down jumps to: the day the sheet
-/// was about.
-///
-/// The SERVER's day, not the device's. The sheet names `today` off the headline
-/// payload, and a till whose clock has already crossed midnight — or that sits
-/// in another zone — must not land on a different day from the one it printed.
-/// When the two agree, which is every ordinary tap, it is stored as the Today
-/// PRESET, so coming back to Accounting after midnight moves with the calendar
-/// like any other Today; when they do not, the server's day is pinned.
-///
-/// What still differs on that day is Accounting's card, not the window: its
-/// "By payment method" is /reports/sales by_method, which has no Unallocated
-/// row and takes no refunds off. So its bar matches this sheet's Collected on
-/// every bill whose split parts add up — production holds no split that does
-/// not — and a bad split's residual is on this sheet alone. Routing that card through
-/// settlementByMethod too is its own change: it moves an existing report.
-DateRange _headlineAccountingWindow(String serverToday) {
-  final device = DateRange.fromPreset(RangePreset.today);
-  if (!isDayKey(serverToday) || serverToday == device.from) return device;
-  return DateRange(from: serverToday, to: serverToday, preset: RangePreset.custom);
-}
-
 /// One mode's drill-down from [_headlineByMethod]: what it took today, what
-/// came back off it, and a jump to Accounting on that same day — hidden when
-/// Accounting is not reachable for this user, which [_detailSheet] decides.
+/// came back off it, and where to read more — the Settlement Summary on that
+/// same day first, that mode's own bills in Accounting second. Each is hidden
+/// when this user cannot open it, which [_glanceSheet] decides.
+///
+/// The Settlement Summary is the report these rows ARE (settlementByMethod), so
+/// Unallocated and refunds read there as they read here. Accounting's "By
+/// payment method" card is /reports/sales by_method — no Unallocated row, no
+/// refunds taken off — and its bill list filters on the one method stored on a
+/// bill, so a bill paid in parts is under Split there; the sheet says so.
+///
+/// [drill] overrides the row's own (Cash collection passes the tile's); [extra]
+/// adds lines under the figures.
 Future<void> _headlineMethodSheet(
   BuildContext context, {
   required Map mode,
@@ -1622,23 +2117,22 @@ Future<void> _headlineMethodSheet(
   required String hint,
   required String today,
   required int splitBills,
+  GlanceDrill? drill,
+  List<Widget> extra = const [],
 }) {
   final text = Theme.of(context).textTheme;
   final method = '${mode['method'] ?? ''}'.trim();
   final refund = _numOf(mode['refund']);
-  final note = TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
-  return _detailSheet(
+  final note = _glanceNote();
+  final canOpen = ModuleNavigator.of(context)?.canOpen ?? (_) => false;
+  // Said only where Accounting is actually one of the places offered.
+  final toBills = drill != null &&
+      (drill.resolve(canOpen)?.module == 'Accounting' || drill.resolveSecondary(canOpen)?.module == 'Accounting');
+  return _glanceSheet(
     context,
     eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
     title: '${PaymentModes.reportName(mode, method)} · ${_money(mode['amount'])}',
-    jumpTo: 'Accounting',
-    // Land on THIS DAY. Accounting opens on the window it last showed — Last 30
-    // days on a first visit — and its Cash bar there is a month of cash beside
-    // the day's figure the owner just tapped. A remembered window rather than a
-    // focus request: Accounting reads no focus, and a request left parked on
-    // the shell would reset the window again on the next remount, after the
-    // owner had moved the chip themselves.
-    beforeJump: () => DateRangeMemory.remember('accounting', _headlineAccountingWindow(today)),
+    drill: drill,
     children: [
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
@@ -1663,6 +2157,14 @@ Future<void> _headlineMethodSheet(
       if (hint.isNotEmpty) ...[
         const SizedBox(height: AppSpacing.sm),
         Text(hint, style: note),
+      ],
+      if (extra.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        ...extra,
+      ],
+      if (toBills) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceBillListNote, style: note),
       ],
     ],
   );
@@ -2825,7 +3327,14 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // Renders nothing at all when the read was refused or failed. See
           // [_overviewHeadline]: the three states are the whole of this card's
           // correctness, and "no box" is one of them.
-          ..._overviewHeadline(context, data['headline'] as Map?, columns: headlineCols),
+          ..._overviewHeadline(
+            context,
+            data['headline'] as Map?,
+            columns: headlineCols,
+            // The count this page already fetched for its Operations tile; the
+            // empty-day sentence names it (item 10). Null when not fetched.
+            openBills: _int((data['openBills'] as Map?)?['total']),
+          ),
 
           if (statCards.isNotEmpty) ...[
             _dashGrid(statCards, cols),
@@ -21654,6 +22163,44 @@ Widget _analyticsBody(
 // --- Accounting & reporting --------------------------------------------------
 Widget accountingModule(RestClient rest, Profile p) => _AccountingView(rest: rest, profile: p);
 
+/// A ONE-SHOT settled-bill filter for Accounting, set by a jump that is about
+/// particular bills (item 10: a payment mode's own bills, the Split bills behind
+/// the split note). Taken once, on arrival, and dropped — so the next ordinary
+/// visit opens on "All methods" exactly as it always has.
+///
+/// Session memory rather than a focus request, for the reason
+/// [_primeGlanceJump] gives: Accounting reads no focus, and a request parked on
+/// the shell would re-apply itself on every remount.
+abstract final class AccountingBillFilter {
+  static String? _method;
+  static bool _reveal = false;
+  static bool _pending = false;
+
+  /// [method] filters the list (null = all methods); [reveal] scrolls the page
+  /// to the settled bills once they have painted.
+  static void remember(String? method, {bool reveal = false}) {
+    final m = method?.trim();
+    _method = (m == null || m.isEmpty) ? null : m;
+    _reveal = reveal;
+    _pending = true;
+  }
+
+  /// The pending filter, or null — and either way, nothing is pending after.
+  static ({String? method, bool reveal})? take() {
+    if (!_pending) return null;
+    final out = (method: _method, reveal: _reveal);
+    reset();
+    return out;
+  }
+
+  /// Test seam — a suite must not inherit the previous test's filter.
+  static void reset() {
+    _pending = false;
+    _method = null;
+    _reveal = false;
+  }
+}
+
 class _AccountingView extends StatefulWidget {
   final RestClient rest;
   final Profile profile;
@@ -21690,9 +22237,18 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   String _billTerm = '';
   String? _billMethod;
 
+  // Set when a glance jump asked to land ON the settled bills (item 10); spent
+  // by the first build that has them to show.
+  bool _revealBillsOnArrival = false;
+
   @override
   void initState() {
     super.initState();
+    final arrival = AccountingBillFilter.take();
+    if (arrival != null) {
+      _billMethod = arrival.method;
+      _revealBillsOnArrival = arrival.reveal;
+    }
     unawaited(primeFromCache(
       fetch: _fetch,
       apply: (d) { _apply(d); _loading = false; _error = null; },
@@ -21783,6 +22339,32 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         _loading = false;
       });
     }
+  }
+
+  /// Bring the Settled bills header into view once, after the figures paint.
+  ///
+  /// The page is a lazy ListView, so a header several screens down has no
+  /// element — and nothing for ensureVisible to find — until the list has been
+  /// scrolled near it. So this walks down a viewport at a time until the header
+  /// is built, then settles on it. Bounded, and it stops at the end of the list.
+  void _revealBillsOnce() {
+    var steps = 0;
+    void step() {
+      if (!mounted) return;
+      final ctx = _settledBillsKey.currentContext;
+      if (ctx != null && ctx.mounted) {
+        Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+        return;
+      }
+      if (!_scroll.hasClients || steps++ > 40) return;
+      final pos = _scroll.position;
+      if (pos.pixels >= pos.maxScrollExtent) return;
+      _scroll.jumpTo(math.min(pos.pixels + pos.viewportDimension, pos.maxScrollExtent));
+      WidgetsBinding.instance.addPostFrameCallback((_) => step());
+      WidgetsBinding.instance.scheduleFrame();
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => step());
   }
 
   double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
@@ -22321,6 +22903,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         onRetry: _load,
       );
     }
+    if (_revealBillsOnArrival) {
+      _revealBillsOnArrival = false;
+      _revealBillsOnce();
+    }
 
     String money(double v) => '₹${v.toStringAsFixed(0)}';
     final byDay = ((_sales['by_day'] as List?) ?? [])
@@ -22585,7 +23171,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
               onQuery: (q) => setState(() => _billTerm = q),
             ),
           ),
-          if (byMethod.isNotEmpty) ...[
+          // Also shown when a jump arrived with a filter this window's modes do not
+          // list — 'Split' is never one of them (the sales cut books a split's
+          // parts under their own modes) — so the filter in force is always one
+          // the owner can see and clear, and the dropdown always holds its value.
+          if (byMethod.isNotEmpty || _billMethod != null) ...[
             const SizedBox(width: AppSpacing.sm),
             SizedBox(
               width: 180,
@@ -22600,6 +23190,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                     DropdownMenuItem<String>(
                       value: _s(m as Map, 'method', ''),
                       child: Text(PaymentModes.reportName(m), overflow: TextOverflow.ellipsis),
+                    ),
+                  if (_billMethod != null && !byMethod.any((m) => _s(m as Map, 'method', '') == _billMethod))
+                    DropdownMenuItem<String>(
+                      value: _billMethod,
+                      child: Text(_billMethod!, overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),

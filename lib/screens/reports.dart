@@ -152,6 +152,25 @@ String _misBucket = 'day';
 /// out of the address book they were editing.
 String _misView = 'report';
 
+/// Open the pack on [key] next time it mounts — the report a jump from the
+/// Overview's "Today at a glance" box names (item 10). Same seam as the tab
+/// strip's own memory: the shell remounts the module on every jump, so this is
+/// read on arrival. An unknown key changes nothing rather than landing on a
+/// report nobody asked for.
+///
+/// A known key also puts the module back on the report view: an owner who
+/// last had Email reports open (item 9) and then taps a glance figure is
+/// asking for that report, not for the address book.
+void misRememberReport(String key) {
+  final i = _misReports.indexWhere((r) => r.key == key);
+  if (i < 0) return;
+  _misOpenTab = i;
+  _misView = 'report';
+}
+
+/// The key of the report the pack will open on. For tests.
+String get misOpenReportKey => _misReports[_misOpenTab.clamp(0, _misReports.length - 1)].key;
+
 /// Test seam: a suite must not inherit the previous test's tab or columns.
 void misResetReportMemory() {
   _misOpenTab = 0;
@@ -1485,6 +1504,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       ];
     case 'sales_summary':
       final salesNc = NcSettle.salesSummary(totals);
+      final orderTypes = _misOrderTypes(context, d['by_order_type']);
       return [
         _misTiles([
           _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi, sub: 'what guests paid'),
@@ -1494,6 +1514,13 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'ABV', _money(totals['abv']), sub: 'tax-inclusive'),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax'),
         ]),
+        // Under the tiles, above the ladder: on a desktop this chrome is capped
+        // and the ladder fills it, and the split is what a jump from the
+        // Overview's Online sale came to see — it must not open below the fold.
+        if (orderTypes != null) ...[
+          orderTypes,
+          const SizedBox(height: AppSpacing.md),
+        ],
         _misLadderCard(context, totals),
         if (salesNc != null) ...[
           const SizedBox(height: AppSpacing.md),
@@ -1728,6 +1755,41 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     default:
       return const [];
   }
+}
+
+/// The web's label for the Sales Summary's order-type split
+/// (app/dashboard/reports/context-panels.tsx), word for word.
+const String kMisOrderTypeLabel = 'By order type:';
+
+/// One chip per `by_order_type` row, in the web badge's words:
+/// `delivery · ₹1250.50 (5.9%)` — the channel as the server grouped it, its
+/// gross, and its share. Printed in the server's order; nothing is summed,
+/// sorted or relabelled here, and a row with no channel is not a row.
+List<String> misOrderTypeChips(Object? raw, String Function(Object? v) money) => [
+      if (raw is List)
+        for (final r in raw)
+          if (r is Map && '${r['order_type'] ?? ''}'.trim().isNotEmpty)
+            '${'${r['order_type']}'.trim()} · ${money(r['grand_total'])} (${misPercent(r['share_pct'])})',
+    ];
+
+/// THE ORDER-TYPE SPLIT above the ladder, in the web's words. It is where the
+/// Overview's Online sale lands (client item 10): Online is the delivery and
+/// other channels here, and no other screen cuts trade by channel — so the
+/// split is drawn, not merely fetched. An older backend sends none: no line.
+Widget? _misOrderTypes(BuildContext context, Object? raw) {
+  final chips = misOrderTypeChips(raw, _money);
+  if (chips.isEmpty) return null;
+  return Wrap(
+    key: const ValueKey('mis-order-types'),
+    spacing: AppSpacing.sm,
+    runSpacing: AppSpacing.sm,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      Text(kMisOrderTypeLabel, style: Theme.of(context).textTheme.bodySmall),
+      // Wrapped, never ellipsised: the figure is the end of the label.
+      for (final c in chips) InfoChip(label: c, wrap: true),
+    ],
+  );
 }
 
 /// NC BESIDE THE MONEY (client item 5): the bills settled as non-chargeable and
