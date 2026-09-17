@@ -189,8 +189,9 @@ const String settleAnywayLabel = 'Settle anyway';
 /// guest's details change after the print (an address or a GSTIN: the server's
 /// paper digest carries them), and then printed_total == grand_total. "Shows
 /// ₹2100.00; the bill is now ₹2100.00" reads as if nothing changed, so the
-/// amounts are named only when they differ by at least half a paisa AND the
-/// reader would see two different figures.
+/// amounts are named only when they are different numbers of paise (the web's
+/// rule, `Math.round(printed * 100) !== Math.round(now * 100)`) AND the reader
+/// would see two different figures.
 String? stalePaperSettleWarning({
   required bool? paperStale,
   String? printedClock,
@@ -205,7 +206,7 @@ String? stalePaperSettleWarning({
   final now = grandTotal == null ? null : money(grandTotal);
   final differ = printedTotal != null &&
       grandTotal != null &&
-      (printedTotal - grandTotal).abs() >= 0.005 &&
+      (printedTotal * 100).round() != (grandTotal * 100).round() &&
       printed != now;
   final amounts = differ
       ? '$paper shows $printed; the bill is now $now.'

@@ -619,16 +619,20 @@ void main() {
       String? warn(double printed, double now, [String Function(double)? m]) => stalePaperSettleWarning(
           paperStale: true, printedClock: '13:32', printedTotal: printed, grandTotal: now, money: m ?? money);
       expect(warn(2100, 2100), same);
-      // Under half a paisa apart is the same total (floating-point noise).
+      // The same number of paise is the same total (floating-point noise).
       expect(warn(2100, 2100.004), same);
       expect(warn(2100.004, 2100), same);
+      expect(warn(2100.001, 2099.999), same);
       // One paisa apart is a real change, and is named.
       expect(warn(2100, 2100.01),
           'The printed bill (13:32) shows ₹2100.00; the bill is now ₹2100.01. Print the updated bill before taking payment.');
       expect(warn(2100.01, 2100),
           'The printed bill (13:32) shows ₹2100.01; the bill is now ₹2100.00. Print the updated bill before taking payment.');
-      // Half a paisa is the line (the web's rule too): 0.6 paise apart, and shown apart, is named.
+      // Paise are compared rounded, as the web does: 0.6 paise apart, and shown apart, is named...
       expect(warn(2100, 2100.006),
+          'The printed bill (13:32) shows ₹2100.00; the bill is now ₹2100.01. Print the updated bill before taking payment.');
+      // ...and so are two sub-paisa totals that round to different paise.
+      expect(warn(2100.004, 2100.006),
           'The printed bill (13:32) shows ₹2100.00; the bill is now ₹2100.01. Print the updated bill before taking payment.');
       // Two totals the reader would see as the same figure are not named either.
       expect(warn(2100, 2100.3, (v) => '₹${v.round()}'), same);
@@ -889,6 +893,11 @@ void main() {
       expect(bps, contains('`\${paper} shows \${money(printed)}; the bill is now \${money(now)}.`'));
       expect(bps, contains('`\${paper} no longer matches the bill.`'));
       expect(bps, contains('Print the updated bill before taking payment.'));
+      // The same rule for when the two totals are named: different paise
+      // (floor_state.dart's `(printedTotal * 100).round() != (grandTotal * 100).round()`).
+      expect(bps, contains('Math.round(printed * 100) !== Math.round(now * 100)'));
+      expect(File('lib/models/floor_state.dart').readAsStringSync(),
+          contains('(printedTotal * 100).round() != (grandTotal * 100).round()'));
       expect(tm, contains("The printed bill moves with them. The guest's paper still says \${from.trim()}; "
           'the bill will show as \${to.trim()} (printed as \${from.trim()}).'));
       // The web shows the server's 2.0.2 refusal sentence beside the same button.
