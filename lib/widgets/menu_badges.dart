@@ -50,14 +50,23 @@ class MenuBadgePill extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: faded ? AppColors.borderStrong : AppColors.edge(color)),
       ),
-      child: ChipLabel(
-        badge.label,
-        style: TextStyle(
-          fontSize: dense ? 10 : 11.5,
-          height: 1.35,
-          fontWeight: FontWeight.w600,
-          color: faded ? AppColors.textTertiary : color,
-        ),
+      // ChipLabel is a Flexible, so it has to sit directly in a Row — like every
+      // other pill's label. Straight inside the Container it was a
+      // ParentDataWidget error on every pill drawn (a failed assertion in
+      // debug; in release the flex parent-data cast cannot succeed either).
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ChipLabel(
+            badge.label,
+            style: TextStyle(
+              fontSize: dense ? 10 : 11.5,
+              height: 1.35,
+              fontWeight: FontWeight.w600,
+              color: faded ? AppColors.textTertiary : color,
+            ),
+          ),
+        ],
       ),
     );
   }

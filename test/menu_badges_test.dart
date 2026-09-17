@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:restaurant_owner_app/models/menu_badge.dart';
+import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
+import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/widgets/menu_badges.dart';
 
 /// Configurable menu badges, owner-app side.
 ///
@@ -172,5 +176,54 @@ void main() {
         "Owner's Pick",
       );
     });
+  });
+
+  group('drawing', () {
+    // The pill's label is a ChipLabel, which is a Flexible. Put straight inside
+    // the pill's Container it was an "Incorrect use of ParentDataWidget" on
+    // every pill ever drawn — the tile's badges and the whole tag-dishes dialog
+    // — and no test had ever drawn one. Found by the 2.0.2 search registry,
+    // which opens that dialog.
+    for (final ds in DesignSystem.values) {
+      testWidgets('a pill, a tile row and a cramped pill all draw cleanly (${ds.id})', (tester) async {
+        tester.view.physicalSize = const Size(360, 640);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+        await tester.pumpWidget(GaiaScope(
+          system: ds,
+          child: MaterialApp(
+            theme: ds == DesignSystem.gaia ? GaiaTheme.dark() : AppTheme.dark(),
+            home: Scaffold(
+              body: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const MenuBadgePill(badge: MenuBadge(id: 'must_try', label: 'Must Try', kind: MenuBadgeKind.promo)),
+                const MenuBadgePill(
+                  badge: MenuBadge(id: 'jain', label: 'Jain', kind: MenuBadgeKind.diet),
+                  dense: false,
+                  faded: true,
+                ),
+                const MenuBadgeChips(
+                  catalogue: catalogue,
+                  item: {'badges': ['must_try', 'bestseller', 'jain'], 'allergens': ['nuts']},
+                ),
+                const SizedBox(
+                  width: 60,
+                  child: MenuBadgePill(
+                    badge: MenuBadge(id: 'long', label: 'Chef recommends this one', kind: MenuBadgeKind.promo),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        ));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(find.text('Must Try'), findsNWidgets(2));
+        expect(find.text('Contains nuts'), findsOneWidget, reason: 'the allergen always shows');
+        // A narrow parent ellipsises the label rather than overflowing.
+        final long = tester.widget<Text>(find.text('Chef recommends this one'));
+        expect(long.overflow, TextOverflow.ellipsis);
+        expect(tester.getSize(find.text('Chef recommends this one')).width, lessThan(60));
+      }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.android, TargetPlatform.windows}));
+    }
   });
 }
