@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'api_client.dart';
 import 'auth_controller.dart';
@@ -26,7 +27,11 @@ class RestClient {
   RestClient(this.auth);
 
   Future<dynamic> get(String path) => _req('GET', path);
-  Future<dynamic> post(String path, [Object? body]) => _req('POST', path, body);
+  /// [asOutlet] sends this one request as a real outlet while the app is in
+  /// the all-outlets view, whose writes the server refuses outright. Only Send
+  /// now uses it (client item 9: the combined scope rides in the BODY); it is
+  /// never queued, so the outbox's own outlet stamp is untouched.
+  Future<dynamic> post(String path, [Object? body, String? asOutlet]) => _req('POST', path, body, asOutlet);
   Future<dynamic> put(String path, [Object? body]) => _req('PUT', path, body);
   Future<dynamic> patch(String path, [Object? body]) => _req('PATCH', path, body);
   Future<dynamic> delete(String path, [Object? body]) => _req('DELETE', path, body);
@@ -59,7 +64,7 @@ class RestClient {
   bool _cacheableGet(String method, String path) =>
       method == 'GET' && !path.startsWith('/auth');
 
-  Future<dynamic> _req(String method, String path, [Object? body]) async {
+  Future<dynamic> _req(String method, String path, [Object? body, String? asOutlet]) async {
     final token = auth.token;
     if (token == null) throw ApiException('Not signed in.', 401);
     final res = _cacheRes;
@@ -117,7 +122,7 @@ class RestClient {
 
     try {
       Future<dynamic> call() =>
-          auth.api.request(method, path, token, body, auth.selectedOutletId);
+          auth.api.request(method, path, token, body, asOutlet ?? auth.selectedOutletId);
       final data = key == null ? await call() : await IdempotencyScope.run(key, call);
       if (res != null) {
         if (_cacheableGet(method, path)) {
@@ -238,6 +243,23 @@ class RestClient {
     }
     try {
       return await auth.api.getText(path, token, auth.selectedOutletId);
+    } on ApiException catch (e) {
+      if (e.status == 401) await auth.logout(expired: true);
+      rethrow;
+    }
+  }
+
+  /// Authenticated GET returning the raw bytes (a stored report attachment).
+  /// Never cached, like [getText].
+  Future<Uint8List> getBytes(String path) async {
+    final token = auth.token;
+    if (token == null) throw ApiException('Not signed in.', 401);
+    if (GetCachePolicy.isCacheOnly) {
+      GetCachePolicy.stamp?.recordMiss();
+      throw const CacheMiss();
+    }
+    try {
+      return await auth.api.getBytes(path, token, auth.selectedOutletId);
     } on ApiException catch (e) {
       if (e.status == 401) await auth.logout(expired: true);
       rethrow;
