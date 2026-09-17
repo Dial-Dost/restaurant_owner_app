@@ -27,9 +27,10 @@ import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 /// THE FIELDS THIS CLIENT READS ARE THE CONTRACT — see
 /// [m.serverSaysBillPrinted]. They are needed in TWO places, not one:
 /// `/bill-for-table` (the sheet, which decides whether to draw the button) and
-/// the `/get-tables` row (the grid, which decides whether the table is still on
-/// this waiter's screen). Without the second, "clear from their view" survives
-/// on the device that printed and nowhere else.
+/// the `/get-tables` row (the grid, which paints the table orange — client
+/// items 1 and 2; until 2.0.2 it decided whether the table stayed on this
+/// waiter's screen at all). Without the second, the orange survives on the
+/// device that printed and nowhere else.
 ///
 /// AND IT FAILS SAFE. Silence means NOT printed, so the waiter gets their
 /// button. The alternative — reading silence as "already printed" — leaves
@@ -222,8 +223,14 @@ void main() {
     });
   });
 
-  group('the grid retires a table on the server\'s word, not this device\'s', () {
-    testWidgets('a waiter loses a table the SERVER says is printed', (tester) async {
+  // REWRITTEN ON PURPOSE FOR CLIENT ITEMS 1 AND 2. This group used to pin that
+  // a waiter's grid RETIRED a table the server called printed. The table now
+  // stays and is painted orange; what is still pinned is WHOSE word paints it.
+  final Finder printedChip = find.byKey(const ValueKey('table-T1-Bill printed'));
+  final Finder runningChip = find.byKey(const ValueKey('table-T1-Running'));
+
+  group('the grid paints a table printed on the server\'s word, not this device\'s', () {
+    testWidgets('a waiter keeps a table the SERVER says is printed, in orange', (tester) async {
       // NOTHING WAS PRINTED ON THIS DEVICE. The record can only have come from
       // the other till, or from before this app was reinstalled — which is
       // exactly the case a per-device memory cannot answer.
@@ -232,30 +239,33 @@ void main() {
         _FakeApi(_routes(printState: const {'bill_printed_at': '2026-09-11T10:42:00Z'}),
             role: 'waiter', actions: const ['a1'], waiterOnly: true),
       );
-      expect(find.text('T1'), findsNothing);
+      expect(find.text('T1'), findsOneWidget);
+      expect(printedChip, findsOneWidget);
     });
 
-    // CHANGED ON PURPOSE FOR CLIENT ITEM 6: the PRINTED PARTY leaves, and the
-    // number stays as the next party's seat, decided on that row's own print
-    // state — which the server says is not printed.
-    testWidgets('…and keeps its NUMBER through the next party\'s seat', (tester) async {
+    // CLIENT ITEM 6 AND ITEMS 1 AND 2: the printed party stays, and the number
+    // comes back beside it as the next party's seat, painted on that row's own
+    // print state — which the server says is not printed.
+    testWidgets('…with its NUMBER again, green, as the next party\'s seat', (tester) async {
       await _mountFloor(
         tester,
         _FakeApi(_routes(printState: const {'bill_printed_at': '2026-09-11T10:42:00Z'}, nextParty: true),
             role: 'waiter', actions: const ['a1'], waiterOnly: true),
       );
-      expect(_printedRow, findsNothing);
+      expect(_printedRow, findsOneWidget);
       expect(_nextPartyRow, findsOneWidget);
-      expect(find.text('T1'), findsOneWidget);
-      expect(find.text('Next party'), findsOneWidget);
+      expect(find.text('T1'), findsNWidgets(2));
+      expect(find.byKey(const ValueKey('table-T1 #2-Free')), findsOneWidget);
+      expect(find.byTooltip('Next party'), findsOneWidget);
     });
 
-    testWidgets('and keeps it when the server has said nothing', (tester) async {
+    testWidgets('and a table the server has said nothing about reads as it always did', (tester) async {
       await _mountFloor(
         tester,
         _FakeApi(_routes(), role: 'waiter', actions: const ['a1'], waiterOnly: true),
       );
       expect(find.text('T1'), findsOneWidget);
+      expect(runningChip, findsOneWidget);
     });
 
     testWidgets('an owner keeps the table either way', (tester) async {
@@ -334,9 +344,11 @@ void main() {
             role: 'waiter', actions: const ['a1'], waiterOnly: true),
         deviceMemory: const ['T1'],
       );
-      expect(find.text('T1'), findsOneWidget,
+      expect(find.text('T1'), findsOneWidget);
+      expect(runningChip, findsOneWidget,
           reason: 'the server is describing the bill the guest is sitting in '
               'front of; a tablet memory does not get to overrule it');
+      expect(printedChip, findsNothing);
     });
 
     testWidgets('server says PRINTED, this device has no memory of it',
@@ -348,9 +360,10 @@ void main() {
         _FakeApi(_routes(printState: const {'print_count': 2}, nextParty: true),
             role: 'waiter', actions: const ['a1'], waiterOnly: true),
       );
-      // CHANGED ON PURPOSE FOR CLIENT ITEM 6: the printed PARTY is gone and the
-      // next party's seat is what reads "T1".
-      expect(_printedRow, findsNothing);
+      // Client items 1 and 2: the printed party stays, orange, beside the next
+      // party's seat.
+      expect(_printedRow, findsOneWidget);
+      expect(printedChip, findsOneWidget);
       expect(_nextPartyRow, findsOneWidget);
     });
 
@@ -363,7 +376,9 @@ void main() {
         _FakeApi(_routes(), role: 'waiter', actions: const ['a1'], waiterOnly: true),
         deviceMemory: const ['T1'],
       );
-      expect(find.text('T1'), findsNothing);
+      // The table stays (client items 1 and 2); the memory paints it printed.
+      expect(find.text('T1'), findsOneWidget);
+      expect(printedChip, findsOneWidget);
     });
 
     testWidgets('and an owner keeps the row through every one of those',

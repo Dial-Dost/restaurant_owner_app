@@ -37,6 +37,7 @@ import '../services/rest_client.dart';
 import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/app_search_field.dart';
 import '../ui/widgets/fork_button.dart';
 import '../ui/widgets/fork_card.dart';
 import '../ui/widgets/section_header.dart';
@@ -1059,14 +1060,8 @@ class _LeverPickerPanel extends StatefulWidget {
 }
 
 class _LeverPickerPanelState extends State<_LeverPickerPanel> {
-  final TextEditingController _search = TextEditingController();
+  String _query = '';
   late final Set<String> _local = {...widget.active};
-
-  @override
-  void dispose() {
-    _search.dispose();
-    super.dispose();
-  }
 
   void _toggle(String key) {
     setState(() {
@@ -1078,7 +1073,7 @@ class _LeverPickerPanelState extends State<_LeverPickerPanel> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
-    final query = _search.text;
+    final query = _query;
     // Search filters the FULL catalogue, not one category; a category with
     // nothing left drops out rather than rendering an empty header.
     final groups = groupedParams(query: query);
@@ -1086,26 +1081,11 @@ class _LeverPickerPanelState extends State<_LeverPickerPanel> {
     return Column(mainAxisSize: MainAxisSize.min, children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.md, AppSpacing.md, AppSpacing.sm),
-        child: TextField(
-          key: const ValueKey('sim-pick-search'),
-          controller: _search,
+        child: AppSearchField(
+          testId: 'sim-pick-search',
+          hint: 'Search parameters…',
           autofocus: widget.autofocusSearch,
-          decoration: InputDecoration(
-            prefixIcon: const Icon(Icons.search, size: 18),
-            hintText: 'Search parameters…',
-            isDense: true,
-            suffixIcon: query.isEmpty
-                ? null
-                : IconButton(
-                    icon: const Icon(Icons.clear, size: 18),
-                    tooltip: 'Clear search',
-                    onPressed: () {
-                      _search.clear();
-                      setState(() {});
-                    },
-                  ),
-          ),
-          onChanged: (_) => setState(() {}),
+          onQuery: (q) => setState(() => _query = q),
         ),
       ),
       Flexible(

@@ -136,6 +136,9 @@ class _NotificationsBellState extends State<NotificationsBell> {
         if (meta.containsKey('feedback_id')) return 'Feedback'; // low rating
         if (meta.containsKey('alert_key')) return 'Analytics'; // KPI alert
         return 'Analytics';
+      case 'report':
+        // Client item 9: Reports → Email reports; a 2.0.1 inbox bell says Accounting.
+        return meta['module'] == 'Accounting' ? 'Accounting' : 'Reports';
       default:
         return null;
     }

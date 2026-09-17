@@ -852,6 +852,11 @@ void main() {
   testWidgets('a mode opens its drill-down, which jumps to Accounting ON THAT DAY', (tester) async {
     // The day the headline is about is the device's today here — the ordinary
     // tap. Accounting was last on 30 days, as it is on a first visit.
+    //
+    // This host shows no Reports tile, so the row's first stop (the Settlement
+    // Summary, item 10) is not offered and its Accounting fallback is — the
+    // path an identity without the report pack takes. The Reports-first path is
+    // test/overview_glance_test.dart's.
     DateRangeMemory.reset();
     addTearDown(DateRangeMemory.reset);
     DateRangeMemory.remember('accounting', DateRange.fromPreset(RangePreset.last30));

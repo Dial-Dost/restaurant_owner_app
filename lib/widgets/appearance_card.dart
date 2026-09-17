@@ -178,30 +178,38 @@ class _BackdropControls extends StatelessWidget {
       // The miniature: the real GradientBackdrop (same widget, same resolver),
       // with the two body inks sitting on its brightest region so the owner
       // SEES the readability the guard is promising.
-      ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: SizedBox(
-          height: 116,
-          child: GradientBackdrop(
-            heroHeight: 116,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Rustic Fork', style: text.titleMedium),
-                const SizedBox(height: 2),
-                Text('Covers 42 · APC ₹512 · 6 open bills', style: text.bodySmall),
-                const Spacer(),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    gradient: AppColors.cardGradient,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: AppColors.border),
+      //
+      // It is 116px whatever the device, so its ink samples keep one line and
+      // ignore the device's text size: on a 360dp phone they wrapped past the
+      // bottom even at 1x, and by 82px at 1.3x.
+      MediaQuery.withNoTextScaling(
+        child: ClipRRect(
+          key: const ValueKey('backdrop-preview'),
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(
+            height: 116,
+            child: GradientBackdrop(
+              heroHeight: 116,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Rustic Fork', style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Text('Covers 42 · APC ₹512 · 6 open bills',
+                      style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  const Spacer(),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: AppColors.cardGradient,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Text('Live preview — this is your backdrop',
+                        style: text.labelMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
                   ),
-                  child: Text('Live preview — this is your backdrop',
-                      style: text.labelMedium),
-                ),
-              ]),
+                ]),
+              ),
             ),
           ),
         ),
@@ -569,58 +577,64 @@ class _DesignSwatch extends StatelessWidget {
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
+        key: ValueKey('design-swatch-${system.id}'),
         onTap: onTap,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Container(
-              width: 122,
-              height: 82,
-              padding: const EdgeInsets.all(9),
-              decoration: BoxDecoration(
-                color: ground,
-                // The selection ring wears the ACTIVE accent, the same rule
-                // the scheme and accent swatches follow.
-                border: Border.all(
-                  color: selected ? AppColors.copperHi : AppColors.border,
-                  width: selected ? 2 : 1,
-                ),
-                borderRadius: BorderRadius.circular(gaia ? 2 : 10),
-              ),
+            // A picture of the system at a fixed 122x82, so its sample figure
+            // keeps the size it was drawn at: at 2x text it grew taller than the
+            // box. The name under it scales with the device.
+            MediaQuery.withNoTextScaling(
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+                width: 122,
+                height: 82,
+                padding: const EdgeInsets.all(9),
                 decoration: BoxDecoration(
-                  color: surface,
-                  border: Border.all(color: line),
-                  // The corner radius is itself part of the preview: 2px vs
-                  // 14px is the most visible single difference between them.
-                  borderRadius: BorderRadius.circular(gaia ? 2 : 8),
+                  color: ground,
+                  // The selection ring wears the ACTIVE accent, the same rule
+                  // the scheme and accent swatches follow.
+                  border: Border.all(
+                    color: selected ? AppColors.copperHi : AppColors.border,
+                    width: selected ? 2 : 1,
+                  ),
+                  borderRadius: BorderRadius.circular(gaia ? 2 : 10),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      '1,248',
-                      maxLines: 1,
-                      style: gaia
-                          ? GaiaType.serif(
-                              size: 26,
-                              weight: 500,
-                              height: 1,
-                              color: GaiaColors.champagne2)
-                          : TextStyle(
-                              fontSize: 24,
-                              height: 1,
-                              fontWeight: FontWeight.w300,
-                              letterSpacing: -0.8,
-                              color: ink,
-                            ),
-                    ),
-                    const SizedBox(height: 7),
-                    Container(width: 44, height: 3, color: accent),
-                  ],
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: surface,
+                    border: Border.all(color: line),
+                    // The corner radius is itself part of the preview: 2px vs
+                    // 14px is the most visible single difference between them.
+                    borderRadius: BorderRadius.circular(gaia ? 2 : 8),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '1,248',
+                        maxLines: 1,
+                        style: gaia
+                            ? GaiaType.serif(
+                                size: 26,
+                                weight: 500,
+                                height: 1,
+                                color: GaiaColors.champagne2)
+                            : TextStyle(
+                                fontSize: 24,
+                                height: 1,
+                                fontWeight: FontWeight.w300,
+                                letterSpacing: -0.8,
+                                color: ink,
+                              ),
+                      ),
+                      const SizedBox(height: 7),
+                      Container(width: 44, height: 3, color: accent),
+                    ],
+                  ),
                 ),
               ),
             ),

@@ -12,6 +12,14 @@
 //     cancel underneath: the mandatory reason (1.2), the void-or-plain route
 //     decision, and nothing new on the wire. Hidden from somebody who can take
 //     neither route, and never on the trailing group, which is not a ticket.
+//
+//   CLIENT ITEM 3 (2026-09-17) — "On the waiter dashboard, Cancel KOT option
+//     should be removed." Hidden from a waiter-only login, whatever it holds
+//     (the server's `cancel_kot`, and the same answer worked out against an
+//     older backend); every other role keeps it exactly as before.
+//
+//   CLIENT ITEM 4 — a ticket moved here from another table says so in its
+//     header: "KOT 65 · 16:27 · from 12".
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -85,12 +93,14 @@ Map<String, dynamic> _bill(List<String> orderIds) => {
 // ---------------------------------------------------------------- the harness
 
 class _FakeApi extends ApiClient {
-  _FakeApi(this.routes, {required this.actions, this.role = 'admin', this.waiterOnly});
+  _FakeApi(this.routes, {required this.actions, this.role = 'admin', this.waiterOnly, this.cancelKot});
 
   final Map<String, dynamic> routes;
   final List<String> actions;
   final String role;
   final bool? waiterOnly;
+  /// The server's `scope.cancel_kot`, when the fake backend sends one.
+  final bool? cancelKot;
   final List<String> calls = [];
   final List<({String method, String path, Object? body})> writes = [];
 
@@ -109,7 +119,8 @@ class _FakeApi extends ApiClient {
           'emp_Fname': 'Ravi',
           'role': role,
           'role_all': [role],
-          if (waiterOnly != null) 'scope': <String, dynamic>{'waiter_only': waiterOnly},
+          if (waiterOnly != null || cancelKot != null)
+            'scope': <String, dynamic>{'waiter_only': ?waiterOnly, 'cancel_kot': ?cancelKot},
           'actions_set': actions,
           'action_names': const <String>[],
         }),
@@ -241,6 +252,15 @@ void main() {
       expect(noTime.header, 'KOT 2');
     });
 
+    test('CLIENT ITEM 4 — a moved ticket says where it came from, after the time', () {
+      final moved = {..._order('o-1', kotNos: [65]), 'moved_from': '12', 'moved_at': '2026-09-13T09:30:00Z'};
+      final g = m.tableKotGroups(_bill(['o-1']), [moved])!.single;
+      expect(g.header, 'KOT 65 · ${RestaurantTime.clock('2026-09-13T09:27:00Z')} · from 12');
+      expect(g.label, 'KOT 65', reason: 'the label stays the handle the pass quotes');
+      final undated = m.tableKotGroups(_bill(['x']), [{..._order('x', kotNos: [2], at: ''), 'moved_from': '15'}])!.single;
+      expect(undated.header, 'KOT 2 · from 15');
+    });
+
     test('zero, negative and duplicate KOT numbers are not numbers', () {
       final groups = m.tableKotGroups(_bill(['a', 'b']), [
         {..._order('a'), 'kot_nos': [0, -1, 'x']},
@@ -352,10 +372,44 @@ void main() {
       expect(api.writes, isEmpty);
     });
 
-    testWidgets('a waiter holding Add Orders cancels on the plain route, with the reason',
+    testWidgets('CLIENT ITEM 3 — a waiter-only login sees the tickets and no Cancel KOT, whatever it holds',
+        (tester) async {
+      final setups = <({List<String> actions, bool? cancelKot})>[
+        // The server's answer…
+        (actions: const [_addOrders], cancelKot: false),
+        // …and against a backend older than the flag, the same answer worked out.
+        (actions: const [_addOrders], cancelKot: null),
+        // A waiter granted Void Orders loses it too: the role, not the grant.
+        (actions: const [_addOrders, 'c1f83b26-5a97-4e40-b8d3-7e02a9c4f156'], cancelKot: null),
+      ];
+      for (final setup in setups) {
+        final api = _FakeApi(_routes(orders: _threeOrders),
+            actions: setup.actions, role: 'waiter', waiterOnly: true, cancelKot: setup.cancelKot);
+        await _openT1(tester, api);
+        expect(_header(5), findsOneWidget);
+        expect(_header(7), findsOneWidget);
+        expect(_cancel(5), findsNothing);
+        expect(_cancel(7), findsNothing);
+        expect(find.text('Cancel KOT'), findsNothing);
+        expect(api.writes, isEmpty);
+      }
+    });
+
+    testWidgets('the server\'s cancel_kot is obeyed in both directions', (tester) async {
+      final no = _FakeApi(_routes(orders: _threeOrders), actions: const [_addOrders],
+          role: 'manager', waiterOnly: false, cancelKot: false);
+      await _openT1(tester, no);
+      expect(_cancel(5), findsNothing);
+      final yes = _FakeApi(_routes(orders: _threeOrders), actions: const [_addOrders],
+          role: 'captain', waiterOnly: false, cancelKot: true);
+      await _openT1(tester, yes);
+      expect(_cancel(5), findsOneWidget);
+    });
+
+    testWidgets('a floor role that is not a waiter-only login, holding Add Orders, cancels on the plain route, with the reason',
         (tester) async {
       final api = _FakeApi(_routes(orders: _threeOrders),
-          actions: const [_addOrders], role: 'waiter', waiterOnly: true);
+          actions: const [_addOrders], role: 'captain', waiterOnly: false);
       await _openT1(tester, api);
       expect(_cancel(5), findsOneWidget);
 

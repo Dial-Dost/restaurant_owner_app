@@ -5,11 +5,15 @@
 // Summary, Cover Size Summary, Settlement Summary — and the six that migrations
 // 034-039 finally gave data to: NC Summary, Service Charge Deny, Group Summary,
 // Variation Summary, Tip Summary and Counter Summary. Backed by /reports/mis/*,
-// all GETs, all read-only — nothing on this screen writes, so nothing on it can
-// reach the offline outbox. The one exception is the "Manage sessions" sheet,
-// which replaces the restaurant's saved time slots (PUT /reports/mis/time-slots):
-// a settings write, offered only to a caller the server marks `can_edit`, and
-// not on the outbox allowlist, so it is online-only by construction.
+// all GETs, all read-only — the reports themselves write nothing, so nothing
+// they do can reach the offline outbox. Two exceptions, both online-only by
+// construction because neither is on the outbox allowlist:
+//   * the "Manage sessions" sheet, which replaces the restaurant's saved time
+//     slots (PUT /reports/mis/time-slots), offered only to a caller the server
+//     marks `can_edit`;
+//   * EMAIL (client item 9): the Email button beside Export (Send now, for the
+//     report and days on screen) and the "Email reports" view — the address
+//     book, the schedules and the delivery history. See report_email.dart.
 //
 // WHY THIS IS A `part` OF modules.dart AND NOT ITS OWN LIBRARY. The drill-down
 // from a Discount or an Order Summary row has to open THE SAME BILL BODY the
@@ -143,9 +147,34 @@ final Map<String, Set<String>> _misHiddenColumns = <String, Set<String>>{};
 /// fourteen of fifteen tabs is a dead control.
 String _misBucket = 'day';
 
+/// Which view was open — the reports, or Email reports — for the session, like
+/// the tab: switching outlet remounts the module and must not throw the owner
+/// out of the address book they were editing.
+String _misView = 'report';
+
+/// Open the pack on [key] next time it mounts — the report a jump from the
+/// Overview's "Today at a glance" box names (item 10). Same seam as the tab
+/// strip's own memory: the shell remounts the module on every jump, so this is
+/// read on arrival. An unknown key changes nothing rather than landing on a
+/// report nobody asked for.
+///
+/// A known key also puts the module back on the report view: an owner who
+/// last had Email reports open (item 9) and then taps a glance figure is
+/// asking for that report, not for the address book.
+void misRememberReport(String key) {
+  final i = _misReports.indexWhere((r) => r.key == key);
+  if (i < 0) return;
+  _misOpenTab = i;
+  _misView = 'report';
+}
+
+/// The key of the report the pack will open on. For tests.
+String get misOpenReportKey => _misReports[_misOpenTab.clamp(0, _misReports.length - 1)].key;
+
 /// Test seam: a suite must not inherit the previous test's tab or columns.
 void misResetReportMemory() {
   _misOpenTab = 0;
+  _misView = 'report';
   _misHiddenColumns.clear();
   _misBucket = 'day';
   TimeSlotMemory.reset();
@@ -239,8 +268,9 @@ class _ReportsViewState extends State<_ReportsView> {
     }
   }
 
+  // The box's text. Kept here because the box is only built for the reports
+  // that read a search, and is built away and back as the tabs change.
   final TextEditingController _searchCtl = TextEditingController(text: '');
-  Timer? _searchDebounce;
   String _search = '';
 
   // The outlet list behind the scope selector. Loaded lazily and best-effort:
@@ -253,9 +283,31 @@ class _ReportsViewState extends State<_ReportsView> {
   // widget (ModuleNavigator) is only legal once dependencies are resolved, and
   // whether this user can switch outlets at all is what decides if the call is
   // worth making. Guarded so a rebuild does not refetch.
+  /// The view on screen: 'report' or 'email'.
+  String _view = _misView;
+  int _focusSerial = -1;
+
+  void _setView(String next) => setState(() {
+        _view = next;
+        _misView = next;
+      });
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // A bell about an emailed report (its meta says module 'Reports'), or the
+    // Accounting card's "Open Email reports", lands on the Email reports view.
+    // "Scheduled email reports are waiting" names no delivery and no schedule:
+    // it carries view 'email' (and its kind), or it landed on the report grid.
+    final focus = ModuleNavigator.of(context)?.focusFor('Reports');
+    if (focus != null && focus.serial != _focusSerial) {
+      _focusSerial = focus.serial;
+      final t = focus.target;
+      if (t['view'] == 'email' || t['delivery_id'] != null || t['schedule_id'] != null || t['kind'] != null) {
+        _view = 'email';
+        _misView = 'email';
+      }
+    }
     if (_askedOutlets) return;
     _askedOutlets = true;
     if (ModuleNavigator.of(context)?.switchOutlet == null) return;
@@ -270,7 +322,6 @@ class _ReportsViewState extends State<_ReportsView> {
 
   @override
   void dispose() {
-    _searchDebounce?.cancel();
     _searchCtl.dispose();
     super.dispose();
   }
@@ -281,29 +332,25 @@ class _ReportsViewState extends State<_ReportsView> {
   }
 
   void _setTab(int i) {
+    // A term the new report's endpoint does not read would sit in a visible
+    // box filtering nothing, and the empty state would go on to say "no rows
+    // match" about a search that was never applied. Dropped, loudly, by the
+    // field disappearing with it.
+    final drop = !_misReports[i].searchable;
     setState(() {
       _tab = i;
       _misOpenTab = i;
-      // A term the new report's endpoint does not read would sit in a visible
-      // box filtering nothing, and the empty state would go on to say "no rows
-      // match" about a search that was never applied. Dropped, loudly, by the
-      // field disappearing with it.
-      if (!_misReports[i].searchable && _search.isNotEmpty) {
-        _search = '';
-        _searchCtl.clear();
-        _searchDebounce?.cancel();
-      }
+      if (drop) _search = '';
     });
+    // Cleared after, so the box's own '' finds the search already empty. It
+    // also cancels a word still waiting out the debounce.
+    if (drop) _searchCtl.clear();
   }
 
-  void _onSearch(String v) {
-    _searchDebounce?.cancel();
-    // A keystroke must not be a request: these queries scan a whole window.
-    _searchDebounce = Timer(const Duration(milliseconds: 450), () {
-      if (!mounted) return;
-      final t = v.trim();
-      if (t != _search) setState(() => _search = t);
-    });
+  // A keystroke must not be a request: these queries scan a whole window, so
+  // the box debounces what it sends here.
+  void _onSearchQuery(String q) {
+    if (mounted && q != _search) setState(() => _search = q);
   }
 
   @override
@@ -344,8 +391,22 @@ class _ReportsViewState extends State<_ReportsView> {
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SectionHeader(
           title: 'Reports',
-          trailing: narrow ? null : InfoChip(icon: Icons.calendar_today_outlined, label: _range.label()),
+          trailing: narrow || _view == 'email' ? null : InfoChip(icon: Icons.calendar_today_outlined, label: _range.label()),
         ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: _MisSegment(
+            key: const ValueKey('reports-view'),
+            options: const ['report', 'email'],
+            labels: const ['Reports', kEmailAreaTitle],
+            selected: _view,
+            onSelected: _setView,
+          ),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        if (_view == 'email')
+          Expanded(child: _EmailReportsPanel(rest: widget.rest))
+        else ...[
         // Every figure below is cut on this window and this outlet, so the
         // controls that set them sit above the figures, never beside them.
         _toolbar(context, report, narrow, nav),
@@ -359,6 +420,7 @@ class _ReportsViewState extends State<_ReportsView> {
         Container(height: 1, color: AppColors.divider),
         const SizedBox(height: AppSpacing.md),
         Expanded(child: pane),
+        ],
       ]),
     );
   }
@@ -400,42 +462,16 @@ class _ReportsViewState extends State<_ReportsView> {
         if (report.searchable)
         SizedBox(
           width: narrow ? double.infinity : 260,
-          // Listens to the controller, not to _search: the clear affordance has
-          // to appear on the first keystroke, while the QUERY deliberately waits
-          // out the debounce. Scoped here so a keystroke rebuilds one field and
-          // not the grid under it.
-          child: ValueListenableBuilder<TextEditingValue>(
-            valueListenable: _searchCtl,
-            builder: (context, value, _) => TextField(
-            key: const ValueKey('reports-search'),
+          // The x follows the box from the first keystroke, while the QUERY
+          // waits out the debounce. A keystroke rebuilds the box, not the grid
+          // under it.
+          child: AppSearchField(
+            testId: 'reports-search',
+            hint: _misSearchHint(report),
             controller: _searchCtl,
-            onChanged: _onSearch,
-            onSubmitted: (v) {
-              _searchDebounce?.cancel();
-              final t = v.trim();
-              if (t != _search) setState(() => _search = t);
-            },
-            style: const TextStyle(fontSize: 13),
-            decoration: InputDecoration(
-              isDense: true,
-              hintText: _misSearchHint(report),
-              prefixIcon: const Icon(Icons.search, size: 16),
-              prefixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 30),
-              suffixIcon: value.text.isEmpty
-                  ? null
-                  : IconButton(
-                      icon: const Icon(Icons.close, size: 15),
-                      tooltip: 'Clear search',
-                      onPressed: () {
-                        _searchCtl.clear();
-                        _searchDebounce?.cancel();
-                        if (_search.isNotEmpty) setState(() => _search = '');
-                      },
-                    ),
-              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              border: OutlineInputBorder(borderRadius: AppRadius.inputAll),
-            ),
-            ),
+            debounce: const Duration(milliseconds: 450),
+            compact: true,
+            onQuery: _onSearchQuery,
           ),
         ),
         // Time-wise: Sales Summary only — see [_misBucket].
@@ -1168,7 +1204,13 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               ],
               _actionBar(context, narrow: true),
               const SizedBox(height: AppSpacing.md),
-              if (empty) SizedBox(height: 280, child: body) else body,
+              // A FLOOR, not a fixed height: at 1.3x text on a 360dp phone the
+              // empty state's wrapped caption needs more than 280px, and a fixed
+              // box cut it off. Under the floor it still centres, as it always did.
+              if (empty)
+                ConstrainedBox(constraints: const BoxConstraints(minHeight: 280), child: body)
+              else
+                body,
               const SizedBox(height: AppSpacing.md),
               _footer(context),
             ],
@@ -1197,7 +1239,25 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
         const SizedBox(height: AppSpacing.md),
         _actionBar(context, narrow: false),
         const SizedBox(height: AppSpacing.md),
-        Expanded(child: body),
+        // Rows bring the grid, which scrolls itself. The empty state does not,
+        // and the slot can be shorter than it: Sales Summary's chrome fills its
+        // 45% cap, so a pane from 430px up to roughly 600px leaves too little
+        // under the controls. So it scrolls here, never shorter than the slot,
+        // which keeps it centred exactly as before whenever it fits. Its own
+        // controller, not the route's: the chrome and the sidebar share that one.
+        Expanded(
+          child: empty
+              ? LayoutBuilder(
+                  builder: (context, slot) => SingleChildScrollView(
+                    primary: false,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(minHeight: slot.maxHeight),
+                      child: body,
+                    ),
+                  ),
+                )
+              : body,
+        ),
         const SizedBox(height: AppSpacing.sm),
         _footer(context),
       ]));
@@ -1234,6 +1294,24 @@ class _MisReportPaneState extends State<_MisReportPane> with CachePrimedScreen {
               icon: Icons.download_outlined,
               dense: true,
               onPressed: _rows.isEmpty ? null : () {},
+            ),
+          ),
+        ),
+        // Email: the server builds and sends the files for whole days, so it
+        // waits for nothing on screen — only for somebody to choose addresses.
+        Tooltip(
+          message: kEmailButtonTooltip,
+          child: ForkButton.ghost(
+            key: const ValueKey('reports-email'),
+            label: kEmailButtonLabel,
+            icon: Icons.forward_to_inbox,
+            dense: true,
+            onPressed: () => _openEmailSend(
+              context,
+              rest: widget.rest,
+              reportKey: widget.report.key,
+              range: widget.range,
+              slotPhrase: AppliedTimeSlot.fromMeta(_meta)?.phrase,
             ),
           ),
         ),
@@ -1450,6 +1528,7 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
       ];
     case 'sales_summary':
       final salesNc = NcSettle.salesSummary(totals);
+      final orderTypes = _misOrderTypes(context, d['by_order_type']);
       return [
         _misTiles([
           _misStat(context, kGross, _money(totals['grand_total']), tint: AppColors.copperHi, sub: 'what guests paid'),
@@ -1459,6 +1538,13 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
           _misStat(context, 'ABV', _money(totals['abv']), sub: 'tax-inclusive'),
           _misStat(context, 'APC', _money(totals['apc']), sub: 'pre-tax'),
         ]),
+        // Under the tiles, above the ladder: on a desktop this chrome is capped
+        // and the ladder fills it, and the split is what a jump from the
+        // Overview's Online sale came to see — it must not open below the fold.
+        if (orderTypes != null) ...[
+          orderTypes,
+          const SizedBox(height: AppSpacing.md),
+        ],
         _misLadderCard(context, totals),
         if (salesNc != null) ...[
           const SizedBox(height: AppSpacing.md),
@@ -1693,6 +1779,41 @@ List<Widget> _misSummary(BuildContext context, _MisReport report, Map<String, dy
     default:
       return const [];
   }
+}
+
+/// The web's label for the Sales Summary's order-type split
+/// (app/dashboard/reports/context-panels.tsx), word for word.
+const String kMisOrderTypeLabel = 'By order type:';
+
+/// One chip per `by_order_type` row, in the web badge's words:
+/// `delivery · ₹1250.50 (5.9%)` — the channel as the server grouped it, its
+/// gross, and its share. Printed in the server's order; nothing is summed,
+/// sorted or relabelled here, and a row with no channel is not a row.
+List<String> misOrderTypeChips(Object? raw, String Function(Object? v) money) => [
+      if (raw is List)
+        for (final r in raw)
+          if (r is Map && '${r['order_type'] ?? ''}'.trim().isNotEmpty)
+            '${'${r['order_type']}'.trim()} · ${money(r['grand_total'])} (${misPercent(r['share_pct'])})',
+    ];
+
+/// THE ORDER-TYPE SPLIT above the ladder, in the web's words. It is where the
+/// Overview's Online sale lands (client item 10): Online is the delivery and
+/// other channels here, and no other screen cuts trade by channel — so the
+/// split is drawn, not merely fetched. An older backend sends none: no line.
+Widget? _misOrderTypes(BuildContext context, Object? raw) {
+  final chips = misOrderTypeChips(raw, _money);
+  if (chips.isEmpty) return null;
+  return Wrap(
+    key: const ValueKey('mis-order-types'),
+    spacing: AppSpacing.sm,
+    runSpacing: AppSpacing.sm,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      Text(kMisOrderTypeLabel, style: Theme.of(context).textTheme.bodySmall),
+      // Wrapped, never ellipsised: the figure is the end of the label.
+      for (final c in chips) InfoChip(label: c, wrap: true),
+    ],
+  );
 }
 
 /// NC BESIDE THE MONEY (client item 5): the bills settled as non-chargeable and

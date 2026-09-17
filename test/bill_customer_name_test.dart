@@ -317,7 +317,7 @@ void main() {
       await tester.tap(_save);
       await tester.pumpAndSettle();
       expect(find.text('GSTIN must be 15 characters, e.g. 29ABCDE1234F1Z5'), findsOneWidget);
-      expect(find.text('Name / GSTIN on bill · Table T1'), findsOneWidget, reason: 'the dialog stays open');
+      expect(find.text('Name / GSTIN / address on bill · Table T1'), findsOneWidget, reason: 'the dialog stays open');
       expect(_nameWrites(api), isEmpty);
     });
 
@@ -382,7 +382,7 @@ void main() {
       expect(_headerName(tester), 'Mr Sharma');
 
       await _openDialog(tester);
-      expect(find.text('Name / GSTIN on bill · Table T1'), findsOneWidget);
+      expect(find.text('Name / GSTIN / address on bill · Table T1'), findsOneWidget);
       expect(_fieldText(tester), 'Mr Sharma');
     });
 
@@ -436,6 +436,10 @@ void main() {
       await tester.tap(_save);
       await tester.pumpAndSettle();
 
+      // Clear clears all THREE boxes. This fixture's bill carries no
+      // `customer_address` key (a server before client item 7), so nobody saw
+      // an address and the empty box is not sent: the request is exactly the
+      // 2.0.1 one (an address write would be a 503 before migration 054).
       expect(_nameWrites(api).single.body, {'table_name': 'T1', 'customer': ''});
       expect(find.text('Name cleared — the bill will print without a guest name.'), findsOneWidget);
       expect(_headerName(tester), 'No guest name on the bill');

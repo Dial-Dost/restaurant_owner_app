@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -279,6 +280,20 @@ class ApiClient {
     };
     final res = await http.get(_u(path), headers: headers);
     if (res.statusCode >= 200 && res.statusCode < 300) return res.body;
+    final decoded = res.body.isEmpty ? null : _tryJson(res.body);
+    throw ApiException.fromBody(decoded, res.statusCode);
+  }
+
+  /// Authenticated GET that returns the raw BYTES — a stored report attachment
+  /// (an .xlsx is binary, and decoding it as text would corrupt it). Throws
+  /// [ApiException] on non-2xx, with the server's own sentence.
+  Future<Uint8List> getBytes(String path, String token, [String? outletId]) async {
+    final headers = <String, String>{
+      'Authorization': 'Bearer $token',
+      if (outletId != null && outletId.isNotEmpty) 'X-Outlet-Id': outletId,
+    };
+    final res = await http.get(_u(path), headers: headers);
+    if (res.statusCode >= 200 && res.statusCode < 300) return res.bodyBytes;
     final decoded = res.body.isEmpty ? null : _tryJson(res.body);
     throw ApiException.fromBody(decoded, res.statusCode);
   }

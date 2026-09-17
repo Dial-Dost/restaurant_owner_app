@@ -2,11 +2,14 @@
 // kitchen ticket prints, laid out the way the reference docket is.
 //
 // NOT THE KITCHEN DOCKET. The docket a kitchen cooks from is drawn by the
-// backend (escpos.ts layoutKot, a raster in Liberation Sans) and pushed to a
-// thermal printer. This is a PDF, printed wherever the system print dialog
-// sends it, in the pdf package's default font. What it shares with the docket
-// is everything a chef actually reads: THE ORDER OF THE LINES, WHICH OF THEM
-// ARE BOLD, AND THE WORDS ON THEM. The reference docket, transcribed:
+// backend (escpos.ts layoutKot, a raster in DejaVu Sans Condensed — the
+// Tahoma-like face client item 5 asked for) and pushed to a thermal printer.
+// This is a PDF, printed wherever the system print dialog sends it, in the pdf
+// package's default font (Helvetica). What it shares with the docket is
+// everything a chef actually reads: THE ORDER OF THE LINES, WHICH OF THEM ARE
+// BOLD, WHICH ONE IS SMALLER AND SLANTED, THE WORDS ON THEM — and the docket's
+// type sizes ([kotCopyBodyPt], [kotCopyNotePt]). The reference docket,
+// transcribed:
 //
 //   Running Table                     centred
 //   KOT                               centred, BOLD
@@ -20,7 +23,7 @@
 //   ------------------------------
 //   No.Item                      Qty
 //   1 Subz Tehri                   1  dish name BOLD, qty a bare number
-//     [Note] Hold Dessert             under the dish, upright
+//     [Note] Hold Dessert             under the dish, SMALLER and SLANTED
 //   ------------------------------
 //   Total Qty                      3
 //
@@ -37,8 +40,9 @@
 //   ------------------------------
 //   No.Item                      Qty
 //   1 Subz Tehri                   1
-//     [Hold]                          only what the docket says: the marker
-//     [Note] Hold Dessert
+//     [Hold]                          only what the docket says: the marker,
+//                                     upright, at the dish's size
+//     [Note] Hold Dessert             smaller and slanted, as on the docket
 //   ------------------------------
 //   Total Qty                      1
 //   Hold Qty                       1  (only when something is held)
@@ -67,6 +71,22 @@
 // word.
 //
 // PURE: no Flutter, no pdf, no network. modules.dart draws these rows.
+
+/// THE DOCKET'S TYPE SIZES, IN THE PDF'S POINTS.
+///
+/// The thermal docket is set at escpos.ts `KOT_BODY_PPEM['80mm'].standard` —
+/// 27 dots per em, the size measured off the client's reference photograph —
+/// on a 203 dpi head, and a dish's "[Note]" at `KOT_NOTE_SCALE` (0.87) of that,
+/// rounded to the whole dots the glyph atlas is baked at: 23. A point is 1/72
+/// inch, so the copy's sizes are those dots at 72/203: 9.6pt and 8.2pt. The
+/// copy follows the STANDARD size, not the restaurant's KOT text size — that
+/// setting sizes the kitchen docket, and this is a copy for whoever pressed the
+/// button.
+const double kotPrinterDpi = 203;
+const int kotDocketBodyDots = 27;
+const int kotDocketNoteDots = 23;
+const double kotCopyBodyPt = kotDocketBodyDots * 72 / kotPrinterDpi;
+const double kotCopyNotePt = kotDocketNoteDots * 72 / kotPrinterDpi;
 
 /// The line under a HELD dish, on the docket, on this copy and on the kitchen
 /// board — word for word escpos.ts `KOT_HOLD_LINE`. It said "[Hold] Do not
@@ -179,26 +199,32 @@ enum KotCopyKind {
 }
 
 /// One line of the copy. Only the fields its [kind] uses are meaningful.
-typedef KotCopyRow = ({KotCopyKind kind, String text, bool bold, bool centred, String no, String qty});
+///
+/// [KotCopyRow.note] is set on the one [KotCopyKind.under] line that is a
+/// dish's note: the docket sets it a step smaller and slanted (escpos.ts
+/// `size: "note"`), and "[Hold]" — an instruction, not a remark — upright at
+/// the dish's size.
+typedef KotCopyRow = ({KotCopyKind kind, String text, bool bold, bool centred, bool note, String no, String qty});
 
 KotCopyRow _line(String text, {bool bold = false, bool centred = true}) =>
-    (kind: KotCopyKind.line, text: text, bold: bold, centred: centred, no: '', qty: '');
+    (kind: KotCopyKind.line, text: text, bold: bold, centred: centred, note: false, no: '', qty: '');
 
-const KotCopyRow _rule = (kind: KotCopyKind.rule, text: '', bold: false, centred: false, no: '', qty: '');
+const KotCopyRow _rule =
+    (kind: KotCopyKind.rule, text: '', bold: false, centred: false, note: false, no: '', qty: '');
 
 KotCopyRow _cols(String no, String name, String qty, {bool bold = false}) =>
-    (kind: KotCopyKind.columns, text: name, bold: bold, centred: false, no: no, qty: qty);
+    (kind: KotCopyKind.columns, text: name, bold: bold, centred: false, note: false, no: no, qty: qty);
 
-KotCopyRow _under(String text) =>
-    (kind: KotCopyKind.under, text: text, bold: false, centred: false, no: '', qty: '');
+KotCopyRow _under(String text, {required bool note}) =>
+    (kind: KotCopyKind.under, text: text, bold: false, centred: false, note: note, no: '', qty: '');
 
 /// THE LOCAL COPY OF ONE ORDER, line by line, in the reference docket's order.
 ///
 /// `order` is one entry of GET /orders (table, order_type, note, items);
 /// `stamp` is the printed time, passed in so the copy is a pure function of its
-/// input. Emphasis is WEIGHT, never size — "KOT", the service mode, the table
-/// and each dish name are bold, everything else is regular and upright — which
-/// is how the reference docket does it.
+/// input. Emphasis is WEIGHT — "KOT", the service mode, the table and each dish
+/// name are bold, everything else is regular — and the one line set smaller and
+/// slanted is a dish's "[Note]", which is how the reference docket does it.
 List<KotCopyRow> kotCopyRows(Map order, {required String stamp}) {
   String field(String key) {
     final v = '${order[key] ?? ''}'.trim();
@@ -226,8 +252,10 @@ List<KotCopyRow> kotCopyRows(Map order, {required String stamp}) {
   rows.add(_cols('No.Item', '', 'Qty'));
   for (final r in docket.rows) {
     rows.add(_cols(r.no, r.name, '${r.qty}', bold: true));
+    // [kotDocket] hangs at most two lines under a dish: [kotHoldLine], then the
+    // note line. Whatever is not the hold marker is the note.
     for (final l in r.under) {
-      rows.add(_under(l));
+      rows.add(_under(l, note: l != kotHoldLine));
     }
   }
   rows.add(_rule);

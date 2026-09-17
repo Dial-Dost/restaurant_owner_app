@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:restaurant_owner_app/models/floor_state.dart';
 import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/theme/contrast.dart';
 import 'package:restaurant_owner_app/widgets/appearance_card.dart';
+import 'package:restaurant_owner_app/widgets/floor_chips.dart';
 import 'package:restaurant_owner_app/widgets/theme_toggle.dart';
 
 /// 6.6 — the interface theme toggle: Dark (default, untouched), or Light in
@@ -206,9 +208,18 @@ void main() {
   });
 
   group('light palettes stay readable (WCAG AA 4.5:1)', () {
-    // Mirrors modules.dart's table-state washes (2.2): _kOccupiedWash 0.20,
-    // _kSeatedWash 0.16, _kReservedWash 0.13, composited over AppColors.card.
-    const occupiedWash = 0.20, seatedWash = 0.16, reservedWash = 0.13;
+    // The floor's state washes are [floorWash] (lib/widgets/floor_chips.dart),
+    // each in the scheme's FIXED floor ink — client items 1 and 2 took the
+    // accent off the floor — composited over the card. Until 2.0.2 this
+    // mirrored _kOccupiedWash 0.20 (in the accent) / _kSeatedWash 0.16 /
+    // _kReservedWash 0.13.
+    Color floorInkOf(AppShellScheme s, FloorState state) => switch (state) {
+          FloorState.free => s.floorFree,
+          FloorState.seated => s.floorSeated,
+          FloorState.running => s.floorRunning,
+          FloorState.printed => s.floorPrinted,
+          FloorState.reserved => s.floorReserved,
+        };
 
     for (final palette in [for (final t in LightTone.values) AppLightPalettes.of(t)]) {
       final grounds = {
@@ -257,25 +268,17 @@ void main() {
 
           // The floor: each table state's wash, with the ink that sits on it —
           // the name and figures (primary), the waiter/covers line
-          // (secondary), accent money/OTP (hi) and the status chip label.
-          final washes = {
-            'occupied': Color.alphaBlend(l.base.withValues(alpha: occupiedWash), palette.card),
-            'seated': Color.alphaBlend(palette.warning.withValues(alpha: seatedWash), palette.card),
-            'reserved': Color.alphaBlend(palette.info.withValues(alpha: reservedWash), palette.card),
-          };
-          final stateColour = {'occupied': l.base, 'seated': palette.warning, 'reserved': palette.info};
-          washes.forEach((state, wash) {
-            check('${a.id}/$state textPrimary', palette.textPrimary, wash);
-            check('${a.id}/$state textSecondary', palette.textSecondary, wash);
-            check('${a.id}/$state copperHi', l.hi, wash);
-            check('${a.id}/$state success', palette.success, wash);
-            final c = stateColour[state]!;
-            // StatusChip: 12% tint of its colour over the wash, label lifted
-            // 25% toward the primary ink (AppColors.lift on a light palette).
-            final chip = Color.alphaBlend(c.withValues(alpha: 0.12), wash);
-            check('${a.id}/$state chip label',
-                Color.lerp(c, palette.textPrimary, 0.25)!, chip);
-          });
+          // (secondary), accent money/OTP (hi) and the state chip, which is
+          // its ink on an opaque card pill (FloorChip).
+          for (final state in FloorState.values) {
+            final ink = floorInkOf(palette, state);
+            final wash = Color.alphaBlend(ink.withValues(alpha: floorWash(state)), palette.card);
+            check('${a.id}/${state.name} textPrimary', palette.textPrimary, wash);
+            check('${a.id}/${state.name} textSecondary', palette.textSecondary, wash);
+            check('${a.id}/${state.name} copperHi', l.hi, wash);
+            check('${a.id}/${state.name} success', palette.success, wash);
+            check('${a.id}/${state.name} chip label', ink, palette.card);
+          }
         }
         expect(failures, isEmpty);
       });

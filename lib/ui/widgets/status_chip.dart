@@ -19,20 +19,34 @@ import '../theme/app_colors.dart';
 ///     child under `MainAxisSize.min` is laid out at its natural width and does
 ///     NOT assert, so ample space renders exactly as before.
 ///
+/// Being a [Flexible], it must be a DIRECT child of a Row/Column. A pill with no
+/// row of its own (just a padded label) still needs one:
+/// `Row(mainAxisSize: MainAxisSize.min, children: [ChipLabel(...)])`. Anywhere
+/// else, debug builds report "Incorrect use of ParentDataWidget" and release
+/// builds throw on the parent-data cast and replace the label with an
+/// ErrorWidget.
+///
 /// Truncation, never scaling: shrinking the glyphs would trade an overflow for
 /// type nobody can read, which is the opposite of what a 1.3x scale was asked
 /// for. Call sites that carry genuinely unbounded free text still cap the VALUE
 /// (and keep the full one a tap away) — that is about meaning, not layout.
+///
+/// [wrap] is the other answer, for a label that ends in a figure: "delivery ·
+/// ₹2000000.22 (2.0%)" ellipsised on a phone hides the one part that was the
+/// point. Such a label takes a second line instead; still no overflow.
 class ChipLabel extends StatelessWidget {
-  const ChipLabel(this.label, {super.key, required this.style});
+  const ChipLabel(this.label, {super.key, required this.style, this.wrap = false});
 
   final String label;
   final TextStyle style;
+  final bool wrap;
 
   @override
   Widget build(BuildContext context) {
     return Flexible(
-      child: Text(label, style: style, maxLines: 1, overflow: TextOverflow.ellipsis),
+      child: wrap
+          ? Text(label, style: style)
+          : Text(label, style: style, maxLines: 1, overflow: TextOverflow.ellipsis),
     );
   }
 }
@@ -100,10 +114,13 @@ class StatusChip extends StatelessWidget {
 /// Quiet metadata chip — icon + text on a recessed pill. Used for dates,
 /// categories, table numbers ("📅 Oct 21" style chips in the reference).
 class InfoChip extends StatelessWidget {
-  const InfoChip({super.key, this.icon, required this.label});
+  const InfoChip({super.key, this.icon, required this.label, this.wrap = false});
 
   final IconData? icon;
   final String label;
+
+  /// Wrap a long label rather than cut it (see [ChipLabel]).
+  final bool wrap;
 
   @override
   Widget build(BuildContext context) {
@@ -127,6 +144,7 @@ class InfoChip extends StatelessWidget {
           ],
           ChipLabel(
             label,
+            wrap: wrap,
             style: TextStyle(
               fontSize: 11,
               fontWeight: FontWeight.w500,

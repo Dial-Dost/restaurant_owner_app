@@ -48,6 +48,10 @@ class _FakeApi extends ApiClient {
   /// path -> status to answer with instead of success (a real server refusal).
   final Map<String, int> failWith = <String, int>{};
 
+  /// path -> a refusal with the server's own body, decoded by the production
+  /// factory ([ApiException.fromBody]) — the words a parked chip will show.
+  final Map<String, ({int status, Map<String, dynamic> body})> refuseWith = {};
+
   /// How many times a path has been answered — lets a test fail once then heal.
   final Map<String, int> hits = <String, int>{};
 
@@ -80,6 +84,8 @@ class _FakeApi extends ApiClient {
     hits[path] = (hits[path] ?? 0) + 1;
     final status = failWith[path];
     if (status != null) throw ApiException('Table already settled', status);
+    final refusal = refuseWith[path];
+    if (refusal != null) throw ApiException.fromBody(refusal.body, refusal.status);
     if (routes.containsKey(path)) {
       final route = routes[path];
       return route is dynamic Function() ? route() : route;
@@ -371,6 +377,43 @@ void main() {
     expect(Outbox.instance.entries.first.attempts, 0);
     await Outbox.instance.discard(failed.id);
     expect(Outbox.instance.entries, hasLength(1));
+  });
+
+  // CLIENT ITEM 3 (2.0.2). A waiter's cancel queued offline on an app that still
+  // drew the button meets the server's new refusal when the line comes back. It
+  // must be PARKED on the first answer — a 403 is not "retry" — with the
+  // server's sentence on the chip, so the waiter learns who to ask; and a replay
+  // of a cancel that DID land stays a quiet success (the server answers
+  // unchanged:true before it judges the role).
+  test('a queued waiter cancel refused with cancel_needs_senior is parked with the server\'s words', () async {
+    await _fresh();
+    final api = _FakeApi();
+    final rest = await _signIn(api);
+    api.offline = true;
+    await expectLater(
+        rest.patch('/orders/o1/status', {'status': 'Cancelled', 'reason': 'Aaa', 'cancel_kind': 'other'}),
+        throwsA(isA<OfflineQueued>()));
+
+    api.offline = false;
+    const sentence = 'KOT-3 has gone to the kitchen. Only a manager, cashier, captain or admin can cancel it — ask one of them.';
+    api.refuseWith['/orders/o1/status'] = (
+      status: 403,
+      body: {
+        'error': 'Forbidden',
+        'code': 'cancel_needs_senior',
+        'details': sentence,
+        'allowed_roles': ['admin', 'manager', 'cashier', 'captain'],
+        'order_id': 'o1',
+        'kot_nos': [3],
+      },
+    );
+    final result = await rest.drainOutbox();
+    expect(result.outcome, OutboxDrainOutcome.blocked);
+    expect(api.writeLog, ['PATCH /orders/o1/status'], reason: 'asked once, not retried');
+    final parked = Outbox.instance.entries.single;
+    expect(parked.failed, isTrue);
+    expect(parked.failureStatus, 403);
+    expect(parked.failureMessage, sentence);
   });
 
   test('a retryable failure is parked once it has spun long enough', () async {

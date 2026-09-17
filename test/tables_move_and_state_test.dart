@@ -17,7 +17,9 @@
 //   ITEM 11 — Occupied means an order has been placed. A seated party with no
 //     order is its own state. The seating itself is untouched (that is a money
 //     question — see MoveTableParty), so this is asserted as a RENDERING, and
-//     an older backend that sends no `has_order` must keep painting Occupied.
+//     an older backend that sends no `has_order` must keep painting it busy.
+//     2.0.2 (client items 1 and 2) renamed the state RUNNING, gave every state
+//     a fixed ink of its own, and drew the chips as FloorChips.
 //
 //   ITEMS 21/22 — Move table and Move an order issue ONE call each, to the
 //     routes that do the whole thing in one transaction, and never a sequence
@@ -42,7 +44,7 @@ import 'package:restaurant_owner_app/ui/theme/app_colors.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
 import 'package:restaurant_owner_app/ui/theme/appearance.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_button.dart';
-import 'package:restaurant_owner_app/ui/widgets/status_chip.dart';
+import 'package:restaurant_owner_app/widgets/floor_chips.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
 
 class _FakeApi extends ApiClient {
@@ -210,14 +212,14 @@ List<String> _headerOrder(WidgetTester tester, List<String> labels) {
 Finder _button(String label) =>
     find.byWidgetPredicate((w) => w is ForkButton && w.label == label, description: 'ForkButton "$label"');
 
-/// A StatusChip by its LABEL, not by its rendered text.
+/// A floor state chip by its LABEL, not by its rendered text.
 ///
 /// Gaia draws a status as an engraved outline and upper-cases it; Rustic draws
 /// a tinted capsule and does not. Matching the widget keeps one assertion true
 /// of the same call site in both design systems, which is the point being made.
 Finder _statusChip(String label) => find.byWidgetPredicate(
-      (w) => w is StatusChip && w.label == label,
-      description: 'StatusChip "$label"',
+      (w) => w is FloorChip && w.label == label,
+      description: 'FloorChip "$label"',
     );
 
 /// Open a table's bottom sheet by tapping its card.
@@ -393,7 +395,7 @@ void main() {
 
   // --------------------------------------------------------------- ITEM 11 ---
   group('item 11 — Occupied means an order has been placed', () {
-    testWidgets('seated with no order reads SEATED; seated with an order reads OCCUPIED', (tester) async {
+    testWidgets('seated with no order reads SEATED; seated with an order reads RUNNING', (tester) async {
       await _mountTables(
         tester,
         _routes([
@@ -405,7 +407,7 @@ void main() {
       );
       // Four distinct states on one floor.
       expect(_statusChip('Seated'), findsOneWidget);
-      expect(_statusChip('Occupied'), findsOneWidget);
+      expect(_statusChip('Running'), findsOneWidget);
       expect(_statusChip('Reserved'), findsOneWidget);
       expect(_statusChip('Free'), findsOneWidget);
       // And the actionable line that goes with the new state.
@@ -422,7 +424,7 @@ void main() {
           _table('T4'),
         ]),
       );
-      expect(find.text('1 Occupied'), findsOneWidget);
+      expect(find.text('1 Running'), findsOneWidget);
       expect(find.text('2 Seated'), findsOneWidget);
       expect(find.text('1 Free'), findsOneWidget);
     });
@@ -430,14 +432,14 @@ void main() {
     testWidgets('with nobody waiting, no Seated chip clutters the legend', (tester) async {
       await _mountTables(tester, _routes([_table('T1', occupied: true, hasOrder: true, total: 50), _table('T2')]));
       expect(find.textContaining('Seated'), findsNothing);
-      expect(find.text('1 Occupied'), findsOneWidget);
+      expect(find.text('1 Running'), findsOneWidget);
     });
 
-    testWidgets('an OLDER backend that never sends has_order still reads Occupied', (tester) async {
+    testWidgets('an OLDER backend that never sends has_order still reads busy (Running)', (tester) async {
       // Missing data must degrade to the behaviour that shipped, never to a new
       // claim that nobody in the restaurant has ordered anything.
       await _mountTables(tester, _routes([_table('T1', occupied: true)]));
-      expect(_statusChip('Occupied'), findsOneWidget);
+      expect(_statusChip('Running'), findsOneWidget);
       expect(_statusChip('Seated'), findsNothing);
     });
 
@@ -466,7 +468,7 @@ void main() {
         system: DesignSystem.gaia,
       );
       expect(_statusChip('Seated'), findsOneWidget);
-      expect(_statusChip('Occupied'), findsOneWidget);
+      expect(_statusChip('Running'), findsOneWidget);
       expect(_statusChip('Free'), findsOneWidget);
     });
   });
@@ -568,14 +570,17 @@ void main() {
       await tester.tap(find.text('Table T7'));
       await tester.pumpAndSettle();
       expect(find.textContaining('correction docket prints'), findsOneWidget);
+      // Client item 4: with no picker, the confirm is where the dishes are named.
+      expect(find.textContaining('2 × Paneer Tikka.'), findsOneWidget);
       await tester.tap(find.text('Confirm'));
       await tester.pumpAndSettle();
 
       final moves = api.writes.where((w) => w.path == '/tables/move-order').toList();
       expect(moves, hasLength(1));
       expect(moves.first.body, {'order_id': 'o-1', 'to_table': 'T7'});
-      // The KOT number is reported back, so whoever pressed it can tell the pass.
-      expect(find.textContaining('KOT-26'), findsOneWidget);
+      // The KOT number is reported back, so whoever pressed it can tell the pass —
+      // and the dishes, so they can tell the pass WHAT (client item 4).
+      expect(find.text('Moved to T7: 2 × Paneer Tikka. Correction docket KOT-26 is printing — tell the pass.'), findsOneWidget);
     });
 
     testWidgets('several live orders on the real /orders shape open a picker that says what each holds', (tester) async {
@@ -613,9 +618,12 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('No live order on this table to move.'), findsNothing);
       expect(find.text('Which order on T4?'), findsOneWidget);
-      expect(find.textContaining('2 items'), findsOneWidget);
-      expect(find.textContaining('1 item'), findsOneWidget);
-      expect(find.text('Order o-c'), findsNothing);
+      // Client item 4: each row names its dishes — it used to say "2 items" and
+      // "1 item", which is not how anybody tells two tickets apart.
+      expect(find.text('2 × Paneer Tikka, 2 × Masala Chai\nThe kitchen has this one'), findsOneWidget);
+      expect(find.text('2 × Masala Chai\nNot sent to the kitchen yet'), findsOneWidget);
+      expect(find.textContaining('item'), findsNothing);
+      expect(find.textContaining('Order o-c'), findsNothing);
     });
 
     testWidgets('an UNBARKED order says nothing will print', (tester) async {

@@ -74,6 +74,12 @@ class AppShellScheme {
     this.danger = _darkDanger,
     this.info = _darkInfo,
     this.neutral = _darkNeutral,
+    this.floorFree = _darkFloorFree,
+    this.floorSeated = _darkFloorSeated,
+    this.floorRunning = _darkFloorRunning,
+    this.floorPrinted = _darkFloorPrinted,
+    this.floorReserved = _darkFloorReserved,
+    this.floorNextParty = _darkFloorNextParty,
   });
 
   // The shipped strokes and status inks, as the defaults every DARK scheme
@@ -87,6 +93,15 @@ class AppShellScheme {
   static const Color _darkDanger = Color(0xFFC97B6E);
   static const Color _darkInfo = Color(0xFF8FA3B8);
   static const Color _darkNeutral = Color(0xFF9A978F);
+
+  // The floor's five states and the next-party chip, on every dark scheme.
+  // See [floorFree].
+  static const Color _darkFloorFree = Color(0xFF6CC070);
+  static const Color _darkFloorSeated = Color(0xFFE2C458);
+  static const Color _darkFloorRunning = Color(0xFFE0697A);
+  static const Color _darkFloorPrinted = Color(0xFFF28C3A);
+  static const Color _darkFloorReserved = Color(0xFF79A7D8);
+  static const Color _darkFloorNextParty = Color(0xFFB9B4A8);
 
   final String id;
   final String label;
@@ -120,6 +135,30 @@ class AppShellScheme {
   final Color danger;
   final Color info;
   final Color neutral;
+
+  // THE FLOOR'S INKS — client items 1 and 2: "the fresh table 12 in green, and
+  // the table 12 whose bill has been printed but not settled in orange".
+  //
+  // FIXED PER SCHEME AND NEVER THE ACCENT. The floor used to paint a running
+  // table in the owner's accent (AppColors.copper), so an owner on the Sage
+  // accent had running and free in two greens, and Reserved and the next-party
+  // chip were the same blue. Each state now has one ink of its own, held by
+  // test/waiter_floor_printed_test.dart to 4.5:1 on every ground of its scheme
+  // and to a CIEDE2000 distance of 12 from every other state. The web
+  // dashboard carries the same values (src/lib/floor-state.ts FLOOR_INKS).
+  //
+  //   floorFree       nobody there — every free table, the next party's included
+  //   floorSeated     a party sat down, nothing ordered yet
+  //   floorRunning    food ordered, bill not printed
+  //   floorPrinted    bill printed, not settled — the night-settle backlog
+  //   floorReserved   a booking holds it
+  //   floorNextParty  the neutral "#2" chip on a next-party seat
+  final Color floorFree;
+  final Color floorSeated;
+  final Color floorRunning;
+  final Color floorPrinted;
+  final Color floorReserved;
+  final Color floorNextParty;
 }
 
 /// The Rustic Fork palette — a near-black workspace with a single warm
@@ -319,6 +358,14 @@ abstract final class AppColors {
   static Color get danger => _shell.danger;
   static Color get info => _shell.info;
   static Color get neutral => _shell.neutral;
+
+  // ── Floor (fixed per scheme, never the accent — see AppShellScheme) ─
+  static Color get floorFree => _shell.floorFree;
+  static Color get floorSeated => _shell.floorSeated;
+  static Color get floorRunning => _shell.floorRunning;
+  static Color get floorPrinted => _shell.floorPrinted;
+  static Color get floorReserved => _shell.floorReserved;
+  static Color get floorNextParty => _shell.floorNextParty;
 
   /// 12% tint used behind status chips.
   static Color tint(Color c) => c.withValues(alpha: 0.12);

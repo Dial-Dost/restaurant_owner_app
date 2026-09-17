@@ -5,11 +5,13 @@
 // but a chef should read the same thing off both: the same LINE ORDER, the same
 // WEIGHTS, the same WORDS — no restaurant name; "KOT", the service mode, the
 // table and each dish name bold; the quantity a plain number; "[Hold]" and
-// nothing after it; "[Note]" upright under the hold.
+// nothing after it, upright; "[Note]" under the hold, a step SMALLER and
+// SLANTED, as the thermal docket has set it since client item 5 — and the
+// docket's type sizes.
 //
 // These pin [kotCopyRows] (what is on the paper, in order) and [kotCopyPdf]
-// (that the PDF really carries those words, in the default font, on A4 and on a
-// roll).
+// (that the PDF really carries those words, in the faces and sizes the docket
+// uses, in the default font, on A4 and on a roll).
 
 import 'dart:convert';
 
@@ -23,15 +25,29 @@ import 'package:restaurant_owner_app/screens/modules.dart' as m;
 ///   `C* KOT`         a centred bold line      `L  Table 5`  a left regular one
 ///   `1|Subz Tehri*|1`  a dish row (`*` = bold name)
 ///   `  [Hold]`       a line under a dish       `----`       a rule
+///   ` /[Note] …`     a line under a dish set as a NOTE: smaller, slanted
 List<String> paper(List<KotCopyRow> rows) => [
       for (final r in rows)
         switch (r.kind) {
           KotCopyKind.line => '${r.centred ? 'C' : 'L'}${r.bold ? '*' : ' '} ${r.text}',
           KotCopyKind.rule => '----',
           KotCopyKind.columns => '${r.no}|${r.text}${r.bold ? '*' : ''}|${r.qty}',
-          KotCopyKind.under => '  ${r.text}${r.bold ? '*' : ''}',
+          KotCopyKind.under => '${r.note ? ' /' : '  '}${r.text}${r.bold ? '*' : ''}',
         },
     ];
+
+/// Every word the PDF draws, with the face and the size it is drawn in — read
+/// out of the uncompressed content stream (`BT /F9 8.15764 Tf … [(word)]TJ ET`)
+/// and the font objects it names (`9 0 obj <</…/BaseFont/Helvetica-Oblique…`).
+List<({String word, String face, double size})> pdfWords(String pdf) {
+  final faces = <String, String>{
+    for (final m in RegExp(r'(\d+) 0 obj\s*<<[^>]*?/BaseFont\s*/([\w-]+)').allMatches(pdf)) 'F${m.group(1)}': m.group(2)!,
+  };
+  return [
+    for (final m in RegExp(r'BT /(F\d+) ([\d.]+) Tf [^\[]*\[\((.*?)\)\]TJ ET').allMatches(pdf))
+      (word: m.group(3)!, face: faces[m.group(1)] ?? '?${m.group(1)}', size: double.parse(m.group(2)!)),
+  ];
+}
 
 Map<String, dynamic> _item(String name, {int qty = 1, bool held = false, String note = '', String? variation}) => {
       'id': 'i-$name',
@@ -72,7 +88,7 @@ void main() {
         '1|Subz Tehri*|1',
         '2|Ghewar Berry Mousse*|1',
         '3|Gaia Rose Cookies*|1',
-        '  [Note] Hold Dessert',
+        ' /[Note] Hold Dessert',
         '----',
         'Total Qty||3',
         '----',
@@ -107,7 +123,7 @@ void main() {
         '  [Hold]',
         '3|Gaia Rose Cookies*|1',
         '  [Hold]',
-        '  [Note] Serve with the mains, no nuts',
+        ' /[Note] Serve with the mains, no nuts',
         '4|Paneer Tikka (Half)*|3',
         '----',
         'Total Qty||15',
@@ -116,18 +132,32 @@ void main() {
       ]);
     });
 
-    test('the hold line is "[Hold]" and nothing else; it and the note are upright and regular', () {
+    test('the hold line is "[Hold]" and nothing else, upright; the note is the one note line; neither is bold', () {
       final rows = kotCopyRows({
         'table': '7',
         'items': [_item('Gulab Jamun', held: true, note: 'Dessert course')],
       }, stamp: _stamp);
       final under = rows.where((r) => r.kind == KotCopyKind.under).toList();
       expect(under.map((r) => r.text), ['[Hold]', '[Note] Dessert course']);
+      expect(under.map((r) => r.note), [false, true]);
       expect(under.every((r) => !r.bold), isTrue);
+      // Nothing but a dish's note is ever set as one.
+      expect(rows.where((r) => r.note).map((r) => r.text), ['[Note] Dessert course']);
       final all = paper(rows).join('\n');
       expect(all, isNot(matches(RegExp('do not cook|until fired', caseSensitive: false))));
       // Everything held: no "Total Qty 0" over the hold total.
       expect(paper(rows).where((l) => l.contains('Qty||')), ['Hold Qty||1']);
+    });
+
+    test('a note that reads "[Hold]" is still a note, and an unheld dish\'s note is one too', () {
+      final rows = kotCopyRows({
+        'table': '7',
+        'items': [_item('Naan', note: '[Hold]'), _item('Dal', held: true)],
+      }, stamp: _stamp);
+      expect(paper(rows).where((l) => l.startsWith(' /') || l.startsWith('  [')), [
+        ' /[Note] [Hold]',
+        '  [Hold]',
+      ]);
     });
 
     test('no restaurant name, no "x" before a quantity, no dot leaders, no station line', () {
@@ -211,11 +241,65 @@ void main() {
       expect(pdf, contains('Jamun'));
       expect(pdf, contains('KOT'));
       expect(pdf, isNot(contains(RegExp('cook|fired', caseSensitive: false))));
-      // The default font, in its regular and bold faces — and no italic one.
+      // The default font, in its regular and bold faces, and the slanted one
+      // for the note.
       expect(pdf, contains('/Helvetica'));
       expect(pdf, contains('/Helvetica-Bold'));
-      expect(pdf, isNot(contains('Oblique')));
+      expect(pdf, contains('/Helvetica-Oblique'));
       expect(pdf, isNot(contains('Gaia - Global')));
+    });
+
+    test('THE NOTE IS SMALLER AND SLANTED, AS ON THE DOCKET; [Hold] and the dish stay upright at the body size',
+        () async {
+      final rows = kotCopyRows({
+        'table': '33',
+        'items': [_item('Gulab Jamun', held: true, note: 'Dessert course')],
+      }, stamp: _stamp);
+      final words = pdfWords(await pdfText(rows));
+      ({String face, double size}) of(String word) {
+        final hit = words.where((w) => w.word == word).toList();
+        expect(hit, hasLength(1), reason: '"$word" drawn once, in: $words');
+        return (face: hit.single.face, size: hit.single.size);
+      }
+
+      const body = 27 * 72 / 203;
+      const note = 23 * 72 / 203;
+      for (final w in ['[Note]', 'Dessert', 'course']) {
+        expect(of(w).face, 'Helvetica-Oblique', reason: w);
+        expect(of(w).size, closeTo(note, 0.001), reason: w);
+      }
+      expect(of('[Hold]').face, 'Helvetica');
+      expect(of('[Hold]').size, closeTo(body, 0.001));
+      for (final w in ['Gulab', 'Jamun', 'KOT']) {
+        expect(of(w).face, 'Helvetica-Bold', reason: w);
+        expect(of(w).size, closeTo(body, 0.001), reason: w);
+      }
+      // Every word is one of the docket's two sizes, and only the note's
+      // words are slanted.
+      expect(words.map((w) => w.size.toStringAsFixed(3)).toSet(), {body.toStringAsFixed(3), note.toStringAsFixed(3)});
+      expect(words.where((w) => w.face == 'Helvetica-Oblique').map((w) => w.word), ['[Note]', 'Dessert', 'course']);
+    });
+
+    test('an order with no dish note sets nothing slanted', () async {
+      final rows = kotCopyRows({
+        'table': '33',
+        'note': 'No onions for the whole table',
+        'items': [_item('Gulab Jamun', held: true)],
+      }, stamp: _stamp);
+      final pdf = await pdfText(rows);
+      expect(pdf, contains('onions'), reason: 'the ORDER note is a plain line');
+      expect(pdf, isNot(contains('Oblique')));
+      expect(pdfWords(pdf).map((w) => w.face).toSet(), {'Helvetica', 'Helvetica-Bold'});
+    });
+
+    test('the sizes are the kitchen docket\'s: 27 dots per em, the note 0.87 of it, at 203 dpi', () {
+      // escpos.ts KOT_BODY_PPEM['80mm'].standard and KOT_NOTE_SCALE, rounded to
+      // the whole dots the glyph atlas is baked at.
+      expect(kotDocketBodyDots, 27);
+      expect(kotDocketNoteDots, (27 * 0.87).round());
+      expect(kotPrinterDpi, 203);
+      expect(kotCopyBodyPt, closeTo(9.576, 0.001));
+      expect(kotCopyNotePt, closeTo(8.158, 0.001));
     });
 
     test('prints on a roll as well as on A4', () async {

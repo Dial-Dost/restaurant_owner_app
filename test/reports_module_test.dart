@@ -15,9 +15,15 @@ import 'package:restaurant_owner_app/services/date_range.dart';
 import 'package:restaurant_owner_app/services/report_export.dart';
 import 'package:restaurant_owner_app/services/restaurant_time.dart';
 import 'package:restaurant_owner_app/services/rest_client.dart';
+import 'package:restaurant_owner_app/ui/gaia/gaia.dart';
 import 'package:restaurant_owner_app/ui/theme/app_theme.dart';
+import 'package:restaurant_owner_app/ui/theme/appearance.dart';
+import 'package:restaurant_owner_app/ui/widgets/empty_state.dart';
 import 'package:restaurant_owner_app/ui/widgets/fork_card.dart';
+import 'package:restaurant_owner_app/ui/widgets/fork_tabs.dart';
 import 'package:restaurant_owner_app/widgets/module_navigator.dart';
+
+import 'search_contract.dart';
 
 /// Insights → Reports: the nine MIS / control reports.
 ///
@@ -90,6 +96,22 @@ const _salesSummary = {
   'by_order_type': [
     {'order_type': 'Dine-in', 'bills': 2, 'grand_total': 2000.0, 'share_pct': 100.0},
   ],
+};
+
+/// Sales Summary over a period that settled nothing. Its rows live under
+/// `series`, not `rows`, and its chrome (six tiles and the money ladder) is
+/// drawn whether or not there are any.
+final _emptySalesSummary = <String, dynamic>{
+  ..._salesSummary,
+  'totals': {
+    'gross': 0.0, 'discount': 0.0, 'net': 0.0, 'service_charge': 0.0,
+    'tax': 0.0, 'round_off': 0.0, 'grand_total': 0.0, 'refund': 0.0,
+    'refunded_tax': 0.0, 'bills': 0, 'covers': 0, 'discounted_bills': 0,
+    'estimated_discount_bills': 0, 'apc': 0.0, 'abv': 0.0,
+    'bills_without_covers': 0,
+  },
+  'series': <Map<String, dynamic>>[],
+  'by_order_type': <Map<String, dynamic>>[],
 };
 
 const _orderSummary = {
@@ -256,6 +278,18 @@ const _itemWise = {
   'page': {'limit': 100, 'offset': 0, 'total': 1, 'has_more': false},
   'bill_level_discount': 100.0,
   'category_exact': false,
+};
+
+/// The same report over a period that sold nothing.
+final _emptyItemWise = <String, dynamic>{
+  ..._itemWise,
+  'rows': <Map<String, dynamic>>[],
+  'totals': {
+    'items': 0, 'qty': 0, 'gross_amount': 0.0, 'discount_amount': 0.0,
+    'net_amount': 0.0, 'dine_in_qty': 0, 'takeaway_qty': 0, 'delivery_qty': 0, 'other_qty': 0,
+  },
+  'page': {'limit': 100, 'offset': 0, 'total': 0, 'has_more': false},
+  'bill_level_discount': 0.0,
 };
 
 const _billEdit = {
@@ -540,14 +574,27 @@ class _FakeApi extends ApiClient {
   List<String> get gets => calls.where((c) => c.startsWith('GET ')).toList();
 }
 
-Widget _host(Widget child, {void Function(String)? switchOutlet}) => MaterialApp(
-      theme: AppTheme.dark(),
-      home: ModuleNavigator(
-        openModule: (_, {Map<String, dynamic>? target}) {},
-        visibleLabels: const ['Reports', 'History', 'Accounting'],
-        clearFocus: () {},
-        switchOutlet: switchOutlet ?? (_) {},
-        child: Scaffold(backgroundColor: Colors.transparent, body: child),
+Widget _host(
+  Widget child, {
+  void Function(String)? switchOutlet,
+  DesignSystem system = DesignSystem.rustic,
+  double textScale = 1.0,
+}) =>
+    GaiaScope(
+      system: system,
+      child: MaterialApp(
+        theme: system == DesignSystem.gaia ? GaiaTheme.dark() : AppTheme.dark(),
+        builder: (context, child) => MediaQuery(
+          data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(textScale)),
+          child: child!,
+        ),
+        home: ModuleNavigator(
+          openModule: (_, {Map<String, dynamic>? target}) {},
+          visibleLabels: const ['Reports', 'History', 'Accounting'],
+          clearFocus: () {},
+          switchOutlet: switchOutlet ?? (_) {},
+          child: Scaffold(backgroundColor: Colors.transparent, body: child),
+        ),
       ),
     );
 
@@ -557,6 +604,8 @@ Future<_FakeApi> _mount(
   double height = 1000,
   _FakeApi? api,
   void Function(String)? switchOutlet,
+  DesignSystem system = DesignSystem.rustic,
+  double textScale = 1.0,
 }) async {
   await tester.pumpWidget(const SizedBox());
   tester.view.physicalSize = Size(width, height);
@@ -567,15 +616,25 @@ Future<_FakeApi> _mount(
   final auth = AuthController(api: fake);
   await auth.login('CSR Organics', 'admin', 'admin123');
   final rest = RestClient(auth);
-  await tester.pumpWidget(_host(m.reportsModule(rest, auth.profile!), switchOutlet: switchOutlet));
+  await tester.pumpWidget(_host(m.reportsModule(rest, auth.profile!),
+      switchOutlet: switchOutlet, system: system, textScale: textScale));
   await tester.pumpAndSettle();
   return fake;
 }
 
 /// Nine tabs do not fit a 1400px desktop, let alone a 390px phone — the strip
-/// scrolls, so a test has to scroll it exactly as a reader would.
+/// scrolls, so a test has to scroll it exactly as a reader would. The label is
+/// looked up inside the tab strip and in either case, because Gaia draws its
+/// tab labels in capitals.
 Future<void> _openTab(WidgetTester tester, String title) async {
-  final tab = find.text(title).first;
+  final tab = find
+      .descendant(
+        of: find.byType(ForkTabs),
+        matching: find.byWidgetPredicate(
+            (w) => w is Text && (w.data == title || w.data == title.toUpperCase()),
+            description: 'tab label "$title"'),
+      )
+      .first;
   await tester.ensureVisible(tab);
   await tester.pumpAndSettle();
   await tester.tap(tab);
@@ -1227,6 +1286,124 @@ void main() {
     expect(api.gets.any((c) => c.contains('/reports/mis/bill/')), isTrue);
   });
 
+  // AN EMPTY PERIOD ON A PHONE WITH LARGE TEXT. The compact layout used to put
+  // the empty state in a FIXED 280px box. At 1.3x on a 360dp phone the icon,
+  // the title and a caption wrapped to several lines need more than that, so
+  // the column overflowed: 26px in Rustic Fork, 57px in Gaia, whose type is
+  // taller. 280 is a floor now, not a ceiling.
+  for (final system in DesignSystem.values) {
+    testWidgets('an empty period on a 360dp phone at 1.3x text fits its box (${system.label})',
+        (tester) async {
+      await _mount(
+        tester,
+        width: 360,
+        height: 900,
+        system: system,
+        textScale: 1.3,
+        api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}),
+      );
+      expect(find.byKey(const ValueKey('reports-cards')), findsNothing);
+
+      // At 1.3x the summary tiles push the empty state below the fold, into the
+      // list's cache area: built, but not painted — and an overflow is only
+      // reported when it paints. So bring it on screen first, as a reader would.
+      final empty = find.byType(EmptyState, skipOffstage: false);
+      expect(empty, findsOneWidget);
+      await tester.ensureVisible(empty);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      expect(tester.getSize(empty).height, greaterThan(280),
+          reason: 'at 1.3x the empty state needs more than the old 280');
+      // Measured against the Column, not the padded EmptyState: an overflow
+      // smaller than the 40px padding (Rustic's 26) still lands inside the
+      // outer box, but never inside the Column that was squeezed.
+      final content = tester.getRect(find.descendant(of: empty, matching: find.byType(Column)).first);
+      final caption = tester.getRect(find.textContaining('Item Wise has no rows between'));
+      expect(caption.bottom, lessThanOrEqualTo(content.bottom),
+          reason: 'the caption runs past the bottom of its own column');
+    }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android}));
+  }
+
+  testWidgets('at normal text size the phone empty state keeps its 280px, and the desktop fills the pane',
+      (tester) async {
+    // Growing with the text must not change the look anyone already has: at 1x
+    // the phone box is the same 280px it always was...
+    await _mount(tester,
+        width: 360, height: 900, api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}));
+    expect(tester.getSize(find.byType(EmptyState, skipOffstage: false)).height, 280);
+
+    // ...and the desktop never had the box: its empty state takes whatever the
+    // pane leaves under the controls, as the grid would.
+    await _mount(tester, api: _FakeApi(extra: {'/reports/mis/item-wise': _emptyItemWise}));
+    expect(find.text('Nothing in this period'), findsOneWidget);
+    expect(find.byKey(const ValueKey('reports-grid')), findsNothing);
+    expect(tester.getSize(find.byType(EmptyState)).height, greaterThan(280));
+    expect(tester.takeException(), isNull);
+  });
+
+  // AN EMPTY PERIOD IN A MID-HEIGHT DESKTOP WINDOW. From 430px of pane the
+  // desktop layout takes over, and Sales Summary's chrome fills its 45% cap, so
+  // the slot left under the controls was shorter than the empty state itself:
+  // 79px short at 680, 46 at 740 and 13 at 800 in Rustic Fork (89, 56 and 23 in
+  // Gaia). The empty state now scrolls inside that slot instead of overflowing it.
+  for (final system in DesignSystem.values) {
+    for (final height in const <double>[680, 740, 800]) {
+      testWidgets(
+          'an empty Sales Summary in a 1400x${height.toInt()} window scrolls, not overflows (${system.label})',
+          (tester) async {
+        await _mount(tester,
+            height: height,
+            system: system,
+            api: _FakeApi(extra: {'/reports/mis/sales-summary': _emptySalesSummary}));
+        await _openTab(tester, 'Sales Summary');
+        expect(tester.takeException(), isNull);
+        // The desktop layout, not the phone's: only the compact list pulls to refresh.
+        expect(find.byType(RefreshIndicator), findsNothing);
+
+        final empty = find.byType(EmptyState);
+        expect(empty, findsOneWidget);
+        // Measured against the Column: squeezed, it is shorter than its own
+        // caption; given room to scroll, it is exactly as tall as its content.
+        final content = find.descendant(of: empty, matching: find.byType(Column)).first;
+        final caption = find.textContaining('Sales Summary has no rows between');
+        expect(tester.getRect(caption).bottom, lessThanOrEqualTo(tester.getRect(content).bottom),
+            reason: 'the caption runs past the bottom of its own column');
+
+        // And nothing is out of reach: the caption scrolls into the slot.
+        await tester.ensureVisible(caption);
+        await tester.pumpAndSettle();
+        final slot = tester.getRect(find.ancestor(of: empty, matching: find.byType(Scrollable)).first);
+        final seen = tester.getRect(caption);
+        expect(seen.top, greaterThanOrEqualTo(slot.top));
+        expect(seen.bottom, lessThanOrEqualTo(slot.bottom));
+        expect(tester.takeException(), isNull);
+      }, variant: TargetPlatformVariant(<TargetPlatform>{TargetPlatform.windows, TargetPlatform.android}));
+    }
+  }
+
+  // With room to spare nothing moves: the empty state is still the whole slot,
+  // its content still centred in it, and there is nothing to scroll.
+  for (final system in DesignSystem.values) {
+    testWidgets('a desktop empty state with room still fills its slot, centred (${system.label})',
+        (tester) async {
+      await _mount(tester,
+          height: 1000,
+          system: system,
+          api: _FakeApi(extra: {'/reports/mis/sales-summary': _emptySalesSummary}));
+      await _openTab(tester, 'Sales Summary');
+      expect(find.byType(RefreshIndicator), findsNothing);
+
+      final empty = find.byType(EmptyState);
+      final slot = find.ancestor(of: empty, matching: find.byType(Scrollable)).first;
+      expect(tester.getRect(empty), tester.getRect(slot));
+      expect(tester.state<ScrollableState>(slot).position.maxScrollExtent, 0);
+      final content = tester.getRect(find.descendant(of: empty, matching: find.byType(Column)).first);
+      expect(content.center.dy, closeTo(tester.getRect(empty).center.dy, 0.5));
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   // -------------------------------------------------------------- search ---
 
   testWidgets('search rides on the request, debounced so a keystroke is not a query',
@@ -1254,7 +1431,13 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.byKey(const ValueKey('reports-grid')), findsNothing);
+    // At 520px the ladder may start just below the fold: since 2.0.2 the
+    // Reports / Email reports switch (item 9) and the order-type split (item
+    // 10) sit above it. It is reached by the same one ordinary scroll.
+    await tester.scrollUntilVisible(find.text('Money ladder'), 100,
+        scrollable: find.descendant(of: find.byType(ListView), matching: find.byType(Scrollable)).first);
     expect(find.text('Money ladder'), findsOneWidget);
+    expect(tester.takeException(), isNull);
 
     // The rows are below the fold of ONE ordinary vertical scroll — no pinned
     // header fighting for the same pixels, nothing clipped.
@@ -1282,6 +1465,93 @@ void main() {
     await tester.tap(find.byTooltip('Clear search'));
     await tester.pumpAndSettle();
     expect(find.byTooltip('Clear search'), findsNothing);
+  });
+
+  // A report whose endpoint reads no search drops the term, box and all: a
+  // word left in the box would filter nothing, and the empty state would go on
+  // to blame it. The box is only built for the searchable reports, so what
+  // empties it is `_setTab` clearing the screen's controller while the box can
+  // still hear it. Without that, the next searchable report showed the old
+  // word, x and all, over a report that was not filtered by it.
+  final searchBox = find.byKey(const ValueKey('reports-search'));
+  String boxText(WidgetTester tester) =>
+      tester.widget<EditableText>(find.descendant(of: searchBox, matching: find.byType(EditableText))).controller.text;
+  String lastOrderSummary(_FakeApi api) =>
+      api.gets.lastWhere((g) => g.contains('/reports/mis/order-summary'), orElse: () => '');
+
+  testWidgets('a report that reads no search drops the term: back on a searchable one, the box is empty',
+      (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    await tester.enterText(searchBox, '101');
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pumpAndSettle();
+    expect(lastOrderSummary(api), contains('search=101'));
+
+    await _openTab(tester, 'Sales Summary');
+    expect(searchBox, findsNothing, reason: 'Sales Summary reads no search');
+    await _openTab(tester, 'Order Summary');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(boxText(tester), isEmpty, reason: 'the dropped term came back in the box');
+    expect(find.byTooltip('Clear search'), findsNothing);
+    expect(lastOrderSummary(api), isNot(contains('search=')));
+  }, variant: searchPlatforms);
+
+  testWidgets('a term still waiting out the debounce is dropped by the tab change too', (tester) async {
+    final api = await _mount(tester);
+    await _openTab(tester, 'Order Summary');
+    final sales = find.text('Sales Summary').first;
+    await tester.ensureVisible(sales);
+    await tester.pumpAndSettle();
+    final before = api.gets.length;
+
+    await tester.enterText(searchBox, '101');
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(sales);
+    await tester.pump();
+    expect(searchBox, findsNothing);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+
+    await _openTab(tester, 'Order Summary');
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(boxText(tester), isEmpty);
+    expect(find.byTooltip('Clear search'), findsNothing);
+    expect(api.gets.skip(before).where((g) => g.contains('search=')), isEmpty,
+        reason: 'the word typed before the tab change was sent after it');
+  }, variant: searchPlatforms);
+
+  // CLIENT ITEM 6 (2.0.2): the MIS search is one of the app's registered search
+  // boxes (test/search_clear_registry_test.dart). Its contract row lives here,
+  // beside the fixtures it needs: the x, pressed where it is drawn, must send
+  // the next report request without `search=`.
+  searchContractRows('reports-search', (tester, ds) async {
+    await tester.pumpWidget(const SizedBox());
+    useSearchView(tester, onPhone ? null : const Size(1400, 1000));
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final fake = _FakeApi();
+    final auth = AuthController(api: fake);
+    await auth.login('CSR Organics', 'admin', 'admin123');
+    await tester.pumpWidget(searchThemed(
+      ds,
+      ModuleNavigator(
+        openModule: (_, {Map<String, dynamic>? target}) {},
+        visibleLabels: const ['Reports', 'History', 'Accounting'],
+        clearFocus: () {},
+        switchOutlet: (_) {},
+        child: Scaffold(backgroundColor: Colors.transparent, body: m.reportsModule(RestClient(auth), auth.profile!)),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    // The report it opens on reads a search (Gaia spells the tab names its own
+    // way, so the row does not go looking for one).
+    return SearchSurface(
+      field: find.byKey(const ValueKey('reports-search')),
+      typed: '101',
+      filtered: () => fake.gets.lastWhere((g) => g.contains('/reports/mis/')).contains('search='),
+    );
   });
 
   // ------------------------------------------------- pure export rendering --

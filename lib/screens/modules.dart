@@ -17,11 +17,16 @@ import 'package:qr_flutter/qr_flutter.dart';
 
 import '../config.dart';
 import '../models/bill_round_off.dart';
+import '../models/cancel_kot.dart';
+import '../models/floor_state.dart';
+import '../models/glance_drill.dart';
 import '../models/gross_net.dart';
 import '../models/kot_copy.dart';
 import '../models/kot_docket_settings.dart';
 import '../models/next_party.dart';
+import '../models/order_moves.dart';
 import '../models/profile.dart';
+import '../models/report_email.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
 import '../models/table_assignment.dart';
@@ -38,6 +43,7 @@ import '../services/tz_offsets.dart';
 import '../ui/gaia/gaia.dart';
 import '../ui/theme/app_colors.dart';
 import '../ui/theme/app_spacing.dart';
+import '../ui/widgets/app_search_field.dart';
 import '../ui/widgets/charts.dart';
 import '../ui/widgets/date_range_picker.dart';
 import '../ui/widgets/empty_state.dart';
@@ -56,6 +62,7 @@ import '../models/menu_badge.dart';
 import '../models/payment_modes.dart';
 import '../models/nc_settle.dart';
 import '../widgets/async_view.dart';
+import '../widgets/floor_chips.dart';
 import '../widgets/live_gross.dart';
 import '../widgets/menu_badges.dart';
 import '../widgets/module_navigator.dart';
@@ -75,6 +82,11 @@ import 'simulation.dart' as simulation;
 // other module here. Duplicating those into a second library is how a control
 // report ends up disagreeing with the screen it was reconciled against.
 part 'reports.dart';
+
+// Email reports (client item 9): the address book, the schedules, the delivery
+// history and the Send-now sheet the report pane's Email button opens. A part
+// for the same reason: the history formats through this library's helpers.
+part 'report_email.dart';
 
 // The capture screens (migrations 034-039): the comp sheet, the void reason, the
 // service-charge waiver, the tender/tip/till payment screen, and the menu group
@@ -1007,6 +1019,10 @@ Widget _recordHeadRow(
 // [beforeJump] runs only when the jump is actually taken, just before the shell
 // switches module — the place to set up the destination (its reporting window,
 // say) without touching it when the sheet is merely closed.
+//
+// [secondaryJumpTo] is a second, quieter "View in <Module>" for a sheet whose
+// figure has two honest homes (item 10: a payment mode's report AND its bills),
+// gated and primed exactly like the first.
 Future<void> _detailSheet(
   BuildContext context, {
   required String eyebrow,
@@ -1015,9 +1031,13 @@ Future<void> _detailSheet(
   String? jumpTo,
   Map<String, dynamic>? jumpTarget,
   VoidCallback? beforeJump,
+  String? secondaryJumpTo,
+  VoidCallback? beforeSecondaryJump,
 }) {
   final nav = ModuleNavigator.of(context);
   final canJump = jumpTo != null && (nav?.canOpen(jumpTo) ?? false);
+  final canJump2 =
+      secondaryJumpTo != null && secondaryJumpTo != jumpTo && (nav?.canOpen(secondaryJumpTo) ?? false);
   return showDialog<void>(
     context: context,
     builder: (ctx) {
@@ -1057,8 +1077,21 @@ Future<void> _detailSheet(
                 runSpacing: AppSpacing.sm,
                 children: [
                   ForkButton.ghost(label: 'Close', dense: true, onPressed: () => Navigator.pop(ctx)),
+                  if (canJump2)
+                    ForkButton.ghost(
+                      key: const ValueKey('sheet-jump-secondary'),
+                      label: 'View in $secondaryJumpTo',
+                      icon: Icons.arrow_forward,
+                      dense: true,
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        beforeSecondaryJump?.call();
+                        nav!.openModule(secondaryJumpTo);
+                      },
+                    ),
                   if (canJump)
                     ForkButton(
+                      key: const ValueKey('sheet-jump'),
                       label: 'View in $jumpTo',
                       icon: Icons.arrow_forward,
                       dense: true,
@@ -1241,8 +1274,22 @@ Color _stageColor(String status) {
 /// Under the figures, when the server sent them: today's takings BY PAYMENT
 /// METHOD — see [_headlineByMethod].
 ///
+/// EVERY ELEMENT LEADS SOMEWHERE — client item 10: "The entire 'Today at a
+/// glance' section needs to be made clickable; each option in it must be
+/// clickable." Each figure, chip, count, note and line opens a sheet built from
+/// THIS payload (no extra read, so it works on a cached one), footed by a jump
+/// pinned to the server's day (models/glance_drill.dart); a pure count jumps
+/// straight there, and the header carries a "Today's report" link. There is no
+/// card-wide tap: nesting it over these would be the hit-target fight the stat
+/// cards below already document. Each wrapper is a [_TapRow], which adds no
+/// geometry, so the box still reads as the one box of bare columns H1 asked for.
+/// A destination this user cannot open is dropped (the next fallback is tried);
+/// the sheet still opens, so no element is ever a dead tap.
+///
 /// [columns] lays the figures out; the call site owns the breakpoints.
-List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2}) {
+/// [openBills] is the Overview's own open-bill count (null when not fetched),
+/// which the empty-day sentence adds.
+List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns = 2, int? openBills}) {
   // State one. "Not fetched" — which is not "fetched and empty", and is why the
   // Overview's load() keeps this entry's raw null instead of coalescing it.
   if (headline == null) return const [];
@@ -1259,6 +1306,7 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final h = headline;
 
   final text = Theme.of(context).textTheme;
+  final nav = ModuleNavigator.of(context);
 
   /// One figure: the server's label, the money, the server's definition under
   /// it. Null when the server did not send this metric — an unnamed money
@@ -1270,44 +1318,57 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
     final label = '${f['label'] ?? ''}'.trim();
     if (label.isEmpty) return null;
     final hint = '${f['hint'] ?? ''}'.trim();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-        const SizedBox(height: AppSpacing.xs),
-        // Scaled down, never clipped. A six-figure total cut off mid-number is
-        // the one thing on this card nobody can work around — there is no hover
-        // on a till screen, and the digits that go missing are the expensive
-        // ones. Same treatment the week-on-week delta gets in the stat cards.
-        FittedBox(
-          fit: BoxFit.scaleDown,
-          alignment: Alignment.centerLeft,
-          child: Text(
-            // _money prints an em dash for a value the server omitted, which is
-            // the whole point: a figure that never arrived must not read as
-            // zero takings.
-            _money(f['value']),
-            maxLines: 1,
-            softWrap: false,
-            style: text.displaySmall!.copyWith(fontSize: 22, color: AppColors.textPrimary),
+    return _glanceTap(
+      key: ValueKey('glance-$key'),
+      semantics: '$label ${_money(f['value'])}, opens details',
+      onTap: () => _glanceFigureSheet(context, h, key),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // The chevron is the affordance a touch screen has instead of a hover
+          // wash. Beside the label and never in its way: the label keeps its
+          // two lines and gives up width to the 14px glyph, not the other way.
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Flexible(
+              child: Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+            ),
+            Icon(Icons.chevron_right, size: 14, color: AppColors.textTertiary),
+          ]),
+          const SizedBox(height: AppSpacing.xs),
+          // Scaled down, never clipped. A six-figure total cut off mid-number is
+          // the one thing on this card nobody can work around — there is no hover
+          // on a till screen, and the digits that go missing are the expensive
+          // ones. Same treatment the week-on-week delta gets in the stat cards.
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              // _money prints an em dash for a value the server omitted, which is
+              // the whole point: a figure that never arrived must not read as
+              // zero takings.
+              _money(f['value']),
+              maxLines: 1,
+              softWrap: false,
+              style: text.displaySmall!.copyWith(fontSize: 22, color: AppColors.textPrimary),
+            ),
           ),
-        ),
-        if (hint.isNotEmpty) ...[
-          const SizedBox(height: 3),
-          Text(hint,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text(hint,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+          ],
         ],
-      ],
+      ),
     );
   }
 
   // The order the requirement lists them in, which is also the order they read
   // in: today's pair, the online pair beside it, what is in the drawer, then
   // the month standing behind all of it.
-  const order = ['today_net', 'today_gross', 'online_net', 'online_gross', 'cash_collection', 'month_to_date'];
+  const order = kGlanceFigureKeys;
 
   // Built with a plain loop rather than a collection-if: `figure` returns null
   // for a metric the payload did not carry, and dropping it is the only honest
@@ -1336,30 +1397,89 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   final byMethod = _headlineByMethod(context, h, columns: columns);
   final ncToday = _headlineNc(context, h);
 
+  // "Today's report": a link, not a sheet — it IS the destination. Absent when
+  // this user can open none of the places it leads. Beside the title on a wide
+  // window; on a phone it joins the chips below instead, because beside the
+  // title it cut "Today at a glance" to "TODAY AT A GLA…" at 360px in Gaia.
+  final report = _glanceResolve(nav, glanceDrillOf(h, 'header'));
+  final narrow = MediaQuery.sizeOf(context).width < 760;
+  final reportLink = report == null
+      ? null
+      : ForkButton.subtle(
+          key: const ValueKey('glance-report'),
+          label: kGlanceReportButton,
+          icon: Icons.arrow_forward,
+          onPressed: _glanceGo(nav, report),
+        );
+
   return [
     // ONE box, as the requirement words it. The figures inside are bare columns
     // and not tiles for the same reason: six cards in a row is six boxes, which
     // is the layout this requirement exists to replace.
     ForkCard(
+      key: const ValueKey('glance-box'),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SectionHeader(
-          title: 'Today at a glance',
-          padding: const EdgeInsets.only(bottom: AppSpacing.md),
-          // Only when there is something to count. "0 bills settled" sitting
-          // beside the sentence below would say the same thing twice, in two
-          // voices, and one of them in a tag that normally means good news.
-          trailing: (bills != null && bills > 0) ? TickTag('$bills bill(s) settled') : null,
+        // The title explains how the box is cut; the link beside it opens the
+        // day's report. Two different answers, so two different targets.
+        _glanceTap(
+          key: const ValueKey('glance-header'),
+          semantics: 'Today at a glance, how today is cut',
+          // The report link lives inside this row, so its own button node must
+          // survive: the row names itself and keeps its children.
+          mergeChildren: false,
+          onTap: () => _glanceDaySheet(context, h, 'header'),
+          child: SectionHeader(
+            title: 'Today at a glance',
+            padding: const EdgeInsets.only(bottom: AppSpacing.md),
+            trailing: narrow ? null : reportLink,
+          ),
         ),
-        // The day, the zone and the month window these figures were cut on.
-        // Printed because the owner is being asked to trust six numbers against
-        // their own reports: without the boundaries, a disagreement about which
-        // day it is looks exactly like a disagreement about the money.
-        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty) ...[
-          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, children: [
-            if (today.isNotEmpty) InfoChip(icon: Icons.today, label: _fmtDay(today)),
-            if (zoneCaption.isNotEmpty) InfoChip(icon: Icons.public, label: zoneCaption),
+        // The day, the zone and the month window these figures were cut on, and
+        // how many bills are behind them. Printed because the owner is being
+        // asked to trust six numbers against their own reports: without the
+        // boundaries, a disagreement about which day it is looks exactly like a
+        // disagreement about the money. A Wrap, so the four never overflow a
+        // phone — the bill count used to sit in the header's trailing slot,
+        // which is now the report link's.
+        if (today.isNotEmpty || zoneCaption.isNotEmpty || monthFrom.isNotEmpty || (bills ?? 0) > 0 ||
+            (narrow && reportLink != null)) ...[
+          Wrap(spacing: AppSpacing.sm, runSpacing: AppSpacing.sm, crossAxisAlignment: WrapCrossAlignment.center, children: [
+            // Only when there is something to count. "0 bills settled" sitting
+            // beside the sentence below would say the same thing twice, in two
+            // voices, and one of them in a tag that normally means good news.
+            if (bills != null && bills > 0)
+              _glanceTap(
+                key: const ValueKey('glance-bills'),
+                semantics: "$bills bills settled today, opens the day's bills",
+                onTap: _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'bills'))) ??
+                    () => _glanceCountSheet(context, h),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: TickTag('$bills bill(s) settled'),
+                ),
+              ),
+            if (today.isNotEmpty)
+              _glanceTap(
+                key: const ValueKey('glance-day'),
+                semantics: '${_fmtDay(today)}, how today is cut',
+                onTap: () => _glanceDaySheet(context, h, 'day'),
+                child: InfoChip(icon: Icons.today, label: _fmtDay(today)),
+              ),
+            if (zoneCaption.isNotEmpty)
+              _glanceTap(
+                key: const ValueKey('glance-zone'),
+                semantics: '$zoneCaption, how today is cut',
+                onTap: () => _glanceDaySheet(context, h, 'zone'),
+                child: InfoChip(icon: Icons.public, label: zoneCaption),
+              ),
             if (monthFrom.isNotEmpty)
-              InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
+              _glanceTap(
+                key: const ValueKey('glance-month'),
+                semantics: 'Month from ${_fmtDay(monthFrom)}, opens month to date',
+                onTap: () => _glanceFigureSheet(context, h, 'month_to_date', via: 'month'),
+                child: InfoChip(icon: Icons.calendar_month, label: 'month from ${_fmtDay(monthFrom)}'),
+              ),
+            if (narrow && reportLink != null) reportLink,
           ]),
           const SizedBox(height: AppSpacing.lg),
         ],
@@ -1376,12 +1496,25 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
           // the other is indistinguishable from a bug in whichever one they
           // checked second. Matching the web exactly is worth more than the
           // marginally tidier layout, so the divergence was removed.
-          Text(
-            monthFrom.isEmpty
-                ? 'Nothing has been settled yet today. Month to date still counts every earlier day.'
-                : 'Nothing has been settled yet today. Month to date still counts every day since '
-                    '${_fmtDay(monthFrom)}.',
-            style: text.bodySmall!.copyWith(color: AppColors.textSecondary),
+          //
+          // It leads to the FLOOR (item 10): on an empty day the money is still
+          // on the tables, and the open-bill count this page already fetched
+          // says how much of it there is.
+          _glanceTap(
+            key: const ValueKey('glance-nothing-settled'),
+            semantics: 'Nothing has been settled yet today, opens the floor',
+            onTap: _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'nothing_settled'))) ??
+                () => _glanceDaySheet(context, h, 'day'),
+            child: Text(
+              [
+                monthFrom.isEmpty
+                    ? 'Nothing has been settled yet today. Month to date still counts every earlier day.'
+                    : 'Nothing has been settled yet today. Month to date still counts every day since '
+                        '${_fmtDay(monthFrom)}.',
+                if (openBills != null) glanceOpenBillsSentence(openBills),
+              ].join(' '),
+              style: text.bodySmall!.copyWith(color: AppColors.textSecondary),
+            ),
           ),
           const SizedBox(height: AppSpacing.lg),
         ],
@@ -1401,6 +1534,312 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
   ];
 }
 
+/// A glance element as a control: the click cursor and hover wash of [_TapRow]
+/// (no geometry of its own) and ONE button node for a screen reader, named by
+/// [semantics] rather than by the loose texts inside it.
+Widget _glanceTap({
+  Key? key,
+  required Widget child,
+  required VoidCallback onTap,
+  required String semantics,
+  bool mergeChildren = true,
+}) =>
+    Semantics(
+      key: key,
+      button: true,
+      label: semantics,
+      onTap: onTap,
+      excludeSemantics: mergeChildren,
+      child: _TapRow(onTap: onTap, child: child),
+    );
+
+/// The destination [drill] resolves to for this user, or null.
+GlanceTarget? _glanceResolve(ModuleNavigator? nav, GlanceDrill? drill) =>
+    (nav == null || drill == null) ? null : drill.resolve(nav.canOpen);
+
+/// A direct jump to [t], or null when there is nowhere to go.
+VoidCallback? _glanceGo(ModuleNavigator? nav, GlanceTarget? t) {
+  if (nav == null || t == null) return null;
+  return () {
+    _primeGlanceJump(t);
+    nav.openModule(t.module);
+  };
+}
+
+/// Set the destination up to show the SAME number the owner tapped, just before
+/// the shell switches to it (the shell remounts the module on every jump, so it
+/// reads this on arrival). Session memory, not a focus request: none of these
+/// modules reads a focus, and a request left parked on the shell would reset
+/// the window again on the next remount, after the owner had moved the chip.
+///
+///  * Reports — the report tab, the server's day (or month), and ALL DAY: a
+///    remembered "Lunch" would show a slice that cannot equal the tile.
+///  * Accounting — the window, and a one-shot bill-list filter that also
+///    scrolls to the settled bills when the jump is about them.
+///  * History — the window.
+///  * Analytics — the window. It is where a figure falls back to for a user
+///    whose plan or role hides Reports, and its one date control would
+///    otherwise open on whatever it last showed (the last 30 days, first time).
+void _primeGlanceJump(GlanceTarget t) {
+  final window = glanceWindowOf(t);
+  switch (t.module) {
+    case 'Reports':
+      if (t.report != null) misRememberReport(t.report!);
+      if (window != null) DateRangeMemory.remember('reports', window);
+      if (t.slotAll) TimeSlotMemory.remember('reports', TimeSlotSelection.allDay);
+    case 'Accounting':
+      if (window != null) DateRangeMemory.remember('accounting', window);
+      AccountingBillFilter.remember(t.method, reveal: t.bills);
+    case 'History':
+      if (window != null) DateRangeMemory.remember('history', window);
+    case 'Analytics':
+      if (window != null) DateRangeMemory.remember('analytics', window);
+  }
+}
+
+/// A glance sheet: [_detailSheet], with its jump and secondary jump resolved
+/// from [drill] for this user and primed on the way out.
+Future<void> _glanceSheet(
+  BuildContext context, {
+  required String eyebrow,
+  required String title,
+  required List<Widget> children,
+  GlanceDrill? drill,
+}) {
+  final nav = ModuleNavigator.of(context);
+  final canOpen = nav?.canOpen ?? (_) => false;
+  final jump = drill?.resolve(canOpen);
+  final second = drill?.resolveSecondary(canOpen);
+  return _detailSheet(
+    context,
+    eyebrow: eyebrow,
+    title: title,
+    jumpTo: jump?.module,
+    beforeJump: jump == null ? null : () => _primeGlanceJump(jump),
+    secondaryJumpTo: second?.module,
+    beforeSecondaryJump: second == null ? null : () => _primeGlanceJump(second),
+    children: children,
+  );
+}
+
+TextStyle _glanceNote() => TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
+
+/// "Today at a glance · 17 Sep" — every sheet says which day it is about.
+String _glanceEyebrow(Map h, String label) {
+  final today = '${h['today'] ?? ''}';
+  return today.isEmpty ? label : '$label · ${_fmtDay(today)}';
+}
+
+/// A figure's sheet. [via] names the element that opened it when that is not
+/// the figure itself (the month chip opens the month to date sheet), so its
+/// jump is that element's.
+Future<void> _glanceFigureSheet(BuildContext context, Map h, String key, {String? via}) {
+  if (key == 'cash_collection') return _glanceCashSheet(context, h);
+  final f = h[key] is Map ? h[key] as Map : const {};
+  final label = '${f['label'] ?? ''}'.trim();
+  final hint = '${f['hint'] ?? ''}'.trim();
+  final text = Theme.of(context).textTheme;
+  final drill = glanceDrillOf(h, via ?? key);
+  final value = _money(f['value']);
+  final note = _glanceNote();
+
+  switch (key) {
+    case 'today_net':
+    case 'today_gross':
+      final ladder = h['today_ladder'];
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          _detailRow(context, 'Bills settled today', '${_int(h['today_bills']) ?? 0}'),
+          // The steps between Net and Gross, rung by rung, when the server sent
+          // them. An older backend sends none, and a missing ladder is not a
+          // ladder of zeros — so it is left out, not drawn as ₹0.00.
+          if (ladder is Map) ...[
+            const SizedBox(height: AppSpacing.sm),
+            for (final (rung, name) in kGlanceLadder)
+              _detailRow(
+                context,
+                name,
+                (rung == 'discount' || rung == 'refund') && _numOf(ladder[rung]) > 0
+                    ? '− ${_money(ladder[rung])}'
+                    : _money(ladder[rung]),
+                trailing: (rung == 'net' && key == 'today_net') || (rung == 'grand_total' && key == 'today_gross')
+                    ? 'this figure'
+                    : null,
+              ),
+          ],
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+          if (key == 'today_gross') ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(kGlanceGrossAddsUp, style: note),
+          ],
+        ],
+      );
+    case 'online_net':
+    case 'online_gross':
+      final bills = _int(h['today_online_bills']);
+      final zero = _numOf((h['online_gross'] as Map?)?['value']) == 0 && (bills ?? 0) == 0;
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          if (bills != null) _detailRow(context, 'Online bills today', '$bills'),
+          for (final k in const ['online_net', 'online_gross'])
+            if (h[k] is Map) _detailRow(context, '${(h[k] as Map)['label']}', _money((h[k] as Map)['value'])),
+          const SizedBox(height: AppSpacing.sm),
+          Text(kGlanceOnlineRule, style: note),
+          // The owner's most likely reading of ₹0 here is "Zomato is missing".
+          // It is not: at the table it is a payment mode, and it is counted —
+          // under the by-method block.
+          if (zero) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(kGlanceOnlineNone, style: text.bodySmall!.copyWith(color: AppColors.textPrimary)),
+          ],
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+        ],
+      );
+    default: // month_to_date
+      final today = '${h['today'] ?? ''}';
+      final from = '${h['month_from'] ?? ''}';
+      return _glanceSheet(
+        context,
+        eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+        title: '$label · $value',
+        drill: drill,
+        children: [
+          if (_int(h['month_bills']) != null) _detailRow(context, 'Bills settled this month', '${_int(h['month_bills'])}'),
+          if (from.isNotEmpty && today.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(glanceMonthSentence(_fmtDay(from), _fmtDay(today)), style: text.bodySmall),
+          ],
+          const SizedBox(height: AppSpacing.sm),
+          Text(kGlanceSettledClock, style: note),
+          if (hint.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Text(hint, style: note),
+          ],
+        ],
+      );
+  }
+}
+
+/// "How today is cut": the day, the zone, the clock a bill counts on. Opened by
+/// the header, the day chip and the zone chip; the zone chip's jump is Settings
+/// (where the zone is set — admin only, which the shell decides) and, for anyone
+/// who cannot open it, the day's report.
+Future<void> _glanceDaySheet(BuildContext context, Map h, String key) {
+  final today = '${h['today'] ?? ''}';
+  final monthFrom = '${h['month_from'] ?? ''}';
+  final zone = '${h['timezone'] ?? ''}'.trim();
+  final offset = zone.isEmpty ? '' : RestaurantTime.offsetLabelOf(zone);
+  final zoneCaption = zone.isEmpty ? '' : (offset == 'unsupported' ? zone : '$zone ($offset)');
+  final nav = ModuleNavigator.of(context);
+  var drill = glanceDrillOf(h, key);
+  if (key == 'zone' && _glanceResolve(nav, drill) == null) drill = glanceDrillOf(h, 'day');
+  final bills = _int(h['today_bills']);
+  return _glanceSheet(
+    context,
+    eyebrow: 'Today at a glance',
+    title: kGlanceDayTitle,
+    drill: drill,
+    children: [
+      if (today.isNotEmpty) Text(glanceDaySentence(_fmtDay(today), zoneCaption), style: Theme.of(context).textTheme.bodySmall),
+      const SizedBox(height: AppSpacing.sm),
+      if (today.isNotEmpty) _detailRow(context, 'Today', _fmtDay(today)),
+      if (zoneCaption.isNotEmpty) _detailRow(context, 'Time zone', zoneCaption),
+      if (monthFrom.isNotEmpty) _detailRow(context, 'Month from', _fmtDay(monthFrom)),
+      if (bills != null) _detailRow(context, 'Bills settled today', '$bills'),
+      const SizedBox(height: AppSpacing.sm),
+      Text(kGlanceSettledClock, style: _glanceNote()),
+    ],
+  );
+}
+
+/// The bill count's own sheet — only for a user who can open none of the
+/// places the count leads, so the tag is never a dead tap.
+Future<void> _glanceCountSheet(BuildContext context, Map h) => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: '${_int(h['today_bills']) ?? 0} bill(s) settled',
+      drill: glanceDrillOf(h, 'bills'),
+      children: [
+        Text(kGlanceSettledClock, style: _glanceNote()),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceNoDestination, style: _glanceNote()),
+      ],
+    );
+
+/// Cash collection's sheet: the Cash row's own sheet when there is one (they
+/// are one number — the server reads the tile off the row), a plain "no cash"
+/// sheet when there is not. Its jumps are the tile's: the Settlement Summary,
+/// and the Cash register as a separately labelled second place.
+Future<void> _glanceCashSheet(BuildContext context, Map h) {
+  final rows = h['today_by_method'];
+  final cash = rows is List
+      ? rows.whereType<Map>().where((m) => '${m['method'] ?? ''}'.trim().toLowerCase() == 'cash').firstOrNull
+      : null;
+  final f = h['cash_collection'] is Map ? h['cash_collection'] as Map : const {};
+  final drill = glanceDrillOf(h, 'cash_collection');
+  if (cash != null) {
+    final section = h['by_method'] is Map ? h['by_method'] as Map : const {};
+    return _headlineMethodSheet(
+      context,
+      mode: cash,
+      share: _glanceShareOf(h, cash),
+      label: '${section['label'] ?? ''}'.trim(),
+      hint: '${section['hint'] ?? ''}'.trim(),
+      today: '${h['today'] ?? ''}',
+      splitBills: _int(h['today_split_bills']) ?? 0,
+      drill: drill,
+      extra: [
+        if ('${f['hint'] ?? ''}'.trim().isNotEmpty) Text('${f['hint']}'.trim(), style: _glanceNote()),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceDrawerNote, style: _glanceNote()),
+      ],
+    );
+  }
+  return _glanceSheet(
+    context,
+    eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+    title: '${'${f['label'] ?? ''}'.trim()} · ${_money(f['value'])}',
+    drill: drill,
+    children: [
+      Text(kGlanceNoCash, style: Theme.of(context).textTheme.bodySmall),
+      if ('${f['hint'] ?? ''}'.trim().isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text('${f['hint']}'.trim(), style: _glanceNote()),
+      ],
+      const SizedBox(height: AppSpacing.sm),
+      Text(kGlanceDrawerNote, style: _glanceNote()),
+    ],
+  );
+}
+
+/// A mode's share of today: the server's, else computed; a dash — never 0% —
+/// with nothing to divide by. Same rule as the web's modeSharePct.
+String _glanceShareOf(Map h, Map m) {
+  final s = m['share_pct'];
+  if (s is num) return '${s.toStringAsFixed(1)}%';
+  final g = h['today_gross'];
+  final rows = h['today_by_method'];
+  final total = (g is Map && g['value'] is num)
+      ? (g['value'] as num).toDouble()
+      : (rows is List ? rows.whereType<Map>().fold<double>(0, (a, r) => a + _numOf(r['amount'])) : 0.0);
+  if (!(total > 0)) return '–';
+  return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
+}
+
 /// TODAY BY PAYMENT METHOD, inside the headline box. Client ask: "How much money
 /// from each payment method made in the day has to be shown."
 ///
@@ -1418,9 +1857,11 @@ List<Widget> _overviewHeadline(BuildContext context, Map? headline, {int columns
 /// (the nothing-settled sentence above already says so), or when the block has
 /// no label (an unnamed list of money — the rule `figure` applies above).
 ///
-/// Each row opens a drill-down with a jump to Accounting. Not Reports: the
-/// report pack takes no focus target, so a jump there would land on whichever
-/// report was open last.
+/// Each row opens a drill-down whose jump is the Settlement Summary on that day
+/// — the report that computes these rows, Unallocated and refunds included —
+/// with that mode's own bills in Accounting as a second place (item 10). The
+/// label jumps straight to the report; the split note and the warning open
+/// their own sheets.
 Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final raw = h['today_by_method'];
   if (raw is! List) return null;
@@ -1432,6 +1873,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
   final hint = section is Map ? '${section['hint'] ?? ''}'.trim() : '';
 
   final text = Theme.of(context).textTheme;
+  final nav = ModuleNavigator.of(context);
   // The server's Today's gross sale — the figure the rows add up to. Summed
   // here only if a payload somehow carried rows without it.
   final grossFig = h['today_gross'];
@@ -1454,14 +1896,16 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
       : (unallocatedBills == 1 ? "1 bill's" : "$unallocatedBills bills'");
   final today = '${h['today'] ?? ''}';
 
-  // The server's share, else computed; a dash — never 0% — with nothing to
-  // divide by. Same rule as the web's modeSharePct.
-  String shareOf(Map m) {
-    final s = m['share_pct'];
-    if (s is num) return '${s.toStringAsFixed(1)}%';
-    if (!(total > 0)) return '–';
-    return '${(_numOf(m['amount']) / total * 100).toStringAsFixed(1)}%';
-  }
+  void openRow(Map m, {GlanceDrill? drill}) => _headlineMethodSheet(
+        context,
+        mode: m,
+        share: _glanceShareOf(h, m),
+        label: label,
+        hint: hint,
+        today: today,
+        splitBills: splitBills,
+        drill: drill ?? glanceDrillOf(h, 'by_method_row', rowMethod: '${m['method']}'.trim()),
+      );
 
   final rows = <Widget>[];
   for (final m in modes) {
@@ -1472,7 +1916,7 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     final amount = _numOf(m['amount']);
     final bills = _int(m['bills']) ?? 0;
     final refund = _numOf(m['refund']);
-    final share = shareOf(m);
+    final share = _glanceShareOf(h, m);
     final isUnallocated = method == 'Unallocated';
     rows.add(Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
       HBarRow(
@@ -1484,38 +1928,47 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
         value: _money(amount),
         color: isUnallocated ? AppColors.warning : null,
         tooltip: '$modeLabel · ${_money(amount)} · $bills bill(s) · $share of today',
-        onTap: () => _headlineMethodSheet(
-          context,
-          mode: m,
-          share: share,
-          label: label,
-          hint: hint,
-          today: today,
-          splitBills: splitBills,
-        ),
+        onTap: () => openRow(m),
       ),
       // The counts go on their own line UNDER the bar, not in HBarRow's `sub`.
       // That row gives only its label, so a bill count and a share beside the
       // figure overflowed a 360px phone by 99px once the day ran to eight
       // digits. A wrapping line cannot, and it is the web block's layout too.
-      Text(
-        '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: text.bodySmall!.copyWith(fontSize: 11),
+      // Part of the row's tap target (item 10): it is that row's detail.
+      _glanceTap(
+        key: ValueKey('glance-mode-count-$method'),
+        semantics: '$modeLabel, $bills bills, opens details',
+        onTap: () => openRow(m),
+        child: Text(
+          '$bills bill(s) · $share${refund > 0 ? ' · − ${_money(refund)} refunded · ${_money(m['net_amount'])} after refunds' : ''}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: text.bodySmall!.copyWith(fontSize: 11),
+        ),
       ),
     ]));
   }
 
+  // The label is a direct jump to the report these rows are; for someone who
+  // cannot open it, a sheet listing the modes, so it never taps into nothing.
+  final labelJump = _glanceGo(nav, _glanceResolve(nav, glanceDrillOf(h, 'by_method')));
+
   return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-    Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-    if (hint.isNotEmpty) ...[
-      const SizedBox(height: 3),
-      Text(hint,
-          maxLines: 3,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
-    ],
+    _glanceTap(
+      key: const ValueKey('glance-by-method'),
+      semantics: '$label, opens the Settlement Summary',
+      onTap: labelJump ?? () => _glanceByMethodSheet(context, h, modes, label, hint),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        Text(label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        if (hint.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(hint,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+        ],
+      ]),
+    ),
     const SizedBox(height: AppSpacing.sm),
     // One across on a phone, two or three on wider windows — the web's
     // 1 / 2 / 3 grid, keyed off the headline's own column count.
@@ -1525,28 +1978,73 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
     // row here.
     if (splitBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
-      Text(
-        '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
-        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+      _glanceTap(
+        key: const ValueKey('glance-split'),
+        semantics: '$splitBills bills paid across more than one method, opens details',
+        onTap: () => _glanceSplitSheet(context, h, splitBills),
+        child: Text(
+          '$splitBills bill(s) paid across more than one method; each part counts under its own method.',
+          style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.textSecondary),
+        ),
       ),
     ],
     // LOUD: the one line that means something is wrong. It should always be 0,
     // and it is wrong in EITHER direction — a split whose parts exceed the bill
     // books a negative residual — and wrong even when the residuals cancel. Same
-    // words as the web's unallocatedWarning.
+    // words as the web's unallocatedWarning. It opens the Unallocated row's own
+    // sheet, whose jump is the Split bills that need looking at.
     if (unallocated != 0 || unallocatedBills > 0) ...[
       const SizedBox(height: AppSpacing.sm),
-      Text(
-        unallocated != 0
-            ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
-                'do not add up to their totals and need looking at.'
-            : '$whose split amounts do not add up to their totals and need looking at '
-                '(the differences cancel out to ${_money(0)} today).',
-        style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+      _glanceTap(
+        key: const ValueKey('glance-unallocated'),
+        semantics: 'Unallocated money, opens details',
+        onTap: () => unallocatedRow.isEmpty
+            ? _glanceSplitSheet(context, h, splitBills, key: 'unallocated')
+            : openRow(unallocatedRow.first, drill: glanceDrillOf(h, 'unallocated')),
+        child: Text(
+          unallocated != 0
+              ? '${_money(unallocated.abs())} could not be put under a payment method — $whose split amounts '
+                  'do not add up to their totals and need looking at.'
+              : '$whose split amounts do not add up to their totals and need looking at '
+                  '(the differences cancel out to ${_money(0)} today).',
+          style: text.bodySmall!.copyWith(fontSize: 11, color: AppColors.warning),
+        ),
       ),
     ],
   ]);
 }
+
+/// The by-method label's sheet, for a user who cannot open the report.
+Future<void> _glanceByMethodSheet(BuildContext context, Map h, List<Map> modes, String label, String hint) =>
+    _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, label),
+      title: kGlanceByMethodTitle,
+      drill: glanceDrillOf(h, 'by_method'),
+      children: [
+        for (final m in modes)
+          _detailRow(context, PaymentModes.reportName(m, '${m['method']}'.trim()), _money(m['amount']),
+              trailing: '${_int(m['bills']) ?? 0} bill(s)'),
+        if (hint.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(hint, style: _glanceNote()),
+        ],
+      ],
+    );
+
+/// The split note's sheet: what a bill paid in parts does to the rows, and a
+/// jump to those bills.
+Future<void> _glanceSplitSheet(BuildContext context, Map h, int splitBills, {String key = 'split'}) => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: '$splitBills bill(s) paid across more than one method',
+      drill: glanceDrillOf(h, key),
+      children: [
+        Text(kGlanceSplitRule, style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceBillListNote, style: _glanceNote()),
+      ],
+    );
 
 /// NON-CHARGEABLE TODAY, under the by-method block (client item 5). A bill
 /// settled as NC took 0.00, so it has no row among the modes (the server drops
@@ -1554,55 +2052,63 @@ Widget? _headlineByMethod(BuildContext context, Map h, {int columns = 2}) {
 /// drawer that never came in. So it is its own labelled line — `today_nc`,
 /// server-authored — shown even on a day when no mode took anything. The web
 /// `headline-stats.tsx` draws the same line. Null when there is nothing today,
-/// or the payload is from a backend without it.
+/// or the payload is from a backend without it. It opens a sheet whose jump is
+/// the NC Summary for the day (item 10).
 Widget? _headlineNc(BuildContext context, Map h) {
   final nc = NcSettle.headlineNc(h);
   if (nc == null) return null;
   final text = Theme.of(context).textTheme;
-  return Column(
-    key: const ValueKey('headline-nc'),
-    crossAxisAlignment: CrossAxisAlignment.start,
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
-      const SizedBox(height: 4),
-      Text(NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v)), style: text.titleSmall),
-      if (nc.hint.isNotEmpty) ...[
-        const SizedBox(height: 3),
-        Text(nc.hint,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+  final line = NcSettle.besideLine(nc.bills, nc.value, (v) => _money(v));
+  return _glanceTap(
+    key: const ValueKey('glance-nc'),
+    semantics: '${nc.label}, $line, opens details',
+    onTap: () => _glanceSheet(
+      context,
+      eyebrow: _glanceEyebrow(h, 'Today at a glance'),
+      title: nc.label,
+      drill: glanceDrillOf(h, 'nc'),
+      children: [
+        _detailRow(context, 'NC bills', '${nc.bills}'),
+        _detailRow(context, 'Given away', _money(nc.value)),
+        if (nc.hint.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(nc.hint, style: _glanceNote()),
+        ],
       ],
-    ],
+    ),
+    child: Column(
+      key: const ValueKey('headline-nc'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(nc.label.toUpperCase(), maxLines: 2, overflow: TextOverflow.ellipsis, style: text.labelSmall),
+        const SizedBox(height: 4),
+        Text(line, style: text.titleSmall),
+        if (nc.hint.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Text(nc.hint,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10.5, height: 1.25, color: AppColors.textSecondary)),
+        ],
+      ],
+    ),
   );
 }
 
-/// The Accounting window the by-method drill-down jumps to: the day the sheet
-/// was about.
-///
-/// The SERVER's day, not the device's. The sheet names `today` off the headline
-/// payload, and a till whose clock has already crossed midnight — or that sits
-/// in another zone — must not land on a different day from the one it printed.
-/// When the two agree, which is every ordinary tap, it is stored as the Today
-/// PRESET, so coming back to Accounting after midnight moves with the calendar
-/// like any other Today; when they do not, the server's day is pinned.
-///
-/// What still differs on that day is Accounting's card, not the window: its
-/// "By payment method" is /reports/sales by_method, which has no Unallocated
-/// row and takes no refunds off. So its bar matches this sheet's Collected on
-/// every bill whose split parts add up — production holds no split that does
-/// not — and a bad split's residual is on this sheet alone. Routing that card through
-/// settlementByMethod too is its own change: it moves an existing report.
-DateRange _headlineAccountingWindow(String serverToday) {
-  final device = DateRange.fromPreset(RangePreset.today);
-  if (!isDayKey(serverToday) || serverToday == device.from) return device;
-  return DateRange(from: serverToday, to: serverToday, preset: RangePreset.custom);
-}
-
 /// One mode's drill-down from [_headlineByMethod]: what it took today, what
-/// came back off it, and a jump to Accounting on that same day — hidden when
-/// Accounting is not reachable for this user, which [_detailSheet] decides.
+/// came back off it, and where to read more — the Settlement Summary on that
+/// same day first, that mode's own bills in Accounting second. Each is hidden
+/// when this user cannot open it, which [_glanceSheet] decides.
+///
+/// The Settlement Summary is the report these rows ARE (settlementByMethod), so
+/// Unallocated and refunds read there as they read here. Accounting's "By
+/// payment method" card is /reports/sales by_method — no Unallocated row, no
+/// refunds taken off — and its bill list filters on the one method stored on a
+/// bill, so a bill paid in parts is under Split there; the sheet says so.
+///
+/// [drill] overrides the row's own (Cash collection passes the tile's); [extra]
+/// adds lines under the figures.
 Future<void> _headlineMethodSheet(
   BuildContext context, {
   required Map mode,
@@ -1611,23 +2117,22 @@ Future<void> _headlineMethodSheet(
   required String hint,
   required String today,
   required int splitBills,
+  GlanceDrill? drill,
+  List<Widget> extra = const [],
 }) {
   final text = Theme.of(context).textTheme;
   final method = '${mode['method'] ?? ''}'.trim();
   final refund = _numOf(mode['refund']);
-  final note = TextStyle(fontSize: 11, height: 1.3, color: AppColors.textSecondary);
-  return _detailSheet(
+  final note = _glanceNote();
+  final canOpen = ModuleNavigator.of(context)?.canOpen ?? (_) => false;
+  // Said only where Accounting is actually one of the places offered.
+  final toBills = drill != null &&
+      (drill.resolve(canOpen)?.module == 'Accounting' || drill.resolveSecondary(canOpen)?.module == 'Accounting');
+  return _glanceSheet(
     context,
     eyebrow: today.isEmpty ? label : '$label · ${_fmtDay(today)}',
     title: '${PaymentModes.reportName(mode, method)} · ${_money(mode['amount'])}',
-    jumpTo: 'Accounting',
-    // Land on THIS DAY. Accounting opens on the window it last showed — Last 30
-    // days on a first visit — and its Cash bar there is a month of cash beside
-    // the day's figure the owner just tapped. A remembered window rather than a
-    // focus request: Accounting reads no focus, and a request left parked on
-    // the shell would reset the window again on the next remount, after the
-    // owner had moved the chip themselves.
-    beforeJump: () => DateRangeMemory.remember('accounting', _headlineAccountingWindow(today)),
+    drill: drill,
     children: [
       _detailRow(context, 'Collected', _money(mode['amount']), trailing: '${_int(mode['bills']) ?? 0} bill(s)'),
       _detailRow(context, "Share of today's gross", share),
@@ -1652,6 +2157,14 @@ Future<void> _headlineMethodSheet(
       if (hint.isNotEmpty) ...[
         const SizedBox(height: AppSpacing.sm),
         Text(hint, style: note),
+      ],
+      if (extra.isNotEmpty) ...[
+        const SizedBox(height: AppSpacing.sm),
+        ...extra,
+      ],
+      if (toBills) ...[
+        const SizedBox(height: AppSpacing.sm),
+        Text(kGlanceBillListNote, style: note),
       ],
     ],
   );
@@ -2814,7 +3327,14 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           // Renders nothing at all when the read was refused or failed. See
           // [_overviewHeadline]: the three states are the whole of this card's
           // correctness, and "no box" is one of them.
-          ..._overviewHeadline(context, data['headline'] as Map?, columns: headlineCols),
+          ..._overviewHeadline(
+            context,
+            data['headline'] as Map?,
+            columns: headlineCols,
+            // The count this page already fetched for its Operations tile; the
+            // empty-day sentence names it (item 10). Null when not fetched.
+            openBills: _int((data['openBills'] as Map?)?['total']),
+          ),
 
           if (statCards.isNotEmpty) ...[
             _dashGrid(statCards, cols),
@@ -3556,8 +4076,19 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
 
             final title = Text('Table ${_s(o, 'table')}',
                 style: text.titleSmall, maxLines: 1, overflow: TextOverflow.ellipsis);
-            final desc = Text('${_s(o, 'customer', 'Guest')} · ${items.length} item(s)',
-                style: text.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis);
+            // CLIENT ITEM 4: a ticket a dish move emptied says what left it and
+            // where ("Moved to 31: 1 × NOT YOUR PUCHKA"), not "0 item(s)"; a
+            // ticket that arrived by a move says where from.
+            final movedAway = movedAwayLine(o);
+            final movedFrom = _s(o, 'moved_from', '');
+            final desc = Text(
+                movedAway != null && items.isEmpty
+                    ? movedAway
+                    : '${_s(o, 'customer', 'Guest')} · ${items.length} item(s)',
+                key: ValueKey('order-desc-${o['id']}'),
+                style: text.bodySmall,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis);
             final emoji = orderType == 'delivery'
                 ? '🛵'
                 : orderType == 'takeaway'
@@ -3580,6 +4111,8 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                   // no `kot_nos` must not grow a "KOT —" line implying the
                   // ticket was never sent to the kitchen.
                   if (kotLabel.isNotEmpty) _kv('KOT', kotLabel),
+                  if (movedFrom.isNotEmpty) _kv('Moved from', 'Table $movedFrom'),
+                  if (movedAway != null) _kv('Moved', movedAway),
                   _kv('Placed', placedLabel.isEmpty ? '\u2014' : placedLabel),
                   _kv('Taken by', _s(o, 'taken_by_employee_name', '\u2014')),
                   // D2's span as a line rather than a chip. Not live here — a
@@ -3726,9 +4259,15 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                     Text(_money(o['total']), style: text.titleSmall),
                   ],
                 ]),
-                if (stale || focused || orderType != 'dine_in') ...[
+                if (stale || focused || orderType != 'dine_in' || movedFrom.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   Wrap(spacing: 6, runSpacing: 6, children: [
+                    if (movedFrom.isNotEmpty)
+                      InfoChip(
+                        key: ValueKey('order-moved-from-${o['id']}'),
+                        icon: Icons.move_down,
+                        label: 'Moved from $movedFrom',
+                      ),
                     if (stale)
                       StatusChip(
                         label: 'Over 24h · unsettled',
@@ -3776,7 +4315,9 @@ Widget ordersModule(RestClient rest, Profile p) => AsyncView<Map<String, dynamic
                               rest: rest,
                               profile: p,
                               orderId: '${o['id']}',
-                              value: voidValue(o['total']))) {
+                              value: voidValue(o['total']),
+                              // Never ticketed: a waiter keeps this (item 3).
+                              pending: true)) {
                             reload();
                           }
                         },
@@ -3896,14 +4437,48 @@ List<Map<String, dynamic>> _parseMenuRows(List<List<String>> rows) {
   return items;
 }
 
-Widget menuModule(RestClient rest, Profile p) {
-  // Selected category tab (0 = All). Captured by the builder closure so the
-  // choice survives AsyncView reloads after edits.
-  var tab = 0;
-  // Live search text — also captured, so a reload (edit/toggle/delete) keeps
-  // the operator inside the same result set.
-  var query = '';
-  return AsyncView<Map<String, dynamic>>(
+Widget menuModule(RestClient rest, Profile p) => _MenuModule(rest: rest, profile: p);
+
+/// The Menu module. A StatefulWidget for one reason: HomeShell calls
+/// `menuModule(rest, p)` on EVERY build of the shell, and the shell rebuilds on
+/// any MediaQuery change — the phone keyboard sliding away after a search, a
+/// window resize — and on any of its own setStates. When the tab and the search
+/// were locals of that function, each of those rebuilds made fresh ones, and the
+/// operator's search was wiped the moment the keyboard went down to show the
+/// results (CLIENT ITEM 6, 2.0.2). Held here, only a deliberate remount (the
+/// shell's refresh) starts the Menu afresh.
+class _MenuModule extends StatefulWidget {
+  const _MenuModule({required this.rest, required this.profile});
+
+  final RestClient rest;
+  final Profile profile;
+
+  @override
+  State<_MenuModule> createState() => _MenuModuleState();
+}
+
+class _MenuModuleState extends State<_MenuModule> {
+  // Selected category tab (0 = All). Survives AsyncView reloads after edits.
+  int tab = 0;
+  // The search the list is filtered on — also kept, so a reload (edit/toggle/
+  // delete) leaves the operator inside the same result set. Written only by
+  // the search box; the empty state's "Clear search" clears the box.
+  String query = '';
+  // Owned here rather than by the box: the box sits in a lazily built list and
+  // can be built away and back while the search should stay.
+  final TextEditingController _search = TextEditingController();
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rest = widget.rest;
+    final p = widget.profile;
+    return AsyncView<Map<String, dynamic>>(
       load: () async {
         final items = await rest.getList('/menu');
         // Enrich each item with its theoretical cost + margin (recipe/BOM based).
@@ -4394,7 +4969,12 @@ Widget menuModule(RestClient rest, Profile p) {
                 ForkButton.ghost(label: 'Queue pre-order menu', icon: Icons.timer_outlined, dense: true, onPressed: queueMenu),
               ]),
               const SizedBox(height: AppSpacing.lg),
-              _MenuSearchField(initial: query, onChanged: (v) => setTab(() => query = v)),
+              AppSearchField(
+                testId: 'menu-search',
+                hint: 'Search menu…',
+                controller: _search,
+                onQuery: (q) => setTab(() => query = q),
+              ),
               if (cats.isNotEmpty && !searching) ...[
                 const SizedBox(height: AppSpacing.xl),
                 ForkTabs(tabs: tabs, selected: tab, onSelected: (i) => setTab(() => tab = i)),
@@ -4410,7 +4990,7 @@ Widget menuModule(RestClient rest, Profile p) {
                       label: 'Clear search',
                       icon: Icons.clear,
                       dense: true,
-                      onPressed: () => setTab(() => query = ''),
+                      onPressed: _search.clear,
                     ),
                   )
                 else ...[
@@ -4442,62 +5022,6 @@ Widget menuModule(RestClient rest, Profile p) {
           );
         });
       },
-    );
-}
-
-// Menu search box. Owns (and disposes) its controller; [initial] seeds it and
-// re-syncs when the module clears the query from elsewhere (the empty-state
-// "Clear search" action), mirroring the order-entry search idiom.
-class _MenuSearchField extends StatefulWidget {
-  const _MenuSearchField({required this.initial, required this.onChanged});
-
-  final String initial;
-  final ValueChanged<String> onChanged;
-
-  @override
-  State<_MenuSearchField> createState() => _MenuSearchFieldState();
-}
-
-class _MenuSearchFieldState extends State<_MenuSearchField> {
-  late final TextEditingController _c = TextEditingController(text: widget.initial);
-
-  @override
-  void didUpdateWidget(_MenuSearchField old) {
-    super.didUpdateWidget(old);
-    if (widget.initial != _c.text) _c.text = widget.initial;
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  void _set(String v) {
-    widget.onChanged(v);
-    setState(() {/* refresh the clear button */});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return TextField(
-      controller: _c,
-      decoration: InputDecoration(
-        prefixIcon: const Icon(Icons.search, size: 18),
-        hintText: 'Search menu…',
-        isDense: true,
-        suffixIcon: _c.text.isEmpty
-            ? null
-            : IconButton(
-                icon: const Icon(Icons.clear, size: 18),
-                tooltip: 'Clear search',
-                onPressed: () {
-                  _c.clear();
-                  _set('');
-                },
-              ),
-      ),
-      onChanged: _set,
     );
   }
 }
@@ -5832,7 +6356,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
   // The term the SERVER is filtering on (the field debounces into it), so a
   // search spans the whole trail rather than the pages scrolled in so far.
   String _query = '';
-  Timer? _debounce;
 
   // Mirrors the backend's Audit_log_category enum, in the same order the web
   // dashboard lists it. 'All' is the absence of the filter, not a value.
@@ -5875,7 +6398,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
 
   @override
   void dispose() {
-    _debounce?.cancel();
     _scroll.dispose();
     _search.dispose();
     super.dispose();
@@ -5979,16 +6501,13 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
     if (pos.pixels >= pos.maxScrollExtent - 400) _load(append: true);
   }
 
-  // Typing re-queries the SERVER, so it filters the whole trail; the debounce
-  // keeps that to one request per pause rather than one per keystroke.
-  void _onSearchChanged(String v) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 300), () {
-      final next = v.trim();
-      if (!mounted || next == _query) return;
-      setState(() => _query = next);
-      _load();
-    });
+  // Typing re-queries the SERVER, so it filters the whole trail; the box's
+  // debounce keeps that to one request per pause rather than one per
+  // keystroke, and an emptied box re-queries at once.
+  void _onSearchQuery(String next) {
+    if (!mounted || next == _query) return;
+    setState(() => _query = next);
+    _load();
   }
 
   /// Every filter change funnels through here, because all of them share one
@@ -6096,8 +6615,6 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       _query.isNotEmpty || _category != 'All' || _from.isNotEmpty || _to.isNotEmpty;
 
   void _clearFilters() {
-    _search.clear();
-    _debounce?.cancel();
     _applyFilters(() {
       _preset = 0;
       _from = '';
@@ -6105,6 +6622,9 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       _category = 'All';
       _query = '';
     });
+    // After the reload above, so the box's '' finds the query already empty
+    // and does not send a second request.
+    _search.clear();
   }
 
   /// The window in words, in the RESTAURANT's zone — so the reader can tell a
@@ -6203,14 +6723,12 @@ class _AuditLogViewState extends State<_AuditLogView> with CachePrimedScreen {
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-        child: TextField(
+        child: AppSearchField(
+          testId: 'audit-search',
+          hint: 'Filter by action, employee, or detail…',
           controller: _search,
-          decoration: const InputDecoration(
-            prefixIcon: Icon(Icons.search, size: 18),
-            hintText: 'Filter by action, employee, or detail…',
-            isDense: true,
-          ),
-          onChanged: _onSearchChanged,
+          debounce: const Duration(milliseconds: 300),
+          onQuery: _onSearchQuery,
         ),
       ),
       Padding(
@@ -6950,77 +7468,51 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
       builder: (context, data, reload) {
         final scope = FloorScope.of(p, surface: surface);
         final allRows = (data['tables'] as List?) ?? const [];
-        // REQUIREMENT C3 — "the table should clear/reset from their view".
+        // CLIENT ITEMS 1 AND 2 — A PRINTED TABLE STAYS ON EVERY FLOOR.
         //
-        // THEIR VIEW, and nothing else. The row leaves this one grid on this one
-        // device; the table is still occupied, still owes the money, still on
-        // every manager's screen and still on the Floor plan. Nothing is written
-        // — see [BillPrintScope] for why "clear the table" could not be what was
-        // meant, given C2 says the same waiter may not settle.
-        //
-        // Only on the SERVICE surface. The floor plan is a picture of the room,
-        // and a room with a table missing out of it is not a floor plan.
+        // C3 used to filter a printed table off a waiter's grid ("clear from
+        // their view"). Gaia settles its bills at night, so that emptied the
+        // waiter's floor of every pending bill for hours: "if a bill is not
+        // settled, the table completely vanishes". The printed table now stays,
+        // orange ([FloorState.printed]), and nothing is filtered on the service
+        // surface — see [BillPrintScope.retiresTable].
         //
         // CLIENT ITEM 6 — AND THE ROOM HAS NO "12 #2" IN IT. A next-party seat
         // ([isNextPartyRow]) is a second name for a table the plan already
         // draws, opened by the server when 12's bill was printed and retired
         // once it is idle; it is not furniture, so the layout editor never
-        // shows it. On the service surface it is an ordinary row and passes
-        // the C3 filter below on ITS OWN print state: the printed party at 12
-        // leaves the waiter's grid, and the tile for the next party at 12 is
-        // exactly what they are left with.
+        // shows it. On the service surface it is an ordinary row: the green
+        // "12" beside the orange one.
         final List rows = surface != FloorSurface.service
             ? [for (final r in allRows) if (!isNextPartyRow(r as Map)) r]
-            : [
-                for (final r in allRows)
-                  if (!BillPrintScope.of(p,
-                          // THE SERVER DECIDES, AND THE `??` IS THE WHOLE POINT.
-                          // When the row carries print state at all, that state
-                          // is the answer — including when it says "not printed"
-                          // and this tablet remembers otherwise. The per-device
-                          // memory is reached ONLY on the null, which means the
-                          // backend shipped no print state on this payload; see
-                          // [serverBillPrintState] for the exact keys and
-                          // [PrintedBills] for what that fallback is worth (it
-                          // survives a restart, not a reinstall and not a second
-                          // tablet).
-                          printed: serverBillPrintState(r as Map) ??
-                              PrintedBills.instance
-                                  .printed(p.resId, p.outletId, _s(r, 'table_name')))
-                      .retiresTable)
-                    r,
-              ];
+            : allRows;
         final zones = ((data['zones'] as List?) ?? const []).map((z) => '$z').toList();
         final zoneError = _s(data, 'zone_error', '');
         final zoneOrder = (data['order'] as Map?)?.cast<String, int>() ?? const <String, int>{};
         final zoneBorn = (data['born'] as Map?)?.cast<String, DateTime>() ?? const <String, DateTime>{};
-        // Counted off the SAME three-state rule the cards paint with, so the
-        // legend can never disagree with what is on screen.
-        final occ = rows.where((r) => _tableState(r as Map).label == 'Occupied').length;
-        final waiting = rows.where((r) => _tableState(r as Map).label == 'Seated').length;
-        // A PARTY at "12 #2" is counted like any other (it is somebody to
-        // serve), but an idle next-party seat is not a free TABLE — 12 is
-        // already counted — and it carries 12's booking, so it would count a
+        // Counted off the SAME rule the tiles paint with ([_floorState]), so the
+        // legend can never disagree with what is on screen. A PARTY at "12 #2"
+        // is counted like any other (somebody to serve, or a bill to settle),
+        // but an idle next-party seat is not a free TABLE — 12 is already
+        // counted — and it carries 12's booking, so it would count a
         // reservation twice. Free and Reserved are the room's.
-        final res = rows
-            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Reserved')
-            .length;
-        final free = rows
-            .where((r) => !isNextPartyRow(r as Map) && _tableState(r).label == 'Free')
-            .length;
+        final floorStates = <FloorState>[
+          for (final r in rows)
+            if (_floorState(r as Map, p) case final s
+                when !(isNextPartyRow(r) && (s == FloorState.free || s == FloorState.reserved)))
+              s,
+        ];
         // A caller (an order notification's "Open T4") asked us to focus a table.
         final focus = _focusOf(context, 'Tables');
         final focusTable = focus?.tableName ?? focus?.idOf(const ['table_name']);
         final focusFound = focusTable != null && rows.any((r) => _s(r as Map, 'table_name') == focusTable);
+        // CLIENT ITEMS 1 AND 2: "3 Running · 8 Bill printed · 2 Seated · 23 Free",
+        // in the tiles' own inks. A state with no table is left out, as "0
+        // Seated" always was. "N Bill printed" is the night-settle backlog, and
+        // a tap narrows the floor to it ([PrintedBacklogFilter]).
         final serviceLegend = <Widget>[
-          StatusChip(label: '$occ Occupied', color: AppColors.copper, dense: true),
-          // Only when there IS one. A restaurant where every seated table has
-          // ordered should not carry a permanent "0 Seated" chip explaining a
-          // distinction it never sees.
-          if (waiting > 0)
-            StatusChip(label: '$waiting Seated', color: AppColors.warning, dense: true),
-          StatusChip(label: '$res Reserved', color: AppColors.info, dense: true),
-          StatusChip(label: '$free Free', color: AppColors.neutral, dense: true),
+          for (final row in floorLegend(floorStates, withCounts: true))
+            FloorLegendChip(key: ValueKey('floor-legend-${row.state.name}'), state: row.state, label: row.label),
         ];
         // 2.1 — ON THE FLOOR PLAN THE HEADER READS THE ROOM, NOT THE SERVICE.
         // "4 Occupied · 23 Free" is the Tables screen's read-out (2.2), and the
@@ -7061,7 +7553,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                   context, rest, [for (final r in allRows) if (!isNextPartyRow(r as Map)) r], reload),
             ),
         ];
-        return Scaffold(
+        return PrintedBacklogFilter(states: floorStates, child: Scaffold(
           backgroundColor: Colors.transparent,
           // See [FloorScope.addTable]: the floor's layout controls travel
           // together, and a waiter has none of them.
@@ -7103,13 +7595,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
           ),
           // A restaurant with zones but no tables yet is a real state now that a
           // zone can exist on its own — don't hide the roster behind "no tables".
-          body: rows.isEmpty && allRows.isNotEmpty
-              // C3: every table this waiter had is printed and off their list.
-              // Said in words, because a blank grid on the screen they land on
-              // reads as an outage rather than as a finished section.
-              ? _empty('Nothing open for you right now — every table you printed '
-                  'has gone to a manager to settle.')
-              : rows.isEmpty && zones.isEmpty
+          body: rows.isEmpty && zones.isEmpty
               ? _empty(scope.addTable
                   ? 'No tables yet — add one with the button below.'
                   : 'No tables on the floor yet.')
@@ -7177,6 +7663,11 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                         padding: const EdgeInsets.only(bottom: 10),
                         child: Wrap(spacing: 6, runSpacing: 6, children: headerActions),
                       ),
+                    // CLIENT ITEMS 1 AND 2 — the waiter's colour key: what green,
+                    // orange and the rest mean, with no counts (a count of the
+                    // restaurant's tables is the summary they do not get).
+                    if (!scope.floorSummary && surface == FloorSurface.service)
+                      const Padding(padding: EdgeInsets.only(bottom: 10), child: FloorColourKey()),
                     // Floor SECTIONS — create / rename / un-label, and drag a
                     // table from one zone to another. See [_FloorSections].
                     _FloorSections(
@@ -7193,7 +7684,7 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
                     ),
                   ]),
                 ),
-        );
+        ));
       },
     );
 
@@ -7981,7 +8472,14 @@ class _FloorSectionsState extends State<_FloorSections> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
-    final all = widget.rows.map((r) => r as Map).toList();
+    // CLIENT ITEMS 1 AND 2: the owner's "N Bill printed" chip narrows the floor
+    // to the night-settle backlog ([PrintedBacklogFilter]). Service only.
+    // Only while a printed table is there to show (PrintedBacklogFilter.activeOf).
+    final onlyPrinted = widget.surface == FloorSurface.service && PrintedBacklogFilter.activeOf(context);
+    final all = [
+      for (final r in widget.rows)
+        if (!onlyPrinted || _floorState(r as Map, widget.profile) == FloorState.printed) r as Map,
+    ];
     // Grouped on the lower-cased name so a table labelled "Patio" lands in the
     // roster's "patio" instead of splitting the floor into two look-alike zones.
     final groups = <String, List<Map>>{};
@@ -7995,10 +8493,13 @@ class _FloorSectionsState extends State<_FloorSections> {
     // Every zone on the roster gets a group even when nothing is in it. This is
     // the whole point of reading the roster: an empty zone has no table to be
     // inferred from, so before this it simply did not exist on this screen.
-    _zonesNow().forEach((key, name) {
-      groups.putIfAbsent(key, () => <Map>[]);
-      labels.putIfAbsent(key, () => name);
-    });
+    // (Not while the printed-only filter is on: an empty zone has no backlog.)
+    if (!onlyPrinted) {
+      _zonesNow().forEach((key, name) {
+        groups.putIfAbsent(key, () => <Map>[]);
+        labels.putIfAbsent(key, () => name);
+      });
+    }
     // The owner's arrangement, falling through to alphabetical for anything
     // they have not placed. "Unassigned" is never IN this list — it always
     // renders last, so no table can hide behind a section it hasn't been given.
@@ -8422,12 +8923,14 @@ class _ReorderSectionsDialogState extends State<_ReorderSectionsDialog> {
 //   Seated    a party is seated — counted, timed, waiter assigned, OTP minted —
 //             and has not ordered yet. This is the state that used to be
 //             painted as Occupied and was the actual complaint.
-//   Occupied  seated AND food is on the bill.
+//   Running   seated AND food is on the bill (1.8.7 to 2.0.1 said "Occupied").
+//   Bill printed  the same, once the bill has been printed — client items 1
+//             and 2 (models/floor_state.dart).
 //
 // Everything money-adjacent on this card still keys on SEATED, never on the
 // display state: the covers chip, the OTP, the bill line, and every action in
-// the sheet. The only things the new state changes are the chip, the tint and
-// the legend.
+// the sheet. The only things the states change are the chip, the tint and the
+// legend.
 
 /// Is a party physically at this table? The seating fact — `is_occupied` —
 /// under whichever name this backend sends it.
@@ -8442,48 +8945,37 @@ bool _tableSeated(Map t) => t['seated'] == true || t['occupied'] == true;
 /// claim about the floor.
 bool _tableHasOrder(Map t) => t.containsKey('has_order') ? t['has_order'] == true : true;
 
-/// How strongly a table tile is washed with its state colour.
+/// The five-state floor status ([floorStateOf]). `reserved` covers both an
+/// active booking window and an upcoming one, and never outranks a party who is
+/// actually sitting there. How strongly each state washes its tile is
+/// [floorWash]; its ink is [floorInk] — fixed per scheme, never the accent.
 ///
-/// One place to tune the floor's readability, because these three numbers are
-/// the whole difference between "I can see which tables are busy" and "I have to
-/// read every card". They are alphas composited over `AppColors.card`
-/// (0xFF1B1716), so they behave the same way under every shell scheme rather
-/// than being hand-picked hexes that only work against one background.
-///
-/// Ordered by how much the state wants attention, and deliberately NOT equal:
-/// Occupied is the state the floor is scanned for, so it is the loudest.
-const double _kOccupiedWash = 0.20;
-const double _kSeatedWash = 0.16;
-const double _kReservedWash = 0.13;
+/// PRINTED is the SERVER'S print state for this seating. This device's memory
+/// ([PrintedBills]) answers only when the row carries no print state at all —
+/// a backend older than those fields; see [serverBillPrintState].
+FloorState _floorState(Map t, Profile p) => floorStateOf(
+      seated: _tableSeated(t),
+      hasOrder: t.containsKey('has_order') ? t['has_order'] == true : null,
+      printed: serverBillPrintState(t) ??
+          PrintedBills.instance.printed(p.resId, p.outletId, _s(t, 'table_name')),
+      reserved: t['reserved'] == true || t['booked'] == true,
+    );
 
-/// The three-state floor status. `reserved` covers both an active booking
-/// window and an upcoming one, and never outranks a party who is actually
-/// sitting there.
-({String label, Color color}) _tableState(Map t) {
-  final seated = _tableSeated(t);
-  if (seated && _tableHasOrder(t)) return (label: 'Occupied', color: AppColors.copper);
-  // Amber, not copper: a party sitting with nothing ordered is the one state on
-  // this floor plan that is asking somebody to go over. It is deliberately NOT
-  // the reserved blue either — a reserved table is a promise, this is a guest.
-  if (seated) return (label: 'Seated', color: AppColors.warning);
-  if (t['reserved'] == true || t['booked'] == true) return (label: 'Reserved', color: AppColors.info);
-  return (label: 'Free', color: AppColors.neutral);
+/// [_floorState] as the words and ink a chip draws.
+({String label, Color color}) _tableState(Map t, Profile p) {
+  final s = _floorState(t, p);
+  return (label: s.word, color: floorInk(s));
 }
 
-/// A one-line description of an order, for a picker that has to let somebody
-/// tell two tickets on the same table apart: how many lines and what it is
-/// worth. Falls back to the id only when the payload carries neither, so a row
-/// is never blank.
-String _kotSummary(Map order) {
-  // `/orders` carries `items` and `total` on the row itself; the nested `food`
-  // map is an older shape, still honoured so nothing that sends it goes blank.
-  final food = order['food'] is Map ? order['food'] as Map : order;
-  final items = (food['items'] as List?) ?? const [];
-  final total = food['total'] ?? food['subtotal'];
-  final n = items.length;
-  final money = total == null ? '' : ' \u00b7 ${_money(total)}';
-  if (n == 0 && money.isEmpty) return 'Order ${_s(order, 'id')}';
-  return '$n item${n == 1 ? '' : 's'}$money';
+/// When the bill in hand was last printed, as the restaurant's clock reads it
+/// ("13:32", or "16/09 13:32") — '' when the payload names no print. The LAST
+/// print, because that is the paper the guest is holding.
+String _printedClock(Map? row) {
+  for (final k in const ['printed_at', 'last_printed_at', 'bill_printed_at']) {
+    final v = '${row?[k] ?? ''}'.trim();
+    if (v.isNotEmpty) return printedClockOf(RestaurantTime.wallOf(v), RestaurantTime.nowWall());
+  }
+  return '';
 }
 
 /// Card width for one floor-plan tile inside a zone [available] px wide.
@@ -8543,12 +9035,14 @@ class _TableBox extends StatelessWidget {
     final shownName = tableDisplayName(table);
     // `occupied` here is the SEATING — a party is physically at this table —
     // and it is what every money-adjacent line below keys on. What the card
-    // SAYS is a separate decision with three answers; see _tableState.
+    // SAYS is a separate decision with five answers; see _floorState.
     final occupied = _tableSeated(table);
-    final reserved = table['reserved'] == true || table['booked'] == true;
-    final state = _tableState(table);
-    final status = state.label;
-    final stateColor = state.color;
+    final floor = _floorState(table, profile);
+    final status = floor.word;
+    final stateColor = floorInk(floor);
+    // CLIENT ITEMS 1 AND 2: the orange tile says when its paper was printed,
+    // whether the bill has grown since, and under which name it was printed.
+    final printed = floor == FloorState.printed;
     // A seated party who has not ordered is tinted like the state they are in,
     // so the floor reads at a glance without anyone parsing a chip.
     final awaitingOrder = occupied && !_tableHasOrder(table);
@@ -8605,7 +9099,6 @@ class _TableBox extends StatelessWidget {
         constraints: const BoxConstraints(minHeight: 128),
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          gradient: occupied || reserved ? null : AppColors.cardGradient,
           // OCCUPIED AND FREE MUST BE TELLABLE APART ACROSS THE ROOM.
           //
           // These washes used to be 0.07 / 0.07 / 0.06 over AppColors.card,
@@ -8618,40 +9111,35 @@ class _TableBox extends StatelessWidget {
           // READ the card to know whether there is a party at it.
           //
           // The fills below are strong enough to carry the state on their own,
-          // and the status pill now confirms what the colour already said rather
-          // than being the only thing that says it. Each state keeps its own hue
-          // — copper earns, amber wants attention, blue is a promise — so this is
-          // more contrast, not a new vocabulary.
-          color: awaitingOrder
-              ? Color.alphaBlend(AppColors.warning.withValues(alpha: _kSeatedWash), AppColors.card)
-              : occupied
-                  ? Color.alphaBlend(AppColors.copper.withValues(alpha: _kOccupiedWash), AppColors.card)
-                  : reserved
-                      ? Color.alphaBlend(AppColors.info.withValues(alpha: _kReservedWash), AppColors.card)
-                      : null,
+          // and the status pill confirms what the colour already said rather
+          // than being the only thing that says it. CLIENT ITEMS 1 AND 2: every
+          // state has its own FIXED ink (green free, amber seated, red running,
+          // orange printed, blue reserved — [floorInk]), and a free table is
+          // washed green too, faintly ([floorWash]).
+          color: Color.alphaBlend(stateColor.withValues(alpha: floorWash(floor)), AppColors.card),
           borderRadius: AppRadius.cardAll,
           border: Border.all(
             color: focused
                 ? AppColors.copperHi
-                : awaitingOrder
-                    ? AppColors.warning.withValues(alpha: 0.60)
-                    : occupied
-                        ? AppColors.copper.withValues(alpha: 0.85)
-                        : reserved
-                            ? AppColors.info.withValues(alpha: 0.50)
-                            : AppColors.border,
+                : stateColor.withValues(
+                    alpha: switch (floor) {
+                      FloorState.running || FloorState.printed => 0.85,
+                      FloorState.seated => 0.60,
+                      FloorState.reserved => 0.50,
+                      FloorState.free => 0.45,
+                    }),
             // A busy table is outlined, not hairlined. At 1px against a 7%-white
             // border the occupied edge was the same weight as every free card's;
             // 2px is what makes the distinction survive being glanced at.
-            width: focused ? 2 : (occupied || awaitingOrder ? 2 : 1),
+            width: focused || occupied ? 2 : 1,
           ),
-          // The copper glow is the "this table is earning" signal, so it belongs
-          // to Occupied alone. A seated table with no order gets the tint and
-          // the border but not the glow.
+          // The glow is the "this table owes money" signal: running and printed
+          // alone. A seated table with no order gets the tint and the border
+          // but not the glow.
           boxShadow: focused
               ? [BoxShadow(color: AppColors.copperHi.withValues(alpha: 0.22), blurRadius: 26, spreadRadius: 1)]
-              : occupied && !awaitingOrder
-                  ? [BoxShadow(color: AppColors.copper.withValues(alpha: 0.10), blurRadius: 24)]
+              : floor == FloorState.running || floor == FloorState.printed
+                  ? [BoxShadow(color: stateColor.withValues(alpha: 0.10), blurRadius: 24)]
                   : null,
         ),
         child: Column(
@@ -8689,21 +9177,41 @@ class _TableBox extends StatelessWidget {
                   duration: AppDurations.base,
                   switchInCurve: Curves.easeOut,
                   switchOutCurve: Curves.easeIn,
-                  child: StatusChip(
-                      key: ValueKey('table-$name-$status'),
-                      label: status,
-                      color: stateColor,
-                      dense: true),
+                  child: FloorStateChip(key: ValueKey('table-$name-$status'), state: floor),
                 ),
+                // "#2", neutral and small: the tile reads "12" like its root,
+                // and this says which party. "Next party" is its tooltip and
+                // its spoken label (and the words, on a server with no
+                // party_no).
                 if (nextParty)
-                  StatusChip(
+                  FloorChip(
                       key: ValueKey('next-party-chip-$name'),
-                      label: nextPartyChip,
-                      color: AppColors.info,
-                      dense: true),
+                      label: nextPartyBadge(table['party_no']) ?? nextPartyChip,
+                      color: AppColors.floorNextParty,
+                      tooltip: nextPartyChip),
                 ?apcTick,
               ],
             ),
+            if (printed) ...[
+              const SizedBox(height: 6),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                for (final chip in printedTileChips(
+                  printedClock: _printedClock(table),
+                  paperStale: paperStaleOf(table),
+                  printedAs: printedAsOf(table),
+                ))
+                  chip == paperStaleChip
+                      ? FloorChip(
+                          key: ValueKey('table-paper-stale-$name'),
+                          label: chip,
+                          color: AppColors.floorPrinted,
+                          maxLines: 2)
+                      : InfoChip(
+                          key: ValueKey('table-printed-$name-$chip'),
+                          icon: chip.startsWith('Printed as') ? Icons.swap_horiz : Icons.receipt_long_outlined,
+                          label: chip),
+              ]),
+            ],
             if (occupied && otp.isNotEmpty) ...[
               const SizedBox(height: 8),
               // Copper-accented, kept prominent — staff read this aloud to guests.
@@ -8989,7 +9497,7 @@ class _TableSheetState extends State<_TableSheet> {
   /// sheet that describes rather than decides. Every ACTION below reads
   /// [_occupied], the seating, because a party who has not ordered yet still
   /// needs Add order, Settle, Release and Edit seating.
-  ({String label, Color color}) get _state => _tableState(widget.table);
+  ({String label, Color color}) get _state => _tableState(widget.table, widget.profile);
   String get _orderUrl {
     final root = '${AppConfig.orderBaseUrl}/order/${widget.profile.restaurantUsername}';
     // Opaque token hides + locks the table in the URL (preferred).
@@ -9320,14 +9828,117 @@ class _TableSheetState extends State<_TableSheet> {
   /// [billPrintStateKeys]. It is NOT a second opinion: a server that says "not
   /// printed" is not overruled by this tablet's memory, because the server is
   /// describing the bill the guest is actually sitting in front of.
+  ///
+  /// The floor row this sheet was opened from answers too, before the bill has
+  /// loaded: /get-tables carries the same print state, and a printed table must
+  /// open ORANGE (client items 1 and 2), not as an unprinted one for a moment.
   bool get _billPrinted =>
       serverBillPrintState(_bill) ??
+      serverBillPrintState(widget.table) ??
       PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name);
 
-  /// Whether this reader may print this bill, and what happens to the table on
-  /// their screen once they have. One object asked at every affordance, for the
-  /// same reason [FloorScope] is.
-  BillPrintScope get _printScope => BillPrintScope.of(widget.profile, printed: _billPrinted);
+  /// CLIENT ITEMS 1 AND 2 — DOES THE PAPER STILL MATCH THE BILL? The bill's
+  /// own answer once it has loaded (the whole paper: lines, discount, charges),
+  /// the floor row's until then (the lines). Null is "not known".
+  bool? get _paperStale => _bill != null ? paperStaleOf(_bill) : paperStaleOf(widget.table);
+
+  /// Whether this reader may print this bill, and what the control says. One
+  /// object asked at every affordance, for the same reason [FloorScope] is.
+  BillPrintScope get _printScope =>
+      BillPrintScope.of(widget.profile, printed: _billPrinted, paperStale: _paperStale);
+
+  /// CLIENT ITEMS 1 AND 2 — the orange line at the top of a printed table's
+  /// sheet: when it was printed, whether it has grown since, and the name the
+  /// paper carries after a move. Said to everyone; none of it is money.
+  Widget _printedBanner(TextTheme text) {
+    final source = _bill ?? widget.table;
+    final chips = printedTileChips(
+      printedClock: _printedClock(source),
+      paperStale: _paperStale,
+      printedAs: printedAsOf(source),
+    );
+    return ForkCard(
+      key: const ValueKey('table-printed-banner'),
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(children: [
+        Icon(Icons.receipt_long, size: 18, color: AppColors.floorPrinted),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(chips.join(' · '),
+              style: text.titleSmall!.copyWith(color: AppColors.floorPrinted)),
+        ),
+      ]),
+    );
+  }
+
+  /// CLIENT ITEMS 1 AND 2 — "ADD TO PRINTED BILL", ASKED FIRST.
+  ///
+  /// The orange table's first control. It does not open the pad straight away:
+  /// the new food goes on paper the guest already holds, and the green seat
+  /// beside this table is where a NEW party's order belongs. So the confirm says
+  /// both — "12's bill was printed at 13:32. These items go on that bill and it
+  /// must be printed again. New guests? Use the green 12." — and only [Add to
+  /// printed bill] opens the pad that sends `add_to_printed_bill` (the server
+  /// refuses a waiter's addition without it). [Use green 12] opens the pad on
+  /// the green seat instead, whose first order seats the new party.
+  Future<void> _addToPrinted() async {
+    // The green seat, off the floor as it is now. A floor that cannot be read
+    // offers no green seat rather than a stale one.
+    Map? green;
+    try {
+      final rows = await widget.rest.getList('/get-tables');
+      green = greenSeatFor(widget.table, rows,
+          (r) => !_tableSeated(r) && r['has_order'] != true && r['reserved'] != true && r['booked'] != true);
+    } catch (_) {/* no green seat to offer */}
+    if (!mounted) return;
+    final parent = parentTableOf(widget.table);
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        key: const ValueKey('add-to-printed-confirm'),
+        backgroundColor: AppColors.surface,
+        title: Text(addToPrintedBillLabel(_name, parentTable: parent)),
+        content: Text(addToPrintedBillConfirm(
+          table: _name,
+          parentTable: parent,
+          printedClock: _printedClock(_bill ?? widget.table),
+          hasGreen: green != null,
+        )),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          if (green != null)
+            OutlinedButton(
+              key: const ValueKey('add-to-printed-use-green'),
+              onPressed: () => Navigator.pop(ctx, 'green'),
+              child: Text(useGreenTableLabel(tableDisplayName(widget.table))),
+            ),
+          FilledButton(
+            key: const ValueKey('add-to-printed-go'),
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.floorPrinted,
+              foregroundColor: AppColors.isLight ? Colors.white : AppColors.bg,
+            ),
+            onPressed: () => Navigator.pop(ctx, 'printed'),
+            child: const Text(addToPrintedBillAction),
+          ),
+        ],
+      ),
+    );
+    if (choice == null || !mounted) return;
+    final greenName = green == null ? '' : _s(green, 'table_name');
+    Navigator.of(context).pop();
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => choice == 'green' && greenName.isNotEmpty
+            // The green seat is free: its first order seats the new party,
+            // covers and all, whoever is taking it.
+            ? OrderEntryScreen(rest: widget.rest, tableName: greenName, occupyOnSend: true)
+            : OrderEntryScreen(rest: widget.rest, tableName: _name, addToPrintedBill: true),
+      ),
+    );
+    widget.reload();
+  }
 
   /// THE SERVER'S SERVICE CLOCK FOR THIS SEATING — requirement D2, measured
   /// once, on the machine that has the whole picture.
@@ -9428,6 +10039,12 @@ class _TableSheetState extends State<_TableSheet> {
     // the server renders, so a settings/profile hiccup must degrade to the old
     // name-only header rather than block the print.
     final paper = await _billPaper();
+    // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
+    // another till may have printed it since this sheet opened. The same
+    // tri-state C3 uses, so an older backend falls back to this device's
+    // memory and nothing else.
+    final printedBefore = serverBillPrintState(bill) ??
+        PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name);
     // 5.1 — and the LOGO, which this preview never drew. The logo the roll
     // prints (GET /restaurant/logo/bill: the SVG bill logo or the branding PNG,
     // fitted and thresholded exactly as the printer gets it), falling back to
@@ -9459,12 +10076,12 @@ class _TableSheetState extends State<_TableSheet> {
         // the caller's employee record — which is the person signed in here.
         cashier: widget.profile.firstName.trim(),
         printedAt: RestaurantTime.nowWall(),
-        // ROUND 2 ITEM 4 — read off the bill JUST fetched, not the sheet's copy:
-        // another till may have printed it since this sheet opened. The same
-        // tri-state C3 uses, so an older backend falls back to this device's
-        // memory and nothing else.
-        reprint: serverBillPrintState(bill) ??
-            PrintedBills.instance.printed(widget.profile.resId, widget.profile.outletId, _name),
+        reprint: printedBefore,
+        // CLIENT ITEMS 1 AND 2: a print that replaces paper the bill has
+        // outgrown says UPDATED BILL, and which print it replaces — the roll's
+        // own banner (escpos.ts), previewed.
+        updated: printedBefore && paperStaleOf(bill) == true,
+        replacesLine: replacesBillLine(_printedClock(bill)),
       ),
     );
     if (confirmed == true) {
@@ -9504,12 +10121,19 @@ class _TableSheetState extends State<_TableSheet> {
       return;
     }
     if (!mounted) return;
+    // An UPDATED bill when the paper the guest holds no longer matches — the
+    // one reprint a waiter may make (client items 1 and 2).
+    final updated = BillPrintScope.of(widget.profile,
+            printed: serverBillPrintState(bill) ?? _billPrinted, paperStale: paperStaleOf(bill))
+        .updated;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.surface,
-        title: Text('Print the bill for $_name?'),
-        content: Text('${lines.length} item(s) on this table. The printed bill goes to the guest.'),
+        title: Text(updated ? 'Print the updated bill for $_name?' : 'Print the bill for $_name?'),
+        content: Text(updated
+            ? '${lines.length} item(s) on this table. The updated bill goes to the guest and replaces the one they have.'
+            : '${lines.length} item(s) on this table. The printed bill goes to the guest.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Print')),
@@ -9517,31 +10141,27 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (ok != true) return;
-    final retires = BillPrintScope.of(widget.profile, printed: true).retiresTable;
-    if (!await _thermalPrint(messenger, announceNextParty: !retires)) return;
-    // ---- REQUIREMENT C3: the one print, and what it costs the waiter --------
+    final waiterOnly = RoleScope.isWaiterOnly(widget.profile);
+    if (!await _thermalPrint(messenger, announceNextParty: !waiterOnly)) return;
+    if (!waiterOnly) return;
+    // ---- REQUIREMENT C3, AS CLIENT ITEMS 1 AND 2 LEFT IT ---------------------
     //
-    // Asked as the state the print PUTS this reader in — "printed: true" — so
-    // the one rule in [BillPrintScope] answers here too rather than a second
-    // role test being written at the call site. It comes back false for every
-    // identity that is not waiter-only, so a manager's print marks nothing,
-    // retires nothing, and reads exactly as it did.
-    if (!BillPrintScope.of(widget.profile, printed: true).retiresTable) return;
+    // The print is remembered on this device for a backend that sends no print
+    // state (the fallback [_billPrinted] reads), and NOTHING IS WRITTEN to the
+    // table: it is still occupied and still owes the money. It no longer
+    // leaves the waiter's floor — it stays, orange, until a manager settles it
+    // at night — and the line says so, with the green seat the server opened
+    // for the next guests.
     await PrintedBills.instance.mark(widget.profile.resId, widget.profile.outletId, _name);
     if (!mounted) return;
-    // CLIENT ITEM 6: the table's NUMBER is not gone with it. The line names
-    // the seat the server opened for the next guests ("Seat the next party at
-    // 12 (next party).") — the tile the waiter will find on the floor below.
-    final seat = _nextPartySeat.message;
     messenger.showSnackBar(SnackBar(
-        duration: Duration(seconds: seat == null ? 4 : 7),
-        content: Text('${tableSentenceNameOf(widget.table)} is printed and with a manager to settle. '
-            'It has come off your tables.${seat == null ? '' : ' $seat'}')));
-    // The sheet closes and the floor reloads WITHOUT this table — that is the
-    // whole of "clear/reset from their view". NOTHING IS WRITTEN to the table:
-    // it is still occupied, still owes the money, and is still on every
-    // manager's screen. See [BillPrintScope] for why it cannot mean more than
-    // that without becoming the settle C2 forbids.
+        key: const ValueKey('table-printed-stays'),
+        duration: const Duration(seconds: 7),
+        content: Text(printedStaysMessage(
+          tableSentence: tableSentenceNameOf(widget.table),
+          root: tableDisplayName(widget.table),
+          hasGreen: _nextPartySeat.table != null,
+        ))));
     _popAndReload();
   }
 
@@ -9591,19 +10211,43 @@ class _TableSheetState extends State<_TableSheet> {
     if (dest == null || dest.isEmpty) return;
     try {
       final res = await widget.rest.post('/bills/move-item', {'from_table': _name, 'to_table': dest, 'item_name': name, 'price': price});
-      // CLIENT ITEM 6: moved onto a table whose bill is already printed — its
-      // paper is now short, and the line offers the reprint of THAT table.
-      final reprint = ReprintNeeded.parse(res, fallbackTable: dest);
-      if (reprint == null) {
-        messenger.showSnackBar(SnackBar(content: Text('Moved $name to Table $dest.')));
-      } else if (mounted) {
-        await askToReprint(context, widget.rest, reprint,
-            messenger: messenger, lead: 'Moved $name to Table $dest.');
-      }
+      // CLIENT ITEM 4: the answer names the dish and whether its docket is
+      // printing on the new table, under the KOT number the pass knows it by.
+      final said = movedItemSentence(toTable: dest, dishes: movedDishesOf(res), fallbackName: name, response: res);
+      await _afterMoveReprints(messenger, res, fallbackTable: dest, lead: said);
       await _loadBill();
       widget.reload();
     } catch (e) {
+      // A comped dish is refused in the server's words ("Reverse the comp
+      // first, then move it."), as is a printed bill.
       messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  /// What a move tells the person who pressed it: [lead] as a snackbar, or —
+  /// when the move changed a bill whose paper is already in a guest's hand —
+  /// one "Reprint the bill?" for each such table (CLIENT ITEMS 4 and 6). A move
+  /// changes two bills, so there can be two; this sheet's own table is reprinted
+  /// with its own Print.
+  Future<void> _afterMoveReprints(
+    ScaffoldMessengerState messenger,
+    Object? res, {
+    required String fallbackTable,
+    required String lead,
+  }) async {
+    final reprints = ReprintNeeded.parseAll(res, fallbackTable: fallbackTable);
+    if (reprints.isEmpty) {
+      messenger.showSnackBar(SnackBar(key: const ValueKey('move-result'), content: Text(lead)));
+      return;
+    }
+    var first = true;
+    for (final reprint in reprints) {
+      if (!mounted) return;
+      await askToReprint(context, widget.rest, reprint,
+          messenger: messenger,
+          lead: first ? lead : null,
+          printHere: reprint.table == _name ? () => _thermalPrint(messenger) : null);
+      first = false;
     }
   }
 
@@ -9742,28 +10386,45 @@ class _TableSheetState extends State<_TableSheet> {
   /// sent only when the person CHANGED it: the route reads an omitted field as
   /// "unchanged", so a name-only correction is exactly the request it always
   /// was, and keeps working on a server whose GSTIN column is not migrated yet.
+  ///
+  /// CLIENT ITEM 7 — and the guest's address, by the same rule: sent only when
+  /// it changed. A bill read from a server before item 7 carries no
+  /// `customer_address` key at all; then the address goes out only if somebody
+  /// typed in its box (and the answer is checked for it).
   Future<void> _editBillCustomerName(ScaffoldMessengerState messenger) async {
     final currentGstin = '${_bill?['customer_gstin'] ?? ''}'.trim();
+    final addressKnown = _bill?.containsKey('customer_address') ?? false;
+    final currentAddress = billCustomerAddressSeed(_bill?['customer_address']);
     final details = await _askBillCustomerDetails(
       context,
-      title: 'Name / GSTIN on bill · Table $_name',
+      title: 'Name / GSTIN / address on bill · Table $_name',
       // Said plainly because the behaviour is not obvious: the name is stored
       // on every running order, so it changes the whole table's bill, and a
       // settled bill is refused by this route (Accounting has its own).
-      explanation: 'This is the name printed at the top of the bill. It applies to the whole '
-          'table, and can be changed until the bill is settled. Leave it empty to '
-          'print no name.',
+      explanation: 'This is the name, GSTIN and address printed at the top of the bill. They apply '
+          'to the whole table, and can be changed until the bill is settled. Leave a box empty '
+          'to print nothing for it.',
       currentName: _bill?['customer'],
       currentGstin: currentGstin,
+      currentAddress: currentAddress,
     );
     if (details == null) return;
     final name = details.customer;
     final gstinChanged = details.gstin != normaliseBillCustomerGstin(currentGstin);
+    // See [billCustomerAddressToSend]: against a server that sends no address,
+    // an emptied box is not a request to clear one nobody here could see.
+    final addressChanged = billCustomerAddressToSend(
+      address: details.address,
+      seed: currentAddress,
+      known: addressKnown,
+      touched: details.addressTouched,
+    );
     try {
       final res = await widget.rest.post('/bills/customer-name', {
         'table_name': _name,
         'customer': name,
         if (gstinChanged) 'customer_gstin': details.gstin.isEmpty ? null : details.gstin,
+        if (addressChanged) 'customer_address': details.address.isEmpty ? null : details.address,
       });
       // The server's answer when it gave one: it normalises again, and `null`
       // is how it says the name was cleared.
@@ -9774,6 +10435,10 @@ class _TableSheetState extends State<_TableSheet> {
       // the paper.
       final gstinIgnored = gstinChanged && res is Map && !res.containsKey('customer_gstin');
       final savedGstin = res is Map && res.containsKey('customer_gstin') ? '${res['customer_gstin'] ?? ''}' : details.gstin;
+      // The same check for the address (a server before client item 7).
+      final addressIgnored = addressChanged && res is Map && !res.containsKey('customer_address');
+      final savedAddress =
+          res is Map && res.containsKey('customer_address') ? '${res['customer_address'] ?? ''}' : details.address;
       messenger.showSnackBar(SnackBar(
           content: Text([
         saved.isEmpty
@@ -9783,6 +10448,10 @@ class _TableSheetState extends State<_TableSheet> {
           'The GSTIN was not saved: this server has not finished updating.'
         else if (gstinChanged)
           savedGstin.isEmpty ? 'Customer GSTIN removed.' : 'Customer GSTIN: $savedGstin.',
+        if (addressIgnored && details.address.isNotEmpty)
+          billCustomerAddressNotSaved
+        else if (addressChanged && !addressIgnored)
+          savedAddress.trim().isEmpty ? 'Address removed.' : 'Address added to the bill.',
       ].join(' '))));
       await _loadBill();
       widget.reload();
@@ -9801,40 +10470,69 @@ class _TableSheetState extends State<_TableSheet> {
   /// Shown to anyone who may edit it (so an unnamed table can be named), and to
   /// everyone else only when there is something to read. Neither the name nor
   /// the GSTIN is money, so a waiter's scoping does not remove them (C4).
+  ///
+  /// CLIENT ITEM 7 — the address's first line under them (two lines at most;
+  /// the paper has room for all five). Not money either, so a scoped waiter
+  /// reads it on their own table too.
+  ///
+  /// THE BUTTON SITS UNDER THE LINES AT EVERY WIDTH, not only on a phone. Its
+  /// label, "Edit name / GSTIN / address", is 376px wide in Rustic Fork and
+  /// 412px in the Gaia skin (wider again with a larger text size), and this
+  /// card is never much wider than 600px, because a Material bottom sheet
+  /// stops at 640. Beside the lines, that label left the name 128–157px on the
+  /// Windows till, so "Acme Pvt Ltd" and the GSTIN wrapped, and it overflowed
+  /// the Gaia card in 490–510dp windows. No width suits "beside" for this
+  /// label, so the header never switches layouts.
   Widget? _billCustomerHeader(ScaffoldMessengerState messenger, TextTheme text) {
     if (!_occupied || _bill == null) return null;
     final name = billCustomerNameSeed(_bill!['customer']);
     final gstin = _s(_bill!, 'customer_gstin', '').trim();
+    final address = billCustomerAddressLines(_bill!['customer_address']);
     final mayEdit = _mayEditBillCustomerName(widget.profile, _scope);
-    if (!mayEdit && name.isEmpty && gstin.isEmpty) return null;
+    if (!mayEdit && name.isEmpty && gstin.isEmpty && address.isEmpty) return null;
+    final lines =
+        Column(key: const ValueKey('table-bill-customer-lines'), crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(name.isEmpty ? 'No guest name on the bill' : name,
+          key: const ValueKey('table-bill-customer'),
+          style: name.isEmpty ? text.bodySmall : text.titleSmall,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis),
+      if (gstin.isNotEmpty) ...[
+        const SizedBox(height: 2),
+        Text('GSTIN $gstin', key: const ValueKey('table-bill-customer-gstin'), style: text.bodySmall),
+      ],
+      if (address.isNotEmpty) ...[
+        const SizedBox(height: 2),
+        Text(
+          address.length == 1 ? address.first : '${address.first} (+${address.length - 1} more)',
+          key: const ValueKey('table-bill-customer-address'),
+          style: text.bodySmall,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ],
+    ]);
     return ForkCard(
       key: const ValueKey('table-bill-customer-header'),
       inset: true,
       padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
-      child: Row(children: [
-        Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(name.isEmpty ? 'No guest name on the bill' : name,
-                key: const ValueKey('table-bill-customer'),
-                style: name.isEmpty ? text.bodySmall : text.titleSmall,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis),
-            if (gstin.isNotEmpty) ...[
-              const SizedBox(height: 2),
-              Text('GSTIN $gstin', key: const ValueKey('table-bill-customer-gstin'), style: text.bodySmall),
-            ],
-          ]),
-        ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Icon(Icons.person_outline, size: 18, color: AppColors.textSecondary),
+          const SizedBox(width: 10),
+          Expanded(child: lines),
+        ]),
         if (mayEdit) ...[
-          const SizedBox(width: 8),
-          ForkButton.ghost(
-            key: const ValueKey('table-bill-customer-name'),
-            label: 'Edit name / GSTIN',
-            icon: Icons.edit_outlined,
-            dense: true,
-            onPressed: () => _editBillCustomerName(messenger),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: ForkButton.ghost(
+              key: const ValueKey('table-bill-customer-name'),
+              label: billCustomerEditLabel,
+              icon: Icons.edit_outlined,
+              dense: true,
+              onPressed: () => _editBillCustomerName(messenger),
+            ),
           ),
         ],
       ]),
@@ -9950,12 +10648,21 @@ class _TableSheetState extends State<_TableSheet> {
   /// Merge is for — putting two parties on one bill — and the server refuses it
   /// by name, but offering it here and then explaining the refusal would be a
   /// worse way to teach the same thing than not offering it.
+  ///
+  /// CLIENT ITEM 2 — A WAITER'S TOO ([FloorScope.moveTable]), on any seated
+  /// table, the orange ones included: a printed party moves with its bill and
+  /// its print record, and the server opens the green seat at the destination.
+  /// The party's own table FAMILY is never offered ("12" and "12 #2" are one
+  /// table: the server refuses the move); another table's free next-party seat
+  /// is, by its sentence name ("15 (next party)"). NOT QUEUED: offline, the
+  /// move is refused here and nothing is saved to send later.
   Future<void> _moveTable(ScaffoldMessengerState messenger) async {
     List rows = const [];
     try {
       rows = await widget.rest.getList('/get-tables');
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('Could not read the floor plan — $e')));
+      messenger.showSnackBar(SnackBar(
+          content: Text(isUnreachableError(e) ? moveTableNeedsConnection : 'Could not read the floor plan — $e')));
       return;
     }
     final covers = _int(widget.table['covers']) ?? 1;
@@ -9963,6 +10670,7 @@ class _TableSheetState extends State<_TableSheet> {
       final m = t as Map;
       final n = _s(m, 'table_name');
       if (n.isEmpty || n == _name) return false;
+      if (sameTableFamily(widget.table, m)) return false;
       if (_tableSeated(m)) return false;
       // The server enforces this too (assertCoversFitTable, the same rule
       // seating uses). Filtering here means the list only ever offers tables the
@@ -9983,11 +10691,13 @@ class _TableSheetState extends State<_TableSheet> {
         children: [
           for (final t in free)
             SimpleDialogOption(
-              onPressed: () => Navigator.pop(ctx, _s(t as Map, 'table_name')),
+              key: ValueKey('move-to-${_s(t as Map, 'table_name')}'),
+              onPressed: () => Navigator.pop(ctx, _s(t, 'table_name')),
               child: ListTile(
                 dense: true,
-                leading: const Icon(Icons.table_restaurant),
-                title: Text('Table ${_s(t, 'table_name')}'),
+                // Green: every table on this list is free.
+                leading: Icon(Icons.table_restaurant, color: AppColors.floorFree),
+                title: Text('Table ${tableSentenceNameOf(t)}'),
                 subtitle: Text(_seatsLabel(t)),
               ),
             ),
@@ -9995,24 +10705,35 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (dest == null || dest.isEmpty || !mounted) return;
-    // Named consequences, because this moves money as well as people.
+    final from = tableSentenceNameOf(widget.table);
+    final to = tableSentenceName(dest);
+    // Named consequences, because this moves money as well as people — and,
+    // for a printed party, paper that still names the table they left.
     final ok = await _confirm(
       context,
-      'Move everything from $_name to $dest?',
+      'Move everything from $from to $to?',
       'The guests, their $covers cover${covers == 1 ? '' : 's'}, every order and the '
-      'running bill move together. $_name becomes free.',
+      'running bill move together. $from becomes free.'
+      '${_billPrinted ? ' ${printedPartyMoveNote(from, to)}' : ''}',
     );
     if (!ok) return;
     try {
       final res = await widget.rest.post('/tables/move', {'from_table': _name, 'to_table': dest});
       final moved = res is Map ? (_int(res['moved_orders']) ?? 0) : 0;
+      // A printed party's destination gets its own green seat; the server
+      // names it (next_party_message) and the line passes it on.
+      final seat = res is Map ? _s(res, 'next_party_message', '') : '';
       messenger.showSnackBar(SnackBar(
-          content: Text('Moved $_name to $dest — $moved order${moved == 1 ? '' : 's'} came with them.')));
+          duration: Duration(seconds: seat.isEmpty ? 4 : 7),
+          content: Text('Moved $_name to $dest — $moved order${moved == 1 ? '' : 's'} came with them.'
+              '${seat.isEmpty ? '' : ' $seat'}')));
       _popAndReload();
     } catch (e) {
       // The server refuses rather than half-applying, so the floor is exactly as
-      // it was and the message is the whole story.
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      // it was and the message is the whole story. Offline, OutboxPolicy
+      // refuses the write before it is sent: nothing was queued.
+      messenger.showSnackBar(SnackBar(
+          content: Text(e is OfflineUnavailable || isUnreachableError(e) ? moveTableNeedsConnection : '$e')));
     }
   }
 
@@ -10055,6 +10776,11 @@ class _TableSheetState extends State<_TableSheet> {
     // One ticket needs no picker; several do, and each row has to say enough to
     // tell them apart — what is on it, what it is worth, and whether the kitchen
     // has already been told.
+    //
+    // CLIENT ITEM 4: each row is the ticket as the pass knows it ("KOT 65") and
+    // the dishes on it — the picker used to say "3 items · ₹1427.00", which is
+    // not how anybody tells two tickets apart. The money stays only for a login
+    // that is shown money.
     var order = mine.length == 1 ? mine.first as Map : null;
     order ??= await showDialog<Map>(
         context: context,
@@ -10062,17 +10788,36 @@ class _TableSheetState extends State<_TableSheet> {
           title: Text('Which order on $_name?'),
           children: [
             for (final o in mine)
-              SimpleDialogOption(
-                onPressed: () => Navigator.pop(ctx, o as Map),
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(_orderBarked(o) ? Icons.receipt_long : Icons.hourglass_empty),
-                  title: Text(_kotSummary(o)),
-                  subtitle: Text(_orderBarked(o)
-                      ? 'The kitchen has this one'
-                      : 'Not sent to the kitchen yet'),
-                ),
-              ),
+              Builder(builder: (_) {
+                final row = moveOrderPickerRow(o as Map);
+                final id = _s(o, 'id');
+                // A KOT number OR a bark — the rule the confirm, the dashboard
+                // and the server all use (moveOrderKitchenHas).
+                final kitchenHas = moveOrderKitchenHas(o);
+                return SimpleDialogOption(
+                  key: ValueKey('move-order-pick-$id'),
+                  onPressed: () => Navigator.pop(ctx, o),
+                  child: ListTile(
+                    dense: true,
+                    isThreeLine: row.dishes.isNotEmpty,
+                    leading: Icon(kitchenHas ? Icons.receipt_long : Icons.hourglass_empty),
+                    title: Text(
+                      _scope.money ? '${row.title} · ${_money(o['total'] ?? o['subtotal'])}' : row.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      [
+                        if (row.dishes.isNotEmpty) row.dishes,
+                        kitchenHas ? 'The kitchen has this one' : 'Not sent to the kitchen yet',
+                      ].join('\n'),
+                      key: ValueKey('move-order-dishes-$id'),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                );
+              }),
           ],
         ),
       );
@@ -10117,16 +10862,12 @@ class _TableSheetState extends State<_TableSheet> {
       ),
     );
     if (dest == null || dest.isEmpty || !mounted) return;
-    final barked = _orderBarked(order);
+    // The confirm names WHAT is moving — every dish, even when there was only
+    // one ticket and so no picker — before what the kitchen will see.
     final ok = await _confirm(
       context,
       'Move this order to $dest?',
-      barked
-          ? 'The kitchen already has a docket for $_name, so a correction docket '
-            'prints for $dest with the same KOT number. $_name keeps its guests '
-            'and its other orders.'
-          : 'The kitchen has not been sent this order yet, so nothing prints now — '
-            'it will print for $dest when it is sent.',
+      moveOrderConfirmBody(order: order, fromTable: _name, toTable: dest),
     );
     if (!ok) return;
     try {
@@ -10135,13 +10876,16 @@ class _TableSheetState extends State<_TableSheet> {
         {'order_id': _s(order, 'id'), 'to_table': dest},
       );
       final print = res is Map ? res['print'] : null;
-      final kotNo = print is Map ? print['kot_no'] : null;
-      final printed = print is Map && print['printed'] == true;
-      messenger.showSnackBar(SnackBar(
-        content: Text(printed
-            ? 'Moved to $dest. Correction docket KOT-$kotNo is printing — tell the pass.'
-            : 'Moved to $dest. Nothing was on the pass for it, so no docket printed.'),
-      ));
+      final served = movedDishesOf(res);
+      final said = movedOrderSentence(
+        toTable: dest,
+        printed: print is Map && print['printed'] == true,
+        kotNo: print is Map ? print['kot_no'] : null,
+        dishes: served.isNotEmpty ? served : orderDishLines(order),
+      );
+      // A senior moving between printed bills is offered both reprints (the
+      // server refuses a waiter-only login outright, in its own words).
+      await _afterMoveReprints(messenger, res, fallbackTable: dest, lead: said);
       _popAndReload();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -10195,8 +10939,20 @@ class _TableSheetState extends State<_TableSheet> {
     final orderIds = (_bill?['order_ids'] as List?) ?? [];
     if (orderIds.isEmpty) return;
     final oid = '${orderIds.first}';
+    // CLIENT ITEMS 1 AND 2 — this settles the bill too, so it asks the payment
+    // sheet's question, off a fresh read (the sheet may have been open a while).
+    // A read that fails asks off the bill in hand; it never blocks.
+    Map? paper = _bill;
     try {
-      await widget.rest.post('/bills/order/$oid/admin-approve-payment');
+      final r = await widget.rest.get('/bill-for-table?table_name=${Uri.encodeQueryComponent(_name)}');
+      if (r is Map) paper = r;
+    } catch (_) {/* the bill in hand */}
+    if (!mounted) return;
+    final stale = _stalePaperWarningOf(paper);
+    if (stale != null && !await _confirmStalePaperSettle(context, stale)) return;
+    try {
+      await widget.rest.post('/bills/order/$oid/admin-approve-payment',
+          stale != null ? const {'settled_with_stale_paper': true} : null);
       await widget.rest.post('/bills/order/$oid/close');
       messenger.showSnackBar(const SnackBar(content: Text('Payment approved — table freed.')));
       _popAndReload();
@@ -10310,7 +11066,7 @@ class _TableSheetState extends State<_TableSheet> {
               // "Table 12 (next party)" for a next-party seat (client item 6) -
               // the number the waiter tapped, in the words the web uses too.
               Expanded(child: Text('Table ${tableSentenceNameOf(widget.table)}', style: text.headlineMedium)),
-              StatusChip(label: _state.label, color: _state.color),
+              FloorChip(label: _state.label, color: _state.color, dense: false),
             ]),
             const SizedBox(height: 10),
             Wrap(spacing: 6, runSpacing: 6, children: [
@@ -10385,6 +11141,11 @@ class _TableSheetState extends State<_TableSheet> {
                   ),
               ],
             ]),
+            // CLIENT ITEMS 1 AND 2 — "Printed 13:32 · Updated — print again".
+            if (_occupied && _billPrinted) ...[
+              const SizedBox(height: 12),
+              _printedBanner(text),
+            ],
             // ROUND 2 ITEM 1 — the name and GSTIN on this table's bill, at the top.
             if (_billCustomerHeader(messenger, text) case final header?) ...[
               const SizedBox(height: 12),
@@ -10698,24 +11459,27 @@ class _TableSheetState extends State<_TableSheet> {
               // guests and everything of theirs; Move an order takes one ticket
               // and leaves the guests where they are.
               //
-              // Gated with Merge and the rest of billOps, and for Merge's exact
-              // reason: both of these carry a running bill from one table to
-              // another, which is a change to what a guest owes and where it is
-              // owed. A waiter who mis-keys a ticket asks the same person they
-              // would ask to split or discount one.
-              if (_scope.billOps) ...[
+              // Each on its own flag ([FloorScope.moveTable], [FloorScope.moveOrder]).
+              // Move an order stays a senior's: it carries food from one bill to
+              // another, and a waiter who mis-keys a ticket asks the same person
+              // they would ask to split or discount one. Move table is a
+              // waiter's too since 2.0.2 (client item 2) — theirs sits at the
+              // top of the sheet ([_orderAndPrintActions]).
+              if (_scope.moveTable || _scope.moveOrder) ...[
                 const SizedBox(height: 10),
                 Wrap(alignment: WrapAlignment.center, spacing: 10, runSpacing: 10, children: [
-                  ForkButton.ghost(
-                    label: 'Move table',
-                    icon: Icons.swap_horiz,
-                    onPressed: () => _moveTable(messenger),
-                  ),
-                  ForkButton.ghost(
-                    label: 'Move an order',
-                    icon: Icons.move_down,
-                    onPressed: () => _moveKot(messenger),
-                  ),
+                  if (_scope.moveTable)
+                    ForkButton.ghost(
+                      label: 'Move table',
+                      icon: Icons.swap_horiz,
+                      onPressed: () => _moveTable(messenger),
+                    ),
+                  if (_scope.moveOrder)
+                    ForkButton.ghost(
+                      label: 'Move an order',
+                      icon: Icons.move_down,
+                      onPressed: () => _moveKot(messenger),
+                    ),
                 ]),
               ],
               // ITEM 20. Freeing an occupied table without taking the money is a
@@ -10866,30 +11630,46 @@ class _TableSheetState extends State<_TableSheet> {
       // A waiter has no "seat guests" button any more, so placing the
       // order is how a table starts. POST /orders provisions the seating
       // server-side; nothing here has to be pressed first.
+      //
+      // CLIENT ITEMS 1 AND 2: ON A PRINTED TABLE THE FIRST CONTROL IS "ADD TO
+      // PRINTED BILL", and it asks before it opens the pad ([_addToPrinted]).
+      // Only on a server that takes it ([FloorScope.addToPrinted]): 2.0.1
+      // refuses every waiter order there, so the plain "Add order" stays and
+      // 2.0.1's own refusal offers the next party's seat.
       if (!_scope.seat) ...[
-        full(ForkButton(
-          key: const ValueKey('table-add-order'),
-          label: 'Add order',
-          icon: Icons.add,
-          large: true,
-          onPressed: _addOrder,
-        )),
+        if (_occupied && _billPrinted && _scope.addToPrinted)
+          full(ForkButton(
+            key: const ValueKey('table-add-to-printed'),
+            label: addToPrintedBillAction,
+            icon: Icons.add,
+            large: true,
+            onPressed: _addToPrinted,
+          ))
+        else
+          full(ForkButton(
+            key: const ValueKey('table-add-order'),
+            label: 'Add order',
+            icon: Icons.add,
+            large: true,
+            onPressed: _addOrder,
+          )),
         // Nothing to print until something has been ordered — an empty
         // table has no bill, and a button that answers "No open bill to
         // print for this table" is a button that wasted a walk.
         //
-        // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME. Once this
-        // waiter has printed, the control is gone and a sentence stands
-        // where it was. The sentence is not decoration — a waiter handed a
-        // blank space where a button was will go and press it on the next
-        // tablet, and a guest asking for their bill again needs to hear
-        // what happens next rather than watch somebody prod a dead screen.
+        // REQUIREMENT C3: AND NOTHING TO PRINT A SECOND TIME — unless the
+        // paper is out of date (client items 1 and 2), when the control comes
+        // back as "Print updated bill". Otherwise a sentence stands where it
+        // was. The sentence is not decoration — a waiter handed a blank space
+        // where a button was will go and press it on the next tablet, and a
+        // guest asking for their bill again needs to hear what happens next
+        // rather than watch somebody prod a dead screen.
         if (_occupied) ...[
           const SizedBox(height: 10),
           if (_printScope.print)
             full(ForkButton.ghost(
               key: const ValueKey('table-print-bill'),
-              label: 'Print bill',
+              label: _printScope.printLabel,
               icon: Icons.receipt_long,
               large: true,
               onPressed: () => _printBillWithoutPreview(messenger),
@@ -10903,14 +11683,28 @@ class _TableSheetState extends State<_TableSheet> {
                 Icon(Icons.receipt_long_outlined, size: 16, color: AppColors.textSecondary),
                 const SizedBox(width: 10),
                 Expanded(
+                  // The last sentence is a 2.0.2 server's promise: an older
+                  // one never marks the paper out of date, so a waiter can
+                  // never print an update there.
                   child: Text(
                     'Bill printed. A manager reprints it and settles the table '
-                    'from here — ask one if the guest needs another copy.',
+                    'from here — ask one if the guest needs another copy.'
+                    '${_scope.addToPrinted ? ' Anything you add to it can be printed again as an updated bill.' : ''}',
                     style: text.bodySmall,
                   ),
                 ),
               ]),
             ),
+          // CLIENT ITEM 2 — "Move table", on any seated table, orange included.
+          if (_scope.moveTable) ...[
+            const SizedBox(height: 10),
+            full(ForkButton.ghost(
+              key: const ValueKey('table-move-party'),
+              label: 'Move table',
+              icon: Icons.swap_horiz,
+              onPressed: () => _moveTable(messenger),
+            )),
+          ],
         ],
         const SizedBox(height: 16),
       ],
@@ -10921,18 +11715,21 @@ class _TableSheetState extends State<_TableSheet> {
       // wrap and still previews the receipt first, then prints via the server
       // (unified ESC/POS format → thermal printer agent), matching the web bill.
       if (_scope.seat && _occupied) ...[
+        // The same question on a printed table as a waiter is asked: the web
+        // dashboard asks everyone, and a manager's dessert lands on the same
+        // paper.
         full(ForkButton(
           key: const ValueKey('table-manager-add-order'),
-          label: 'Add order',
+          label: _billPrinted ? addToPrintedBillAction : 'Add order',
           icon: Icons.add,
           large: true,
-          onPressed: _addOrder,
+          onPressed: _billPrinted ? _addToPrinted : _addOrder,
         )),
         if (_bill != null && _scope.billOps) ...[
           const SizedBox(height: 10),
           full(ForkButton.ghost(
             key: const ValueKey('table-manager-print-bill'),
-            label: 'Print bill',
+            label: _printScope.printLabel,
             icon: Icons.receipt_long,
             large: true,
             onPressed: () => _previewBill(messenger),
@@ -10957,6 +11754,7 @@ class _TableSheetState extends State<_TableSheet> {
         orderId: '${orderIds.first}',
         tableName: _name,
         fallbackTotal: _money(_bill?['grand_total'] ?? _bill?['total_amt']),
+        paperBill: _bill,
       ),
     );
     if (done == true) _popAndReload();
@@ -11146,6 +11944,12 @@ class _BillPreviewDialog extends StatelessWidget {
   /// banner on paper or here.
   final bool reprint;
 
+  /// CLIENT ITEMS 1 AND 2 — the print replaces paper the bill has outgrown, so
+  /// the roll stamps "** UPDATED BILL **" and [replacesLine] ("Replaces the
+  /// bill printed 13:32") where it would stamp REPRINT, and so does this.
+  final bool updated;
+  final String replacesLine;
+
   /// True when the tenant prints on the 58mm roll (`bill_paper_width`): 32
   /// columns, no margins, the narrow item table. False is the 80mm roll, which
   /// is also what an unreadable setting means on the server.
@@ -11176,6 +11980,8 @@ class _BillPreviewDialog extends StatelessWidget {
     this.logo,
     required this.tableName,
     this.reprint = false,
+    this.updated = false,
+    this.replacesLine = '',
     this.narrow = false,
     this.qrNote = '',
     this.showQr = true,
@@ -11345,7 +12151,7 @@ class _BillPreviewDialog extends StatelessWidget {
     // same payload as the total; nothing is re-rounded here.
     final roundOff = billRoundOff(bill['round_off']);
     final billNo = _s(bill, 'bill_no', '');
-    // The customer slot — `Name:` / `Customer GSTIN:`.
+    // The customer slot — `Name:` / `Customer GSTIN:` / `Address:` (item 7).
     final customerLines = billCustomerLines(bill);
     // The label the paper gives the charge line: the configured percentage. It
     // labels a charge that is charged and nothing else — a removed charge has
@@ -11399,7 +12205,24 @@ class _BillPreviewDialog extends StatelessWidget {
                       // logo, because that is where the roll prints it. Large, bold
                       // and boxed so it cannot be read past on a copy turned toward
                       // a guest.
-                      if (reprint) ...[
+                      if (updated) ...[
+                        Container(
+                          key: const ValueKey('bill-preview-updated'),
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          decoration: BoxDecoration(border: Border.all(color: Colors.black87, width: 2)),
+                          child: const Text('UPDATED BILL',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  fontSize: 22, fontWeight: FontWeight.w900, letterSpacing: 3, color: Colors.black)),
+                        ),
+                        if (replacesLine.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text(replacesLine,
+                                key: const ValueKey('bill-preview-replaces'), textAlign: TextAlign.center),
+                          ),
+                        const SizedBox(height: 8),
+                      ] else if (reprint) ...[
                         Container(
                           key: const ValueKey('bill-preview-reprint'),
                           padding: const EdgeInsets.symmetric(vertical: 4),
@@ -11463,10 +12286,21 @@ class _BillPreviewDialog extends StatelessWidget {
                       // restaurant header and above the date / cashier block.
                       // "Name: <name>", or a bare "Name:" for a walk-in exactly as
                       // the paper leaves the slot blank; "Customer GSTIN:" only
-                      // when set. See [billCustomerLines].
-                      for (final l in customerLines)
-                        Text(l,
-                            key: ValueKey('bill-preview-customer-${l.startsWith('Customer GSTIN') ? 'gstin' : 'name'}'),
+                      // when set; client item 7 adds the address lines under it.
+                      // See [billCustomerLines].
+                      //
+                      // KEYED BY POSITION. The keys used to be the line's KIND
+                      // (name / gstin), and an address brings several lines of
+                      // one kind — which is a duplicate-key crash of the whole
+                      // preview for every bill that carries an address. The first
+                      // two keep the names tests and tools already read.
+                      for (var i = 0; i < customerLines.length; i++)
+                        Text(customerLines[i],
+                            key: ValueKey(i == 0
+                                ? 'bill-preview-customer-name'
+                                : (i == 1 && customerLines[i].startsWith('Customer GSTIN'))
+                                    ? 'bill-preview-customer-gstin'
+                                    : 'bill-preview-customer-$i'),
                             style: _ink),
                       _rule(),
                       // The date and the table on one line, the table in bold —
@@ -11622,6 +12456,9 @@ Future<bool> _confirm(BuildContext context, String title, String message) async 
   final ok = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
+      // A move's confirm names every dish it carries (client item 4); on a
+      // 360dp phone that list must scroll rather than overflow.
+      scrollable: true,
       title: Text(title),
       content: Text(message),
       actions: [
@@ -12812,12 +13649,16 @@ Future<void> _changeOrderStatus(
   // Un-barked orders must pass the Barked step before they can be cooked/served —
   // BUT a Pending order isn't approved to the kitchen yet, so it can't be barked
   // until it's accepted (Preparing). Don't offer 'Barked' while Pending.
-  final isPending = current.toLowerCase() == 'pending';
+  final isPending = orderIsPending(current);
+  // CLIENT ITEM 3 — "Cancelled" on a ticketed order is Cancel KOT by another
+  // name, so it is offered exactly where Cancel KOT is. A Pending order's
+  // "Cancelled" is a decline, and a waiter keeps it.
+  final mayCancel = isPending || profile == null || _mayCancelKot(profile);
   final stages = <String>[
     if (!barked && !isPending) 'Barked',
     'Preparing',
     if (barked) 'Served',
-    'Cancelled',
+    if (mayCancel) 'Cancelled',
   ];
   final messenger = ScaffoldMessenger.of(context);
   // A settled bill is view-once: its order status is locked and cannot change.
@@ -12976,7 +13817,7 @@ Future<void> _changeOrderStatus(
     // The stage sheet above was awaited, so the screen may be gone; a reason
     // form opened against a dead context is a form nobody can dismiss.
     if (!context.mounted) return;
-    if (await _cancelOrder(context, rest: rest, profile: profile, orderId: orderId, value: value)) {
+    if (await _cancelOrder(context, rest: rest, profile: profile, orderId: orderId, value: value, pending: isPending)) {
       reload();
     }
     return;
@@ -13781,6 +14622,12 @@ class _KdsCardState extends State<_KdsCard> {
 ///
 /// Returns true when the order was cancelled, false when the user backed out or
 /// the write failed — so the caller reloads only when something changed.
+///
+/// CLIENT ITEM 3 — [pending] says the order has never been ticketed (a Decline).
+/// Anything else is a KOT the kitchen holds, and a login that may not cancel one
+/// ([_mayCancelKot]) is told so here, in the server's words, and nothing is
+/// sent: the buttons are already hidden, and this is what stops a call site
+/// added later from quietly re-opening the path.
 Future<bool> _cancelOrder(
   BuildContext context, {
   required RestClient rest,
@@ -13788,12 +14635,23 @@ Future<bool> _cancelOrder(
   required String orderId,
   String what = 'this order',
   String value = '',
+  bool pending = false,
 }) async {
   final messenger = ScaffoldMessenger.of(context);
+  if (!pending && profile != null && !_mayCancelKot(profile)) {
+    messenger.showSnackBar(SnackBar(
+      key: const ValueKey('cancel-needs-senior'),
+      content: Text(cancelNeedsSeniorSentence(const [])),
+    ));
+    return false;
+  }
   // WHOEVER CAN GIVE THE FULLER ANSWER IS ASKED FOR IT. The void form records a
   // kind, a reason AND an authoriser against the order in one transaction, which
-  // is what the Void KOT report is built to read.
-  if (profile != null && _mayDo(profile, Capability.voidOrder, _permVoidOrder)) {
+  // is what the Void KOT report is built to read. Not a waiter-only login's
+  // decline, though: the server refuses that login the void route for anything
+  // but a Pending order, and a manager's name is not what declining a QR order
+  // should cost.
+  if (profile != null && _mayCancelKot(profile) && _mayDo(profile, Capability.voidOrder, _permVoidOrder)) {
     return misVoidOrder(context, rest: rest, profile: profile, orderId: orderId,
         what: what, value: value);
   }
@@ -13897,12 +14755,15 @@ Future<void> _reprintKot(
 // so the kitchen board, this copy and their tests read one definition.
 
 /// THE LOCAL KOT COPY AS A PDF — [kotCopyRows] drawn in the pdf package's
-/// default font, in a column as wide as an 80mm roll prints (72mm).
+/// default font (Helvetica), in a column as wide as an 80mm roll prints (72mm).
 ///
-/// ONE TYPE SIZE FOR EVERY LINE, as on the reference docket, where emphasis is
+/// THE KITCHEN DOCKET'S SIZES, as on the reference docket, where emphasis is
 /// WEIGHT: "KOT", the service mode, the table and each dish name are bold, and
-/// nothing is set larger or in italics. 10pt is the docket's own standard size
-/// (28 dots per em at the printer's 203 dpi is 9.9pt), so the copy matches the
+/// nothing is set larger. Every line is [kotCopyBodyPt] — the docket's standard
+/// 27 dots per em at the printer's 203 dpi, 9.6pt — except a dish's "[Note]",
+/// which the docket sets a step smaller and slanted: [kotCopyNotePt] (its 23
+/// dots, 8.2pt) in Helvetica-Oblique, whose 12-degree slant is the docket's
+/// 0.21 shear. "[Hold]" stays upright at the body size. So the copy matches the
 /// paper the client approved rather than a document. It does NOT follow the
 /// restaurant's KOT text size — that setting sizes the kitchen docket, and this
 /// is a copy for whoever pressed the button.
@@ -13918,9 +14779,11 @@ pw.Document kotCopyPdf(
   PdfPageFormat pageFormat = PdfPageFormat.a4,
   bool compress = true,
 }) {
-  const size = 10.0;
+  const size = kotCopyBodyPt;
   const regular = pw.TextStyle(fontSize: size);
   final bold = pw.TextStyle(fontSize: size, fontWeight: pw.FontWeight.bold);
+  // Never bold: the docket's note face is the slanted regular one.
+  final note = pw.TextStyle(fontSize: kotCopyNotePt, fontStyle: pw.FontStyle.italic);
   // THE COLUMNS ARE SIZED TO WHAT THEY HOLD, as the docket's are: the number
   // column to the widest dish number (so item 100 cannot print over its dish),
   // the quantity column to the widest quantity or "Qty". A digit in the default
@@ -13950,7 +14813,7 @@ pw.Document kotCopyPdf(
       case KotCopyKind.under:
         return pw.Padding(
           padding: pw.EdgeInsets.only(left: numW, bottom: 1),
-          child: pw.Text(r.text, style: regular),
+          child: pw.Text(r.text, style: r.note ? note : regular),
         );
       case KotCopyKind.columns:
         final qty = pw.SizedBox(width: qtyW, child: pw.Text(r.qty, style: regular, textAlign: pw.TextAlign.right));
@@ -14963,7 +15826,6 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
   String _sort = 'recent';
   String _segment = 'all';
   String _query = '';
-  Timer? _debounce;
 
   @override
   void initState() {
@@ -14990,7 +15852,6 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
 
   @override
   void dispose() {
-    _debounce?.cancel();
     _scroll.dispose();
     _searchField.dispose();
     super.dispose();
@@ -15142,14 +16003,22 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
     _load();
   }
 
-  void _onSearchChanged(String v) {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 300), () {
-      final next = v.trim();
-      if (!mounted || next == _query) return;
-      _applyFilter(() => _query = next);
-    });
+  void _onSearchQuery(String next) {
+    if (!mounted || next == _query) return;
+    _applyFilter(() => _query = next);
   }
+
+  /// The one Guests search box, for both design systems: the Rustic column and
+  /// the Gaia bokeh list each place it, and the x, the debounce and the
+  /// clearing are the same in both. The controller is the State's because the
+  /// Gaia list builds the box lazily.
+  Widget _guestSearch() => AppSearchField(
+        testId: 'guests-search',
+        hint: 'Find a guest by name, phone or email…',
+        controller: _searchField,
+        debounce: const Duration(milliseconds: 300),
+        onQuery: _onSearchQuery,
+      );
 
   /// The number on a segment tab, or null when there is no honest one to show.
   ///
@@ -15220,15 +16089,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-        child: TextField(
-          controller: _searchField,
-          decoration: const InputDecoration(
-            prefixIcon: Icon(Icons.search, size: 18),
-            hintText: 'Find a guest by name, phone or email…',
-            isDense: true,
-          ),
-          onChanged: _onSearchChanged,
-        ),
+        child: _guestSearch(),
       ),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -15307,15 +16168,7 @@ class _CustomersViewState extends State<_CustomersView> with CachePrimedScreen {
               titleEmphasis: 'book.',
               sub: _spendBasis.isEmpty ? null : 'Spend basis \u00b7 $_spendBasis',
             ),
-            GaiaSearchField(
-              controller: _searchField,
-              hint: 'Find a guest by name, phone or email',
-              onChanged: _onSearchChanged,
-              onClear: () {
-                _searchField.clear();
-                _onSearchChanged('');
-              },
-            ),
+            _guestSearch(),
             const SizedBox(height: 14),
             Wrap(spacing: 6, runSpacing: 8, children: [
               for (final seg in _customerSegments)
@@ -15797,15 +16650,24 @@ class _SegmentChip extends StatelessWidget {
 }
 
 // Month-by-month business summary, up to 3 years back.
-Widget historyModule(RestClient rest, Profile p) => _HistoryModule(rest: rest);
+//
+// CLIENT ITEM 8 — "Reprint bill should show up in History; old bills should be
+// reprintable from the history section." The profile is handed down now: it
+// used to be dropped right here, so every settled bill History opened was the
+// Reports drill-down's read-only sheet, with no Reprint and no name edit — for
+// the same people who reprint that bill from Accounting, on a screen the same
+// permission opens (/analytics/history and /print/bill/settled are both
+// validated on it).
+Widget historyModule(RestClient rest, Profile p) => _HistoryModule(rest: rest, profile: p);
 
 /// Holds History's reporting window. It opens WIDER than the 30-day default the
 /// other modules use — a month-by-month table cut to one month is a single row,
 /// which looks like a broken screen — but it is the same control, so a range
 /// picked here reads exactly like a range picked in Accounting.
 class _HistoryModule extends StatefulWidget {
-  const _HistoryModule({required this.rest});
+  const _HistoryModule({required this.rest, required this.profile});
   final RestClient rest;
+  final Profile profile;
   @override
   State<_HistoryModule> createState() => _HistoryModuleState();
 }
@@ -15829,6 +16691,7 @@ class _HistoryModuleState extends State<_HistoryModule> {
         widget.rest,
         _range,
         _setRange,
+        profile: widget.profile,
         key: ValueKey('history-${_range.from}-${_range.to}'),
       );
 }
@@ -15837,6 +16700,7 @@ Widget _historyBody(
   RestClient rest,
   DateRange range,
   ValueChanged<DateRange> onRange, {
+  required Profile profile,
   Key? key,
 }) => AsyncView<Map<String, dynamic>>(
       key: key,
@@ -15884,7 +16748,12 @@ Widget _historyBody(
           child: ListView(padding: AppSpacing.pageNarrow, children: [
             SectionHeader(
               title: 'History',
-              trailing: InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
+              // The window is spelled out by the date chip directly under this
+              // header. On a phone this copy is wider than the room beside the
+              // title (2.0.1 overflowed by 9px at 360dp), so it is left out there.
+              trailing: MediaQuery.sizeOf(context).width < 420
+                  ? null
+                  : InfoChip(icon: Icons.calendar_today_outlined, label: range.label()),
             ),
             const SizedBox(height: AppSpacing.sm),
             // Every figure below is cut on this window, so it sits above them.
@@ -16002,6 +16871,7 @@ Widget _historyBody(
                             rest: rest,
                             month: m,
                             title: pretty('${m['month']}'),
+                            profile: profile,
                           ),
                         ),
                       );
@@ -16028,6 +16898,7 @@ Widget _historyBody(
                       rest: rest,
                       month: m,
                       title: pretty('${m['month']}'),
+                      profile: profile,
                     ),
                   ),
                   child: Row(children: [
@@ -16051,10 +16922,86 @@ Widget _historyBody(
                 ),
               );
             }),
+            // CLIENT ITEM 8 — the window's settled bills, on the page itself,
+            // with a search: an old bill is found by its number, table or
+            // cashier rather than three taps down a month. Each row opens the
+            // same sheet Accounting's does, Reprint and all.
+            const SizedBox(height: AppSpacing.xxl),
+            _HistorySettledBills(
+              key: ValueKey('history-bills-${range.from}-${range.to}'),
+              rest: rest,
+              range: range,
+              profile: profile,
+            ),
           ]),
         );
       },
     );
+
+/// CLIENT ITEM 8 — History's own settled-bill list: the page's window, a
+/// search box (with its clear), and Accounting's paged list, opened as a
+/// HISTORY surface — so a bill reprints and its name / GSTIN / address can be
+/// corrected here, and moving it to another till stays in Accounting.
+class _HistorySettledBills extends StatefulWidget {
+  const _HistorySettledBills({super.key, required this.rest, required this.range, required this.profile});
+  final RestClient rest;
+  final DateRange range;
+  final Profile profile;
+
+  @override
+  State<_HistorySettledBills> createState() => _HistorySettledBillsState();
+}
+
+class _HistorySettledBillsState extends State<_HistorySettledBills> {
+  // The page's own controller, as Accounting's list keeps one: the box sits in
+  // a lazily built page, and the word must outlive the box being built away.
+  final TextEditingController _search = TextEditingController();
+  String _term = '';
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Column(
+      key: const ValueKey('history-settled-bills'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // No range chip beside the title: the page's own date chip sets the
+        // window, and the sentence under it names it (a chip would not fit a
+        // phone beside the title).
+        const SectionHeader(title: 'Settled bills', padding: EdgeInsets.only(bottom: 6)),
+        Text('Every bill closed in ${widget.range.label()}, newest first — tap one to see it in full or reprint it.',
+            style: text.bodySmall),
+        const SizedBox(height: AppSpacing.md),
+        // The shared box (client item 6): its x is there from the first
+        // keystroke, clears the box and the query at once, and Enter searches
+        // without waiting out the debounce.
+        AppSearchField(
+          testId: 'history-bill-search',
+          hint: 'Search bill no, table, cashier…',
+          controller: _search,
+          debounce: const Duration(milliseconds: 350),
+          onQuery: (q) => setState(() => _term = q),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        _ClosedBillsList(
+          rest: widget.rest,
+          profile: widget.profile,
+          surface: _ClosedBillSurface.history,
+          filter: _ClosedBillFilter(from: widget.range.from, to: widget.range.to, search: _term),
+          emptyCaption: _term.isEmpty
+              ? 'No bills were closed in ${widget.range.label()}.'
+              : 'No settled bill in ${widget.range.label()} matches "$_term".',
+        ),
+      ],
+    );
+  }
+}
 
 /// First and last calendar day of a "YYYY-MM" bucket, as the `from`/`to` the
 /// bills endpoint expects. Null when the bucket isn't a month.
@@ -16071,12 +17018,15 @@ Widget _historyBody(
 }
 
 /// What a History month card opens: the month's own metrics, then the settled
-/// bills that produced them — each of which opens the bill in full.
+/// bills that produced them — each of which opens the bill in full, with
+/// Reprint and the name / GSTIN / address edit for whoever holds their
+/// permission (client item 8).
 class _MonthDetailSheet extends StatelessWidget {
   final RestClient rest;
   final Map month;
   final String title;
-  const _MonthDetailSheet({required this.rest, required this.month, required this.title});
+  final Profile profile;
+  const _MonthDetailSheet({required this.rest, required this.month, required this.title, required this.profile});
 
   @override
   Widget build(BuildContext context) {
@@ -16118,7 +17068,8 @@ class _MonthDetailSheet extends StatelessWidget {
               ),
               const SizedBox(height: AppSpacing.lg),
               SectionHeader(title: 'Settled bills', padding: const EdgeInsets.only(bottom: 6)),
-              Text('Every bill closed in $title — tap one for its items, taxes, payment and who closed it.',
+              Text('Every bill closed in $title — tap one for its items, taxes, payment and who closed it, '
+                  'or to reprint it.',
                   style: text.bodySmall),
               const SizedBox(height: AppSpacing.md),
               if (range == null)
@@ -16127,6 +17078,8 @@ class _MonthDetailSheet extends StatelessWidget {
                 _ClosedBillsList(
                   rest: rest,
                   pageSize: 10,
+                  profile: profile,
+                  surface: _ClosedBillSurface.history,
                   filter: _ClosedBillFilter(from: range.from, to: range.to),
                   emptyCaption: 'No bills were closed in $title.',
                 ),
@@ -21216,6 +22169,44 @@ Widget _analyticsBody(
 // --- Accounting & reporting --------------------------------------------------
 Widget accountingModule(RestClient rest, Profile p) => _AccountingView(rest: rest, profile: p);
 
+/// A ONE-SHOT settled-bill filter for Accounting, set by a jump that is about
+/// particular bills (item 10: a payment mode's own bills, the Split bills behind
+/// the split note). Taken once, on arrival, and dropped — so the next ordinary
+/// visit opens on "All methods" exactly as it always has.
+///
+/// Session memory rather than a focus request, for the reason
+/// [_primeGlanceJump] gives: Accounting reads no focus, and a request parked on
+/// the shell would re-apply itself on every remount.
+abstract final class AccountingBillFilter {
+  static String? _method;
+  static bool _reveal = false;
+  static bool _pending = false;
+
+  /// [method] filters the list (null = all methods); [reveal] scrolls the page
+  /// to the settled bills once they have painted.
+  static void remember(String? method, {bool reveal = false}) {
+    final m = method?.trim();
+    _method = (m == null || m.isEmpty) ? null : m;
+    _reveal = reveal;
+    _pending = true;
+  }
+
+  /// The pending filter, or null — and either way, nothing is pending after.
+  static ({String? method, bool reveal})? take() {
+    if (!_pending) return null;
+    final out = (method: _method, reveal: _reveal);
+    reset();
+    return out;
+  }
+
+  /// Test seam — a suite must not inherit the previous test's filter.
+  static void reset() {
+    _pending = false;
+    _method = null;
+    _reveal = false;
+  }
+}
+
 class _AccountingView extends StatefulWidget {
   final RestClient rest;
   final Profile profile;
@@ -21243,22 +22234,27 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
   String _payrollMonth = RestaurantTime.thisMonthIso();
   Map<String, dynamic> _payroll = {};
   Map<String, dynamic> _discounts = {};
-  // Scheduled report delivery. Not scoped to the period tabs above: a schedule
-  // is a standing instruction, not a figure cut over the selected window.
-  List _schedules = [];
-  List _deliveries = [];
 
   // Settled-bill browser. The list is paged by _ClosedBillsList itself; this
-  // state only holds what the user filters it by. The term is applied on a
-  // short debounce so typing doesn't fire a request per keystroke.
+  // state only holds what the user filters it by. The box applies the term on
+  // a short debounce so typing doesn't fire a request per keystroke. The
+  // controller is kept here because the page is a lazily built list.
   final TextEditingController _billSearch = TextEditingController();
-  Timer? _billDebounce;
   String _billTerm = '';
   String? _billMethod;
+
+  // Set when a glance jump asked to land ON the settled bills (item 10); spent
+  // by the first build that has them to show.
+  bool _revealBillsOnArrival = false;
 
   @override
   void initState() {
     super.initState();
+    final arrival = AccountingBillFilter.take();
+    if (arrival != null) {
+      _billMethod = arrival.method;
+      _revealBillsOnArrival = arrival.reveal;
+    }
     unawaited(primeFromCache(
       fetch: _fetch,
       apply: (d) { _apply(d); _loading = false; _error = null; },
@@ -21269,7 +22265,6 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
 
   @override
   void dispose() {
-    _billDebounce?.cancel();
     _billSearch.dispose();
     _scroll.dispose();
     super.dispose();
@@ -21305,8 +22300,6 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
       widget.rest.getMap('/expenses?$q'),
       widget.rest.getMap('/payroll?month=$_payrollMonth').catchError((_) => <String, dynamic>{}),
       widget.rest.getMap('/reports/discounts?$q').catchError((_) => <String, dynamic>{}),
-      widget.rest.getMap('/reports/schedules').catchError((_) => <String, dynamic>{}),
-      widget.rest.getMap('/reports/deliveries?limit=20').catchError((_) => <String, dynamic>{}),
     ]);
   }
 
@@ -21317,8 +22310,6 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
     _expenses = (res[3]['expenses'] as List?) ?? [];
     _payroll = res[4];
     _discounts = res[5];
-    _schedules = (res[6]['schedules'] as List?) ?? [];
-    _deliveries = (res[7]['deliveries'] as List?) ?? [];
     _hasData = true;
   }
 
@@ -21354,6 +22345,32 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         _loading = false;
       });
     }
+  }
+
+  /// Bring the Settled bills header into view once, after the figures paint.
+  ///
+  /// The page is a lazy ListView, so a header several screens down has no
+  /// element — and nothing for ensureVisible to find — until the list has been
+  /// scrolled near it. So this walks down a viewport at a time until the header
+  /// is built, then settles on it. Bounded, and it stops at the end of the list.
+  void _revealBillsOnce() {
+    var steps = 0;
+    void step() {
+      if (!mounted) return;
+      final ctx = _settledBillsKey.currentContext;
+      if (ctx != null && ctx.mounted) {
+        Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+        return;
+      }
+      if (!_scroll.hasClients || steps++ > 40) return;
+      final pos = _scroll.position;
+      if (pos.pixels >= pos.maxScrollExtent) return;
+      _scroll.jumpTo(math.min(pos.pixels + pos.viewportDimension, pos.maxScrollExtent));
+      WidgetsBinding.instance.addPostFrameCallback((_) => step());
+      WidgetsBinding.instance.scheduleFrame();
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => step());
   }
 
   double _n(dynamic v) => (v is num) ? v.toDouble() : (double.tryParse('${v ?? ''}') ?? 0);
@@ -21892,6 +22909,10 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         onRetry: _load,
       );
     }
+    if (_revealBillsOnArrival) {
+      _revealBillsOnArrival = false;
+      _revealBillsOnce();
+    }
 
     String money(double v) => '₹${v.toStringAsFixed(0)}';
     final byDay = ((_sales['by_day'] as List?) ?? [])
@@ -22146,37 +23167,21 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
         const SizedBox(height: AppSpacing.md),
         Row(children: [
           Expanded(
-            child: TextField(
+            // The x follows the BOX, not the debounced term: it is there from
+            // the first keystroke (it used to wait out the 350ms).
+            child: AppSearchField(
+              testId: 'bills-search',
+              hint: 'Search bill no, table, customer…',
               controller: _billSearch,
-              decoration: InputDecoration(
-                isDense: true,
-                hintText: 'Search bill no, table, customer…',
-                prefixIcon: Icon(Icons.search, size: 18, color: AppColors.textTertiary),
-                suffixIcon: _billTerm.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close, size: 16),
-                        tooltip: 'Clear search',
-                        onPressed: () {
-                          _billDebounce?.cancel();
-                          _billSearch.clear();
-                          setState(() => _billTerm = '');
-                        },
-                      ),
-              ),
-              onChanged: (v) {
-                _billDebounce?.cancel();
-                _billDebounce = Timer(const Duration(milliseconds: 350), () {
-                  if (mounted) setState(() => _billTerm = v.trim());
-                });
-              },
-              onSubmitted: (v) {
-                _billDebounce?.cancel();
-                setState(() => _billTerm = v.trim());
-              },
+              debounce: const Duration(milliseconds: 350),
+              onQuery: (q) => setState(() => _billTerm = q),
             ),
           ),
-          if (byMethod.isNotEmpty) ...[
+          // Also shown when a jump arrived with a filter this window's modes do not
+          // list — 'Split' is never one of them (the sales cut books a split's
+          // parts under their own modes) — so the filter in force is always one
+          // the owner can see and clear, and the dropdown always holds its value.
+          if (byMethod.isNotEmpty || _billMethod != null) ...[
             const SizedBox(width: AppSpacing.sm),
             SizedBox(
               width: 180,
@@ -22191,6 +23196,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
                     DropdownMenuItem<String>(
                       value: _s(m as Map, 'method', ''),
                       child: Text(PaymentModes.reportName(m), overflow: TextOverflow.ellipsis),
+                    ),
+                  if (_billMethod != null && !byMethod.any((m) => _s(m as Map, 'method', '') == _billMethod))
+                    DropdownMenuItem<String>(
+                      value: _billMethod,
+                      child: Text(_billMethod!, overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) => setState(() => _billMethod = (v ?? '').isEmpty ? null : v),
@@ -22328,627 +23338,11 @@ class _AccountingViewState extends State<_AccountingView> with CachePrimedScreen
             ]),
           ),
         const SizedBox(height: AppSpacing.xxl),
-        _ScheduledReportsCard(
-          rest: widget.rest,
-          schedules: _schedules,
-          deliveries: _deliveries,
-          reload: _load,
-        ),
+        // Scheduled reports moved to Insights → Reports → Email reports
+        // (client item 9); the card says where, and opens it.
+        const _ScheduledReportsMovedCard(),
       ]),
     ));
-  }
-}
-
-// --- Scheduled report delivery ----------------------------------------------
-// The server builds these on its own and files each run's CSV against a
-// delivery row; the notification bell only says one is ready and points here.
-// That split is the backend's: GET /notifications is readable by every
-// authenticated employee, so no figure travels in the bell — which is why the
-// file is downloaded from this card and nowhere else.
-//
-// Only sales, P&L and GST can be scheduled. Those are the three reports scoped
-// to the restaurant's own calendar day, so "yesterday" means the same thing
-// here as in the file; the backend admits nothing else.
-const Map<String, String> _reportKeyLabels = {
-  'sales': 'Sales',
-  'pnl': 'Profit & loss',
-  'gst': 'GST / tax',
-};
-
-const Map<String, String> _reportFrequencyLabels = {
-  'daily': 'Every day',
-  'weekly': 'Every week',
-  'monthly': 'Every month',
-};
-
-// What each frequency actually covers, spelled out in the editor: a report that
-// runs at 08:00 covers YESTERDAY, and that is the kind of thing an owner
-// otherwise discovers by reconciling a file against the wrong day.
-const Map<String, String> _reportPeriodNotes = {
-  'daily': 'Covers the previous day.',
-  'weekly': 'Covers the seven days ending the day before it runs.',
-  'monthly': 'Covers the whole previous calendar month.',
-};
-
-// 0 = Sunday, matching the backend's weekday column.
-const List<String> _weekdayNames = [
-  'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
-];
-
-/// A delivery's status as the owner should read it. `claimed` means the run has
-/// been taken and nothing else may take it; `abandoned` is an occurrence that
-/// came due while the server was down past its catch-up window — recorded as a
-/// row rather than silently skipped, which is the whole point of the history.
-({String label, Color color}) _deliveryStatus(String status) {
-  switch (status) {
-    case 'delivered':
-      return (label: 'Delivered', color: AppColors.success);
-    case 'rendered':
-      return (label: 'Building', color: AppColors.info);
-    case 'claimed':
-      return (label: 'Queued', color: AppColors.neutral);
-    case 'failed':
-      return (label: 'Failed', color: AppColors.danger);
-    case 'abandoned':
-      return (label: 'Missed', color: AppColors.warning);
-  }
-  return (label: status, color: AppColors.neutral);
-}
-
-class _ScheduledReportsCard extends StatefulWidget {
-  final RestClient rest;
-  final List schedules;
-  final List deliveries;
-  final VoidCallback reload;
-  const _ScheduledReportsCard({
-    required this.rest,
-    required this.schedules,
-    required this.deliveries,
-    required this.reload,
-  });
-
-  @override
-  State<_ScheduledReportsCard> createState() => _ScheduledReportsCardState();
-}
-
-class _ScheduledReportsCardState extends State<_ScheduledReportsCard> {
-  bool _busy = false;
-
-  // "All outlets (combined)" is a READ-ONLY view — the backend rejects every
-  // non-GET request while it is active. This list is one of the few that widens
-  // in that mode (it returns every outlet's schedules), so leaving the write
-  // controls up would offer a button whose only possible outcome is a 400.
-  bool get _allOutlets => widget.rest.auth.selectedOutletId == 'all';
-
-  // "Every day at 08:00 Asia/Kolkata" — the zone is named because the hour is
-  // the RESTAURANT's wall clock, not the clock on whichever machine is reading
-  // this. An owner in another state would otherwise read it as their own.
-  String _whenLabel(Map s) {
-    final at = '${_two(_int(s['hour_local']) ?? 0)}:${_two(_int(s['minute_local']) ?? 0)} ${RestaurantTime.zone}';
-    final frequency = _s(s, 'frequency', 'daily');
-    if (frequency == 'weekly') {
-      final wd = _int(s['weekday']) ?? 0;
-      final name = wd >= 0 && wd < _weekdayNames.length ? _weekdayNames[wd] : 'week';
-      return 'Every $name at $at';
-    }
-    if (frequency == 'monthly') {
-      return 'Day ${_int(s['day_of_month']) ?? 1} of every month at $at';
-    }
-    return 'Every day at $at';
-  }
-
-  static String _two(int n) => n.toString().padLeft(2, '0');
-
-  String _periodLabel(Map d) {
-    final from = _s(d, 'period_from', '');
-    final to = _s(d, 'period_to', '');
-    if (from.isEmpty || to.isEmpty) return '';
-    return from == to ? _fmtDay(from) : '${_fmtDay(from)} – ${_fmtDay(to)}';
-  }
-
-  /// Whether a delivery came from "Run now" rather than from its schedule.
-  bool _isManualRun(Object? occurrenceKey) {
-    if (occurrenceKey is! String || occurrenceKey.isEmpty) return true;
-    return occurrenceKey.startsWith('manual:');
-  }
-
-  // Create and edit share one form: the backend takes the same shape on POST
-  // and PATCH, and merges an omitted field onto the existing row.
-  Future<void> _scheduleDialog({Map? existing}) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final name = TextEditingController(text: existing == null ? '' : _s(existing, 'name', ''));
-    String reportKey = _s(existing ?? const {}, 'report_key', 'sales');
-    if (!_reportKeyLabels.containsKey(reportKey)) reportKey = 'sales';
-    String frequency = _s(existing ?? const {}, 'frequency', 'daily');
-    if (!_reportFrequencyLabels.containsKey(frequency)) frequency = 'daily';
-    int weekday = _int(existing?['weekday']) ?? 1;
-    int dayOfMonth = _int(existing?['day_of_month']) ?? 1;
-    int hour = _int(existing?['hour_local']) ?? 8;
-    int minute = _int(existing?['minute_local']) ?? 0;
-    // The quarter-hours plus whatever this row already holds. A schedule saved
-    // from another client at, say, :07 must still open in the dropdown rather
-    // than crash it with a value no item carries.
-    final minuteOptions = (<int>{0, 15, 30, 45, minute}.toList()..sort());
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDlg) => Dialog(
-          backgroundColor: Colors.transparent,
-          child: Container(
-            width: 400,
-            padding: const EdgeInsets.all(22),
-            decoration: BoxDecoration(
-              gradient: AppColors.cardGradient,
-              borderRadius: AppRadius.cardAll,
-              border: Border.all(color: AppColors.borderStrong),
-            ),
-            child: SingleChildScrollView(
-              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('SCHEDULED REPORT', style: Theme.of(ctx).textTheme.labelSmall),
-                const SizedBox(height: 6),
-                Text(existing == null ? 'New schedule' : 'Edit schedule', style: Theme.of(ctx).textTheme.titleMedium),
-                const SizedBox(height: AppSpacing.lg),
-                TextField(
-                  controller: name,
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Name (e.g. Morning sales)', isDense: true),
-                ),
-                const SizedBox(height: AppSpacing.sm),
-                DropdownButtonFormField<String>(
-                  initialValue: reportKey,
-                  dropdownColor: AppColors.cardRaised,
-                  borderRadius: AppRadius.controlAll,
-                  decoration: const InputDecoration(labelText: 'Report', isDense: true),
-                  items: [
-                    for (final e in _reportKeyLabels.entries)
-                      DropdownMenuItem(value: e.key, child: Text(e.value)),
-                  ],
-                  onChanged: (v) => setDlg(() => reportKey = v ?? 'sales'),
-                ),
-                const SizedBox(height: AppSpacing.sm),
-                DropdownButtonFormField<String>(
-                  initialValue: frequency,
-                  dropdownColor: AppColors.cardRaised,
-                  borderRadius: AppRadius.controlAll,
-                  decoration: const InputDecoration(labelText: 'How often', isDense: true),
-                  items: [
-                    for (final e in _reportFrequencyLabels.entries)
-                      DropdownMenuItem(value: e.key, child: Text(e.value)),
-                  ],
-                  onChanged: (v) => setDlg(() => frequency = v ?? 'daily'),
-                ),
-                if (frequency == 'weekly') ...[
-                  const SizedBox(height: AppSpacing.sm),
-                  DropdownButtonFormField<int>(
-                    initialValue: weekday,
-                    dropdownColor: AppColors.cardRaised,
-                    borderRadius: AppRadius.controlAll,
-                    decoration: const InputDecoration(labelText: 'Day of the week', isDense: true),
-                    items: [
-                      for (var i = 0; i < _weekdayNames.length; i++)
-                        DropdownMenuItem(value: i, child: Text(_weekdayNames[i])),
-                    ],
-                    onChanged: (v) => setDlg(() => weekday = v ?? 1),
-                  ),
-                ],
-                if (frequency == 'monthly') ...[
-                  const SizedBox(height: AppSpacing.sm),
-                  DropdownButtonFormField<int>(
-                    initialValue: dayOfMonth,
-                    dropdownColor: AppColors.cardRaised,
-                    borderRadius: AppRadius.controlAll,
-                    // Capped at 28 by the backend so "the 31st" can never skip
-                    // February outright.
-                    decoration: const InputDecoration(labelText: 'Day of the month (1–28)', isDense: true),
-                    items: [
-                      for (var i = 1; i <= 28; i++) DropdownMenuItem(value: i, child: Text('$i')),
-                    ],
-                    onChanged: (v) => setDlg(() => dayOfMonth = v ?? 1),
-                  ),
-                ],
-                const SizedBox(height: AppSpacing.sm),
-                Row(children: [
-                  Expanded(
-                    child: DropdownButtonFormField<int>(
-                      initialValue: hour,
-                      dropdownColor: AppColors.cardRaised,
-                      borderRadius: AppRadius.controlAll,
-                      decoration: const InputDecoration(labelText: 'Hour', isDense: true),
-                      items: [
-                        for (var i = 0; i < 24; i++) DropdownMenuItem(value: i, child: Text(_two(i))),
-                      ],
-                      onChanged: (v) => setDlg(() => hour = v ?? 8),
-                    ),
-                  ),
-                  const SizedBox(width: AppSpacing.sm),
-                  Expanded(
-                    child: DropdownButtonFormField<int>(
-                      initialValue: minute,
-                      dropdownColor: AppColors.cardRaised,
-                      borderRadius: AppRadius.controlAll,
-                      decoration: const InputDecoration(labelText: 'Minute', isDense: true),
-                      items: [
-                        for (final m in minuteOptions) DropdownMenuItem(value: m, child: Text(_two(m))),
-                      ],
-                      onChanged: (v) => setDlg(() => minute = v ?? 0),
-                    ),
-                  ),
-                ]),
-                const SizedBox(height: AppSpacing.sm),
-                Text(
-                  'Runs at ${_two(hour)}:${_two(minute)} on the restaurant\'s clock (${RestaurantTime.zone}). '
-                  '${_reportPeriodNotes[frequency] ?? ''}',
-                  style: Theme.of(ctx).textTheme.bodySmall,
-                ),
-                // The hour above is a wall clock and needs no offset table, but
-                // the run times listed on the card do — say so rather than let
-                // them quietly fall back to device time.
-                if (!RestaurantTime.zoneCovered) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    'This build cannot resolve ${RestaurantTime.zone}\'s UTC offset, so past run times are shown in device time. The report itself still runs on the restaurant\'s clock.',
-                    style: Theme.of(ctx).textTheme.bodySmall,
-                  ),
-                ],
-                const SizedBox(height: AppSpacing.xl),
-                Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-                  ForkButton.ghost(label: 'Cancel', onPressed: () => Navigator.pop(ctx, false)),
-                  const SizedBox(width: AppSpacing.sm),
-                  ForkButton(
-                    label: existing == null ? 'Create' : 'Save',
-                    icon: Icons.check,
-                    onPressed: () => Navigator.pop(ctx, true),
-                  ),
-                ]),
-              ]),
-            ),
-          ),
-        ),
-      ),
-    );
-    if (ok != true) return;
-    if (name.text.trim().isEmpty) {
-      messenger.showSnackBar(const SnackBar(content: Text('Give the schedule a name.')));
-      return;
-    }
-    // weekday and day_of_month are sent only for the frequency that uses them;
-    // the backend nulls the other one so a schedule switched from monthly to
-    // weekly cannot keep a stale day behind it.
-    final body = <String, dynamic>{
-      'name': name.text.trim(),
-      'report_key': reportKey,
-      'frequency': frequency,
-      'hour_local': hour,
-      'minute_local': minute,
-      if (frequency == 'weekly') 'weekday': weekday,
-      if (frequency == 'monthly') 'day_of_month': dayOfMonth,
-    };
-    setState(() => _busy = true);
-    try {
-      if (existing == null) {
-        await widget.rest.post('/reports/schedules', body);
-      } else {
-        await widget.rest.patch('/reports/schedules/${existing['id']}', body);
-      }
-      widget.reload();
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _setEnabled(Map s, bool enabled) async {
-    final messenger = ScaffoldMessenger.of(context);
-    setState(() => _busy = true);
-    try {
-      await widget.rest.patch('/reports/schedules/${s['id']}', {'enabled': enabled});
-      widget.reload();
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  // Queues one extra run outside the schedule. It does NOT render here: the
-  // server picks it up on its next sweep, which is why the message points at
-  // the history rather than promising a file.
-  //
-  // 409 is not a failure. The server buckets a manual run to the restaurant's
-  // own minute and refuses a second one inside it, so the click that got there
-  // first IS queued — reporting that as an error would push the owner into
-  // clicking again, and claiming a second run was queued would be a lie.
-  Future<void> _runNow(Map s) async {
-    final messenger = ScaffoldMessenger.of(context);
-    setState(() => _busy = true);
-    try {
-      await widget.rest.post('/reports/schedules/${s['id']}/run-now');
-      messenger.showSnackBar(
-          const SnackBar(content: Text('Queued — it appears under Recent deliveries once the server has built it.')));
-      widget.reload();
-    } catch (e) {
-      if (e is ApiException && e.status == 409) {
-        messenger.showSnackBar(const SnackBar(
-            content: Text('Already queued a moment ago — that run is still on its way, so nothing extra was queued. '
-                'Watch Recent deliveries.')));
-        // The earlier run is a delivery row that may have appeared since this
-        // page loaded, so refresh instead of leaving the owner with no sign of it.
-        widget.reload();
-      } else {
-        messenger.showSnackBar(SnackBar(content: Text('$e')));
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _delete(Map s) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete this schedule?'),
-        // The server archives rather than destroys: the delivery rows are both
-        // the history and what stops an occurrence going out twice.
-        content: Text('"${_s(s, 'name')}" stops running. Reports it already produced stay in the history and can still be downloaded.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    setState(() => _busy = true);
-    try {
-      await widget.rest.delete('/reports/schedules/${s['id']}');
-      widget.reload();
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  // Same route as the Tally export: pull the stored file and hand it to the
-  // platform save dialog. The figures live only in this file — never in the
-  // notification that announced it.
-  Future<void> _download(Map d) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final fileName = _s(d, 'artifact_name', 'report.csv');
-    try {
-      final csv = await widget.rest.getText('/reports/deliveries/${d['id']}/download');
-      final path = await FilePicker.saveFile(
-        dialogTitle: 'Save $fileName',
-        fileName: fileName,
-        type: FileType.custom,
-        allowedExtensions: const ['csv'],
-        bytes: Uint8List.fromList(utf8.encode(csv)),
-      );
-      messenger.showSnackBar(SnackBar(content: Text(path == null ? 'Download cancelled.' : 'Saved $fileName')));
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final text = Theme.of(context).textTheme;
-    final schedules = [for (final s in widget.schedules) if (s is Map) s];
-    final deliveries = [for (final d in widget.deliveries) if (d is Map) d];
-    // Delivery rows outlive their schedule (they are the history), so a row
-    // whose schedule has since been deleted names the report instead of a
-    // schedule that is no longer there.
-    final nameById = <String, String>{
-      for (final s in schedules) _s(s, 'id', ''): _s(s, 'name', 'Report'),
-    }..remove('');
-    Widget hairline() => Container(height: 1, color: AppColors.divider);
-
-    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      SectionHeader(
-        title: 'Scheduled reports',
-        count: schedules.length,
-        trailing: _allOutlets
-            ? null
-            : ForkButton.ghost(
-                label: 'New schedule',
-                icon: Icons.add,
-                dense: true,
-                onPressed: _busy ? null : () => _scheduleDialog(),
-              ),
-        padding: const EdgeInsets.only(bottom: 6),
-      ),
-      Text(
-        'The server builds these on its own — nobody has to open the app. Each run files a CSV you download below, and the notification bell says when one is ready.',
-        style: text.bodySmall,
-      ),
-      // Said once, here, rather than left to each row's controls to discover a
-      // rejection at a time. The downloads below are reads and stay available.
-      if (_allOutlets) ...[
-        const SizedBox(height: AppSpacing.sm),
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Icon(Icons.lock_outline, size: 14, color: AppColors.textTertiary),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              'All outlets (combined) is a read-only view: every outlet\'s schedules are listed here and none of them can be '
-              'changed from it. Switch to a single outlet to create, edit, pause, delete or run one.',
-              style: text.bodySmall,
-            ),
-          ),
-        ]),
-      ],
-      const SizedBox(height: AppSpacing.md),
-      if (schedules.isEmpty)
-        Text('No scheduled reports yet.', style: text.bodySmall)
-      else
-        for (final s in schedules)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: _scheduleRow(context, s),
-          ),
-      if (deliveries.isNotEmpty) ...[
-        const SizedBox(height: AppSpacing.lg),
-        SectionHeader(
-          title: 'Recent deliveries',
-          count: deliveries.length,
-          padding: const EdgeInsets.only(bottom: 6),
-        ),
-        ForkCard(
-          child: Column(children: [
-            for (var i = 0; i < deliveries.length; i++) ...[
-              if (i > 0) hairline(),
-              _deliveryRow(context, deliveries[i], nameById),
-            ],
-          ]),
-        ),
-      ],
-    ]);
-  }
-
-  Widget _scheduleRow(BuildContext context, Map s) {
-    final text = Theme.of(context).textTheme;
-    final on = s['enabled'] != false;
-    final failures = _int(s['consecutive_failures']) ?? 0;
-    final lastStatus = _s(s, 'last_status', '');
-    final lastError = _s(s, 'last_error', '');
-    final lastRun = _s(s, 'last_run_at', '');
-    return ForkCard(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-        _recordHeadRow(
-          context,
-          leading: Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: AppColors.inset,
-              borderRadius: AppRadius.controlAll,
-              border: Border.all(color: AppColors.border),
-            ),
-            child: Icon(Icons.event_repeat_outlined,
-                size: 16, color: on ? AppColors.textSecondary : AppColors.textTertiary),
-          ),
-          identity: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-            Text(_s(s, 'name', 'Scheduled report'),
-                style: text.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
-            const SizedBox(height: 3),
-            Text('${_reportKeyLabels[_s(s, 'report_key', '')] ?? _s(s, 'report_key')} · ${_whenLabel(s)}',
-                style: text.bodySmall, maxLines: 2, overflow: TextOverflow.ellipsis),
-          ]),
-          trailing: [
-            StatusChip(
-              label: on ? 'On' : 'Paused',
-              color: on ? AppColors.success : AppColors.neutral,
-              dense: true,
-            ),
-            if (lastStatus.isNotEmpty)
-              StatusChip(
-                label: 'Last run ${_deliveryStatus(lastStatus).label.toLowerCase()}',
-                color: _deliveryStatus(lastStatus).color,
-                dense: true,
-              ),
-            // Run now and every item in the menu writes, so in the combined
-            // view they are dropped rather than shown against a row this mode
-            // cannot act on — the note under the section header says why.
-            if (!_allOutlets) ...[
-              ForkButton.ghost(
-                label: 'Run now',
-                icon: Icons.play_arrow_outlined,
-                dense: true,
-                onPressed: _busy ? null : () => _runNow(s),
-              ),
-              PopupMenuButton<String>(
-                iconColor: AppColors.textSecondary,
-                enabled: !_busy,
-                onSelected: (v) {
-                  if (v == 'edit') _scheduleDialog(existing: s);
-                  if (v == 'toggle') _setEnabled(s, !on);
-                  if (v == 'delete') _delete(s);
-                },
-                itemBuilder: (_) => [
-                  const PopupMenuItem(value: 'edit', child: Text('Edit')),
-                  PopupMenuItem(value: 'toggle', child: Text(on ? 'Pause' : 'Resume')),
-                  const PopupMenuItem(value: 'delete', child: Text('Delete')),
-                ],
-              ),
-            ],
-          ],
-        ),
-        if (lastRun.isNotEmpty || failures > 0) ...[
-          const SizedBox(height: 12),
-          Wrap(spacing: AppSpacing.xl, runSpacing: AppSpacing.sm, children: [
-            if (lastRun.isNotEmpty) MicroStat(value: _fmtTime(lastRun), label: 'last run'),
-            if (failures > 0) MicroStat(value: '$failures', label: 'failures in a row'),
-          ]),
-        ],
-        if (lastError.isNotEmpty) ...[
-          const SizedBox(height: AppSpacing.sm),
-          Text(_capped(lastError, 200), style: text.bodySmall!.copyWith(color: AppColors.danger)),
-        ],
-        // The server pauses a schedule that keeps failing rather than raising
-        // the same alarm every morning, so say that is what happened.
-        if (!on && failures > 0) ...[
-          const SizedBox(height: AppSpacing.sm),
-          Text('Paused automatically after repeated failures — fix the cause, then resume it.', style: text.bodySmall),
-        ],
-      ]),
-    );
-  }
-
-  Widget _deliveryRow(BuildContext context, Map d, Map<String, String> nameById) {
-    final text = Theme.of(context).textTheme;
-    final status = _deliveryStatus(_s(d, 'status', ''));
-    final title = nameById['${d['schedule_id']}'] ?? 'Deleted schedule';
-    final when = _s(d, 'delivered_at', '').isNotEmpty ? _s(d, 'delivered_at') : _s(d, 'created_at', '');
-    final error = _s(d, 'error', '');
-    final hasFile = _s(d, 'artifact_name', '').isNotEmpty;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-            Text(title, style: text.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
-            const SizedBox(height: 2),
-            Text(
-              [
-                _periodLabel(d),
-                if (when.isNotEmpty) _fmtTime(when),
-                // A "Run now" carries a `manual:`-prefixed key bucketed to the
-                // minute, so repeated clicks collapse through the partial unique
-                // index; a scheduled occurrence carries a bare day key. Both are
-                // non-null, so presence alone does not tell them apart — reading
-                // it that way labelled every manual run as scheduled. Null still
-                // counts as manual: that is what one stored before the key existed.
-                if (_isManualRun(d['occurrence_key'])) 'run manually',
-                if (d['artifact_truncated'] == true) 'file truncated',
-              ].where((p) => p.isNotEmpty).join(' · '),
-              style: text.bodySmall,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            if (error.isNotEmpty) ...[
-              const SizedBox(height: 2),
-              Text(_capped(error, 160), style: text.bodySmall!.copyWith(color: AppColors.danger)),
-            ],
-          ]),
-        ),
-        const SizedBox(width: AppSpacing.sm),
-        StatusChip(label: status.label, color: status.color, dense: true),
-        if (hasFile) ...[
-          const SizedBox(width: AppSpacing.sm),
-          ForkIconButton(
-            icon: Icons.download_outlined,
-            tooltip: 'Download ${_s(d, 'artifact_name')}',
-            onPressed: () => _download(d),
-          ),
-        ],
-      ]),
-    );
   }
 }
 
@@ -23005,7 +23399,22 @@ String _billTitle(Map b) {
   return table.isEmpty ? left : '$left · $table';
 }
 
-void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? profile, VoidCallback? onChanged]) {
+/// CLIENT ITEM 8 — WHERE a settled bill was opened from, which decides the one
+/// control the two write surfaces do not share. Both show Reprint and the name
+/// / GSTIN / address edit (same permission, same errand: correct it, then print
+/// the corrected copy). Only Accounting shows "Move to another till": that is a
+/// cash-up correction, and a cash-up is reconciled in Accounting. The Reports
+/// drill-down is neither — it opens the body alone, read-only.
+enum _ClosedBillSurface { accounting, history }
+
+void _openClosedBill(
+  BuildContext context,
+  RestClient rest,
+  Map bill, [
+  Profile? profile,
+  VoidCallback? onChanged,
+  _ClosedBillSurface surface = _ClosedBillSurface.accounting,
+]) {
   final id = _s(bill, 'id', '');
   if (id.isEmpty) return;
   showModalBottomSheet<void>(
@@ -23019,6 +23428,7 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? 
       title: _billTitle(bill),
       profile: profile,
       onChanged: onChanged,
+      surface: surface,
     ),
   );
 }
@@ -23028,7 +23438,9 @@ void _openClosedBill(BuildContext context, RestClient rest, Map bill, [Profile? 
 /// [onChanged] is told when the name / GSTIN on this bill was edited — from the
 /// row's own control (with the server's answer) or from the sheet (without).
 Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
-    [Profile? profile, void Function(Map<String, dynamic>? saved)? onChanged]) {
+    [Profile? profile,
+    void Function(Map<String, dynamic>? saved)? onChanged,
+    _ClosedBillSurface surface = _ClosedBillSurface.accounting]) {
   final text = Theme.of(context).textTheme;
   final method = _s(b, 'payment_method', '');
   final refunded = b['refunded'] == true;
@@ -23038,7 +23450,7 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
     padding: const EdgeInsets.only(bottom: 8),
     child: ForkCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      onTap: () => _openClosedBill(context, rest, b, profile, onChanged == null ? null : () => onChanged(null)),
+      onTap: () => _openClosedBill(context, rest, b, profile, onChanged == null ? null : () => onChanged(null), surface),
       child: Row(children: [
         Container(
           width: 36,
@@ -23071,8 +23483,11 @@ Widget _closedBillRow(BuildContext context, RestClient rest, Map b,
           ]),
         ),
         const SizedBox(width: AppSpacing.md),
-        // ROUND 2 ITEM 1 — "Edit name / GSTIN" per past bill, behind the reprint
-        // gate (the widget draws nothing for anyone else).
+        // ROUND 2 ITEM 1 — "Edit name / GSTIN / address" per past bill, behind
+        // the reprint gate (the widget draws nothing for anyone else). The row
+        // does not know the address (the list never carries it), so the widget
+        // reads the bill before its dialog opens, and without that read sends an
+        // address only if one is typed.
         if (onChanged != null && _maySetSettledBillCustomer(profile))
           _EditSettledBillCustomerButton(
             key: ValueKey('closed-bill-row-edit-customer-${_s(b, 'id', '')}'),
@@ -23098,16 +23513,20 @@ class _ClosedBillsList extends StatefulWidget {
   final int pageSize;
   final String emptyCaption;
 
-  /// Whose permissions decide whether a settled bill may be MOVED to another
-  /// till (migration 038). Optional: a surface with no profile to hand shows the
-  /// bill exactly as it always did, read-only.
+  /// Whose permissions decide whether a settled bill may be reprinted, have its
+  /// name / GSTIN / address corrected, or be MOVED to another till (migration
+  /// 038). Optional: a surface with no profile to hand shows the bill read-only.
   final Profile? profile;
+
+  /// Which of those controls this list's bills get — see [_ClosedBillSurface].
+  final _ClosedBillSurface surface;
 
   const _ClosedBillsList({
     required this.rest,
     required this.filter,
     required this.emptyCaption,
     this.profile,
+    this.surface = _ClosedBillSurface.accounting,
     this.pageSize = 15,
   });
 
@@ -23228,7 +23647,7 @@ class _ClosedBillsListState extends State<_ClosedBillsList> with CachePrimedScre
           } else {
             setState(() => b.addAll(saved));
           }
-        }),
+        }, widget.surface),
       if (_hasMore)
         Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -23345,12 +23764,16 @@ class _ClosedBillSheet extends StatelessWidget {
   /// sheet repaints its row too.
   final VoidCallback? onChanged;
 
+  /// Accounting or History — History gets everything but the till move.
+  final _ClosedBillSurface surface;
+
   const _ClosedBillSheet({
     required this.rest,
     required this.billId,
     required this.title,
     this.profile,
     this.onChanged,
+    this.surface = _ClosedBillSurface.accounting,
   });
 
   @override
@@ -23391,13 +23814,15 @@ class _ClosedBillSheet extends StatelessWidget {
                       onChanged?.call();
                     },
                   ),
-                  misBillCounterAction(
-                    context,
-                    rest: rest,
-                    profile: profile!,
-                    billId: billId,
-                    onChanged: reload,
-                  ),
+                  // A cash-up correction, so Accounting's alone (client item 8).
+                  if (surface == _ClosedBillSurface.accounting)
+                    misBillCounterAction(
+                      context,
+                      rest: rest,
+                      profile: profile!,
+                      billId: billId,
+                      onChanged: reload,
+                    ),
                 ],
               ]),
             ),
@@ -23519,7 +23944,8 @@ Widget _closedBillBody(BuildContext context, Map bill, String fallbackTitle, {bo
     // ROUND 2 ITEM 1 — `Name:` and `Customer GSTIN:` directly under the header
     // and above the date, the slot the printed bill carries them in, worded as
     // the paper words them (a walk-in's slot is a bare `Name:`, as on the
-    // paper). They replace the bare name chip.
+    // paper). They replace the bare name chip. Client item 7's `Address:` lines
+    // follow, one per stored line, as the paper prints them.
     for (final l in billCustomerLines(bill)) ...[
       const SizedBox(height: 4),
       Text(l, style: text.bodyMedium),
@@ -32356,6 +32782,16 @@ class _KotAutoPrintCardState extends State<_KotAutoPrintCard> {
 // A 200 whose settings document lacks the key (a backend rolled back since the
 // page loaded, which ignores the key) stored nothing: kotDocketSaved throws,
 // and the card reverts with kotDocketNotSupported rather than confirming.
+//
+// "PRINT A TEST KOT" (client item 5) posts the existing POST /print/test for
+// the kitchen role: one slip in the style and size above, so whoever changed
+// either reads the paper now instead of at the next order. Online only (the
+// outbox refuses every /print write offline, and this says so); disabled while
+// the request is out, so one tap is one slip; a refusal shows the server's
+// sentence. The route checks the Print permission, not the settings one.
+// The button is also off while a pick is saving, and the picks are off while a
+// test is out (kotDocketLocks): the server builds the slip from the settings as
+// they are when the request lands, and a pick has already moved the card.
 class _KotDocketCard extends StatefulWidget {
   final RestClient rest;
   final String initialStyle;
@@ -32370,6 +32806,32 @@ class _KotDocketCardState extends State<_KotDocketCard> {
   late String _style = widget.initialStyle;
   late String _size = widget.initialTextSize;
   bool _busy = false;
+  bool _testing = false;
+
+  KotDocketLocks get _locks => kotDocketLocks(saving: _busy, testing: _testing);
+
+  Future<void> _testPrint() async {
+    if (_locks.testDisabled) return;
+    setState(() => _testing = true);
+    String message;
+    try {
+      final reply = await widget.rest.post(kotTestPrintPath, kotTestPrintBody);
+      message = kotTestPrintSentMessage(reply);
+    } on OfflineUnavailable {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    } on ApiException catch (e) {
+      // A status is the server's answer — show its sentence. No status never
+      // reached anyone.
+      message = kotTestPrintFailedMessage(e.status == null ? kotTestPrintOffline : e.message);
+    } catch (_) {
+      message = kotTestPrintFailedMessage(kotTestPrintOffline);
+    }
+    if (!mounted) return;
+    setState(() => _testing = false);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
 
   void _put(String key, String value) {
     if (key == kotPrintStyleKey) {
@@ -32381,7 +32843,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
 
   Future<void> _save(String key, String value) async {
     final previous = key == kotPrintStyleKey ? _style : _size;
-    if (_busy || value == previous) return;
+    if (_locks.choicesDisabled || value == previous) return;
     setState(() {
       _put(key, value);
       _busy = true;
@@ -32422,7 +32884,7 @@ class _KotDocketCardState extends State<_KotDocketCard> {
         inset: true,
         selected: on,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        onTap: _busy ? null : () => _save(key, o.value),
+        onTap: _locks.choicesDisabled ? null : () => _save(key, o.value),
         child: Row(children: [
           Icon(
             on ? Icons.radio_button_checked : Icons.radio_button_unchecked,
@@ -32469,6 +32931,18 @@ class _KotDocketCardState extends State<_KotDocketCard> {
             style: text.bodySmall!.copyWith(fontWeight: FontWeight.w600),
           ),
         ],
+        const SizedBox(height: AppSpacing.lg),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: ForkButton.ghost(
+            key: const ValueKey('kot-test-print'),
+            label: _testing ? kotTestPrintSending : kotTestPrintLabel,
+            icon: Icons.print_outlined,
+            onPressed: _locks.testDisabled ? null : _testPrint,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(kotTestPrintHelp, style: text.bodySmall),
       ]),
     );
   }
@@ -32621,7 +33095,6 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
   // Seeded from the bundled table so the picker works offline, then replaced by
   // the server's list (the authority on what POST /restaurant/settings accepts).
   List<String> _zones = tzZoneNames;
-  final _search = TextEditingController();
   String _query = '';
 
   @override
@@ -32631,12 +33104,6 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
       final list = [for (final z in (m['timezones'] as List?) ?? const []) '$z'];
       if (mounted && list.isNotEmpty) setState(() => _zones = list);
     }).catchError((_) {/* offline — the bundled list still works */});
-  }
-
-  @override
-  void dispose() {
-    _search.dispose();
-    super.dispose();
   }
 
   @override
@@ -32661,15 +33128,11 @@ class _TimezoneDialogState extends State<_TimezoneDialog> {
             const SizedBox(height: 6),
             Text('Restaurant timezone', style: text.titleMedium),
             const SizedBox(height: AppSpacing.lg),
-            TextField(
-              controller: _search,
+            AppSearchField(
+              testId: 'tz-search',
+              label: 'Search (city or region)',
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Search (city or region)',
-                prefixIcon: Icon(Icons.search, size: 18),
-                isDense: true,
-              ),
-              onChanged: (v) => setState(() => _query = v),
+              onQuery: (q) => setState(() => _query = q),
             ),
             const SizedBox(height: AppSpacing.md),
             if (shown.isEmpty)
@@ -33044,6 +33507,10 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
             if (m.enabled && !m.online)
               Padding(
                 padding: const EdgeInsets.only(left: 16, bottom: 4),
+                // Each option is a checkbox beside its words. The Wrap hands each
+                // one at most the card's width, so the words are Flexible: on a
+                // 360dp phone they wrap under themselves instead of running past
+                // the card's edge (80px of "Require payment screenshot" did).
                 child: Wrap(spacing: 12, children: [
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33054,7 +33521,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(requiresScreenshot: v ?? false)),
                     ),
-                    Text('Require payment screenshot', style: text.bodySmall),
+                    Flexible(child: Text('Require payment screenshot', style: text.bodySmall)),
                   ]),
                   Row(mainAxisSize: MainAxisSize.min, children: [
                     Checkbox(
@@ -33065,7 +33532,7 @@ class _PaymentSettingsCardState extends State<_PaymentSettingsCard> {
                       side: BorderSide(color: AppColors.borderStrong),
                       onChanged: _busy ? null : (v) => _patch(m.id, (x) => x.copyWith(showToGuests: v ?? false)),
                     ),
-                    Text('Show on guest QR page', style: text.bodySmall),
+                    Flexible(child: Text('Show on guest QR page', style: text.bodySmall)),
                   ]),
                 ]),
               ),
@@ -33321,6 +33788,12 @@ class _MessagingSettingsCard extends StatefulWidget {
 }
 
 class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
+  static const _providers = [
+    ('none', 'Off (log only)'),
+    ('twilio', 'Twilio (SMS / WhatsApp)'),
+    ('meta', 'Meta WhatsApp Cloud API'),
+  ];
+
   late String _provider;
   late final TextEditingController _sender;
   late final TextEditingController _keyId;
@@ -33400,15 +33873,22 @@ class _MessagingSettingsCardState extends State<_MessagingSettingsCard> {
         const SizedBox(height: AppSpacing.lg),
         Text('PROVIDER', style: text.labelSmall),
         const SizedBox(height: 6),
+        // A dropdown that is not expanded is as wide as its widest choice, and
+        // "Twilio (SMS / WhatsApp)" at 1.3x is wider than a 360dp phone's card.
+        // Expanded, what the closed field shows is held to the field (which
+        // already spans the card and draws the arrow itself, so nothing moves on
+        // a desktop) and kept to one line. The open menu keeps the full words.
         DropdownButtonFormField<String>(
           initialValue: _provider,
+          isExpanded: true,
           dropdownColor: AppColors.cardRaised,
           borderRadius: AppRadius.controlAll,
           decoration: const InputDecoration(isDense: true),
-          items: const [
-            DropdownMenuItem(value: 'none', child: Text('Off (log only)')),
-            DropdownMenuItem(value: 'twilio', child: Text('Twilio (SMS / WhatsApp)')),
-            DropdownMenuItem(value: 'meta', child: Text('Meta WhatsApp Cloud API')),
+          items: [
+            for (final (value, label) in _providers) DropdownMenuItem(value: value, child: Text(label)),
+          ],
+          selectedItemBuilder: (_) => [
+            for (final (_, label) in _providers) Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
           ],
           onChanged: _busy ? null : (v) => setState(() => _provider = v ?? 'none'),
         ),
@@ -33792,7 +34272,9 @@ class _BrandingCardState extends State<_BrandingCard> {
         const SizedBox(height: 4),
         Text('Logo + colour shown to guests on the QR ordering & reservation pages.', style: text.bodySmall),
         const SizedBox(height: AppSpacing.lg),
-        Row(children: [
+        // A Wrap, not a Row: where the button does not fit beside the logo (a
+        // 360dp phone at large text) it goes under it, label whole.
+        Wrap(crossAxisAlignment: WrapCrossAlignment.center, spacing: AppSpacing.md, runSpacing: AppSpacing.sm, children: [
           Container(
             width: 64, height: 64,
             decoration: BoxDecoration(
@@ -33803,7 +34285,6 @@ class _BrandingCardState extends State<_BrandingCard> {
             ),
             child: _logo.isEmpty ? Icon(Icons.storefront, color: AppColors.textSecondary) : null,
           ),
-          const SizedBox(width: AppSpacing.md),
           ForkButton.ghost(
             label: _logo.isEmpty ? 'Upload logo' : 'Change logo',
             icon: Icons.upload,
@@ -35109,7 +35590,8 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
     final fsMul = _fontScale == 'small' ? 0.92 : (_fontScale == 'large' ? 1.1 : 1.0);
     final body = TextStyle(fontFamily: _font, fontFamilyFallback: const ['Inter', 'Roboto']);
     final serif = const TextStyle(fontFamily: 'Georgia', fontFamilyFallback: ['Times New Roman', 'serif']);
-    return ClipRRect(
+    final miniature = ClipRRect(
+      key: const ValueKey('guest-theme-preview'),
       borderRadius: BorderRadius.circular(22), // --rCard, a design constant
       child: Container(
         decoration: BoxDecoration(
@@ -35248,9 +35730,16 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
                             child: Text('Rate us',
                                 style: body.copyWith(fontSize: 11.5 * fsMul, fontWeight: FontWeight.w500, color: ink)),
                           ),
-                          const Spacer(),
-                          Text(_font,
-                              style: body.copyWith(fontSize: 10, color: ink.withValues(alpha: 0.45))),
+                          const SizedBox(width: 8),
+                          // The font's name takes what the buttons leave, and
+                          // is the first thing to give way.
+                          Expanded(
+                            child: Text(_font,
+                                textAlign: TextAlign.right,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: body.copyWith(fontSize: 10, color: ink.withValues(alpha: 0.45))),
+                          ),
                         ]),
                       ]),
                     ),
@@ -35262,7 +35751,23 @@ class _CustomerBrandingCardState extends State<_CustomerBrandingCard> {
         ]),
       ),
     );
+    // A miniature of the guest page, so it is laid out the way a guest's phone
+    // lays it out: at the guest page's own type scale (Text size above), never
+    // the owner's device text size, and at least a phone's width. A narrower
+    // card shows it scaled down. Laid out in the card itself, an owner's phone
+    // wrapped its lines past the 268px it is, even at 1x.
+    return LayoutBuilder(builder: (context, box) {
+      final unscaled = MediaQuery.withNoTextScaling(child: miniature);
+      if (box.maxWidth >= _previewMinWidth) return unscaled;
+      return FittedBox(
+        fit: BoxFit.scaleDown,
+        alignment: Alignment.topLeft,
+        child: SizedBox(width: _previewMinWidth, child: unscaled),
+      );
+    });
   }
+
+  static const double _previewMinWidth = 380;
 
   // Retired keys this tenant still has stored. Shown read-only and clearly dead —
   // the guest design can't express them, and the backend keeps them untouched.
