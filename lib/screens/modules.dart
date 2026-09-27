@@ -26,6 +26,7 @@ import '../models/kot_docket_settings.dart';
 import '../models/next_party.dart';
 import '../models/order_moves.dart';
 import '../models/profile.dart';
+import '../models/remove_from_kot.dart';
 import '../models/report_email.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
@@ -10166,22 +10167,28 @@ class _TableSheetState extends State<_TableSheet> {
     _popAndReload();
   }
 
+  /// ROUND 4 ITEM 2 — the dish comes off the KOT, not merely off the bill. The
+  /// words are models/remove_from_kot.dart's, shared with the web's
+  /// kot-line-actions.tsx; the route and the body are unchanged.
   Future<void> _removeBillItem(ScaffoldMessengerState messenger, String name, double price) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Remove item?'),
-        content: Text('Remove "$name" from this table\'s bill?'),
+        title: Text(removeFromKotTitle(name)),
+        content: const Text(removeFromKotWarning),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Remove')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), style: FilledButton.styleFrom(backgroundColor: AppColors.danger), child: const Text('Remove from KOT')),
         ],
       ),
     );
     if (ok != true) return;
     try {
-      await widget.rest.post('/bills/remove-item', {'table_name': _name, 'item_name': name, 'price': price});
-      messenger.showSnackBar(SnackBar(content: Text('Removed $name.')));
+      // The answer carries what the pass was handed (kot_cancelled, kot_no) —
+      // the till used to throw it away and say only "Removed X.", which told
+      // nobody whether the kitchen had been stopped.
+      final res = await widget.rest.post('/bills/remove-item', {'table_name': _name, 'item_name': name, 'price': price});
+      messenger.showSnackBar(SnackBar(content: Text(removedFromKotSentence(name, res))));
       await _loadBill();
       widget.reload();
     } catch (e) {
@@ -11040,7 +11047,7 @@ class _TableSheetState extends State<_TableSheet> {
                   if (v == 'move') _moveBillItem(messenger, name, price.toDouble());
                 },
                 itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'remove', child: Text('Remove from bill')),
+                  PopupMenuItem(value: 'remove', child: Text('Remove from KOT')),
                   PopupMenuItem(value: 'move', child: Text('Move to another table')),
                 ],
               ),
