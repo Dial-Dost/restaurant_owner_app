@@ -239,11 +239,18 @@ String _fmtClock(String iso) => iso.isEmpty ? '' : RestaurantTime.clock(iso);
 // A booking's table, so the ROOM's tables only: a next-party seat ("12 #2",
 // client item 6) exists while 12's bill is unpaid and is gone minutes later,
 // and the server refuses a booking on one.
+//
+// `include_hidden=1` BECAUSE THIS IS A LIST OF TABLES, NOT A FLOOR (round-3
+// item 4). The server keeps one card per table number by leaving rows off
+// /get-tables, and the row it leaves off is sometimes the ROOT's — a settled
+// "14" beside a running "14 #2". Dropping the seats out of THAT payload would
+// leave 14 in neither half, and a table nobody can book is a table the owner
+// thinks we deleted.
 Future<String?> _pickTable(BuildContext context, RestClient rest) async {
   List tables;
   try {
     tables = [
-      for (final t in await rest.getList('/get-tables'))
+      for (final t in await rest.getList('/get-tables?include_hidden=1'))
         if (!isNextPartyRow(t as Map)) t,
     ];
   } catch (e) {
@@ -2472,7 +2479,13 @@ Widget overviewModule(RestClient rest, Profile p) => Builder(builder: (shell) {
           maybe(scope.money, () => rest.getMap('/orders/apc')),
           maybe(scope.rating, () => rest.getMap('/feedback/summary')),
           maybe(scope.money, () => rest.getMap('/orders/daily-revenue?days=14')),
-          maybe(scope.floor, () => rest.getList('/get-tables')),
+          // `include_hidden=1`: this figure block COUNTS THE ROOM — countRoomsInUse
+          // folds "12 #2" into 12 and counts the roots — and round-3 item 4's
+          // duplicate rule leaves a card off the default payload that is
+          // sometimes the root's (a settled 12 beside a running "12 #2"). The
+          // floor read would then count that number in neither N nor M and
+          // quietly shrink the restaurant by a table. A count is not a floor.
+          maybe(scope.floor, () => rest.getList('/get-tables?include_hidden=1')),
           // One consolidated insight read — top dishes, best staff, kitchen speed,
           // peak trade and what needs attention. Composed server-side from the
           // same helpers the detail screens use, so these agree with them. It
@@ -7335,7 +7348,20 @@ Widget _floorModule(RestClient rest, Profile p, FloorSurface surface) => AsyncVi
         final liveGross = surface != FloorSurface.service
             ? null
             : rest.getMap('/bills/open?limit=1').then<Object>((page) => page, onError: (Object e) => liveGrossFailure(e));
-        final tables = await rest.getList('/get-tables');
+        // THE LAYOUT EDITOR READS THE ROOM, THE TABLES SCREEN READS THE FLOOR
+        // (round-3 item 4). The server keeps one card per table number by
+        // leaving rows off /get-tables, and the row it leaves off is sometimes
+        // the ROOT's — a settled "12" beside a running "12 #2". The plan builds
+        // its grid, its "N tables · M seats" legend, its Delete-a-table picker
+        // and its "name already taken" list by dropping the next-party seats
+        // from this payload ([isNextPartyRow] below), so a hidden root takes 12
+        // off the layout screen altogether and the owner reads it as a table we
+        // deleted. `include_hidden=1` asks for every live row instead.
+        //
+        // NEVER ON THE SERVICE SURFACE: that one draws cards, and putting the
+        // hidden rows back is exactly the duplicate this round removed.
+        final tables = await rest.getList(
+            surface == FloorSurface.service ? '/get-tables' : '/get-tables?include_hidden=1');
         // 2.1 — "WHAT IS SEEN IN TABLES IS NOT SHOWN IN THE FLOOR PLAN." Who is
         // waiting on a table and which booking it is clubbed into are the live
         // floor, and the layout editor draws neither (see [_TableBox]), so it
