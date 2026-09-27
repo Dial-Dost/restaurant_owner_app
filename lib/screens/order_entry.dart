@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
+import '../models/covers_warning.dart';
+
 import '../models/next_party.dart';
 import '../models/order_draft.dart';
 import '../models/profile.dart';
@@ -347,6 +349,10 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
     }
   }
 
+  /// What the server said about seating a party bigger than the table, held
+  /// from the occupy call until after the order reports (client item 3).
+  CoversWarning? _coversWarning;
+
   Future<void> _send() async {
     if (_cart.isEmpty) return;
     // THE KEYBOARD GOES DOWN ON SEND. A send that lands closes the pad anyway;
@@ -416,7 +422,13 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
         // first and its bill predates the seating it belongs to, so it is
         // attributed to the PREVIOUS party or to none at all.
         try {
-          await widget.rest.post('/occupy-table', {'table_name': _table, 'num_covers': covers});
+          final seated = await widget.rest.post('/occupy-table', {'table_name': _table, 'num_covers': covers});
+          // Bigger party than the table: seated and recorded at its true size,
+          // with a note (client item 3). This used to be a 400 that stopped the
+          // send here, so the kitchen never saw the order at all. Held until
+          // after the order below reports, so the first thing the waiter reads
+          // is whether the food is away.
+          _coversWarning = CoversWarning.parse(seated);
         } on OfflineQueued catch (_) {
           // Queued, not lost — and queued AHEAD of the order below, which the
           // outbox replays in the order it was written. The kitchen ticket must
@@ -453,6 +465,18 @@ class _OrderEntryScreenState extends State<OrderEntryScreen> with CachePrimedScr
       // this route, so it is still on screen after the pop.
       if (reprint != null) {
         showReprintNeeded(ScaffoldMessenger.of(context), widget.rest, reprint);
+      }
+      // CLIENT ITEM 3, after the food news and never before it. The party is
+      // bigger than the table is set for; the order has gone to the kitchen
+      // anyway, and this says what the host can do about the seating. On the
+      // messenger BELOW this route, like the reprint line, so it survives the
+      // pop.
+      final coversWarning = _coversWarning;
+      if (coversWarning != null) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(coversWarning.message),
+          duration: const Duration(seconds: 6),
+        ));
       }
       Navigator.pop(context, true);
     } on OfflineQueued catch (queued) {

@@ -29,6 +29,7 @@ import '../models/profile.dart';
 import '../models/report_email.dart';
 import '../models/role_scope.dart';
 import '../models/service_clock.dart';
+import '../models/covers_warning.dart';
 import '../models/table_assignment.dart';
 import '../services/api_client.dart';
 import '../services/outbox.dart';
@@ -11568,6 +11569,17 @@ class _TableSheetState extends State<_TableSheet> {
           backgroundColor: assignment.leftTableUnattended
               ? unattendedColour
               : null,
+        ));
+      }
+      // A party bigger than the table is now SEATED and told, where it used to
+      // be refused (client item 3). Shown after the assignment line and for
+      // longer: it names something the host can go and fix, while the ordinary
+      // "seated" confirmation is just an acknowledgement.
+      final coversNote = CoversWarning.parse(res);
+      if (coversNote != null) {
+        messenger.showSnackBar(SnackBar(
+          content: Text(coversNote.message),
+          duration: const Duration(seconds: 6),
         ));
       }
       if (!mounted) return;
