@@ -68,6 +68,14 @@ class _FakeApi extends ApiClient {
       return writeReplies[path] ?? <String, dynamic>{'success': true};
     }
     if (routes.containsKey(path)) return routes[path];
+    // THE ROOM READ IS THE SAME FLOOR, ASKED FOR IN FULL. Round-3 item 4's
+    // follow-up: the layout editor and the Overview's count send
+    // `?include_hidden=1` so a card the server hides cannot take its table off
+    // their lists. No fixture here holds a hidden card, so the plain stub is the
+    // right answer to both reads — and hidden_root_room_read_test.dart is where
+    // the two payloads are made to differ.
+    final room = path.replaceFirst(RegExp(r'[?&]include_hidden=1$'), '');
+    if (room != path && routes.containsKey(room)) return routes[room];
     throw ApiException('No fake route for $path', 404);
   }
 }
